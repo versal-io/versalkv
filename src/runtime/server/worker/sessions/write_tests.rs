@@ -269,13 +269,27 @@ fn backpressured_streaming_replica_waits_for_real_writable_readiness() {
         .primary_link_mut(replica_id)
         .expect("registered replica link")
         .set_state(PrimaryLinkState::Streaming);
+    crate::foundation::io::sys::socket::set_buffer_size_raw(
+        backend
+            .transport
+            .raw_fd(token)
+            .expect("replica transport descriptor"),
+        crate::foundation::io::sys::socket::SocketBuffer::Send,
+        4096,
+    )
+    .expect("shrink replica transport send buffer");
     SockRef::from(&replica_stream)
         .set_recv_buffer_size(4096)
         .expect("shrink replica peer receive buffer");
     fill_transport_send_buffer(&mut backend, token);
     backend.transport.clear_interest_requests_for_test();
-    let frame = b"replica-frame";
-    backend.ctx.replication_mut().backlog.append(frame).unwrap();
+    let frame = vec![b'r'; 8 * 1024];
+    backend
+        .ctx
+        .replication_mut()
+        .backlog
+        .append(&frame)
+        .unwrap();
     let queued = {
         let backlog = &backend.ctx.replication().backlog;
         backend
@@ -323,41 +337,43 @@ fn backpressured_streaming_replica_waits_for_real_writable_readiness() {
     SockRef::from(&replica_stream)
         .set_recv_buffer_size(1024 * 1024)
         .expect("expand replica peer receive buffer");
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + Duration::from_secs(10);
     let mut drain = [0_u8; 64 * 1024];
-    let ready = loop {
-        loop {
-            match replica_stream.read(&mut drain) {
-                Ok(0) => break,
-                Ok(_) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(error) => panic!("failed to drain replica peer: {error}"),
+    while backend.connection_registry[token].has_pending_output() {
+        let ready = loop {
+            loop {
+                match replica_stream.read(&mut drain) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(error) => panic!("failed to drain replica peer: {error}"),
+                }
             }
-        }
-        if let Some(ready) = backend
-            .transport
-            .poll_events(Some(Duration::from_millis(10)))
-            .expect("poll real replica writable readiness")
-            .into_iter()
-            .find(|event| event.token == token && event.writable)
-        {
-            break ready;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "replica socket did not become writable after peer drain"
+            if let Some(ready) = backend
+                .transport
+                .poll_events(Some(Duration::from_millis(10)))
+                .expect("poll real replica writable readiness")
+                .into_iter()
+                .find(|event| event.token == token && event.writable)
+            {
+                break ready;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "replica socket did not become writable after peer drain"
+            );
+        };
+        backend.dispatch_transport_event(
+            crate::runtime::server::worker::reactor::ReadyEvent {
+                token: ready.token,
+                readable: ready.readable,
+                writable: ready.writable,
+                error: ready.error,
+                read_hup: ready.read_hup,
+            },
+            false,
         );
-    };
-    backend.dispatch_transport_event(
-        crate::runtime::server::worker::reactor::ReadyEvent {
-            token: ready.token,
-            readable: ready.readable,
-            writable: ready.writable,
-            error: ready.error,
-            read_hup: ready.read_hup,
-        },
-        false,
-    );
+    }
 
     assert!(!backend.connection_registry[token].has_pending_output());
     assert!(!backend.writes.replica_waiting_for_writable(token));

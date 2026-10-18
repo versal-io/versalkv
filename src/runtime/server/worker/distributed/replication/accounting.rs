@@ -360,9 +360,7 @@ impl ServerWorkerState {
                 }
                 Entry::Occupied(mut owner) => {
                     let owner = owner.get_mut();
-                    if (entry.cursor_error && !owner.cursor_error)
-                        || (!owner.cursor_error && entry.bytes > owner.bytes)
-                    {
+                    if (entry.bytes > owner.bytes || entry.cursor_error) && !owner.cursor_error {
                         owner.diagnostic_connection_id = entry.connection_id;
                     }
                     owner.bytes = owner.bytes.max(entry.bytes);

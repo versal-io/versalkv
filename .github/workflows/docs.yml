@@ -28,6 +28,8 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.99.1"
 
       - name: Build documentation
         run: make doc

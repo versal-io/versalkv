@@ -794,6 +794,7 @@ fn slot_snapshot_source_runs_before_later_shutdown_readiness() {
     backend
         .transport
         .wait_readable_for_test(shutdown_peer.token);
+    backend.transport.wait_readable_for_test(source.token);
     backend.transport.queue_test_transport_event_batch(&[
         (source.token, true, false, false, false),
         (shutdown_peer.token, true, false, false, false),

@@ -64,6 +64,7 @@ fn malformed_streaming_frame_tears_down_the_production_replica_link() {
     primary_stream
         .write_all(b"*1\r\n!4\r\nPONG\r\n")
         .expect("write malformed replication command");
+    backend.transport.wait_readable_for_test(Token(main_token));
 
     backend.recv_replication_stream(main_token, main_token);
 

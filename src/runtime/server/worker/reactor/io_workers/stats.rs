@@ -2,6 +2,22 @@ use crate::engine::extension::config::server::IO_THREADS_MAX;
 use crate::framework::capabilities::io::mt_driver::WorkerId;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// Atomically decrement `counter` by one, saturating at zero.
+///
+/// Uses `compare_exchange_weak` instead of `fetch_update`/`try_update` for
+/// toolchain compatibility (the former is stable across all supported
+/// versions; `fetch_update` is deprecated in newer toolchains while
+/// `try_update` is still unstable on older ones).
+fn atomic_saturating_dec(counter: &AtomicU64, success: Ordering, failure: Ordering) {
+    loop {
+        let current = counter.load(failure);
+        match counter.compare_exchange_weak(current, current.saturating_sub(1), success, failure) {
+            Ok(_) => break,
+            Err(_) => continue,
+        }
+    }
+}
+
 #[cfg(test)]
 const ADAPTIVE_SAMPLE_COUNT: usize = 16;
 #[cfg(test)]
@@ -154,9 +170,7 @@ impl IoThreadStats {
 
     pub(crate) fn record_job_dequeued(&self, worker_id: WorkerId) {
         if let Some(counter) = self.queued_jobs.get(worker_id) {
-            let _ = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
-                Some(queued.saturating_sub(1))
-            });
+            atomic_saturating_dec(counter, Ordering::AcqRel, Ordering::Acquire);
         }
     }
 
@@ -172,19 +186,11 @@ impl IoThreadStats {
     }
 
     pub(crate) fn cancel_read_submission(&self) {
-        let _ = self
-            .reads_pending
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |pending| {
-                Some(pending.saturating_sub(1))
-            });
+        atomic_saturating_dec(&self.reads_pending, Ordering::Relaxed, Ordering::Relaxed);
     }
 
     pub(crate) fn record_read_completed(&self) {
-        let _ = self
-            .reads_pending
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |pending| {
-                Some(pending.saturating_sub(1))
-            });
+        atomic_saturating_dec(&self.reads_pending, Ordering::Relaxed, Ordering::Relaxed);
         self.reads_processed.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -193,19 +199,11 @@ impl IoThreadStats {
     }
 
     pub(crate) fn cancel_write_submission(&self) {
-        let _ = self
-            .writes_pending
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |pending| {
-                Some(pending.saturating_sub(1))
-            });
+        atomic_saturating_dec(&self.writes_pending, Ordering::Relaxed, Ordering::Relaxed);
     }
 
     pub(crate) fn record_write_completed(&self) {
-        let _ = self
-            .writes_pending
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |pending| {
-                Some(pending.saturating_sub(1))
-            });
+        atomic_saturating_dec(&self.writes_pending, Ordering::Relaxed, Ordering::Relaxed);
         self.writes_processed.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -214,19 +212,11 @@ impl IoThreadStats {
     }
 
     pub(crate) fn cancel_poll_submission(&self) {
-        let _ = self
-            .polls_pending
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |pending| {
-                Some(pending.saturating_sub(1))
-            });
+        atomic_saturating_dec(&self.polls_pending, Ordering::Relaxed, Ordering::Relaxed);
     }
 
     pub(crate) fn record_poll_completed(&self) {
-        let _ = self
-            .polls_pending
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |pending| {
-                Some(pending.saturating_sub(1))
-            });
+        atomic_saturating_dec(&self.polls_pending, Ordering::Relaxed, Ordering::Relaxed);
         self.polls_processed.fetch_add(1, Ordering::Relaxed);
     }
 
