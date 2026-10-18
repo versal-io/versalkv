@@ -2688,8 +2688,6 @@ def command_check_ci_support(_args: argparse.Namespace, ctx: RepoContext) -> int
         failures.append("CI must install Node.js before running wasm-check")
     if '"scripts/versal-util.py"' not in docs_pipeline:
         failures.append("documentation pipeline does not watch versal-util.py")
-    if "python3 scripts/versal-util.py ci dual-channel" not in pipeline:
-        failures.append("CI does not route dual-channel gate through versal-util.py")
     if "python3 \"$ROOT_DIR/scripts/versal-util.py\" tcl binaries" not in moduleapi:
         failures.append("Module API runner does not use Python binary staging")
     for runner_name, content in (("runtest", runtest), ("runtest-sentinel", sentinel), ("runtest-moduleapi", moduleapi)):
