@@ -168,11 +168,8 @@ impl DirectDualCompletionState {
 
 impl DirectDualRdbChild {
     pub(crate) fn logical_replication_buffer_bytes(&mut self, live_bytes: usize) -> usize {
-        if self.targets.is_empty() {
-            return live_bytes;
-        }
-        self.shared_replication_buffer_bytes = self.shared_replication_buffer_bytes.max(live_bytes);
-        self.shared_replication_buffer_bytes
+        self.shared_replication_buffer_bytes = live_bytes;
+        live_bytes
     }
 }
 
