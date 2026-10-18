@@ -1,0 +1,314 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <title>Versal Web CLI</title>
+    <style>
+      :root {
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        color: #e8edf2;
+        background: #09100e;
+        font-synthesis: none;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        min-height: 100vh;
+        margin: 0;
+        background:
+          radial-gradient(circle at 15% 10%, rgb(54 211 153 / 14%), transparent 30rem),
+          radial-gradient(circle at 85% 90%, rgb(56 189 248 / 10%), transparent 28rem),
+          #09100e;
+      }
+
+      main {
+        width: min(960px, calc(100% - 32px));
+        margin: 0 auto;
+        padding: clamp(32px, 8vh, 84px) 0 40px;
+      }
+
+      .intro {
+        display: flex;
+        align-items: end;
+        justify-content: space-between;
+        gap: 24px;
+        margin-bottom: 20px;
+      }
+
+      h1 {
+        margin: 0;
+        color: #f7fbf9;
+        font-size: clamp(28px, 5vw, 48px);
+        font-weight: 680;
+        letter-spacing: -0.04em;
+      }
+
+      .subtitle {
+        margin: 8px 0 0;
+        color: #8da39b;
+        font-size: 15px;
+      }
+
+      #runtime-status {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        flex: none;
+        padding: 8px 12px;
+        border: 1px solid #293d36;
+        border-radius: 999px;
+        color: #a5b7b0;
+        background: rgb(12 24 20 / 72%);
+        font: 600 12px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+      }
+
+      #runtime-status::before {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: #f6c453;
+        box-shadow: 0 0 14px rgb(246 196 83 / 70%);
+        content: "";
+      }
+
+      #runtime-status[data-state="ready"]::before {
+        background: #4ade80;
+        box-shadow: 0 0 14px rgb(74 222 128 / 70%);
+      }
+
+      #runtime-status[data-state="error"]::before {
+        background: #fb7185;
+        box-shadow: 0 0 14px rgb(251 113 133 / 70%);
+      }
+
+      .terminal {
+        overflow: hidden;
+        border: 1px solid #253a33;
+        border-radius: 16px;
+        background: rgb(5 12 10 / 92%);
+        box-shadow: 0 30px 80px rgb(0 0 0 / 38%);
+      }
+
+      .terminal-bar {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        height: 46px;
+        padding: 0 16px;
+        border-bottom: 1px solid #1d2e28;
+        background: #0c1713;
+      }
+
+      .terminal-dot {
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        background: #fb7185;
+      }
+
+      .terminal-dot:nth-child(2) {
+        background: #f6c453;
+      }
+
+      .terminal-dot:nth-child(3) {
+        background: #4ade80;
+      }
+
+      .terminal-title {
+        margin-left: 8px;
+        color: #758b83;
+        font: 12px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      }
+
+      #terminal-output {
+        min-height: 390px;
+        max-height: 58vh;
+        overflow-y: auto;
+        padding: 20px;
+        scrollbar-color: #2b463c transparent;
+      }
+
+      .terminal-line {
+        margin-bottom: 12px;
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+        font: 14px/1.58 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      }
+
+      .terminal-line--system {
+        color: #769b8d;
+      }
+
+      .terminal-line--command {
+        color: #67e8a7;
+      }
+
+      .terminal-line--reply {
+        color: #dbe7e2;
+      }
+
+      .terminal-line--error {
+        color: #fda4af;
+      }
+
+      #command-form {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 14px 18px;
+        border-top: 1px solid #1d2e28;
+        background: #09130f;
+      }
+
+      .prompt {
+        color: #4ade80;
+        font: 700 16px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      }
+
+      #command-input {
+        min-width: 0;
+        flex: 1;
+        border: 0;
+        outline: 0;
+        color: #f2f7f5;
+        background: transparent;
+        font: 15px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      }
+
+      #command-input::placeholder {
+        color: #50645c;
+      }
+
+      #command-submit {
+        padding: 8px 13px;
+        border: 1px solid #326b52;
+        border-radius: 8px;
+        color: #b8f7d1;
+        background: #123b29;
+        font: 650 12px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        cursor: pointer;
+      }
+
+      #command-submit:disabled {
+        opacity: 0.45;
+        cursor: not-allowed;
+      }
+
+      .examples {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin-top: 16px;
+      }
+
+      .example {
+        padding: 8px 11px;
+        border: 1px solid #223a31;
+        border-radius: 8px;
+        color: #95aaa2;
+        background: rgb(10 23 18 / 74%);
+        font: 12px/1.2 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        cursor: pointer;
+      }
+
+      .example:hover {
+        border-color: #3d6a58;
+        color: #cdfbe0;
+      }
+
+      .hint {
+        margin: 14px 2px 0;
+        color: #60766d;
+        font-size: 12px;
+      }
+
+      kbd {
+        padding: 2px 5px;
+        border: 1px solid #30483f;
+        border-bottom-width: 2px;
+        border-radius: 4px;
+        color: #91a69e;
+        background: #101d18;
+        font: 11px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      }
+
+      @media (max-width: 620px) {
+        main {
+          width: min(100% - 20px, 960px);
+          padding-top: 24px;
+        }
+
+        .intro {
+          align-items: start;
+          flex-direction: column;
+          gap: 14px;
+        }
+
+        #terminal-output {
+          min-height: 55vh;
+        }
+
+        #command-submit {
+          display: none;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header class="intro">
+        <div>
+          <h1>Versal Web CLI</h1>
+          <p class="subtitle">A local, in-browser Valkey-compatible command runtime.</p>
+        </div>
+        <div id="runtime-status" data-state="loading">Loading WASM</div>
+      </header>
+
+      <section class="terminal" aria-label="Versal command terminal">
+        <div class="terminal-bar" aria-hidden="true">
+          <span class="terminal-dot"></span>
+          <span class="terminal-dot"></span>
+          <span class="terminal-dot"></span>
+          <span class="terminal-title">versal-wasm</span>
+        </div>
+        <div id="terminal-output" role="log" aria-live="polite"></div>
+        <form id="command-form" autocomplete="off">
+          <label class="prompt" for="command-input">›</label>
+          <input
+            id="command-input"
+            name="command"
+            type="text"
+            placeholder="SET greeting &quot;hello from wasm&quot;"
+            aria-label="Command"
+            spellcheck="false"
+            disabled
+          />
+          <button id="command-submit" type="submit" disabled>Run</button>
+        </form>
+      </section>
+
+      <nav class="examples" aria-label="Example commands">
+        <button class="example" type="button" data-command="PING">PING</button>
+        <button class="example" type="button" data-command="SET greeting hello">SET greeting hello</button>
+        <button class="example" type="button" data-command="GET greeting">GET greeting</button>
+        <button class="example" type="button" data-command="INCR visits">INCR visits</button>
+        <button class="example" type="button" data-command="RPUSH tasks first second">RPUSH tasks first second</button>
+        <button class="example" type="button" data-command="LRANGE tasks 0 -1">LRANGE tasks 0 -1</button>
+        <button class="example" type="button" data-command="SCAN 0">SCAN 0</button>
+      </nav>
+      <p class="hint">
+        Press <kbd>↑</kbd>/<kbd>↓</kbd> for history, <kbd>Ctrl</kbd> + <kbd>L</kbd> to clear, or type <code>help</code>.
+      </p>
+      <noscript>This page requires JavaScript and WebAssembly support.</noscript>
+    </main>
+
+    <script type="module" src="./terminal.mjs"></script>
+  </body>
+</html>

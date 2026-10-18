@@ -1,0 +1,72 @@
+use crate::engine::core::{CommandEffects, CommandOutcome, CoreEvent, Value};
+use crate::framework::{CommandArgs, CommandError};
+use crate::framework::commands::command_runtime::CommandRuntime;
+use bytes::Bytes;
+use command_macros::command;
+
+#[command("SETEX", runtime)]
+pub fn setex(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> CommandOutcome {
+    let seconds = match std::str::from_utf8(&args.args[1])
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+    {
+        Some(v) => v,
+        None => {
+            return CommandOutcome::reply(Value::error(
+                "ERR value is not an integer or out of range",
+            ))
+        }
+    };
+    if seconds <= 0 {
+        return CommandOutcome::reply(Value::error(
+            "ERR invalid expire time in 'setex' command",
+        ));
+    }
+    let now_ms = runtime.now_ms();
+    let abs_ms = match seconds
+        .checked_mul(1000)
+        .and_then(|d| d.checked_add(now_ms as i64))
+    {
+        Some(v) => v,
+        None => {
+            return CommandOutcome::reply(Value::error(
+                "ERR invalid expire time in 'setex' command",
+            ))
+        }
+    };
+    let db_idx = runtime.selected_db();
+    let key = args.args[0].clone();
+    let val = crate::foundation::io::store::Robj::string(args.args[2].clone());
+    {
+        let db = match runtime.db_mut() {
+            Some(d) => d,
+            None => return CommandOutcome::reply(CommandError::db_index_out_of_range()),
+        };
+        db.set(key.to_vec(), val);
+        db.set_expire(&key, abs_ms as u64);
+    }
+    CommandOutcome {
+        reply: Value::ok(),
+        effects: CommandEffects {
+            changed_keys: vec![(db_idx, key.clone())],
+            events: vec![
+                CoreEvent {
+                    kind: "set",
+                    key: key.clone(),
+                },
+                CoreEvent {
+                    kind: "expire",
+                    key: key.clone(),
+                },
+            ],
+            custom_propagations: vec![vec![
+                Bytes::from_static(b"SET"),
+                key,
+                args.args[2].clone(),
+                Bytes::from_static(b"PXAT"),
+                abs_ms.to_string().into(),
+            ]],
+            ..CommandEffects::default()
+        },
+    }
+}

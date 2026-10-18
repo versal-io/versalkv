@@ -1,0 +1,6 @@
+# Approved unsafe roots. Keep this list exact; callers must use safe APIs.
+src/engine/extension/module
+src/foundation/memory
+src/foundation/io/sys
+src/foundation/io/store/structure
+src/framework/capabilities

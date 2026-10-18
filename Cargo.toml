@@ -1,0 +1,159 @@
+[package]
+name = "versal"
+version = "0.1.0"
+edition = "2021"
+description = "VersalKV server with Valkey protocol compatibility"
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[features]
+default = ["native-deps"]
+native-deps = [
+  "dep:clap",
+  "dep:env_logger",
+  "dep:mlua",
+  "dep:openssl",
+  "dep:polling",
+  "dep:socket2",
+]
+wasm = ["dep:serde", "dep:serde-wasm-bindgen", "dep:wasm-bindgen"]
+
+[dependencies]
+polling = { version = "3", optional = true }
+socket2 = { version = "0.4", features = ["all"], optional = true }
+bytes = "1"
+slab = "0.4"
+log = "0.4"
+env_logger = { version = "0.10", optional = true }
+clap = { version = "4", features = ["derive"], optional = true }
+libc = "0.2"
+indexmap = "1"
+mlua = { version = "0.11", features = ["lua51", "vendored"], optional = true }
+sha1 = "0.10"
+sha2 = "0.10"
+hex = "0.4"
+serde_json = "1"
+rmp = "0.8"
+command_macros = { path = "command_macros" }
+cfg-if = "1"
+memchr = "2"
+openssl = { version = "0.10", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde-wasm-bindgen = { version = "0.6", optional = true }
+wasm-bindgen = { version = "0.2", optional = true }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+proptest = "1"
+rand = "0.8"
+
+[build-dependencies]
+serde_json = "1"
+cc = "1"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = 3
+
+[profile.dev.package.versal]
+opt-level = 2
+
+[lints.clippy]
+# --- Phase-out allow list ---
+too_many_arguments = "allow"
+type_complexity = "allow"
+
+[[bin]]
+name = "versal-server"
+path = "src/bin/server.rs"
+required-features = ["native-deps"]
+
+[[bin]]
+name = "versal-cli"
+path = "src/bin/cli.rs"
+required-features = ["native-deps"]
+
+[[bin]]
+name = "versal-benchmark"
+path = "src/bin/benchmark/main.rs"
+required-features = ["native-deps"]
+
+[[bin]]
+name = "versal-check-aof"
+path = "src/bin/check_aof.rs"
+required-features = ["native-deps"]
+
+[[bin]]
+name = "versal-check-rdb"
+path = "src/bin/check_rdb/main.rs"
+required-features = ["native-deps"]
+
+[[bin]]
+name = "versal-sentinel"
+path = "src/bin/sentinel.rs"
+required-features = ["native-deps"]
+
+[[bench]]
+name = "dict_micro"
+harness = false
+
+[[bench]]
+name = "protocol_micro"
+harness = false
+
+[[bench]]
+name = "bench_g1_dict"
+harness = false
+path = "tests/bench/rust/bench_g1_dict.rs"
+
+[[bench]]
+name = "bench_g2_hashmap_sort"
+harness = false
+path = "tests/bench/rust/bench_g2_hashmap_sort.rs"
+
+[[bench]]
+name = "bench_g3_vecdeque"
+harness = false
+path = "tests/bench/rust/bench_g3_vecdeque.rs"
+
+[[bench]]
+name = "bench_g4_hashset_int"
+harness = false
+path = "tests/bench/rust/bench_g4_hashset_int.rs"
+
+[[bench]]
+name = "bench_g5_indexmap"
+harness = false
+path = "tests/bench/rust/bench_g5_indexmap.rs"
+
+[[bench]]
+name = "bench_g6_set_encoding"
+harness = false
+path = "tests/bench/rust/bench_g6_set_encoding.rs"
+
+[[bench]]
+name = "bench_g7_hash_encoding"
+harness = false
+path = "tests/bench/rust/bench_g7_hash_encoding.rs"
+
+[[bench]]
+name = "bench_g8_list_encoding"
+harness = false
+path = "tests/bench/rust/bench_g8_list_encoding.rs"
+
+[[bench]]
+name = "bench_g9_zset_encoding"
+harness = false
+path = "tests/bench/rust/bench_g9_zset_encoding.rs"
+
+[[bench]]
+name = "bench_g10_string_encoding"
+harness = false
+path = "tests/bench/rust/bench_g10_string_encoding.rs"
+
+[[test]]
+name = "formal"
+path = "tests/formal/mod.rs"
+harness = true

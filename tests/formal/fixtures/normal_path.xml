@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<test-sequences>
+  <sequence name="normal_path">
+    <event type="reply_pong"/>
+    <event type="reply_ok"/>
+    <event type="reply_ok"/>
+    <event type="reply_fullresync"/>
+    <event type="send_rdb_bulk" size="100"/>
+    <event type="send_rdb_complete"/>
+  </sequence>
+</test-sequences>

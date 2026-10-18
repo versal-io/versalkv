@@ -1,0 +1,9 @@
+/target
+/test-logs/
+/src/bin/wasm/pkg/
+Cargo.lock
+/.worktrees
+/.trae
+/dist/
+__pycache__/
+*.pyc

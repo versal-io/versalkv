@@ -1,0 +1,2 @@
+# File-size debt is intentionally empty.
+# `python3 scripts/versal-util.py check file-sizes` rejects active entries here; split oversized files instead.

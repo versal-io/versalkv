@@ -1,0 +1,22 @@
+#!/bin/sh
+
+set -eu
+
+if [ "$#" -ne 0 ]; then
+    printf 'usage: ./runtest-sentinel\n' >&2
+    exit 2
+fi
+
+cargo build --bins
+
+for binary in server cli benchmark check-aof check-rdb sentinel; do
+    cp -p "target/debug/versal-$binary" \
+        "thirdparty/valkey/src/valkey-$binary"
+done
+
+(
+    cd thirdparty/valkey
+    unset VALKEY_BIN_DIR
+    tclsh tests/sentinel/run.tcl \
+        --skip-leaks --dont-clean
+)

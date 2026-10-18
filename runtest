@@ -1,0 +1,42 @@
+#!/bin/sh
+
+set -eu
+
+if [ "$#" -ne 0 ]; then
+    printf 'usage: ./runtest\n' >&2
+    exit 2
+fi
+
+cargo build --bins
+cargo test --lib
+
+for binary in server cli benchmark check-aof check-rdb sentinel; do
+    # Replace the inode: Darwin may kill a newly executed image when an older
+    # process still maps the overwritten file, despite identical signed bytes.
+    destination="thirdparty/valkey/src/valkey-$binary"
+    temporary="$destination.tmp.$$"
+    cp -p "target/debug/versal-$binary" "$temporary"
+    mv -f "$temporary" "$destination"
+done
+
+cp tests/unit/*.tcl thirdparty/valkey/tests/unit/
+
+(
+    cd thirdparty/valkey
+    unset VALKEY_BIN_DIR
+    set -- \
+        --skipunit unit/obuf-limits \
+        --skipunit unit/oom-score-adj
+    # Pin small TCP socket buffers for the harness-launched Rust server so
+    # output-buffer-sensitive units (maxmemory, slot migration) accumulate
+    # user-space backpressure instead of draining into oversized kernel
+    # buffers. Scoped to this harness only; normal clients, replication links,
+    # and the Cluster Bus keep system defaults.
+    VALKEY_TEST_TCP_SNDBUF_BYTES=65536 \
+    VALKEY_TEST_TCP_RCVBUF_BYTES=87380 \
+        tclsh tests/test_helper.tcl \
+        "$@" \
+        --skip-leaks --baseport 5111 --portcount 8000 \
+        --timeout 360 \
+        --stop --dump-logs --dont-clean
+)
