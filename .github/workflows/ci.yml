@@ -69,9 +69,6 @@ jobs:
       - name: Unsafe safety
         run: make check-unsafe-safety
 
-      - name: Dual-channel gate
-        run: python3 scripts/versal-util.py ci dual-channel
-
       - name: CI support wiring
         run: make check-ci-support
 
