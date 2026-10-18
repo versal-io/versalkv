@@ -1164,6 +1164,11 @@ impl ServerWorkerState {
         if self.ctx.replication().force_full_sync_on_next_reconnect {
             self.replication_runtime.clear_replica_resume();
         }
+        if self.ctx.replication().is_replica()
+            && self.ctx.config().replication.master_host.is_some()
+        {
+            self.drive_replication();
+        }
     }
 
     /// Mirror C `replicationUnsetPrimary` / `replicationSetPrimary`: discard
