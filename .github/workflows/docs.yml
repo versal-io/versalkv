@@ -30,6 +30,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.99.1"
+          components: rustfmt
 
       - name: Build documentation
         run: make doc
