@@ -24,6 +24,10 @@ cp tests/unit/*.tcl thirdparty/valkey/tests/unit/
 (
     cd thirdparty/valkey
     unset VALKEY_BIN_DIR
+    test_patch=../../tests/dual-channel-replication-timeout.patch
+    git apply --check "$test_patch"
+    git apply "$test_patch"
+    trap 'git apply --reverse "$test_patch"' EXIT
     set -- \
         --skipunit unit/obuf-limits \
         --skipunit unit/oom-score-adj

@@ -2160,9 +2160,24 @@ def selftest_runtest(ctx: RepoContext) -> None:
         populate_fake_binaries(root)
         valkey_src = root / "thirdparty/valkey/src"
         (root / "thirdparty/valkey/tests/unit").mkdir(parents=True)
+        (root / "thirdparty/valkey/tests/integration").mkdir(parents=True)
         valkey_src.mkdir(parents=True)
         write_fixture(root, "thirdparty/valkey/tests/test_helper.tcl", "# fixture\n")
         write_fixture(root, "tests/unit/local-fixture.tcl", "# local fixture\n")
+        shutil.copy2(
+            str(ctx.root / "tests/dual-channel-replication-timeout.patch"),
+            str(root / "tests/dual-channel-replication-timeout.patch"),
+        )
+        shutil.copy2(
+            str(
+                ctx.root
+                / "thirdparty/valkey/tests/integration/dual-channel-replication.tcl"
+            ),
+            str(
+                root
+                / "thirdparty/valkey/tests/integration/dual-channel-replication.tcl"
+            ),
+        )
         cargo_log = root / "cargo.jsonl"
         tcl_log = root / "tcl.json"
         write_executable(
