@@ -3749,7 +3749,7 @@ fn replica_buffer_memory_excludes_tcp_kernel_send_queue() {
 }
 
 #[test]
-fn direct_dual_cohort_retains_shared_replication_memory_until_completion() {
+fn direct_dual_cohort_reports_live_shared_replication_memory() {
     let mut backend = ServerWorkerState::new(1).unwrap();
     let main_token = 11_001;
     let _main_slab = add_connection(&mut backend, main_token);
@@ -3803,8 +3803,8 @@ fn direct_dual_cohort_retains_shared_replication_memory_until_completion() {
     backend.refresh_replica_output_buffer_bytes();
     assert_eq!(
         backend.ctx.replication().replica_output_buffer_bytes,
-        cohort_memory,
-        "one direct-dual socket draining must not shrink the shared C projection"
+        64 * 1024,
+        "direct-dual memory must shrink when the shared backlog is released"
     );
 
     backend.full_sync.direct_dual_rdb_child = None;
