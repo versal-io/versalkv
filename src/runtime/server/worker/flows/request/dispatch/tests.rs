@@ -441,6 +441,12 @@ fn finalization_schedules_replication_and_defers_origin_reply_to_pending_writes(
         )
         .expect("dispatch distributed writes");
 
+    replica
+        .set_nonblocking(false)
+        .expect("restore replica peer blocking mode");
+    replica
+        .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+        .expect("set replica peer read timeout");
     let mut replicated = vec![0_u8; replication_frame.len()];
     replica
         .read_exact(&mut replicated)

@@ -11,6 +11,20 @@ pub(crate) mod rank_impl;
 
 const ZSKIPLIST_MAXLEVEL: usize = 32;
 
+/// Convert a `Box<T>` into a `NonNull<T>`.
+///
+/// `Box::into_non_null` is only stable on recent toolchains, while the
+/// equivalent `NonNull::new_unchecked(Box::into_raw(...))` pattern triggers
+/// `clippy::nonnull_unchecked_on_box_ptr` on newer toolchains. Encapsulating
+/// both behind one helper with a targeted allow keeps call sites clean and
+/// compatible across supported toolchain versions.
+#[allow(unknown_lints, clippy::nonnull_unchecked_on_box_ptr)]
+fn box_into_non_null<T>(b: Box<T>) -> NonNull<T> {
+    // SAFETY: `Box::into_raw` always returns a valid, non-null, aligned pointer
+    // that owns the allocation.
+    unsafe { NonNull::new_unchecked(Box::into_raw(b)) }
+}
+
 #[derive(Debug)]
 pub struct Level {
     pub forward: Option<NonNull<Node>>,
@@ -46,8 +60,7 @@ impl Node {
             levels,
             backward: None,
         });
-        // SAFETY: Box::into_raw is valid non-null aligned pointer.
-        unsafe { NonNull::new_unchecked(Box::into_raw(node)) }
+        box_into_non_null(node)
     }
     fn new_header() -> NonNull<Self> {
         let mut levels = Vec::with_capacity(ZSKIPLIST_MAXLEVEL);
@@ -60,8 +73,7 @@ impl Node {
             levels,
             backward: None,
         });
-        // SAFETY: Box::into_raw returns a valid non-null aligned pointer.
-        unsafe { NonNull::new_unchecked(Box::into_raw(node)) }
+        box_into_non_null(node)
     }
 }
 

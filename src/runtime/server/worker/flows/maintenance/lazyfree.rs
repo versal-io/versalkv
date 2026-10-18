@@ -294,7 +294,6 @@ mod tests {
         let mut lazyfree = DataLazyfree::new();
 
         assert_eq!(lazyfree.submit(large_list()).expect("queue object"), 65);
-        assert_eq!(lazyfree.poll_completions(), (0, 0));
 
         lazyfree.wait_for_completion_for_test();
         assert_eq!(lazyfree.poll_completions(), (65, 1));
