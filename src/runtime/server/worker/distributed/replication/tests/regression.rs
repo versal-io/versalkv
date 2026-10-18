@@ -3240,6 +3240,31 @@ fn explicit_replicaof_target_change_overrides_old_link_teardown_backoff() {
 }
 
 #[test]
+fn explicit_replicaof_starts_upstream_connect_immediately() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind primary peer");
+    let address = listener.local_addr().expect("primary peer address");
+    let mut backend = ServerWorkerState::new(1).expect("create runtime");
+    backend.ctx.config_mut().replication.master_host = Some(address.ip().to_string());
+    backend.ctx.config_mut().replication.master_port = address.port();
+    backend.ctx.replication_mut().role =
+        crate::engine::distributed::replication::ReplicationRole::Replica;
+    backend.ctx.replication_mut().pending_replicaof_request = true;
+
+    backend.apply_pending_replicaof_request();
+
+    let link = backend
+        .replication_runtime
+        .replica_link()
+        .expect("explicit REPLICAOF must start the upstream connection immediately");
+    assert_eq!(link.master().host, address.ip().to_string());
+    assert_eq!(link.master().port, address.port());
+    assert_eq!(
+        backend.ctx.config().replication.master_link_status,
+        "connect"
+    );
+}
+
+#[test]
 fn primary_to_former_upstream_preserves_resume_from_second_replid() {
     let mut backend = ServerWorkerState::new(1).unwrap();
     backend

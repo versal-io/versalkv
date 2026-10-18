@@ -93,6 +93,13 @@ Rust library unit tests, and the full Tcl regression. Compatibility binaries
 so the harness discovers them. `unit/obuf-limits` and `unit/oom-score-adj` are
 permanently skipped. Default concurrency must be preserved.
 
+- Upstream tests under `thirdparty/valkey` are immutable compatibility
+  specifications. Never modify, patch, relax, replace, filter, or add retries
+  around them to make a failure pass.
+- Do not add test skips or reduce test concurrency. Fix failures in owned
+  implementation code or in generic harness behavior without weakening
+  upstream coverage.
+
 ### 2. Sentinel regression: `./runtest-sentinel`
 
 Runs the native Sentinel Tcl suite (`tests/sentinel/run.tcl`) against the real
