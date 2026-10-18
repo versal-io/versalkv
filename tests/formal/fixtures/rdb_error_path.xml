@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<test-sequences>
+  <sequence name="error_in_replconf_port">
+    <event type="reply_pong"/>
+    <event type="send_error" msg="ERR unknown REPLCONF option"/>
+  </sequence>
+</test-sequences>

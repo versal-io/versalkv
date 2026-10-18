@@ -1,0 +1,33 @@
+name: Documentation
+
+on:
+  push:
+    paths:
+      - "docs/**"
+      - "scripts/versal-util.py"
+      - "src/**/*.rs"
+  pull_request:
+    paths:
+      - "docs/**"
+      - "scripts/versal-util.py"
+      - "src/**/*.rs"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  docs-check:
+    name: Documentation Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository and submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build documentation
+        run: make doc

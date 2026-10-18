@@ -1,0 +1,25 @@
+[package]
+name = "valkey-fuzz"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.versal]
+path = ".."
+
+[profile.release]
+overflow-checks = true
+
+[[bin]]
+name = "resp_parser"
+path = "fuzz_targets/resp_parser.rs"
+
+[[bin]]
+name = "rdb_load"
+path = "fuzz_targets/rdb_load.rs"

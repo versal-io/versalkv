@@ -1,0 +1,93 @@
+#!/bin/sh
+#
+# Build the Rust binary and run Valkey's native Module API test runner.
+
+set -eu
+
+ROOT_DIR=$(cd "$(dirname "$0")" && pwd)
+cd "$ROOT_DIR"
+
+# These cases currently depend on Module API behavior that the Rust server does
+# not provide yet. Keep the list here so the native Valkey runner remains the
+# single source of test execution.
+MODULEAPI_SKIP_UNITS='
+unit/moduleapi/async_rm_call
+unit/moduleapi/blockedclient
+unit/moduleapi/block_keyspace_notification
+unit/moduleapi/blockonbackground
+unit/moduleapi/blockonkeys
+unit/moduleapi/cluster
+unit/moduleapi/commandfilter
+unit/moduleapi/commandresult
+unit/moduleapi/crash
+unit/moduleapi/datatype
+unit/moduleapi/datatype2
+unit/moduleapi/deferred_reply
+unit/moduleapi/defrag
+unit/moduleapi/eventloop
+unit/moduleapi/fork
+unit/moduleapi/getchannels
+unit/moduleapi/getkeys
+unit/moduleapi/hooks
+unit/moduleapi/infotest
+unit/moduleapi/keyspace_events
+unit/moduleapi/mallocsize
+unit/moduleapi/moduleauth
+unit/moduleapi/moduleconfigs
+unit/moduleapi/postnotifications
+unit/moduleapi/propagate
+unit/moduleapi/rdbloadsave
+unit/moduleapi/scriptingengine
+unit/moduleapi/test_lazyfree
+unit/moduleapi/testrdb
+unit/moduleapi/usercall
+unit/moduleapi/unsupported_features
+unit/moduleapi/zset
+'
+
+CARGO_PROFILE_FLAG=""
+CARGO_TARGET_SUBDIR="debug"
+if [ "${1:-}" = "--release" ]; then
+    CARGO_PROFILE_FLAG="--release"
+    CARGO_TARGET_SUBDIR="release"
+    shift
+fi
+
+echo "==>  VersalKV $CARGO_TARGET_SUBDIR..."
+cargo build $CARGO_PROFILE_FLAG --bins
+
+scratch_dir=$(mktemp -d)
+binary_state="$scratch_dir/binaries"
+valkey_src="$ROOT_DIR/thirdparty/valkey/src"
+cleanup() {
+    status=$?
+    trap - EXIT HUP INT TERM
+    set +e
+    if ! python3 "$ROOT_DIR/scripts/versal-util.py" tcl binaries \
+        restore "$valkey_src" "$binary_state"
+    then
+        printf 'failed to restore Valkey test binaries\n' >&2
+        status=1
+    fi
+    rm -rf "$scratch_dir"
+    exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+python3 "$ROOT_DIR/scripts/versal-util.py" tcl binaries \
+    stage "$ROOT_DIR/target/$CARGO_TARGET_SUBDIR" "$valkey_src" "$binary_state"
+if [ ! -x "$valkey_src/valkey-server" ]; then
+    echo ": $valkey_src/valkey-server" >&2
+    exit 1
+fi
+unset VALKEY_BIN_DIR
+
+for unit in $MODULEAPI_SKIP_UNITS; do
+    set -- --skipunit "$unit" "$@"
+done
+
+cd "$ROOT_DIR/thirdparty/valkey"
+./runtest-moduleapi "$@"

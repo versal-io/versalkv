@@ -1,0 +1,16 @@
+# Mutation testing is restricted to L0/L1 modules.
+# Run full mutation campaigns outside the pull-request path.
+examine_globs = [
+    "src/ds/**/*.rs",
+    "src/value/**/*.rs",
+    "src/protocol/**/*.rs",
+    "src/kv_engine/**/*.rs",
+    "src/codec/**/*.rs",
+    "src/persistence/**/*.rs",
+]
+
+exclude_globs = [
+    "src/bin/**/*.rs",
+    "**/tests.rs",
+    "**/test*.rs",
+]

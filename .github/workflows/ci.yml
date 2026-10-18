@@ -1,0 +1,178 @@
+name: CI
+
+on:
+  push:
+    paths-ignore:
+      - "docs/**"
+      - "docs/**/*.md"
+  pull_request:
+    paths-ignore:
+      - "docs/**"
+      - "docs/**/*.md"
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  rust-check:
+    name: Rust Check (fmt, clippy, build, unit, integration, property, static checks)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository and submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Node.js (for wasm-check)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends nodejs
+
+      - name: Format check
+        run: make fmt
+
+      - name: Wasm check
+        run: |
+          rustup target add wasm32-unknown-unknown
+          make wasm-check
+
+      - name: Clippy
+        run: make clippy
+
+      - name: Build
+        run: cargo build --bins
+
+      - name: Unit tests
+        run: cargo test --lib
+
+      - name: Integration tests
+        run: cargo test --test integration
+
+      - name: Property tests
+        run: make property
+
+      - name: Architecture checks
+        run: make check-architecture
+
+      - name: FFI boundaries
+        run: make ffi-boundaries
+
+      - name: Unsafe safety
+        run: make check-unsafe-safety
+
+      - name: Dual-channel gate
+        run: python3 scripts/versal-util.py ci dual-channel
+
+      - name: CI support wiring
+        run: make check-ci-support
+
+  runtest:
+    name: Tcl Regression (runtest)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository and submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential ca-certificates coreutils hostname openssl \
+            procps psmisc tcl8.6 tcl-tls tclx
+          sudo ln -sf /usr/bin/tclsh8.6 /usr/bin/tclsh
+
+      - name: Run Tcl regression suite
+        run: |
+          pkill -f target/debug/versal-server || true
+          rm -rf thirdparty/valkey/tests/tmp/* || true
+          ./runtest
+
+  runtest-sentinel:
+    name: Sentinel Tcl Regression
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout repository and submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential ca-certificates coreutils hostname openssl \
+            procps psmisc tcl8.6 tcl-tls tclx
+          sudo ln -sf /usr/bin/tclsh8.6 /usr/bin/tclsh
+
+      - name: Run Sentinel regression suite
+        run: |
+          make check-sentinel-tcl-support
+          ./runtest-sentinel
+
+  runtest-moduleapi:
+    name: Module API Tcl Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository and submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential ca-certificates coreutils hostname openssl \
+            procps psmisc tcl8.6 tcl-tls tclx
+          sudo ln -sf /usr/bin/tclsh8.6 /usr/bin/tclsh
+
+      - name: Run Module API regression suite
+        run: ./runtest-moduleapi
+
+  daily-performance:
+    name: Daily Performance Baseline
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository and submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run startup regression gate
+        run: make daily-performance BASELINE_MS=${BASELINE_MS:-100} CURRENT_MS=${CURRENT_MS:-100}
+
+  weekly-soak:
+    name: Weekly 72h Soak
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository and submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Dry-run soak plan
+        run: python3 scripts/versal-util.py ci weekly-soak --dry-run --duration-seconds 259200 --interval-seconds 10800

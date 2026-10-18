@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<test-sequences>
+  <sequence name="timeout_in_wait_pong">
+    <event type="wait_timeout" ms="1000"/>
+  </sequence>
+</test-sequences>
