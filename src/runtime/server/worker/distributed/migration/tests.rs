@@ -650,6 +650,7 @@ fn slot_snapshot_relay_stops_after_one_pending_chunk() {
         completion_state: super::SlotSnapshotCompletionState::default(),
     });
 
+    runtime.transport.wait_readable_for_test(source.token);
     runtime.on_slot_snapshot_pipe_readable(id.clone());
 
     assert!(runtime.connection_registry
