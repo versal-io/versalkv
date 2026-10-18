@@ -32,6 +32,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.99.1"
+          components: rustfmt, clippy
 
       - name: Install Node.js (for wasm-check)
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends nodejs
@@ -87,6 +88,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.99.1"
+          components: rustfmt
 
       - name: Install test dependencies
         run: |
@@ -116,6 +118,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.99.1"
+          components: rustfmt
 
       - name: Install test dependencies
         run: |
@@ -143,6 +146,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.99.1"
+          components: rustfmt
 
       - name: Install test dependencies
         run: |
@@ -168,6 +172,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.99.1"
+          components: rustfmt
 
       - name: Run startup regression gate
         run: make daily-performance BASELINE_MS=${BASELINE_MS:-100} CURRENT_MS=${CURRENT_MS:-100}
@@ -185,6 +190,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.99.1"
+          components: rustfmt
 
       - name: Dry-run soak plan
         run: python3 scripts/versal-util.py ci weekly-soak --dry-run --duration-seconds 259200 --interval-seconds 10800
