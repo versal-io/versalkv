@@ -1433,10 +1433,20 @@ mod tests {
                 crate::foundation::io::transport::Interest::ReadWritable,
             )
             .expect("enable accepted read/write interest");
-        events.clear();
-        runtime
-            .poll(&mut events, Some(Duration::from_secs(1)))
-            .expect("poll accepted readable data");
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while !events
+            .iter()
+            .any(|event| event.id == peer.id && event.readable)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "read readiness must arrive before the deadline"
+            );
+            events.clear();
+            runtime
+                .poll(&mut events, Some(Duration::from_millis(10)))
+                .expect("poll accepted readable data");
+        }
         assert!(events
             .iter()
             .any(|event| event.id == peer.id && event.readable));
