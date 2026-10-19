@@ -9,6 +9,32 @@ use crate::engine::host::HostDispatcher;
 use super::sandbox;
 
 pub(super) const HOST_CALLBACK_REGISTRY_KEY: &str = "__valkey_host_callback_v1";
+pub(super) const REDIS_RUNTIME_TABLE_REGISTRY_KEY: &str = "__valkey_redis_runtime_table_v1";
+
+// Bindings split into two shapes:
+// * `raises` bindings forward a single reply; a reply table carrying
+//   `__err_raise` is converted into `error({err = ...})`, matching the C
+//   `redis.call`/control-helper error contract.
+// * protected bindings forward the reply unchanged; error replies are plain
+//   `{err = ...}` tables for `redis.pcall`.
+// The hot success path allocates no Lua table and performs no `unpack`: it is
+// one direct callback call plus a single type tag check.
+const HOST_BINDING_FACTORY: &str = r#"
+    return function(callback, operation, raises)
+        if raises then
+            return function(...)
+                local reply = callback(operation, ...)
+                if type(reply) == 'table' and reply.__err_raise then
+                    error({err = reply.err})
+                end
+                return reply
+            end
+        end
+        return function(...)
+            return callback(operation, ...)
+        end
+    end
+"#;
 
 pub(super) struct LuaHostSlotGuard<'lua> {
     lua: &'lua Lua,
@@ -26,6 +52,43 @@ impl Drop for LuaHostSlotGuard<'_> {
         let _ = self
             .lua
             .unset_named_registry_value(HOST_CALLBACK_REGISTRY_KEY);
+    }
+}
+
+struct LuaHostBindingsGuard {
+    redis: LuaTable,
+    previous: Vec<(&'static str, LuaValue)>,
+}
+
+impl LuaHostBindingsGuard {
+    fn install(lua: &Lua, callback: &LuaFunction) -> LuaResult<Self> {
+        let redis: LuaTable = lua.named_registry_value(REDIS_RUNTIME_TABLE_REGISTRY_KEY)?;
+        let factory: LuaFunction = lua.load(HOST_BINDING_FACTORY).eval()?;
+        let mut guard = Self {
+            redis,
+            previous: Vec::with_capacity(5),
+        };
+        for (name, operation, raises) in [
+            ("call", 0_i64, true),
+            ("pcall", 1, false),
+            ("setresp", 2, true),
+            ("set_repl", 3, true),
+            ("acl_check_cmd", 4, true),
+        ] {
+            let previous = guard.redis.raw_get::<LuaValue>(name)?;
+            let binding: LuaFunction = factory.call((callback.clone(), operation, raises))?;
+            guard.redis.raw_set(name, binding)?;
+            guard.previous.push((name, previous));
+        }
+        Ok(guard)
+    }
+}
+
+impl Drop for LuaHostBindingsGuard {
+    fn drop(&mut self) {
+        for (name, value) in self.previous.drain(..) {
+            let _ = self.redis.raw_set(name, value);
+        }
     }
 }
 
@@ -61,7 +124,8 @@ pub(super) fn with_lua_host<R>(
                 }
             },
         )?;
-        let _slot = LuaHostSlotGuard::install(lua, callback)?;
+        let _slot = LuaHostSlotGuard::install(lua, callback.clone())?;
+        let _bindings = LuaHostBindingsGuard::install(lua, &callback)?;
         invoke()
     })
 }

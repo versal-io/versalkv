@@ -267,6 +267,69 @@ pub trait ScriptEngine: Send + Sync {
     ) -> Result<Value, ScriptError>;
 }
 
+/// Observation gates for nested-command slowlog, commandlog and MONITOR
+/// delivery. Captured once per script invocation because the event loop never
+/// services configuration or MONITOR changes while a script runs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScriptLogGate {
+    pub monitor_present: bool,
+    pub slowlog_enabled: bool,
+    pub slowlog_threshold_us: i64,
+    pub commandlog_enabled: bool,
+    pub commandlog_threshold_us: i64,
+}
+
+impl ScriptLogGate {
+    pub fn logging_active(self) -> bool {
+        self.monitor_present || self.slowlog_enabled || self.commandlog_enabled
+    }
+
+    pub fn should_record_slow(self, duration_us: u64) -> bool {
+        let duration = duration_us as i64;
+        (self.slowlog_enabled
+            && (self.slowlog_threshold_us == 0 || duration >= self.slowlog_threshold_us))
+            || (self.commandlog_enabled
+                && (self.commandlog_threshold_us == 0 || duration >= self.commandlog_threshold_us))
+    }
+}
+
+/// Server-side facts that stay constant for one script invocation. Nested
+/// `redis.call` commands read this snapshot instead of issuing repeated trait
+/// calls and taking the global ACL lock on every command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ScriptEnvSnapshot {
+    pub(crate) privileged_user: bool,
+    pub(crate) readonly_replica: bool,
+    pub(crate) stale_replica: bool,
+    pub(crate) persistence_write_error: bool,
+    pub(crate) maxmemory_limit: bool,
+    pub(crate) log_gate: ScriptLogGate,
+}
+
+impl ScriptEnvSnapshot {
+    /// Fail-closed fallback used only if a reader runs before
+    /// `ensure_env_snapshot`. Admission facts default to the rejecting side,
+    /// so a missing snapshot can never authorize a write that the live state
+    /// would deny. The production path always captures the snapshot as the
+    /// first step of nested-command execution.
+    fn fail_closed() -> Self {
+        Self {
+            privileged_user: false,
+            readonly_replica: true,
+            stale_replica: true,
+            persistence_write_error: true,
+            maxmemory_limit: true,
+            log_gate: ScriptLogGate {
+                slowlog_enabled: true,
+                slowlog_threshold_us: 0,
+                commandlog_enabled: true,
+                commandlog_threshold_us: 0,
+                ..Default::default()
+            },
+        }
+    }
+}
+
 pub struct ScriptRunCtx {
     pub flags: ScriptFlags,
     pub timeout_ms: u64,
@@ -301,6 +364,17 @@ pub struct ScriptRunCtx {
     pub func_name: String,
     pub caller_args: Vec<Vec<u8>>,
     pub script_slot: Option<u16>,
+    /// Per-invocation server facts captured on the first nested command.
+    pub(crate) env: Option<ScriptEnvSnapshot>,
+}
+
+impl ScriptRunCtx {
+    /// Returns the captured invocation environment. Production callers always
+    /// run `ensure_env_snapshot` before nested-command admission; the
+    /// fail-closed fallback only protects direct unit-test helpers.
+    pub(crate) fn env_snapshot(&self) -> ScriptEnvSnapshot {
+        self.env.unwrap_or_else(ScriptEnvSnapshot::fail_closed)
+    }
 }
 
 impl ScriptRunCtx {

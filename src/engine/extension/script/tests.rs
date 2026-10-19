@@ -1,9 +1,11 @@
 use super::{
-    PropagationOp, PropagationTargets, ScriptControlHandle, ScriptError, ScriptKind, ScriptRunCtx,
-    SCRIPT_ALLOW_CROSS_SLOT, SCRIPT_ALLOW_OOM, SCRIPT_EVAL_MODE, SCRIPT_NO_WRITES,
+    PropagationOp, PropagationTargets, ScriptControlHandle, ScriptError, ScriptKind, ScriptLogGate,
+    ScriptRunCtx, SCRIPT_ALLOW_CROSS_SLOT, SCRIPT_ALLOW_OOM, SCRIPT_EVAL_MODE, SCRIPT_NO_WRITES,
 };
 use crate::engine::command::context::CommandConn;
-use crate::engine::command::{CommandArgs, CommandDescriptor};
+use crate::engine::command::{CommandArgs, CommandDescriptor, ResolvedCommand};
+use crate::engine::extension::acl::acl_users;
+use crate::engine::extension::acl::user::AclUser;
 use crate::engine::extension::script::ScriptRuntime;
 use crate::foundation::io::protocol::Value;
 use bytes::Bytes;
@@ -12,6 +14,11 @@ use std::net::SocketAddr;
 #[derive(Default)]
 struct FakeScriptRuntime {
     script_disable_deny_scripts: bool,
+    readonly_replica: bool,
+    stale_replica: bool,
+    persistence_write_error: bool,
+    maxmemory_limit: bool,
+    log_gate: ScriptLogGate,
 }
 
 fn test_ctx() -> ScriptRunCtx {
@@ -36,17 +43,18 @@ fn test_ctx() -> ScriptRunCtx {
         func_name: String::new(),
         caller_args: Vec::new(),
         script_slot: None,
+        env: None,
     }
 }
 
 impl ScriptRuntime for FakeScriptRuntime {
-    fn lookup_command(&self, _name: &[u8]) -> Option<CommandDescriptor> {
+    fn lookup_command(&self, _name: &[u8]) -> Option<ResolvedCommand> {
         None
     }
 
     fn execute_command(
         &mut self,
-        _name: &[u8],
+        _command: ResolvedCommand,
         _conn: &mut dyn CommandConn,
         _args: &CommandArgs,
     ) -> Value {
@@ -58,7 +66,7 @@ impl ScriptRuntime for FakeScriptRuntime {
     }
 
     fn has_maxmemory_limit(&self) -> bool {
-        false
+        self.maxmemory_limit
     }
 
     fn has_enough_replicas_to_write(&self) -> bool {
@@ -66,15 +74,19 @@ impl ScriptRuntime for FakeScriptRuntime {
     }
 
     fn is_readonly_replica(&self) -> bool {
-        false
+        self.readonly_replica
     }
 
     fn is_stale_replica(&self) -> bool {
-        false
+        self.stale_replica
     }
 
     fn has_persistence_write_error(&self) -> bool {
-        false
+        self.persistence_write_error
+    }
+
+    fn script_log_gate(&self) -> ScriptLogGate {
+        self.log_gate
     }
 
     fn script_disable_deny_scripts(&self) -> bool {
@@ -280,4 +292,168 @@ fn script_error_display() {
 fn script_flag_constants_are_distinct() {
     assert_ne!(SCRIPT_ALLOW_OOM, SCRIPT_EVAL_MODE);
     assert_ne!(SCRIPT_ALLOW_CROSS_SLOT, SCRIPT_NO_WRITES);
+}
+
+#[test]
+fn script_log_gate_threshold_zero_records_any_duration() {
+    let gate = ScriptLogGate {
+        slowlog_enabled: true,
+        slowlog_threshold_us: 0,
+        ..Default::default()
+    };
+
+    assert!(gate.should_record_slow(0));
+    assert!(gate.should_record_slow(1));
+    assert!(gate.should_record_slow(u64::MAX));
+
+    let command_gate = ScriptLogGate {
+        commandlog_enabled: true,
+        commandlog_threshold_us: 0,
+        ..Default::default()
+    };
+    assert!(command_gate.should_record_slow(0));
+}
+
+#[test]
+fn script_log_gate_respects_threshold_and_enabled_flags() {
+    let slow_gate = ScriptLogGate {
+        slowlog_enabled: true,
+        slowlog_threshold_us: 100,
+        ..Default::default()
+    };
+    assert!(!slow_gate.should_record_slow(99));
+    assert!(slow_gate.should_record_slow(100));
+    assert!(slow_gate.should_record_slow(101));
+
+    let command_gate = ScriptLogGate {
+        commandlog_enabled: true,
+        commandlog_threshold_us: 50,
+        ..Default::default()
+    };
+    assert!(!command_gate.should_record_slow(49));
+    assert!(command_gate.should_record_slow(50));
+
+    let disabled = ScriptLogGate {
+        slowlog_enabled: false,
+        slowlog_threshold_us: 100,
+        commandlog_enabled: false,
+        commandlog_threshold_us: 50,
+        ..Default::default()
+    };
+    assert!(!disabled.should_record_slow(1_000));
+}
+
+#[test]
+fn script_log_gate_logging_active_tracks_each_sink() {
+    assert!(!ScriptLogGate::default().logging_active());
+    assert!(ScriptLogGate {
+        monitor_present: true,
+        ..Default::default()
+    }
+    .logging_active());
+    assert!(ScriptLogGate {
+        slowlog_enabled: true,
+        ..Default::default()
+    }
+    .logging_active());
+    assert!(ScriptLogGate {
+        commandlog_enabled: true,
+        ..Default::default()
+    }
+    .logging_active());
+}
+
+#[test]
+fn env_snapshot_without_capture_fails_closed() {
+    let env = test_ctx().env_snapshot();
+
+    assert!(!env.privileged_user);
+    assert!(env.readonly_replica);
+    assert!(env.stale_replica);
+    assert!(env.persistence_write_error);
+    assert!(env.maxmemory_limit);
+    assert!(env.log_gate.should_record_slow(0));
+}
+
+/// Installs a user identical to the factory-default privileged bootstrap
+/// user under a unique name, so the test never depends on concurrent edits
+/// to the global "default" entry.
+fn install_factory_privileged_user(username: &str) {
+    let mut user = AclUser::new_disabled();
+    user.apply_rule("on").unwrap();
+    user.apply_rule("nopass").unwrap();
+    user.apply_rule("+@all").unwrap();
+    user.apply_rule("~*").unwrap();
+    user.apply_rule("&*").unwrap();
+    assert!(user.is_factory_default_privileged());
+    acl_users()
+        .lock()
+        .unwrap()
+        .insert(username.to_string(), user);
+}
+
+fn remove_acl_user(username: &str) {
+    acl_users().lock().unwrap().remove(username);
+}
+
+#[test]
+fn ensure_env_snapshot_captures_facts_once_for_privileged_user() {
+    const USERNAME: &str = "__versal_script_env_privileged_user__";
+    install_factory_privileged_user(USERNAME);
+
+    let gate = ScriptLogGate {
+        monitor_present: true,
+        slowlog_enabled: true,
+        slowlog_threshold_us: 123,
+        commandlog_enabled: true,
+        commandlog_threshold_us: 456,
+    };
+    let mut runtime = FakeScriptRuntime {
+        readonly_replica: true,
+        stale_replica: true,
+        persistence_write_error: true,
+        maxmemory_limit: true,
+        log_gate: gate,
+        ..Default::default()
+    };
+    let mut ctx = test_ctx();
+
+    ctx.ensure_env_snapshot(&runtime, USERNAME);
+    let first = ctx.env_snapshot();
+    assert!(first.privileged_user);
+    assert!(first.readonly_replica);
+    assert!(first.stale_replica);
+    assert!(first.persistence_write_error);
+    assert!(first.maxmemory_limit);
+    assert_eq!(first.log_gate, gate);
+
+    // Flip every live fact; the second capture must keep the first snapshot.
+    runtime.readonly_replica = false;
+    runtime.stale_replica = false;
+    runtime.persistence_write_error = false;
+    runtime.maxmemory_limit = false;
+    runtime.log_gate = ScriptLogGate::default();
+    ctx.ensure_env_snapshot(&runtime, USERNAME);
+    assert_eq!(ctx.env_snapshot(), first);
+
+    remove_acl_user(USERNAME);
+}
+
+#[test]
+fn ensure_env_snapshot_marks_unknown_user_non_privileged() {
+    let runtime = FakeScriptRuntime {
+        maxmemory_limit: true,
+        ..Default::default()
+    };
+    let mut ctx = test_ctx();
+
+    ctx.ensure_env_snapshot(&runtime, "__versal_script_env_unknown_user__");
+    let env = ctx.env_snapshot();
+
+    assert!(!env.privileged_user);
+    assert!(!env.readonly_replica);
+    assert!(!env.stale_replica);
+    assert!(!env.persistence_write_error);
+    assert!(env.maxmemory_limit);
+    assert_eq!(env.log_gate, ScriptLogGate::default());
 }

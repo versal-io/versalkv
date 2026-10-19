@@ -3,8 +3,8 @@ use std::cell::Cell;
 
 use crate::engine::command::context::CommandConn;
 use crate::engine::command::{
-    CmdFlags, CommandArgs, CommandDescriptor, CommandKeyIndices, DispatchGroup, CMD_ALL_DBS,
-    CMD_MODULE, CMD_WRITE,
+    CmdFlags, CommandArgs, CommandDescriptor, CommandKeyIndices, DispatchGroup, ResolvedCommand,
+    CMD_ALL_DBS, CMD_MODULE, CMD_WRITE,
 };
 use crate::engine::extension::module::capability::{
     ModuleClientInfo, ModuleClientTracking, ModuleRuntime,
@@ -57,6 +57,22 @@ fn lookup_command(ctx: &ServerContext, name: &[u8]) -> Option<CommandDescriptor>
         .map(CommandSpec::descriptor)
 }
 
+fn resolve_script_command(ctx: &ServerContext, name: &[u8]) -> Option<ResolvedCommand> {
+    ctx.command_registry().resolve(name)
+}
+
+fn execute_script_command(
+    ctx: &mut ServerContext,
+    command: ResolvedCommand,
+    conn: &mut dyn CommandConn,
+    args: &CommandArgs,
+) -> Value {
+    let Some(executor) = ctx.command_registry().executor(command) else {
+        return Value::error("ERR command changed during script execution");
+    };
+    executor.execute(conn, args, ctx)
+}
+
 fn execute_command(
     ctx: &mut ServerContext,
     name: &[u8],
@@ -68,30 +84,6 @@ fn execute_command(
         .lookup(name)
         .expect("command was looked up before execution");
     executor.executor.execute(conn, args, ctx)
-}
-
-fn is_subcommand_container(name: &str) -> bool {
-    matches!(
-        name,
-        "acl"
-            | "client"
-            | "cluster"
-            | "command"
-            | "commandlog"
-            | "config"
-            | "debug"
-            | "function"
-            | "latency"
-            | "memory"
-            | "module"
-            | "object"
-            | "pubsub"
-            | "script"
-            | "sentinel"
-            | "slowlog"
-            | "xgroup"
-            | "xinfo"
-    )
 }
 
 fn module_acl_error(
@@ -188,8 +180,8 @@ fn module_acl_denial(
 }
 
 impl ScriptRuntime for ServerContext {
-    fn lookup_command(&self, name: &[u8]) -> Option<CommandDescriptor> {
-        lookup_command(self, name)
+    fn lookup_command(&self, name: &[u8]) -> Option<ResolvedCommand> {
+        resolve_script_command(self, name)
     }
 
     fn command_acl_categories(
@@ -277,11 +269,11 @@ impl ScriptRuntime for ServerContext {
 
     fn execute_command(
         &mut self,
-        name: &[u8],
+        command: ResolvedCommand,
         conn: &mut dyn CommandConn,
         args: &CommandArgs,
     ) -> Value {
-        execute_command(self, name, conn, args)
+        execute_script_command(self, command, conn, args)
     }
 
     fn num_dbs(&self) -> usize {
@@ -337,19 +329,16 @@ impl ScriptRuntime for ServerContext {
         self.script_disable_deny_scripts()
     }
 
-    fn has_monitor_clients(&self) -> bool {
-        self.has_monitor_clients()
-    }
-
-    fn should_record_slow_command(&self, duration_us: u64) -> bool {
+    fn script_log_gate(&self) -> crate::engine::extension::script::ScriptLogGate {
         let slowlog = self.slowlog();
         let commandlog = &self.commandlog().slow;
-        (slowlog.max_len != 0
-            && slowlog.threshold_us >= 0
-            && (slowlog.threshold_us == 0 || duration_us as i64 >= slowlog.threshold_us))
-            || (commandlog.max_len != 0
-                && commandlog.threshold_us >= 0
-                && (commandlog.threshold_us == 0 || duration_us as i64 >= commandlog.threshold_us))
+        crate::engine::extension::script::ScriptLogGate {
+            monitor_present: self.has_monitor_clients(),
+            slowlog_enabled: slowlog.max_len != 0 && slowlog.threshold_us >= 0,
+            slowlog_threshold_us: slowlog.threshold_us,
+            commandlog_enabled: commandlog.max_len != 0 && commandlog.threshold_us >= 0,
+            commandlog_threshold_us: commandlog.threshold_us,
+        }
     }
 
     fn end_command(&mut self, name: &str, rejected: bool) {
@@ -366,7 +355,7 @@ impl ScriptRuntime for ServerContext {
 
     fn command_stats_name(&self, command: CommandDescriptor, args: &CommandArgs) -> String {
         let name_lower = command.name.to_ascii_lowercase();
-        if !is_subcommand_container(&name_lower) {
+        if !crate::engine::command::is_subcommand_container(&name_lower) {
             return name_lower;
         }
         let Some(subcommand) = args.args.first() else {
@@ -385,10 +374,6 @@ impl ScriptRuntime for ServerContext {
         } else {
             name_lower
         }
-    }
-
-    fn command_has_subcommands(&self, name: &str) -> bool {
-        is_subcommand_container(name)
     }
 
     fn remember_tracked_key(&mut self, token: usize, key: &[u8]) {

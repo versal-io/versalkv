@@ -4,8 +4,8 @@ use std::borrow::Cow;
 
 use crate::engine::command::context::CommandConn;
 use crate::engine::command::{
-    CommandArgs, CommandDescriptor, CommandKeyIndices, CMD_ALL_DBS, CMD_DENYOOM, CMD_MAY_REPLICATE,
-    CMD_NOSCRIPT, CMD_READONLY, CMD_WRITE,
+    CommandArgs, CommandDescriptor, CommandKeyIndices, ResolvedCommand, CMD_ALL_DBS, CMD_DENYOOM,
+    CMD_MAY_REPLICATE, CMD_NOSCRIPT, CMD_READONLY, CMD_WRITE,
 };
 use crate::engine::extension::acl::{AclDenial, AclUser};
 use crate::engine::extension::script::{ScriptRunCtx, ScriptRuntime, SCRIPT_WRITE_DIRTY};
@@ -64,7 +64,7 @@ pub(crate) fn check_acl_command(
     runtime: &dyn crate::engine::extension::script::ScriptRuntime,
     args: &CommandArgs,
 ) -> Option<bool> {
-    let spec = runtime.lookup_command(args.name.as_ref())?;
+    let spec = runtime.lookup_command(args.name.as_ref())?.descriptor();
     let users = crate::engine::extension::acl::acl_users().lock().unwrap();
     let Some(user) = users.get(conn.username()) else {
         return Some(false);
@@ -230,11 +230,6 @@ pub(super) fn redis_call_impl(
     script_ctx: &mut ScriptRunCtx,
     dispatcher: &mut crate::engine::host::HostDispatcher<'_>,
 ) -> LuaResult<LuaValue> {
-    crate::engine::host::yield_script(dispatcher, script_ctx)
-        .map_err(|error| mlua::Error::external(error.to_string()))?;
-    if script_ctx.is_killed() {
-        return Err(mlua::Error::external(script_ctx.kill_message()));
-    }
     let cmd_args = match command_args_from_lua(&args, script_ctx) {
         Ok(args) => args,
         Err(message) => return lua_argument_error(lua, &message, pcall_mode),
@@ -384,6 +379,7 @@ fn integer_bytes(value: i64) -> Bytes {
 
 struct ScriptCommandInvocation<'a> {
     args: &'a CommandArgs,
+    command: ResolvedCommand,
     spec: CommandDescriptor,
     key_indices: Option<CommandKeyIndices>,
     has_subcommands: bool,
@@ -398,13 +394,15 @@ impl<'a> ScriptCommandInvocation<'a> {
         mode: ScriptCallMode,
         runtime: &dyn ScriptRuntime,
     ) -> Result<Self, Value> {
-        let spec = runtime
+        let command = runtime
             .lookup_command(args.name.as_ref())
             .ok_or_else(|| Value::error("ERR Unknown command called from script"))?;
-        let has_subcommands = runtime.command_has_subcommands(spec.name);
+        let spec = command.descriptor();
+        let has_subcommands = crate::engine::command::is_subcommand_container(spec.name);
         validate_script_command(spec, args, runtime, has_subcommands)?;
         Ok(Self {
             args,
+            command,
             spec,
             key_indices: spec.key_indices(args),
             has_subcommands,
@@ -457,7 +455,7 @@ fn script_command_restrictions(
         let name = format!("{}-{}", spec.name, subcommand);
         runtime
             .lookup_command(name.as_bytes())
-            .is_some_and(|command| command.flags & CMD_NOSCRIPT != 0)
+            .is_some_and(|command| command.descriptor().flags & CMD_NOSCRIPT != 0)
     });
     let forced = subcommand
         .as_deref()
@@ -485,8 +483,8 @@ enum ScriptCallDecision {
 fn decide_script_call(
     invocation: &ScriptCommandInvocation<'_>,
     script_ctx: &ScriptRunCtx,
-    runtime: &dyn ScriptRuntime,
 ) -> ScriptCallDecision {
+    let env = script_ctx.env_snapshot();
     let read_only = script_ctx.flags & crate::engine::extension::script::SCRIPT_READ_ONLY != 0;
     if read_only && invocation.may_write_or_replicate {
         return reject(
@@ -497,31 +495,27 @@ fn decide_script_call(
             Some("ERR Write commands are not allowed from read-only scripts."),
         );
     }
-    if invocation.is_write && !read_only && runtime.has_persistence_write_error() {
+    if invocation.is_write && !read_only && env.persistence_write_error {
         return reject("MISCONF Errors writing to the RDB file, writes are disabled because stop-writes-on-bgsave-error is enabled.", None);
     }
     if invocation.is_write && !read_only && !script_ctx.has_enough_replicas_to_write {
         return reject("NOREPLICAS Not enough good replicas to write.", None);
     }
-    if invocation.is_write
-        && !read_only
-        && !script_ctx.is_write_dirty()
-        && runtime.is_readonly_replica()
-    {
+    if invocation.is_write && !read_only && !script_ctx.is_write_dirty() && env.readonly_replica {
         return reject(
             "READONLY You can't write against a read only replica.",
             None,
         );
     }
-    decide_replica_and_oom(invocation, script_ctx, runtime)
+    decide_replica_and_oom(invocation, script_ctx, env)
 }
 
 fn decide_replica_and_oom(
     invocation: &ScriptCommandInvocation<'_>,
     script_ctx: &ScriptRunCtx,
-    runtime: &dyn ScriptRuntime,
+    env: crate::engine::extension::script::ScriptEnvSnapshot,
 ) -> ScriptCallDecision {
-    if runtime.is_stale_replica()
+    if env.stale_replica
         && ((script_ctx.flags & crate::engine::extension::script::SCRIPT_ALLOW_STALE) == 0
             || (invocation.spec.flags & crate::engine::command::CMD_STALE) == 0)
     {
@@ -533,7 +527,7 @@ fn decide_replica_and_oom(
             };
         return reject(message, None);
     }
-    let deny_oom = runtime.has_maxmemory_limit()
+    let deny_oom = env.maxmemory_limit
         && invocation.spec.flags & CMD_DENYOOM != 0
         && script_ctx.flags & crate::engine::extension::script::SCRIPT_ALLOW_OOM == 0
         && script_ctx.flags & crate::engine::extension::script::SCRIPT_READ_ONLY == 0
@@ -612,12 +606,20 @@ fn run_script_command(
         script_ctx.mark_write_dirty();
         script_ctx.flags |= SCRIPT_WRITE_DIRTY;
     }
-    let started = std::time::Instant::now();
-    let result = runtime.execute_command(invocation.args.name.as_ref(), conn, invocation.args);
+    // Mirror C's CMD_CALL_SLOWLOG: read the clock only when slowlog,
+    // commandlog or MONITOR can actually consume the duration.
+    let started = script_ctx
+        .env_snapshot()
+        .log_gate
+        .logging_active()
+        .then(std::time::Instant::now);
+    let result = runtime.execute_command(invocation.command, conn, invocation.args);
     let outcome = ScriptCommandOutcome {
         result,
         stats_name,
-        duration_us: started.elapsed().as_micros() as u64,
+        duration_us: started
+            .map(|started| started.elapsed().as_micros() as u64)
+            .unwrap_or(0),
         db_id: conn.selected_db(),
         skip_propagate: conn.skip_propagate(),
         custom_propagation: conn.take_custom_propagation_since(custom_start),
@@ -875,7 +877,7 @@ fn commit_script_outcome(
     conn.set_cmd_count(conn.cmd_count() + 1);
     record_nested_dirty_keys(invocation, &outcome, script_ctx, conn);
     capture_nested_effect(invocation, &mut outcome, script_ctx);
-    record_nested_observability(invocation, &outcome, conn, runtime);
+    record_nested_observability(invocation, &outcome, script_ctx, conn, runtime);
     record_nested_failure(invocation, &outcome, script_ctx, runtime);
     outcome.result
 }
@@ -941,11 +943,13 @@ fn capture_nested_effect(
 fn record_nested_observability(
     invocation: &ScriptCommandInvocation<'_>,
     outcome: &ScriptCommandOutcome,
+    script_ctx: &ScriptRunCtx,
     conn: &dyn CommandConn,
     runtime: &mut dyn ScriptRuntime,
 ) {
-    let record_slow = runtime.should_record_slow_command(outcome.duration_us);
-    let record_monitor = runtime.has_monitor_clients();
+    let gate = script_ctx.env_snapshot().log_gate;
+    let record_slow = gate.should_record_slow(outcome.duration_us);
+    let record_monitor = gate.monitor_present;
     if !record_slow && !record_monitor {
         return;
     }
@@ -987,12 +991,13 @@ pub(crate) fn execute_script_command(
     conn: &mut dyn CommandConn,
     runtime: &mut dyn ScriptRuntime,
 ) -> Value {
+    script_ctx.ensure_env_snapshot(runtime, conn.username());
     let invocation = match ScriptCommandInvocation::prepare(cmd_args, mode, runtime) {
         Ok(invocation) => invocation,
         Err(error) => return error,
     };
     if let Err(error) = apply_script_call_decision(
-        decide_script_call(&invocation, script_ctx, runtime),
+        decide_script_call(&invocation, script_ctx),
         &invocation,
         script_ctx,
         runtime,
@@ -1000,8 +1005,13 @@ pub(crate) fn execute_script_command(
         return error;
     }
     let stats_name = invocation.resolve_stats_name(runtime);
-    if let Some(denial) = find_script_acl_denial(&invocation, conn, runtime) {
-        return apply_acl_denial(denial, &invocation, script_ctx, conn, runtime);
+    // The factory-default privileged user was verified once when the snapshot
+    // was captured; it skips the per-command ACL lock and permission walk.
+    // Non-default users still run the full ACL check on every command.
+    if !script_ctx.env_snapshot().privileged_user {
+        if let Some(denial) = find_script_acl_denial(&invocation, conn, runtime) {
+            return apply_acl_denial(denial, &invocation, script_ctx, conn, runtime);
+        }
     }
     if let Err(error) = validate_script_admission(&invocation, script_ctx, conn, runtime) {
         return error;
