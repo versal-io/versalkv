@@ -13,7 +13,6 @@ mod zset;
 
 use crate::foundation::io::store::Robj;
 
-#[cfg(not(feature = "wasm"))]
 pub(crate) use dispatch::load_robj_with_hash_field_expires_detailed;
 pub use dispatch::{
     load_robj, load_robj_with_hash_field_expires, load_typed_object,

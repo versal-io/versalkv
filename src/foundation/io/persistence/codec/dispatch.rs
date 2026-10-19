@@ -8,7 +8,6 @@ use crate::foundation::io::store::structure::hash::HashHt;
 use crate::foundation::io::store::structure::set::SetEncoding;
 use crate::foundation::io::store::Robj;
 use crate::foundation::memory::value::ListOps;
-#[cfg(not(feature = "wasm"))]
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -23,7 +22,6 @@ pub enum ObjectLoadError {
 pub(crate) struct LoadedObject {
     pub(crate) object: Robj,
     pub(crate) hash_field_expires: HashMap<Vec<u8>, u64>,
-    #[cfg(not(feature = "wasm"))]
     pub(crate) skipped_expired_hash_fields: Vec<Bytes>,
 }
 
@@ -154,14 +152,12 @@ pub(crate) fn load_robj_with_hash_field_expires_detailed(
         return Some(LoadedObject {
             object: Robj::HashHashtable(loaded.0),
             hash_field_expires: loaded.1,
-            #[cfg(not(feature = "wasm"))]
             skipped_expired_hash_fields: loaded.2,
         });
     }
     load_robj(buf, pos, type_byte).map(|object| LoadedObject {
         object,
         hash_field_expires: HashMap::new(),
-        #[cfg(not(feature = "wasm"))]
         skipped_expired_hash_fields: Vec::new(),
     })
 }

@@ -2,25 +2,21 @@
 
 #[cfg(not(feature = "wasm"))]
 pub mod aof;
+// Host-neutral AOF decode/replay and manifest parsing compile on both targets;
+// the browser startup-recovery path reuses them.
+pub mod aof_decode;
 pub mod codec;
 #[cfg(not(feature = "wasm"))]
 pub mod journal;
+pub mod manifest_parse;
 #[cfg(not(feature = "wasm"))]
 mod persistence_traits;
-#[cfg(not(feature = "wasm"))]
+// The RDB codec (decode engine, serializer, encoder) is free of file-system and
+// thread dependencies, so it compiles on both native and `wasm`. The browser
+// startup-recovery path (loading a base RDB preamble) depends on the decoder.
 pub mod rdb;
 #[cfg(not(feature = "wasm"))]
 pub mod snapshot;
-
-#[cfg(feature = "wasm")]
-#[path = "rdb/encoder.rs"]
-mod rdb_encoder;
-
-#[cfg(feature = "wasm")]
-pub mod rdb {
-    pub(crate) use super::rdb_encoder::RdbVecWriter;
-    pub use super::rdb_encoder::{save_millisecond_time, save_string};
-}
 
 #[cfg(not(feature = "wasm"))]
 pub use persistence_traits::{Journal, Snapshot};
@@ -35,9 +31,7 @@ pub use codec::{
     ObjectLoadError,
 };
 
-#[cfg(not(feature = "wasm"))]
 pub use rdb::serialize;
-#[cfg(not(feature = "wasm"))]
 pub use rdb::{
     is_rdb_magic, load_rdb, load_rdb_bytes_checked, load_rdb_bytes_checked_with_delay,
     load_rdb_bytes_checked_with_delay_stats,
@@ -71,6 +65,15 @@ pub use aof::{
     rotate_aof_increment, AofAppender, AofCommandPlayer, AofDataStore, AofDecoder, AofFsync,
     AofLoadError, AofLoadStats, AofManifestEntry, AofOpenMode, AofStep, PreparedSyncedRdbAofBase,
 };
+
+// On `wasm` the file-backed `aof` module is absent; expose the host-neutral
+// decode/replay and manifest-parse items the browser startup-recovery path uses.
+#[cfg(feature = "wasm")]
+pub use aof_decode::{
+    load_aof_bytes, AofCommandPlayer, AofDecoder, AofLoadError, AofLoadStats, AofStep,
+};
+#[cfg(feature = "wasm")]
+pub use manifest_parse::{format_manifest_token, parse_manifest_bytes, AofManifestEntry};
 
 #[cfg(test)]
 pub use codec::decoder::{load_binary_double, load_string};

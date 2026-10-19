@@ -1,7 +1,7 @@
 mod encoder;
 pub mod serialize;
 mod stream;
-#[cfg(test)]
+#[cfg(all(test, not(feature = "wasm")))]
 mod tests;
 
 pub use encoder::{save_millisecond_time, save_string};

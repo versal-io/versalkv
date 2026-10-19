@@ -51,23 +51,12 @@ pub enum AofOpenMode {
     AppendExisting,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct AofLoadStats {
-    pub cmd_count: u64,
-    pub valid_up_to: usize,
-}
-
-#[derive(Debug)]
-pub enum AofLoadError {
-    Corrupt,
-    ExecError(String),
-    Io(io::Error),
-}
-
-pub trait AofCommandPlayer {
-    fn select_db(&mut self, dbid: u32);
-    fn execute(&mut self, args: &[&[u8]]) -> Result<(), String>;
-}
+// The host-neutral AOF decode/replay types live in `persistence::aof_decode`
+// so they compile on the `wasm` target too. Re-exported here to keep existing
+// `persistence::aof::*` import paths unchanged.
+pub use super::aof_decode::{
+    load_aof_bytes, AofCommandPlayer, AofDecoder, AofLoadError, AofLoadStats, AofStep,
+};
 
 struct FsyncThread {
     handle: Option<JoinHandle<()>>,
@@ -461,139 +450,6 @@ pub fn resolve_aof_read_paths(
     vec![resolve_aof_read_path(dir, filename, appenddirname)]
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum AofStep {
-    Command(Vec<Vec<u8>>),
-    Finished(AofLoadStats),
-    Truncated(AofLoadStats),
-}
-
-#[derive(Default)]
-pub struct AofDecoder {
-    pos: usize,
-    stats: AofLoadStats,
-    finished: bool,
-}
-
-impl AofDecoder {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn position(&self) -> usize {
-        self.pos
-    }
-
-    pub fn step(&mut self, bytes: &[u8]) -> Result<AofStep, AofLoadError> {
-        if self.finished {
-            return Ok(AofStep::Finished(self.stats));
-        }
-        while self.pos < bytes.len() {
-            while self.pos < bytes.len() && (bytes[self.pos] == b'\r' || bytes[self.pos] == b'\n') {
-                self.pos += 1;
-            }
-            if self.pos >= bytes.len() {
-                break;
-            }
-            if bytes[self.pos] == b'#' {
-                while self.pos < bytes.len() && bytes[self.pos] != b'\n' {
-                    self.pos += 1;
-                }
-                continue;
-            }
-            self.stats.valid_up_to = self.pos;
-            if bytes[self.pos] != b'*' {
-                return Err(AofLoadError::Corrupt);
-            }
-            let Some((array_len, mut cursor)) = parse_int_line(bytes, self.pos + 1) else {
-                self.finished = true;
-                return Ok(AofStep::Truncated(self.stats));
-            };
-            if array_len <= 0 {
-                return Err(AofLoadError::Corrupt);
-            }
-            let mut parts = Vec::with_capacity(array_len as usize);
-            for _ in 0..array_len {
-                if cursor >= bytes.len() || bytes[cursor] != b'$' {
-                    self.finished = true;
-                    return Ok(AofStep::Truncated(self.stats));
-                }
-                let Some((bulk_len, next)) = parse_int_line(bytes, cursor + 1) else {
-                    self.finished = true;
-                    return Ok(AofStep::Truncated(self.stats));
-                };
-                if bulk_len < 0 {
-                    self.finished = true;
-                    return Ok(AofStep::Truncated(self.stats));
-                }
-                cursor = next;
-                let end = cursor
-                    .checked_add(bulk_len as usize)
-                    .ok_or(AofLoadError::Corrupt)?;
-                if end + 2 > bytes.len() {
-                    self.finished = true;
-                    return Ok(AofStep::Truncated(self.stats));
-                }
-                if bytes[end] != b'\r' || bytes[end + 1] != b'\n' {
-                    return Err(AofLoadError::Corrupt);
-                }
-                parts.push(bytes[cursor..end].to_vec());
-                cursor = end + 2;
-            }
-            self.pos = cursor;
-            self.stats.cmd_count += 1;
-            self.stats.valid_up_to = self.pos;
-            return Ok(AofStep::Command(parts));
-        }
-        self.stats.valid_up_to = bytes.len();
-        self.finished = true;
-        Ok(AofStep::Finished(self.stats))
-    }
-}
-
-pub fn load_aof_bytes<P: AofCommandPlayer + ?Sized>(
-    bytes: &[u8],
-    player: &mut P,
-) -> Result<AofLoadStats, AofLoadError> {
-    let mut decoder = AofDecoder::new();
-    loop {
-        match decoder.step(bytes)? {
-            AofStep::Command(parts) => {
-                let args: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
-                player.execute(&args).map_err(AofLoadError::ExecError)?;
-            }
-            AofStep::Finished(stats) | AofStep::Truncated(stats) => return Ok(stats),
-        }
-    }
-}
-
-fn parse_int_line(bytes: &[u8], start: usize) -> Option<(i64, usize)> {
-    let mut pos = start;
-    let mut sign: i64 = 1;
-    let mut val: i64 = 0;
-    if pos < bytes.len() && bytes[pos] == b'-' {
-        sign = -1;
-        pos += 1;
-    }
-    let mut any = false;
-    while pos < bytes.len() && bytes[pos] != b'\r' {
-        let c = bytes[pos];
-        if !c.is_ascii_digit() {
-            return None;
-        }
-        val = val.checked_mul(10)?.checked_add((c - b'0') as i64)?;
-        any = true;
-        pos += 1;
-    }
-    if !any {
-        return None;
-    }
-    if pos + 2 > bytes.len() || bytes[pos] != b'\r' || bytes[pos + 1] != b'\n' {
-        return None;
-    }
-    Some((val * sign, pos + 2))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -869,15 +725,5 @@ mod tests {
         let mut player = ErrorPlayer;
         let err = load_aof_bytes(b"*1\r\n$3\r\nSET\r\n", &mut player).unwrap_err();
         assert!(matches!(err, AofLoadError::ExecError(msg) if msg == "boom"));
-    }
-
-    #[test]
-    fn parse_int_line_rejects_missing_digits_crlf_and_overflow() {
-        assert_eq!(parse_int_line(b"123\r\n", 0), Some((123, 5)));
-        assert_eq!(parse_int_line(b"-5\r\n", 0), Some((-5, 4)));
-        assert_eq!(parse_int_line(b"\r\n", 0), None);
-        assert_eq!(parse_int_line(b"12x\r\n", 0), None);
-        assert_eq!(parse_int_line(b"12\n", 0), None);
-        assert_eq!(parse_int_line(b"9223372036854775808\r\n", 0), None);
     }
 }

@@ -238,12 +238,14 @@ impl RdbDecoder {
 
     fn apply_aux_field(&mut self, key: Vec<u8>, value: Vec<u8>) {
         if key.eq_ignore_ascii_case(b"redis-ver") {
+            #[cfg(not(feature = "wasm"))]
             crate::server_log!(
                 notice,
                 "Loading RDB produced by Redis version {}",
                 String::from_utf8_lossy(&value)
             );
         } else if key.eq_ignore_ascii_case(b"valkey-ver") {
+            #[cfg(not(feature = "wasm"))]
             crate::server_log!(
                 notice,
                 "Loading RDB produced by Valkey version {}",
@@ -346,6 +348,7 @@ impl RdbDecoder {
         self.cursor += pos;
 
         if applied_key && self.policy.key_load_delay_us != 0 {
+            #[cfg(not(feature = "wasm"))]
             crate::foundation::io::sys::time::sleep_debug_delay_interruptible(
                 self.policy.key_load_delay_us,
                 || false,

@@ -26,13 +26,9 @@ pub const RDB_TYPE_HASH_2: u8 = 22;
 pub(crate) const QUICKLIST_NODE_CONTAINER_PLAIN: u64 = 1;
 pub(crate) const QUICKLIST_NODE_CONTAINER_PACKED: u64 = 2;
 
-#[cfg(not(feature = "wasm"))]
 pub(crate) const RDB_FOREIGN_VERSION_MIN: u16 = 12;
-#[cfg(not(feature = "wasm"))]
 pub(crate) const RDB_FOREIGN_VERSION_MAX: u16 = 79;
-#[cfg(not(feature = "wasm"))]
 pub(crate) const RDB_FOREIGN_TYPE_MIN: u8 = 22;
-#[cfg(not(feature = "wasm"))]
 pub(crate) const RDB_FOREIGN_TYPE_MAX: u8 = 243;
 
 pub const RDB_OPCODE_IDLE: u8 = 248;
@@ -165,7 +161,6 @@ pub(crate) fn parse_double(b: &[u8]) -> Option<f64> {
     }
 }
 
-#[cfg(any(not(feature = "wasm"), test))]
 pub(crate) fn is_known_object_type(t: u8) -> bool {
     matches!(
         t,

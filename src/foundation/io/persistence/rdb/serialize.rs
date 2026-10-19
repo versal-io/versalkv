@@ -422,6 +422,7 @@ fn append_dataset(out: &mut Vec<u8>, dbs: &DbSet, key_delay_us: i64, compression
     }
 }
 
+#[cfg(not(feature = "wasm"))]
 pub(crate) fn delay_after_key_save(key_delay_us: i64) {
     // C's child-info progress pipe detects an orphan while saving. A disk
     // snapshot has no output pipe, so check the post-fork parent's identity at
@@ -432,6 +433,11 @@ pub(crate) fn delay_after_key_save(key_delay_us: i64) {
         KEY_SAVE_DELAY_INTERRUPTED.load(Ordering::Relaxed)
     });
 }
+
+// The browser host serializes in-process without `fork()` or a debug key-save
+// delay, so the post-fork parent check and interruptible sleep do not apply.
+#[cfg(feature = "wasm")]
+pub(crate) fn delay_after_key_save(_key_delay_us: i64) {}
 
 fn save_aux_str(out: &mut Vec<u8>, key: &[u8], val: &[u8], compression: bool) {
     out.push(RDB_OPCODE_AUX);
