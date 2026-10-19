@@ -135,10 +135,7 @@ wasm-dist: wasm-web
 	cp src/bin/wasm/client.mjs \
 		src/bin/wasm/worker.mjs \
 		src/bin/wasm/worker-entry.mjs \
-		src/bin/wasm/aof-worker.mjs \
-		src/bin/wasm/aof-worker-entry.mjs \
 		src/bin/wasm/aof-opfs.mjs \
-		src/bin/wasm/aof-protocol.mjs \
 		src/bin/wasm/gateway.mjs \
 		$(WASM_DIST_DIR)/
 	@printf '%s\n' 'Bundle ready at $(WASM_DIST_DIR); copy it into the pages repo unchanged.'

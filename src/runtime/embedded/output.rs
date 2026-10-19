@@ -1,5 +1,6 @@
+use bytes::Bytes;
+
 use crate::engine::core::Value;
-use crate::runtime::driver::{HostOperationId, OwnedHostRequest};
 
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "wasm", derive(serde::Serialize))]
@@ -24,20 +25,21 @@ pub enum EmbeddedOutput {
         request_id: u32,
         value: Value,
     },
-    /// A durable host operation the runtime needs the host to perform. The
-    /// paired reply is withheld until the matching `HostCompletion` arrives.
-    HostRequest {
-        operation: HostOperationId,
-        request: OwnedHostRequest,
+    /// A reply whose durable AOF frame must be written to the storage host
+    /// before the reply is released to the client. The single-worker host
+    /// appends `frame` synchronously, then delivers `value`.
+    DurableReply {
+        request_id: u32,
+        value: Value,
+        frame: Bytes,
     },
 }
 
 impl EmbeddedOutput {
     pub(crate) fn into_reply(self) -> Reply {
         match self {
-            Self::Reply { value, .. } => Reply::from_value(value),
-            Self::HostRequest { .. } => {
-                Reply::Error("ERR host request has no synchronous reply".to_owned())
+            Self::Reply { value, .. } | Self::DurableReply { value, .. } => {
+                Reply::from_value(value)
             }
         }
     }

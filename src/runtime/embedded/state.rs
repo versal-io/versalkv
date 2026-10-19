@@ -7,7 +7,6 @@ use crate::runtime::driver::{RuntimeCapabilities, RuntimeClock, RuntimeInstant};
 use super::aof_frame::AofFrameEncoder;
 use super::effects::EmbeddedCommit;
 use super::output::EmbeddedOutput;
-use super::persistence::EmbeddedPersistenceState;
 use super::scheduler;
 use super::session::{EmbeddedEvent, EmbeddedSessionState};
 
@@ -15,10 +14,6 @@ pub(super) struct EmbeddedState {
     pub(super) dbs: DbSet,
     pub(super) session: EmbeddedSessionState,
     pub(super) pending: VecDeque<EmbeddedEvent>,
-    /// Outputs produced out-of-band from the pending command queue, such as
-    /// durable replies released by a host completion.
-    pub(super) completed: VecDeque<EmbeddedOutput>,
-    pub(super) persistence: EmbeddedPersistenceState,
     pub(super) aof_frames: AofFrameEncoder,
     pub(super) wake_pending: bool,
     pub(super) stopped: bool,
@@ -32,8 +27,6 @@ impl Default for EmbeddedState {
             dbs: DbSet::new(16),
             session: EmbeddedSessionState::default(),
             pending: VecDeque::new(),
-            completed: VecDeque::new(),
-            persistence: EmbeddedPersistenceState::default(),
             aof_frames: AofFrameEncoder::default(),
             wake_pending: false,
             stopped: false,
@@ -52,13 +45,13 @@ impl EmbeddedState {
         scheduler::next_deadline(&self.dbs, now)
     }
 
-    /// Finish a completed command: either reply immediately or, when the
-    /// command must be persisted and persistence is enabled, withhold the
-    /// reply behind a durable host request.
+    /// Finish a completed command. When persistence is enabled and the command
+    /// produced a durable AOF frame, emit a `DurableReply` so the host appends
+    /// the frame before releasing the reply; otherwise reply immediately.
     pub(super) fn finish_command(
         &mut self,
         request_id: u32,
-        session: SessionId,
+        _session: SessionId,
         selected_db: u32,
         args: &CommandArgs,
         commit: EmbeddedCommit,
@@ -70,12 +63,10 @@ impl EmbeddedState {
                     .aof_frames
                     .frame_for(selected_db, args, &reply, &effects)
                 {
-                    let append = self
-                        .persistence
-                        .enqueue_append(session, request_id, reply, frame);
-                    return EmbeddedOutput::HostRequest {
-                        operation: append.operation,
-                        request: append.request,
+                    return EmbeddedOutput::DurableReply {
+                        request_id,
+                        value: reply,
+                        frame,
                     };
                 }
             }

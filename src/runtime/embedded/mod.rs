@@ -12,7 +12,6 @@ mod aof_frame;
 mod effects;
 mod machine;
 mod output;
-mod persistence;
 mod scheduler;
 mod session;
 mod state;
@@ -66,9 +65,9 @@ impl EmbeddedRuntime {
         self.kernel.machine().capabilities()
     }
 
-    /// Enable durable persistence. The host calls this once the AOF I/O worker
-    /// is attached so that subsequent write commands are persisted before
-    /// their reply is released.
+    /// Enable durable persistence. The host calls this once the OPFS storage
+    /// backend is ready so that subsequent write commands carry their AOF frame
+    /// in a `DurableReply` for the host to persist before replying.
     pub fn enable_persistence(&mut self) {
         self.kernel.machine_mut().enable_persistence();
     }

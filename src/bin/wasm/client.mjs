@@ -1,29 +1,22 @@
 export class VersalClient {
-  static async create(
-    worker = new Worker(new URL("./worker-entry.mjs", import.meta.url), { type: "module" }),
-    aofWorker = new Worker(new URL("./aof-worker-entry.mjs", import.meta.url), { type: "module" }),
-  ) {
-    const client = new VersalClient(worker, aofWorker);
+  static async create(worker = new Worker(new URL("./worker-entry.mjs", import.meta.url), { type: "module" })) {
+    const client = new VersalClient(worker);
     try {
-      client.#attachAof();
       await client.#request({ kind: "create" });
       return client;
     } catch (error) {
       worker.terminate();
-      aofWorker.terminate();
       throw error;
     }
   }
 
   #worker;
-  #aofWorker;
   #nextId = 1;
   #pending = new Map();
   #failure = null;
 
-  constructor(worker, aofWorker = null) {
+  constructor(worker) {
     this.#worker = worker;
-    this.#aofWorker = aofWorker;
     this.#worker.onmessage = (event) => this.#receive(event.data);
     this.#worker.onerror = (event) => {
       event.preventDefault();
@@ -43,17 +36,7 @@ export class VersalClient {
       await this.#request({ kind: "destroy" });
     } finally {
       this.#worker.terminate();
-      if (this.#aofWorker) this.#aofWorker.terminate();
     }
-  }
-
-  // Link the runtime and AOF I/O workers with a direct MessageChannel so AOF
-  // traffic never passes through the main thread (design §5).
-  #attachAof() {
-    if (!this.#aofWorker) return;
-    const channel = new MessageChannel();
-    this.#worker.postMessage({ kind: "attach_aof", port: channel.port1 }, [channel.port1]);
-    this.#aofWorker.postMessage({ kind: "attach_runtime", port: channel.port2 }, [channel.port2]);
   }
 
   #request(message) {

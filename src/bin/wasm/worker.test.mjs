@@ -125,27 +125,106 @@ test("destroy sends shutdown and cancels the armed timer", async () => {
   assert.deepEqual(scope.messages.at(-1), { id: 3, ok: true });
 });
 
-// A fake MessagePort that records what the runtime worker forwards and can push
-// completions back into the worker's drive loop.
-function fakeAofPort() {
-  const sent = [];
+// A fake OPFS backend recording durable appends/flushes in order.
+function fakeBackend() {
+  const calls = [];
   return {
-    sent,
-    started: false,
-    onmessage: null,
-    postMessage(message) {
-      sent.push(message);
+    calls,
+    async acquireLock() {
+      calls.push(["acquireLock"]);
     },
-    start() {
-      this.started = true;
+    async openActiveIncrement(generation, filename) {
+      calls.push(["open", generation, filename]);
     },
-    deliver(data) {
-      this.onmessage({ data });
+    append(sequence, bytes) {
+      calls.push(["append", sequence, Array.from(bytes)]);
+    },
+    flush(sequence) {
+      calls.push(["flush", sequence]);
+    },
+    close() {
+      calls.push(["close"]);
     },
   };
 }
 
-test("worker forwards host requests and releases the reply on completion", async () => {
+test("worker persists a durable frame before releasing its reply", async () => {
+  const scope = fakeScope();
+  const frame = [42, 1, 2, 3];
+  const runtime = {
+    enabled: false,
+    enable_persistence() {
+      this.enabled = true;
+    },
+    dispatch(input) {
+      if (input.type === "execute") {
+        return {
+          outputs: [
+            { request_id: input.request_id, value: { type: "simple", value: "OK" }, durable_frame: frame },
+          ],
+          wait: { type: "event", deadline_ms: null },
+        };
+      }
+      return { outputs: [], wait: { type: "event", deadline_ms: null } };
+    },
+  };
+  const backend = fakeBackend();
+  installVersalWorker(scope, async () => runtime, () => 0, () => 0, () => backend);
+
+  await scope.onmessage({ data: { id: 1, kind: "create" } });
+  assert.equal(runtime.enabled, true);
+  assert.deepEqual(backend.calls, [
+    ["acquireLock"],
+    ["open", 1, "appendonly.aof.0000000001.incr.aof"],
+  ]);
+
+  await scope.onmessage({ data: { id: 7, kind: "execute", argv: ["SET", "k", "v"] } });
+
+  // The append and flush happen before the reply is posted.
+  assert.deepEqual(backend.calls.slice(2), [
+    ["append", 1, frame],
+    ["flush", 1],
+  ]);
+  assert.deepEqual(scope.messages.at(-1), {
+    id: 7,
+    ok: true,
+    value: { type: "simple", value: "OK" },
+  });
+});
+
+test("worker maps a persistence failure to a MISCONF reply", async () => {
+  const scope = fakeScope();
+  const runtime = {
+    enable_persistence() {},
+    dispatch(input) {
+      if (input.type === "execute") {
+        return {
+          outputs: [
+            { request_id: input.request_id, value: { type: "simple", value: "OK" }, durable_frame: [1] },
+          ],
+          wait: { type: "event", deadline_ms: null },
+        };
+      }
+      return { outputs: [], wait: { type: "event", deadline_ms: null } };
+    },
+  };
+  const backend = fakeBackend();
+  backend.append = () => {
+    throw new Error("quota exceeded");
+  };
+  installVersalWorker(scope, async () => runtime, () => 0, () => 0, () => backend);
+
+  await scope.onmessage({ data: { id: 1, kind: "create" } });
+  await scope.onmessage({ data: { id: 9, kind: "execute", argv: ["SET", "k", "v"] } });
+
+  assert.deepEqual(scope.messages.at(-1), {
+    id: 9,
+    ok: true,
+    value: { type: "error", value: "MISCONF AOF durable write failed: quota exceeded" },
+  });
+});
+
+test("worker still serves commands when the OPFS backend is unavailable", async () => {
   const scope = fakeScope();
   const runtime = {
     enabled: false,
@@ -155,80 +234,23 @@ test("worker forwards host requests and releases the reply on completion", async
     dispatch(input) {
       if (input.type === "execute") {
         return {
-          outputs: [],
-          host_requests: [{ operation: 1, service: "versal.aof", name: "request", payload: [1, 2, 3] }],
+          outputs: [{ request_id: input.request_id, value: { type: "simple", value: "PONG" } }],
           wait: { type: "event", deadline_ms: null },
         };
       }
-      if (input.type === "host_completion") {
-        return {
-          outputs: [{ request_id: 42, value: { type: "simple", value: "OK" } }],
-          host_requests: [],
-          wait: { type: "event", deadline_ms: null },
-        };
-      }
-      return { outputs: [], host_requests: [], wait: { type: "event", deadline_ms: null } };
+      return { outputs: [], wait: { type: "event", deadline_ms: null } };
     },
   };
-  installVersalWorker(scope, async () => runtime, () => 0, () => 0);
-
-  const port = fakeAofPort();
-  scope.onmessage({ data: { kind: "attach_aof", port } });
-  assert.equal(port.started, true);
-
-  await scope.onmessage({ data: { id: 1, kind: "create" } });
-  assert.equal(runtime.enabled, true);
-
-  await scope.onmessage({ data: { id: 42, kind: "execute", argv: ["SET", "k", "v"] } });
-  assert.deepEqual(port.sent, [
-    { operation: 1, service: "versal.aof", name: "request", payload: [1, 2, 3] },
-  ]);
-  // No reply until the durable completion arrives.
-  assert.equal(scope.messages.length, 1); // only the create ack
-
-  port.deliver({ operation: 1, result: { type: "ack" } });
-  assert.deepEqual(scope.messages.at(-1), {
-    id: 42,
-    ok: true,
-    value: { type: "simple", value: "OK" },
+  installVersalWorker(scope, async () => runtime, () => 0, () => 0, () => {
+    throw new Error("OPFS unavailable");
   });
-});
-
-test("worker fails host requests locally when no AOF worker is attached", async () => {
-  const scope = fakeScope();
-  const completions = [];
-  const runtime = {
-    enable_persistence() {},
-    dispatch(input) {
-      if (input.type === "execute") {
-        return {
-          outputs: [],
-          host_requests: [{ operation: 5, service: "versal.aof", name: "request", payload: [] }],
-          wait: { type: "event", deadline_ms: null },
-        };
-      }
-      if (input.type === "host_completion") {
-        completions.push(input);
-        return {
-          outputs: [{ request_id: 9, value: { type: "error", value: "MISCONF" } }],
-          host_requests: [],
-          wait: { type: "event", deadline_ms: null },
-        };
-      }
-      return { outputs: [], host_requests: [], wait: { type: "event", deadline_ms: null } };
-    },
-  };
-  installVersalWorker(scope, async () => runtime, () => 0, () => 0);
 
   await scope.onmessage({ data: { id: 1, kind: "create" } });
-  await scope.onmessage({ data: { id: 9, kind: "execute", argv: ["SET", "k", "v"] } });
-
-  assert.equal(completions.length, 1);
-  assert.equal(completions[0].operation, 5);
-  assert.equal(completions[0].result.type, "error");
+  assert.equal(runtime.enabled, false);
+  await scope.onmessage({ data: { id: 2, kind: "execute", argv: ["PING"] } });
   assert.deepEqual(scope.messages.at(-1), {
-    id: 9,
+    id: 2,
     ok: true,
-    value: { type: "error", value: "MISCONF" },
+    value: { type: "simple", value: "PONG" },
   });
 });
