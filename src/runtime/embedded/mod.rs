@@ -11,6 +11,7 @@ use crate::runtime::driver::{
 mod effects;
 mod machine;
 mod output;
+mod persistence;
 mod scheduler;
 mod session;
 mod state;
