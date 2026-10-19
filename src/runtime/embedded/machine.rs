@@ -19,6 +19,13 @@ impl EmbeddedRuntimeMachine {
     pub(super) const fn capabilities(&self) -> RuntimeCapabilities {
         self.state.capabilities
     }
+
+    /// Enable durable persistence so completed write commands are relayed to
+    /// the storage host before their reply is released. The host calls this
+    /// once the AOF I/O worker is attached (design §6.3).
+    pub(super) fn enable_persistence(&mut self) {
+        self.state.capabilities.persistence = true;
+    }
 }
 
 impl RuntimeMachine for EmbeddedRuntimeMachine {
@@ -72,6 +79,7 @@ impl RuntimeMachine for EmbeddedRuntimeMachine {
                 session,
                 args,
             } => {
+                let selected_db = self.state.session.selected_db;
                 let mut runtime = EmbeddedCommandRuntime::new(
                     &mut self.state.dbs,
                     &mut self.state.session.selected_db,
@@ -80,11 +88,14 @@ impl RuntimeMachine for EmbeddedRuntimeMachine {
                 let outcome =
                     crate::framework::commands::command_runtime::execute(&mut runtime, &args);
                 let mut sink = EmbeddedEffectSink::new(self.state.capabilities);
-                let value = sink.commit(session, CommandTransition::Complete(outcome));
-                Ok(RuntimeProgress::Output(EmbeddedOutput::Reply {
+                let commit = sink.commit(session, CommandTransition::Complete(outcome));
+                Ok(RuntimeProgress::Output(self.state.finish_command(
                     request_id,
-                    value,
-                }))
+                    session,
+                    selected_db,
+                    &args,
+                    commit,
+                )))
             }
         }
     }

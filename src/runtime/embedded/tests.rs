@@ -1,12 +1,149 @@
 use super::{EmbeddedEvent, EmbeddedOutput, EmbeddedRuntime, EmbeddedRuntimeError, Reply};
 use crate::engine::command::CommandArgs;
 use crate::runtime::driver::{
-    RuntimeClock, RuntimeDispatch, RuntimeInput, RuntimeInstant, RuntimeWait,
+    HostOperationId, HostOperationResult, OwnedHostCompletion, OwnedHostRequest, RuntimeClock,
+    RuntimeDispatch, RuntimeInput, RuntimeInstant, RuntimeWait,
 };
 use bytes::Bytes;
 
 fn args(parts: &[&str]) -> Vec<String> {
     parts.iter().map(|part| (*part).to_owned()).collect()
+}
+
+fn execute_event(request_id: u32, parts: &[&str]) -> RuntimeInput<EmbeddedEvent> {
+    let command = CommandArgs::from_parts(
+        parts
+            .iter()
+            .map(|part| Bytes::copy_from_slice(part.as_bytes()))
+            .collect(),
+    );
+    RuntimeInput::External(EmbeddedEvent::Execute {
+        request_id,
+        session: crate::engine::command::SessionId(1),
+        args: command,
+    })
+}
+
+#[test]
+fn durable_write_withholds_reply_until_host_acknowledges() {
+    let mut runtime = EmbeddedRuntime::new();
+    runtime.enable_persistence();
+
+    // A write command produces a host request rather than a direct reply.
+    let step = runtime
+        .dispatch(RuntimeDispatch::new(
+            RuntimeClock::new(1_000, 10_000),
+            execute_event(7, &["SET", "key", "value"]),
+        ))
+        .unwrap();
+    assert_eq!(step.outputs.len(), 1);
+    let EmbeddedOutput::HostRequest { operation, request } = &step.outputs[0] else {
+        panic!("expected a durable host request");
+    };
+    let OwnedHostRequest::Call {
+        service, payload, ..
+    } = request
+    else {
+        panic!("expected a Call host request");
+    };
+    assert_eq!(service.as_ref(), b"versal.aof");
+    let decoded = crate::foundation::io::persistence::decode_aof_io_request(payload)
+        .expect("payload decodes");
+    let crate::foundation::io::persistence::AofIoRequest::Append { bytes, .. } = decoded else {
+        panic!("expected an append request");
+    };
+    assert_eq!(
+        bytes.as_ref(),
+        b"*2\r\n$6\r\nSELECT\r\n$1\r\n0\r\n*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n"
+    );
+    let operation = *operation;
+
+    // The host acknowledges durability, releasing the withheld reply.
+    let step = runtime
+        .dispatch(RuntimeDispatch::new(
+            RuntimeClock::new(1_000, 10_000),
+            RuntimeInput::HostCompletion(OwnedHostCompletion {
+                operation,
+                result: HostOperationResult::Ack,
+            }),
+        ))
+        .unwrap();
+    assert_eq!(step.outputs.len(), 1);
+    let EmbeddedOutput::Reply { request_id, value } = &step.outputs[0] else {
+        panic!("expected the withheld reply");
+    };
+    assert_eq!(*request_id, 7);
+    assert_eq!(*value, crate::engine::core::Value::ok());
+}
+
+#[test]
+fn durable_read_replies_without_a_host_request() {
+    let mut runtime = EmbeddedRuntime::new();
+    runtime.enable_persistence();
+    let step = runtime
+        .dispatch(RuntimeDispatch::new(
+            RuntimeClock::new(1_000, 10_000),
+            execute_event(3, &["GET", "key"]),
+        ))
+        .unwrap();
+    assert_eq!(step.outputs.len(), 1);
+    let EmbeddedOutput::Reply { request_id, value } = &step.outputs[0] else {
+        panic!("reads reply immediately");
+    };
+    assert_eq!(*request_id, 3);
+    assert_eq!(*value, crate::engine::core::Value::null());
+}
+
+#[test]
+fn durable_write_failure_maps_to_a_misconf_reply() {
+    let mut runtime = EmbeddedRuntime::new();
+    runtime.enable_persistence();
+    let step = runtime
+        .dispatch(RuntimeDispatch::new(
+            RuntimeClock::new(1_000, 10_000),
+            execute_event(11, &["SET", "key", "value"]),
+        ))
+        .unwrap();
+    let EmbeddedOutput::HostRequest { operation, .. } = &step.outputs[0] else {
+        panic!("expected a durable host request");
+    };
+    let operation = *operation;
+    let step = runtime
+        .dispatch(RuntimeDispatch::new(
+            RuntimeClock::new(1_000, 10_000),
+            RuntimeInput::HostCompletion(OwnedHostCompletion {
+                operation,
+                result: HostOperationResult::Error("quota exceeded".to_string()),
+            }),
+        ))
+        .unwrap();
+    let EmbeddedOutput::Reply { request_id, value } = &step.outputs[0] else {
+        panic!("expected the withheld reply");
+    };
+    assert_eq!(*request_id, 11);
+    assert_eq!(
+        *value,
+        crate::engine::core::Value::error("MISCONF AOF durable write failed: quota exceeded")
+    );
+}
+
+#[test]
+fn unmatched_host_completion_is_rejected() {
+    let mut runtime = EmbeddedRuntime::new();
+    runtime.enable_persistence();
+    let result = runtime.dispatch(RuntimeDispatch::new(
+        RuntimeClock::new(1_000, 10_000),
+        RuntimeInput::HostCompletion(OwnedHostCompletion {
+            operation: HostOperationId::from_u64(99),
+            result: HostOperationResult::Ack,
+        }),
+    ));
+    assert!(matches!(
+        result,
+        Err(crate::runtime::driver::RuntimeDriverError::Machine(
+            EmbeddedRuntimeError::UnsupportedHostCompletion
+        ))
+    ));
 }
 
 #[test]
@@ -58,7 +195,9 @@ fn dispatch_returns_correlated_reply_and_deadline() {
             }),
         ))
         .unwrap();
-    let EmbeddedOutput::Reply { request_id, value } = &step.outputs[0];
+    let EmbeddedOutput::Reply { request_id, value } = &step.outputs[0] else {
+        panic!("expected a reply output");
+    };
     assert_eq!(*request_id, 17);
     assert_eq!(*value, crate::engine::core::Value::ok());
     assert_eq!(

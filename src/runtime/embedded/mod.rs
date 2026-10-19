@@ -8,6 +8,7 @@ use crate::runtime::driver::{
     RuntimeKernel, RuntimeStep,
 };
 
+mod aof_frame;
 mod effects;
 mod machine;
 mod output;
@@ -63,6 +64,13 @@ impl EmbeddedRuntime {
 
     pub fn capabilities(&self) -> RuntimeCapabilities {
         self.kernel.machine().capabilities()
+    }
+
+    /// Enable durable persistence. The host calls this once the AOF I/O worker
+    /// is attached so that subsequent write commands are persisted before
+    /// their reply is released.
+    pub fn enable_persistence(&mut self) {
+        self.kernel.machine_mut().enable_persistence();
     }
 
     pub fn execute(&mut self, args: &[String], now_ms: u64) -> Reply {

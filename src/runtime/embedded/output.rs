@@ -1,4 +1,5 @@
 use crate::engine::core::Value;
+use crate::runtime::driver::{HostOperationId, OwnedHostRequest};
 
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "wasm", derive(serde::Serialize))]
@@ -19,13 +20,25 @@ pub enum Reply {
 }
 
 pub enum EmbeddedOutput {
-    Reply { request_id: u32, value: Value },
+    Reply {
+        request_id: u32,
+        value: Value,
+    },
+    /// A durable host operation the runtime needs the host to perform. The
+    /// paired reply is withheld until the matching `HostCompletion` arrives.
+    HostRequest {
+        operation: HostOperationId,
+        request: OwnedHostRequest,
+    },
 }
 
 impl EmbeddedOutput {
     pub(crate) fn into_reply(self) -> Reply {
         match self {
             Self::Reply { value, .. } => Reply::from_value(value),
+            Self::HostRequest { .. } => {
+                Reply::Error("ERR host request has no synchronous reply".to_owned())
+            }
         }
     }
 }

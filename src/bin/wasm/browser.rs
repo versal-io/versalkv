@@ -3,21 +3,47 @@
 use bytes::Bytes;
 use wasm_bindgen::prelude::*;
 
-use crate::driver::{RuntimeClock, RuntimeDispatch, RuntimeInput, RuntimeWait};
+use crate::driver::{
+    HostOperationId, HostOperationResult, OwnedHostCompletion, OwnedHostRequest, RuntimeClock,
+    RuntimeDispatch, RuntimeInput, RuntimeWait,
+};
 use crate::embedded::{EmbeddedEvent, EmbeddedOutput, EmbeddedRuntime, Reply};
 use crate::engine::command::SessionId;
 
 #[derive(serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum BrowserInput {
-    Execute { request_id: u32, argv: Vec<String> },
+    Execute {
+        request_id: u32,
+        argv: Vec<String>,
+    },
     Wake,
     Shutdown,
+    /// A durable host operation finished in the AOF I/O worker.
+    HostCompletion {
+        operation: u64,
+        result: BrowserHostResult,
+    },
+}
+
+/// Outcome of a durable host operation reported back by the AOF I/O worker.
+#[derive(serde::Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum BrowserHostResult {
+    /// The operation succeeded with no payload (an append acknowledgement).
+    Ack,
+    /// The operation succeeded and returned payload bytes.
+    Data { bytes: Vec<u8> },
+    /// The operation failed with a host-provided message.
+    Error { message: String },
 }
 
 #[derive(serde::Serialize)]
 struct BrowserStep {
     outputs: Vec<BrowserOutput>,
+    /// Durable host requests the AOF I/O worker must perform before the paired
+    /// client reply is released.
+    host_requests: Vec<BrowserHostRequest>,
     wait: BrowserWait,
 }
 
@@ -25,6 +51,16 @@ struct BrowserStep {
 struct BrowserOutput {
     request_id: u32,
     value: Reply,
+}
+
+/// A durable host request serialized for the AOF I/O worker. `payload` carries
+/// the MessagePack-encoded `AofIoRequest` as raw bytes.
+#[derive(serde::Serialize)]
+struct BrowserHostRequest {
+    operation: u64,
+    service: String,
+    name: String,
+    payload: Vec<u8>,
 }
 
 #[derive(serde::Serialize)]
@@ -59,6 +95,14 @@ impl BrowserVersal {
         }
     }
 
+    /// Enable durable persistence. The host calls this once the AOF I/O worker
+    /// is attached so subsequent write commands are persisted before their
+    /// reply is released.
+    #[wasm_bindgen]
+    pub fn enable_persistence(&mut self) {
+        self.runtime.enable_persistence();
+    }
+
     #[wasm_bindgen]
     pub fn dispatch(
         &mut self,
@@ -81,6 +125,18 @@ impl BrowserVersal {
             }
             BrowserInput::Wake => RuntimeInput::Wake,
             BrowserInput::Shutdown => RuntimeInput::Shutdown,
+            BrowserInput::HostCompletion { operation, result } => {
+                RuntimeInput::HostCompletion(OwnedHostCompletion {
+                    operation: HostOperationId::from_u64(operation),
+                    result: match result {
+                        BrowserHostResult::Ack => HostOperationResult::Ack,
+                        BrowserHostResult::Data { bytes } => {
+                            HostOperationResult::Data(Bytes::from(bytes))
+                        }
+                        BrowserHostResult::Error { message } => HostOperationResult::Error(message),
+                    },
+                })
+            }
         };
         let step = self
             .runtime
@@ -89,17 +145,19 @@ impl BrowserVersal {
                 input,
             ))
             .map_err(|error| JsValue::from_str(&format!("runtime dispatch failed: {error}")))?;
-        let outputs = step
-            .outputs
-            .into_iter()
-            .map(|output| {
-                let EmbeddedOutput::Reply { request_id, value } = output;
-                BrowserOutput {
+        let mut outputs = Vec::new();
+        let mut host_requests = Vec::new();
+        for output in step.outputs {
+            match output {
+                EmbeddedOutput::Reply { request_id, value } => outputs.push(BrowserOutput {
                     request_id,
                     value: Reply::from_value(value),
+                }),
+                EmbeddedOutput::HostRequest { operation, request } => {
+                    host_requests.push(encode_host_request(operation, request));
                 }
-            })
-            .collect();
+            }
+        }
         let wait = match step.wait {
             RuntimeWait::Immediate => BrowserWait::Immediate,
             RuntimeWait::Event { deadline } => BrowserWait::Event {
@@ -107,8 +165,12 @@ impl BrowserVersal {
             },
             RuntimeWait::Stopped => BrowserWait::Stopped,
         };
-        serde_wasm_bindgen::to_value(&BrowserStep { outputs, wait })
-            .map_err(|error| JsValue::from_str(&format!("failed to encode runtime step: {error}")))
+        serde_wasm_bindgen::to_value(&BrowserStep {
+            outputs,
+            host_requests,
+            wait,
+        })
+        .map_err(|error| JsValue::from_str(&format!("failed to encode runtime step: {error}")))
     }
 
     #[wasm_bindgen]
@@ -130,6 +192,41 @@ impl BrowserVersal {
 
 fn clock_ms(value: f64) -> u64 {
     value.max(0.0).min(u64::MAX as f64) as u64
+}
+
+fn encode_host_request(
+    operation: HostOperationId,
+    request: OwnedHostRequest,
+) -> BrowserHostRequest {
+    // The embedded runtime only issues durable AOF calls today; the read/write
+    // request variants are carried through for forward compatibility.
+    let (service, name, payload) = match request {
+        OwnedHostRequest::Call {
+            service,
+            operation: name,
+            payload,
+        } => (service, name, payload),
+        OwnedHostRequest::Read { resource } => (
+            Bytes::from_static(b"versal.aof"),
+            Bytes::from_static(b"read"),
+            resource,
+        ),
+        OwnedHostRequest::Write { resource, payload } => {
+            let mut combined = resource.to_vec();
+            combined.extend_from_slice(&payload);
+            (
+                Bytes::from_static(b"versal.aof"),
+                Bytes::from_static(b"write"),
+                Bytes::from(combined),
+            )
+        }
+    };
+    BrowserHostRequest {
+        operation: operation.as_u64(),
+        service: String::from_utf8_lossy(&service).into_owned(),
+        name: String::from_utf8_lossy(&name).into_owned(),
+        payload: payload.to_vec(),
+    }
 }
 
 fn monotonic_clock_us(value: f64) -> u64 {

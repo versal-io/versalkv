@@ -217,7 +217,10 @@ fn invoke_embedded(
         .outputs
         .into_iter()
         .next()
-        .expect("FaaS command output");
+        .expect("FaaS command output")
+    else {
+        panic!("expected a reply output");
+    };
     assert_eq!(output_id, request_id);
     value
 }
