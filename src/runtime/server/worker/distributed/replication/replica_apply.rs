@@ -475,7 +475,7 @@ impl ServerWorkerState {
             return Ok(None);
         }
         if let Some(journal) = self.ctx.aof_mut().journal.as_mut() {
-            journal.appender.flush(true).map_err(|_| ())?;
+            journal.flush(true).map_err(|_| ())?;
         }
         let manifest = crate::foundation::io::persistence::prepare_synced_rdb_as_aof_base(
             &config.dir,
@@ -503,7 +503,7 @@ impl ServerWorkerState {
         self.ctx.persistence_mut().reset_aof_selected_db();
         self.ctx
             .persistence_mut()
-            .record_aof_size(prepared.journal.appender.current_size());
+            .record_aof_size(prepared.journal.current_size());
         self.ctx.aof_mut().journal = Some(prepared.journal);
         prepared.manifest.finalize();
         crate::server_log!(notice, "Reused RDB file from primary sync as AOF base file");

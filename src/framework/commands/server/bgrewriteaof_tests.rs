@@ -211,7 +211,7 @@ fn rewrite_journal_rotation_resets_only_aof_cursor() {
     assert_eq!(ctx.persistence().aof_selected_db(), -1);
 
     if let Some(mut journal) = ctx.aof_mut().journal.take() {
-        journal.appender.shutdown().unwrap();
+        journal.shutdown().unwrap();
     }
     std::fs::remove_dir_all(dir).unwrap();
 }
@@ -256,7 +256,7 @@ fn rewrite_journal_open_failure_resets_only_aof_cursor_before_replacement() {
     assert!(ctx.aof().journal.is_some());
 
     if let Some(mut journal) = ctx.aof_mut().journal.take() {
-        journal.appender.shutdown().unwrap();
+        journal.shutdown().unwrap();
     }
     std::fs::remove_dir_all(dir).unwrap();
 }

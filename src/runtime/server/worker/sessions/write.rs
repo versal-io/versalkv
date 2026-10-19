@@ -988,7 +988,7 @@ impl ServerWorkerState {
 
         if !aof_enabled {
             if let Some(mut aof) = self.ctx.aof_mut().journal.take() {
-                let _ = aof.appender.shutdown();
+                let _ = aof.shutdown();
                 crate::server_log!(notice, "AOF turned off");
             }
             self.ctx.persistence_mut().reset_aof_selected_db();
@@ -1059,16 +1059,16 @@ impl ServerWorkerState {
         };
         // Keep the appender on the live configured mode except while the C
         // no-appendfsync-on-rewrite gate is active.
-        if aof.appender.fsync_mode() != effective_fsync {
-            if let Err(e) = aof.appender.set_fsync_mode(effective_fsync) {
+        if aof.fsync_mode() != effective_fsync {
+            if let Err(e) = aof.set_fsync_mode(effective_fsync) {
                 crate::server_log!(warning, "AOF fsync mode switch failed: {}", e);
             }
         }
-        let fsync_mode = aof.appender.fsync_mode();
+        let fsync_mode = aof.fsync_mode();
         let aof_flush_start = std::time::Instant::now();
-        let flush_result = aof.appender.flush(false);
+        let flush_result = aof.flush(false);
         let aof_flush_duration_usec = aof_flush_start.elapsed().as_micros() as u64;
-        let current_size = aof.appender.current_size();
+        let current_size = aof.current_size();
         let _ = aof;
         self.ctx.record_eventloop_aof(aof_flush_duration_usec);
 

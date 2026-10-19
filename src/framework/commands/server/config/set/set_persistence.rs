@@ -102,7 +102,7 @@ pub(super) fn config_set_persistence(
                     ctx.persistence_mut().abort_child();
                 }
                 if let Some(mut journal) = ctx.aof_mut().journal.take() {
-                    let _ = journal.appender.shutdown();
+                    let _ = journal.shutdown();
                 }
                 ctx.persistence_mut().reset_aof_selected_db();
             }

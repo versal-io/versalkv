@@ -229,8 +229,8 @@ pub(crate) fn finish_shutdown(ctx: &mut ServerContext, flags: u32) -> Result<(),
 
     if let Some(ref mut aof) = ctx.aof_mut().journal {
         crate::server_log!(notice, "Flushing and closing AOF file.");
-        let _ = aof.appender.flush(true);
-        let _ = aof.appender.shutdown();
+        let _ = aof.flush(true);
+        let _ = aof.shutdown();
     }
 
     crate::server_log!(notice, "{}", messages::READY_TO_EXIT);

@@ -7,7 +7,6 @@ pub(super) fn prepare_debug_loadaof(
 ) -> Result<PreparedHostTask, Value> {
     if let Some(journal) = ctx.aof_mut().journal.as_mut() {
         journal
-            .appender
             .flush(true)
             .map_err(|error| Value::error(format!("ERR {}", error)))?;
     }

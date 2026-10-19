@@ -79,7 +79,7 @@ impl AofState {
     pub fn buffer_allocation_bytes(&self) -> usize {
         self.journal
             .as_ref()
-            .map_or(0, |journal| journal.appender.buffer_allocation_bytes())
+            .map_or(0, |journal| journal.buffer_allocation_bytes())
     }
 }
 
@@ -311,7 +311,7 @@ impl PersistenceState {
 
     pub fn feed_aof(&mut self, frame: &[u8]) {
         if let Some(journal) = self.aof.journal.as_mut() {
-            journal.appender.feed(frame);
+            journal.feed(frame);
         }
         if matches!(self.child, Some(PersistenceChild::AofRewrite { .. })) {
             self.aof.rewrite.buffer.extend_from_slice(frame);

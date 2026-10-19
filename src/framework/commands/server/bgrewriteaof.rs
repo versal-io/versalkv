@@ -148,7 +148,6 @@ fn rotate_increment_for_rewrite(
     ctx.persistence_mut().reset_aof_selected_db();
     if let Some(journal) = ctx.aof_mut().journal.as_mut() {
         journal
-            .appender
             .flush(true)
             .map_err(|error| error.to_string())?;
     }
@@ -175,7 +174,7 @@ fn rotate_increment_for_rewrite(
         .aof_mut()
         .journal
         .take()
-        .map(|mut old_journal| old_journal.appender.shutdown());
+        .map(|mut old_journal| old_journal.shutdown());
     ctx.aof_mut().journal = Some(
         crate::foundation::io::persistence::journal::AofJournal::new(appender),
     );
@@ -280,7 +279,7 @@ pub(crate) fn apply_aof_rewrite_child_completion(
 
     let increment_rotated = ctx.aof().journal.is_some();
     if let Some(mut aof) = ctx.aof_mut().journal.take() {
-        aof.appender.shutdown().ok();
+        aof.shutdown().ok();
     }
 
     let append_enabled = ctx.config().persistence.aof_enabled;

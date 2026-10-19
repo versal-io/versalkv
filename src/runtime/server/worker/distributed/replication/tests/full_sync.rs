@@ -126,7 +126,7 @@ fn assert_atomic_full_sync_state_unchanged(fixture: &AtomicFullSyncFixture) {
     assert_eq!(backend.ctx.persistence().aof_selected_db(), 11);
     assert_eq!(backend.ctx.aof().current_size, 7);
     assert_eq!(
-        backend.ctx.aof().journal.as_ref().unwrap().appender.path(),
+        backend.ctx.aof().journal.as_ref().unwrap().path(),
         fixture.old_journal_path.to_string_lossy()
     );
 }
@@ -264,7 +264,7 @@ fn assert_rejected_rdb_apply_position_preserves_state(
         old_output
     );
     if let Some(mut journal) = fixture.backend.ctx.aof_mut().journal.take() {
-        journal.appender.shutdown().unwrap();
+        journal.shutdown().unwrap();
     }
     std::fs::remove_dir_all(dir).unwrap();
 }
@@ -310,7 +310,7 @@ fn aof_base_prepare_failure_keeps_full_sync_state_unpublished() {
     assert_atomic_full_sync_state_unchanged(&fixture);
     assert_eq!(std::fs::read(dir.join("dump.rdb")).unwrap(), b"old-rdb");
     if let Some(mut journal) = fixture.backend.ctx.aof_mut().journal.take() {
-        journal.appender.shutdown().unwrap();
+        journal.shutdown().unwrap();
     }
     std::fs::remove_dir_all(dir).unwrap();
 }
@@ -361,7 +361,7 @@ fn disk_rdb_commit_failure_rolls_back_prepared_aof_manifest() {
     assert!(!app_dir.join("appendonly.aof.2.incr.aof").exists());
     assert!(dir.join("dump.rdb").is_dir());
     if let Some(mut journal) = fixture.backend.ctx.aof_mut().journal.take() {
-        journal.appender.shutdown().unwrap();
+        journal.shutdown().unwrap();
     }
     std::fs::remove_dir_all(dir).unwrap();
 }
@@ -418,7 +418,6 @@ fn full_sync_aof_base_success_resets_cursors_and_installs_journal() {
         .journal
         .as_ref()
         .unwrap()
-        .appender
         .path()
         .to_string();
     assert!(journal_path.ends_with(".incr.aof"));
@@ -455,7 +454,7 @@ fn full_sync_aof_base_success_resets_cursors_and_installs_journal() {
     assert!(!fixture.backend.ctx.is_loading());
     assert!(dir.join("dump.rdb").is_file());
     if let Some(mut journal) = fixture.backend.ctx.aof_mut().journal.take() {
-        journal.appender.shutdown().unwrap();
+        journal.shutdown().unwrap();
     }
     std::fs::remove_dir_all(dir).unwrap();
 }

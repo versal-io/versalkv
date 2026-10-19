@@ -29,7 +29,6 @@ fn blocked_pump_flushes_aof_before_pending_client_output() {
         .journal
         .as_ref()
         .expect("AOF journal")
-        .appender
         .current_size();
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind client peer");
@@ -62,7 +61,6 @@ fn blocked_pump_flushes_aof_before_pending_client_output() {
             .journal
             .as_ref()
             .expect("AOF journal")
-            .appender
             .current_size()
             > initial_size,
         "blocked before-poll maintenance must flush AOF"

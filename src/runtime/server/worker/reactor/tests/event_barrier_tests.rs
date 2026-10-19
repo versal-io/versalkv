@@ -427,7 +427,6 @@ fn appendfsync_always_defers_new_reply_until_the_next_durable_boundary() {
         .journal
         .as_ref()
         .expect("AOF journal")
-        .appender
         .current_size();
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind client listener");
@@ -458,7 +457,6 @@ fn appendfsync_always_defers_new_reply_until_the_next_durable_boundary() {
                 .journal
                 .as_ref()
                 .expect("AOF journal")
-                .appender
                 .current_size(),
             initial_size,
             "the pre-read barrier must not expose the new reply before durability"
@@ -495,7 +493,6 @@ fn appendfsync_always_defers_new_reply_until_the_next_durable_boundary() {
             .journal
             .as_ref()
             .expect("AOF journal")
-            .appender
             .current_size()
             > initial_size,
         "the first completed turn must establish the durable AOF boundary"
@@ -543,7 +540,6 @@ fn appendfsync_always_defers_new_reply_until_the_next_durable_boundary() {
             .journal
             .as_ref()
             .expect("AOF journal")
-            .appender
             .current_size()
             > initial_size
     );
@@ -573,7 +569,6 @@ fn setup_appendfsync_always_half_close_test(
         .journal
         .as_ref()
         .expect("AOF journal")
-        .appender
         .current_size();
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind client listener");
@@ -698,7 +693,6 @@ fn appendfsync_always_readable_hup_defers_new_reply_until_next_durable_boundary(
             .journal
             .as_ref()
             .expect("AOF journal")
-            .appender
             .current_size(),
         initial_size,
         "the readable half-close turn must not flush AOF inline"
@@ -732,7 +726,6 @@ fn appendfsync_always_readable_hup_defers_new_reply_until_next_durable_boundary(
             .journal
             .as_ref()
             .expect("AOF journal")
-            .appender
             .current_size()
             > initial_size,
         "the end-of-turn durable boundary must flush the SET to AOF"
@@ -746,7 +739,6 @@ fn appendfsync_always_readable_hup_defers_new_reply_until_next_durable_boundary(
             .journal
             .as_ref()
             .expect("AOF journal")
-            .appender
             .current_size()
             > initial_size
     );
@@ -776,7 +768,6 @@ fn pipelined_write_and_unblocked_write_share_the_next_aof_boundary() {
         .journal
         .as_ref()
         .expect("AOF journal")
-        .appender
         .current_size();
 
     let blocked_listener = TcpListener::bind("127.0.0.1:0").expect("bind blocked listener");
@@ -844,7 +835,6 @@ fn pipelined_write_and_unblocked_write_share_the_next_aof_boundary() {
             .journal
             .as_ref()
             .expect("AOF journal")
-            .appender
             .current_size(),
         initial_size,
         "pipelined and unblocked command completion must not flush AOF inline"

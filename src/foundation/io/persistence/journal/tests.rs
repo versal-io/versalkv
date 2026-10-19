@@ -65,7 +65,7 @@ fn append_replay_rewrite_and_truncate_operate_on_the_underlying_aof_file() {
     journal
         .append(b"*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n")
         .unwrap();
-    assert!(std::fs::metadata(journal.appender.path()).unwrap().len() > 0);
+    assert!(std::fs::metadata(journal.path()).unwrap().len() > 0);
 
     journal.replay().unwrap();
     assert_eq!(
@@ -74,10 +74,10 @@ fn append_replay_rewrite_and_truncate_operate_on_the_underlying_aof_file() {
     );
 
     journal.truncate(0).unwrap();
-    assert_eq!(std::fs::metadata(journal.appender.path()).unwrap().len(), 0);
+    assert_eq!(std::fs::metadata(journal.path()).unwrap().len(), 0);
     journal.append(b"*1\r\n$4\r\nPING\r\n").unwrap();
     journal.rewrite().unwrap();
-    assert!(std::fs::metadata(journal.appender.path()).unwrap().len() > 0);
+    assert!(std::fs::metadata(journal.path()).unwrap().len() > 0);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

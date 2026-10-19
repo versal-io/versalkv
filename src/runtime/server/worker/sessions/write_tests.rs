@@ -1694,14 +1694,7 @@ fn no_appendfsync_on_rewrite_pauses_and_restores_effective_fsync_mode() {
 
     backend.flush_aof_if_needed();
     assert_eq!(
-        backend
-            .ctx
-            .aof()
-            .journal
-            .as_ref()
-            .unwrap()
-            .appender
-            .fsync_mode(),
+        backend.ctx.aof().journal.as_ref().unwrap().fsync_mode(),
         crate::foundation::io::persistence::AofFsync::Always
     );
 
@@ -1712,14 +1705,7 @@ fn no_appendfsync_on_rewrite_pauses_and_restores_effective_fsync_mode() {
         .unwrap();
     backend.flush_aof_if_needed();
     assert_eq!(
-        backend
-            .ctx
-            .aof()
-            .journal
-            .as_ref()
-            .unwrap()
-            .appender
-            .fsync_mode(),
+        backend.ctx.aof().journal.as_ref().unwrap().fsync_mode(),
         crate::foundation::io::persistence::AofFsync::No
     );
 
@@ -1730,14 +1716,7 @@ fn no_appendfsync_on_rewrite_pauses_and_restores_effective_fsync_mode() {
         .unwrap();
     backend.flush_aof_if_needed();
     assert_eq!(
-        backend
-            .ctx
-            .aof()
-            .journal
-            .as_ref()
-            .unwrap()
-            .appender
-            .fsync_mode(),
+        backend.ctx.aof().journal.as_ref().unwrap().fsync_mode(),
         crate::foundation::io::persistence::AofFsync::Always
     );
     std::fs::remove_dir_all(dir).unwrap();
