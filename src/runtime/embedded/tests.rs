@@ -90,6 +90,87 @@ fn host_completion_is_rejected_without_persistence() {
 }
 
 #[test]
+fn replay_aof_restores_commands_including_select_and_multi_exec() {
+    let mut runtime = EmbeddedRuntime::new();
+    // A SELECT cursor, a plain write, and a MULTI/EXEC-wrapped group. The
+    // transaction markers must be unwrapped and the inner writes applied.
+    let stream = b"*2\r\n$6\r\nSELECT\r\n$1\r\n0\r\n\
+*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n\
+*1\r\n$5\r\nMULTI\r\n\
+*3\r\n$5\r\nRPUSH\r\n$4\r\nlist\r\n$1\r\na\r\n\
+*1\r\n$4\r\nEXEC\r\n";
+    let applied = runtime.replay_aof(stream).expect("replay succeeds");
+    // SELECT, SET and RPUSH are applied; MULTI/EXEC markers are skipped.
+    assert_eq!(applied, 3);
+
+    assert_eq!(
+        runtime.execute(&args(&["GET", "key"]), 0),
+        Reply::Bulk(Some("value".into()))
+    );
+    assert_eq!(
+        runtime.execute(&args(&["LRANGE", "list", "0", "-1"]), 0),
+        Reply::Array(vec![Some("a".into())])
+    );
+}
+
+#[test]
+fn replay_aof_honors_the_select_cursor_across_databases() {
+    let mut runtime = EmbeddedRuntime::new();
+    let stream = b"*2\r\n$6\r\nSELECT\r\n$1\r\n1\r\n\
+*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n";
+    // SELECT and SET are both applied through the runtime.
+    assert_eq!(runtime.replay_aof(stream).expect("replay succeeds"), 2);
+
+    // The key landed in database 1, not 0.
+    assert_eq!(runtime.execute(&args(&["GET", "k"]), 0), Reply::Bulk(None));
+    assert_eq!(
+        runtime.execute(&args(&["SELECT", "1"]), 0),
+        Reply::Simple("OK".into())
+    );
+    assert_eq!(
+        runtime.execute(&args(&["GET", "k"]), 0),
+        Reply::Bulk(Some("v".into()))
+    );
+}
+
+#[test]
+fn load_base_rdb_ignores_non_rdb_bytes() {
+    let mut runtime = EmbeddedRuntime::new();
+    assert_eq!(runtime.load_base_rdb(b"not an rdb").expect("ok"), 0);
+}
+
+#[test]
+fn load_base_rdb_then_replay_aof_reconstructs_the_dataset() {
+    use crate::foundation::io::store::kv_engine::DbSet;
+    use crate::foundation::io::store::Robj;
+
+    // Build a base snapshot containing one key in database 0.
+    let mut source = DbSet::new(16);
+    source
+        .get_mut(0)
+        .unwrap()
+        .set(b"base-key".to_vec(), Robj::string("base-val"));
+    let rdb = crate::foundation::io::persistence::serialize_all(&source, 0);
+
+    let mut runtime = EmbeddedRuntime::new();
+    let consumed = runtime.load_base_rdb(&rdb).expect("base loads");
+    assert!(consumed > 0);
+
+    // An increment then mutates the dataset on top of the base.
+    let stream = b"*3\r\n$3\r\nSET\r\n$8\r\nincr-key\r\n$8\r\nincr-val\r\n";
+    assert_eq!(runtime.replay_aof(stream).expect("replay succeeds"), 1);
+
+    assert_eq!(
+        runtime.execute(&args(&["GET", "base-key"]), 0),
+        Reply::Bulk(Some("base-val".into()))
+    );
+    assert_eq!(
+        runtime.execute(&args(&["GET", "incr-key"]), 0),
+        Reply::Bulk(Some("incr-val".into()))
+    );
+}
+
+#[test]
 fn shared_handlers_mutate_the_shared_db() {
     let mut runtime = EmbeddedRuntime::new();
     assert_eq!(

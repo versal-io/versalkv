@@ -72,6 +72,21 @@ impl EmbeddedRuntime {
         self.kernel.machine_mut().enable_persistence();
     }
 
+    /// Load a base RDB preamble into the dataset during startup recovery.
+    /// Returns the number of bytes consumed (`0` if `bytes` is not an RDB
+    /// image). The host calls this before replaying the increment and before
+    /// enabling persistence, so loading never re-persists.
+    pub fn load_base_rdb(&mut self, bytes: &[u8]) -> Result<usize, String> {
+        self.kernel.machine_mut().load_base_rdb(bytes)
+    }
+
+    /// Replay an incremental AOF byte stream into the dataset during startup
+    /// recovery. Returns the number of commands applied. The host calls this
+    /// before enabling persistence, so replay never re-persists.
+    pub fn replay_aof(&mut self, bytes: &[u8]) -> Result<u64, String> {
+        self.kernel.machine_mut().replay_aof(bytes)
+    }
+
     pub fn execute(&mut self, args: &[String], now_ms: u64) -> Reply {
         let command = CommandArgs::from_parts(
             args.iter()

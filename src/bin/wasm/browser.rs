@@ -71,6 +71,27 @@ impl BrowserVersal {
         self.runtime.enable_persistence();
     }
 
+    /// Load a base RDB preamble during startup recovery. Returns the number of
+    /// bytes consumed (`0` if `bytes` is not an RDB image). The host calls this
+    /// before replaying the increment and before `enable_persistence`.
+    #[wasm_bindgen]
+    pub fn load_base_rdb(&mut self, bytes: Vec<u8>) -> Result<usize, JsValue> {
+        self.runtime
+            .load_base_rdb(&bytes)
+            .map_err(|error| JsValue::from_str(&format!("failed to load base RDB: {error}")))
+    }
+
+    /// Replay an incremental AOF byte stream during startup recovery. Returns
+    /// the number of commands applied. The host calls this before
+    /// `enable_persistence`, so replay never re-persists.
+    #[wasm_bindgen]
+    pub fn replay_aof(&mut self, bytes: Vec<u8>) -> Result<u32, JsValue> {
+        self.runtime
+            .replay_aof(&bytes)
+            .map(|applied| applied as u32)
+            .map_err(|error| JsValue::from_str(&format!("failed to replay AOF: {error}")))
+    }
+
     #[wasm_bindgen]
     pub fn dispatch(
         &mut self,

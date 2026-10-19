@@ -26,6 +26,18 @@ impl EmbeddedRuntimeMachine {
     pub(super) fn enable_persistence(&mut self) {
         self.state.capabilities.persistence = true;
     }
+
+    /// Load a base RDB preamble during startup recovery. See
+    /// [`EmbeddedState::load_base_rdb`].
+    pub(super) fn load_base_rdb(&mut self, bytes: &[u8]) -> Result<usize, String> {
+        self.state.load_base_rdb(bytes)
+    }
+
+    /// Replay an incremental AOF stream during startup recovery. See
+    /// [`EmbeddedState::replay_aof`].
+    pub(super) fn replay_aof(&mut self, bytes: &[u8]) -> Result<u64, String> {
+        self.state.replay_aof(bytes)
+    }
 }
 
 impl RuntimeMachine for EmbeddedRuntimeMachine {
