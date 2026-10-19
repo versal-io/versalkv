@@ -105,7 +105,7 @@ integration:
 	$(CARGO) test --test integration
 
 wasm-check:
-	$(NODE) --test src/bin/wasm/worker.test.mjs
+	$(NODE) --test 'src/bin/wasm/*.test.mjs'
 	$(CARGO) test --no-default-features --features wasm --lib
 	$(CARGO) build --no-default-features --features wasm --target wasm32-unknown-unknown
 
@@ -135,6 +135,10 @@ wasm-dist: wasm-web
 	cp src/bin/wasm/client.mjs \
 		src/bin/wasm/worker.mjs \
 		src/bin/wasm/worker-entry.mjs \
+		src/bin/wasm/aof-worker.mjs \
+		src/bin/wasm/aof-worker-entry.mjs \
+		src/bin/wasm/aof-opfs.mjs \
+		src/bin/wasm/aof-protocol.mjs \
 		src/bin/wasm/gateway.mjs \
 		$(WASM_DIST_DIR)/
 	@printf '%s\n' 'Bundle ready at $(WASM_DIST_DIR); copy it into the pages repo unchanged.'
