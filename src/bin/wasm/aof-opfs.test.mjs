@@ -10,6 +10,12 @@ function fakeFile() {
     getSize() {
       return file.bytes.length;
     },
+    read(buffer, options) {
+      const at = options?.at ?? 0;
+      const slice = file.bytes.subarray(at, at + buffer.length);
+      buffer.set(slice, 0);
+      return slice.length;
+    },
     write(chunk, options) {
       const at = options?.at ?? file.bytes.length;
       const end = at + chunk.length;
@@ -113,4 +119,22 @@ test("appending without an open increment is a backend fault", async () => {
     () => backend.append(1, new TextEncoder().encode("x")),
     (error) => error instanceof AofStorageError && error.variant.type === "backend",
   );
+});
+
+test("readFile returns null for a missing file and bytes for an existing one", async () => {
+  const directory = fakeDirectory();
+  const backend = new OpfsAofBackend(directory);
+
+  assert.equal(await backend.readFile("appendonly.aof.0000000001.incr.aof"), null);
+
+  // Write content through the append path, then read it back on a fresh handle.
+  await backend.acquireLock();
+  await backend.openActiveIncrement(1, "appendonly.aof.0000000001.incr.aof");
+  const payload = new TextEncoder().encode("*1\r\n$4\r\nPING\r\n");
+  backend.append(1, payload);
+  backend.flush(1);
+  backend.close();
+
+  const read = await backend.readFile("appendonly.aof.0000000001.incr.aof");
+  assert.deepEqual(Array.from(read), Array.from(payload));
 });

@@ -5,9 +5,10 @@
 // synchronous `write`/`flush`/`getSize`/`truncate`/`close`, matching the
 // durable append contract without a `SharedArrayBuffer`.
 //
-// Phase 3 implements the single active-increment append path:
-// AcquireLock, OpenActiveIncrement, Append, Flush, Close. The remaining
-// catalog, rewrite, and manifest operations arrive in later phases.
+// Phase 3 implements the single active-increment append path (AcquireLock,
+// OpenActiveIncrement, Append, Flush, Close); phase 4 adds the single-generation
+// read path (ReadFile) used by startup recovery. The remaining catalog, rewrite,
+// and double-manifest operations arrive in later phases.
 
 const AOF_DIRECTORY = "versal-aof";
 const WRITER_LOCK_FILE = "writer.lock";
@@ -82,6 +83,34 @@ export class OpfsAofBackend {
       throw cause;
     }
     return { type: "lock_acquired" };
+  }
+
+  // Read an existing file's full contents, or `null` when it does not exist.
+  // Used by startup recovery to replay a base RDB and the active increment
+  // before the increment is reopened for appending.
+  async readFile(filename) {
+    const directory = await this.#resolveDirectory();
+    let fileHandle;
+    try {
+      fileHandle = await directory.getFileHandle(filename, { create: false });
+    } catch (cause) {
+      if (cause?.name === "NotFoundError") return null;
+      throw backendError(cause);
+    }
+    let handle;
+    try {
+      handle = await fileHandle.createSyncAccessHandle();
+      const size = handle.getSize();
+      const bytes = new Uint8Array(size);
+      if (size > 0) {
+        handle.read(bytes, { at: 0 });
+      }
+      return bytes;
+    } catch (cause) {
+      throw backendError(cause);
+    } finally {
+      if (handle) handle.close();
+    }
   }
 
   // Open (creating if absent) the active increment file for appending and

@@ -3,6 +3,7 @@ import { OpfsAofBackend } from "./aof-opfs.mjs";
 // Fixed-width generation naming for the single active increment (design §8).
 // The single-worker phase keeps one generation; later phases add rewrite.
 const ACTIVE_GENERATION = 1;
+const ACTIVE_BASE = "appendonly.aof.0000000001.base.rdb";
 const ACTIVE_INCREMENT = "appendonly.aof.0000000001.incr.aof";
 
 export function installVersalWorker(
@@ -74,6 +75,24 @@ export function installVersalWorker(
     }
   };
 
+  // Startup recovery for a single generation (design §12). Replays the base
+  // RDB preamble and the active increment into the runtime before persistence
+  // is enabled, then reopens the increment for appending. Any failure
+  // propagates so the caller can fall back to an in-memory instance.
+  const recover = async () => {
+    await backend.acquireLock();
+    const base = await backend.readFile(ACTIVE_BASE);
+    if (base && base.length > 0) {
+      versal.load_base_rdb(base);
+    }
+    const increment = await backend.readFile(ACTIVE_INCREMENT);
+    if (increment && increment.length > 0) {
+      versal.replay_aof(increment);
+    }
+    await backend.openActiveIncrement(ACTIVE_GENERATION, ACTIVE_INCREMENT);
+    versal.enable_persistence();
+  };
+
   scope.onmessage = async (event) => {
     const message = event.data;
     try {
@@ -83,9 +102,7 @@ export function installVersalWorker(
         // runtime still serves commands as an in-memory instance.
         try {
           backend = backendFactory();
-          await backend.acquireLock();
-          await backend.openActiveIncrement(ACTIVE_GENERATION, ACTIVE_INCREMENT);
-          versal.enable_persistence();
+          await recover();
         } catch {
           backend = null;
         }

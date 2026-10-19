@@ -125,13 +125,19 @@ test("destroy sends shutdown and cancels the armed timer", async () => {
   assert.deepEqual(scope.messages.at(-1), { id: 3, ok: true });
 });
 
-// A fake OPFS backend recording durable appends/flushes in order.
-function fakeBackend() {
+// A fake OPFS backend recording durable appends/flushes in order. `files`
+// seeds readFile() for recovery tests; absent entries read as null.
+function fakeBackend(files = {}) {
   const calls = [];
   return {
     calls,
     async acquireLock() {
       calls.push(["acquireLock"]);
+    },
+    async readFile(filename) {
+      calls.push(["readFile", filename]);
+      const seeded = files[filename];
+      return seeded ? Uint8Array.from(seeded) : null;
     },
     async openActiveIncrement(generation, filename) {
       calls.push(["open", generation, filename]);
@@ -175,13 +181,15 @@ test("worker persists a durable frame before releasing its reply", async () => {
   assert.equal(runtime.enabled, true);
   assert.deepEqual(backend.calls, [
     ["acquireLock"],
+    ["readFile", "appendonly.aof.0000000001.base.rdb"],
+    ["readFile", "appendonly.aof.0000000001.incr.aof"],
     ["open", 1, "appendonly.aof.0000000001.incr.aof"],
   ]);
 
   await scope.onmessage({ data: { id: 7, kind: "execute", argv: ["SET", "k", "v"] } });
 
   // The append and flush happen before the reply is posted.
-  assert.deepEqual(backend.calls.slice(2), [
+  assert.deepEqual(backend.calls.slice(4), [
     ["append", 1, frame],
     ["flush", 1],
   ]);
@@ -190,6 +198,72 @@ test("worker persists a durable frame before releasing its reply", async () => {
     ok: true,
     value: { type: "simple", value: "OK" },
   });
+});
+
+test("worker replays the base RDB and increment on create", async () => {
+  const scope = fakeScope();
+  const replayed = [];
+  const runtime = {
+    enabled: false,
+    enable_persistence() {
+      this.enabled = true;
+    },
+    load_base_rdb(bytes) {
+      replayed.push(["base", Array.from(bytes)]);
+      return bytes.length;
+    },
+    replay_aof(bytes) {
+      replayed.push(["aof", Array.from(bytes)]);
+      return 1;
+    },
+    dispatch() {
+      return { outputs: [], wait: { type: "event", deadline_ms: null } };
+    },
+  };
+  const backend = fakeBackend({
+    "appendonly.aof.0000000001.base.rdb": [10, 20],
+    "appendonly.aof.0000000001.incr.aof": [30, 40, 50],
+  });
+  installVersalWorker(scope, async () => runtime, () => 0, () => 0, () => backend);
+
+  await scope.onmessage({ data: { id: 1, kind: "create" } });
+
+  // Base RDB is replayed before the increment, then persistence is enabled.
+  assert.deepEqual(replayed, [
+    ["base", [10, 20]],
+    ["aof", [30, 40, 50]],
+  ]);
+  assert.equal(runtime.enabled, true);
+  assert.deepEqual(backend.calls, [
+    ["acquireLock"],
+    ["readFile", "appendonly.aof.0000000001.base.rdb"],
+    ["readFile", "appendonly.aof.0000000001.incr.aof"],
+    ["open", 1, "appendonly.aof.0000000001.incr.aof"],
+  ]);
+});
+
+test("worker skips replay when no base or increment exists", async () => {
+  const scope = fakeScope();
+  const runtime = {
+    enabled: false,
+    enable_persistence() {
+      this.enabled = true;
+    },
+    load_base_rdb() {
+      throw new Error("load_base_rdb should not be called");
+    },
+    replay_aof() {
+      throw new Error("replay_aof should not be called");
+    },
+    dispatch() {
+      return { outputs: [], wait: { type: "event", deadline_ms: null } };
+    },
+  };
+  const backend = fakeBackend();
+  installVersalWorker(scope, async () => runtime, () => 0, () => 0, () => backend);
+
+  await scope.onmessage({ data: { id: 1, kind: "create" } });
+  assert.equal(runtime.enabled, true);
 });
 
 test("worker maps a persistence failure to a MISCONF reply", async () => {
