@@ -935,6 +935,11 @@ impl ClusterBusManager {
                 state.confirm_gossip_handshake(&entry.node_id, now);
             }
         }
+        if let Some(handshake_id) = handshake_id.as_deref() {
+            // The stored handshake endpoint can differ from the peer's final
+            // advertised endpoint when CLUSTER MEET uses a custom bus port.
+            state.remove_handshake_node(handshake_id);
+        }
         self.close_endpoint_handshake_links(state, msg);
         let stale_endpoint_handshakes: Vec<String> = state
             .nodes
