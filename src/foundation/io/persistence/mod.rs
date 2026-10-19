@@ -3,6 +3,7 @@
 #[cfg(not(feature = "wasm"))]
 pub mod aof;
 pub mod aof_io;
+pub mod aof_io_codec;
 pub mod codec;
 #[cfg(not(feature = "wasm"))]
 pub mod journal;
@@ -29,6 +30,12 @@ pub use persistence_traits::{Journal, Snapshot};
 pub use aof_io::{
     AofCatalogFile, AofCatalogSnapshot, AofFileKind, AofIoError, AofIoRequest, AofIoResult,
     ManifestSlot, RewriteFiles,
+};
+pub use aof_io_codec::{
+    decode_error as decode_aof_io_error, decode_request as decode_aof_io_request,
+    decode_result as decode_aof_io_result, encode_error as encode_aof_io_error,
+    encode_request as encode_aof_io_request, encode_result as encode_aof_io_result,
+    AofIoDecodeError,
 };
 
 #[cfg(test)]
