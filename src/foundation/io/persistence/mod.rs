@@ -2,6 +2,7 @@
 
 #[cfg(not(feature = "wasm"))]
 pub mod aof;
+pub mod aof_io;
 pub mod codec;
 #[cfg(not(feature = "wasm"))]
 pub mod journal;
@@ -24,6 +25,11 @@ pub mod rdb {
 
 #[cfg(not(feature = "wasm"))]
 pub use persistence_traits::{Journal, Snapshot};
+
+pub use aof_io::{
+    AofCatalogFile, AofCatalogSnapshot, AofFileKind, AofIoError, AofIoRequest, AofIoResult,
+    ManifestSlot, RewriteFiles,
+};
 
 #[cfg(test)]
 pub use codec::decoder_compact;
