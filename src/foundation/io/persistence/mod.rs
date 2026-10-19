@@ -8,6 +8,9 @@ pub mod aof_decode;
 pub mod codec;
 #[cfg(not(feature = "wasm"))]
 pub mod journal;
+// Host-neutral AOF manifest envelope codec (dual-slot framing + CRC) compiles on
+// both targets; the browser dual-slot manifest path reuses it.
+pub mod manifest_envelope;
 pub mod manifest_parse;
 #[cfg(not(feature = "wasm"))]
 mod persistence_traits;
@@ -74,6 +77,14 @@ pub use aof_decode::{
 };
 #[cfg(feature = "wasm")]
 pub use manifest_parse::{format_manifest_token, parse_manifest_bytes, AofManifestEntry};
+
+// The manifest envelope codec is host-neutral; expose it on both targets so the
+// browser dual-slot manifest path and native tooling share one framing.
+pub use manifest_envelope::{
+    build_manifest_payload, decode_manifest_envelope, encode_manifest_envelope,
+    select_higher_generation, ManifestEnvelope, ManifestEnvelopeError, ManifestSlot,
+    MANIFEST_ENVELOPE_HEADER_LEN, MANIFEST_ENVELOPE_MAGIC, MANIFEST_ENVELOPE_VERSION,
+};
 
 #[cfg(test)]
 pub use codec::decoder::{load_binary_double, load_string};
