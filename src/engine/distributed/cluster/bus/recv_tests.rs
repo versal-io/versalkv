@@ -1412,6 +1412,43 @@ fn outgoing_temporary_meet_pong_confirms_the_peer_identity() {
 }
 
 #[test]
+fn pong_from_known_sender_removes_bound_handshake_with_different_endpoint() {
+    let mut manager = ClusterBusManager::new();
+    let mut state = ClusterState::new("127.0.0.1", 6379, 16379);
+    let token = Token(26);
+    let sender_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
+    let mut sender = ClusterNode::new(
+        sender_id.clone(),
+        "127.0.0.1".to_string(),
+        6381,
+        16381,
+        true,
+    );
+    sender.flags &= !CLUSTER_NODE_MYSELF;
+    state.nodes.insert(sender_id.clone(), sender.clone());
+    let handshake_id = state.ensure_handshake_node("127.0.0.1", 6380, 16380, 100);
+    manager.register_outgoing_for_handshake(
+        token,
+        "127.0.0.1:16380".parse().unwrap(),
+        handshake_id.clone(),
+    );
+    manager
+        .connections
+        .get_mut(&token.0)
+        .unwrap()
+        .handshake_sent = true;
+    let mut reader = PacketReader {
+        packet: Some(msg::encode_msg(ClusterMsgType::Pong, &sender, 1, &[])),
+    };
+
+    assert!(!manager.readable(&mut state, &mut reader, token.0, 200));
+
+    assert!(state.nodes.contains_key(&sender_id));
+    assert!(!state.nodes.contains_key(&handshake_id));
+    assert!(state.info_str().contains("cluster_known_nodes:2\r\n"));
+}
+
+#[test]
 fn replica_explicit_meet_learns_gossiped_node_as_trusted() {
     let mut manager = ClusterBusManager::new();
     let mut state = ClusterState::new("127.0.0.1", 6379, 16379);
