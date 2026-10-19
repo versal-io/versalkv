@@ -68,8 +68,8 @@ pub use aof::{
     ensure_aof_increment, format_manifest_token, gc_aof_history, install_synced_rdb_as_aof_base,
     load_aof_bytes, next_rewrite_sequences, prepare_synced_rdb_as_aof_base, read_manifest_entries,
     resolve_aof_read_path, resolve_aof_read_paths, resolve_aof_read_paths_checked,
-    rotate_aof_increment, AofAppender, AofCommandPlayer, AofDecoder, AofFsync, AofLoadError,
-    AofLoadStats, AofManifestEntry, AofOpenMode, AofStep, PreparedSyncedRdbAofBase,
+    rotate_aof_increment, AofAppender, AofCommandPlayer, AofDataStore, AofDecoder, AofFsync,
+    AofLoadError, AofLoadStats, AofManifestEntry, AofOpenMode, AofStep, PreparedSyncedRdbAofBase,
 };
 
 #[cfg(test)]

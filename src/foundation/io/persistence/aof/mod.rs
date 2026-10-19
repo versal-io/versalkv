@@ -148,10 +148,88 @@ impl Drop for FsyncThread {
     }
 }
 
+// ======================== AofDataStore ========================
+
+/// Backend-neutral sink for AOF bytes.
+///
+/// `AofAppender` owns the in-memory buffer, size accounting, and fsync policy,
+/// while an `AofDataStore` performs the raw durable operations. The native
+/// backend wraps a `File` plus an optional background fsync thread; future
+/// hosts (such as the browser OPFS worker) can provide their own backend
+/// without changing appender logic.
+pub trait AofDataStore: Send {
+    /// Append bytes to the end of the backing store.
+    fn append(&mut self, data: &[u8]) -> io::Result<()>;
+
+    /// Persist previously appended bytes (`fdatasync` equivalent).
+    fn sync_data(&mut self) -> io::Result<()>;
+
+    /// Persist bytes and metadata (`fsync` equivalent).
+    fn sync_all(&mut self) -> io::Result<()>;
+
+    /// Resize the backing store to `size` bytes.
+    fn set_len(&mut self, size: u64) -> io::Result<()>;
+
+    /// Enable or disable periodic background persistence.
+    ///
+    /// When `enabled` is `false`, `final_sync_on_disable` decides whether a
+    /// last persistence pass runs while stopping the background worker.
+    fn set_periodic_sync(&mut self, enabled: bool, final_sync_on_disable: bool) -> io::Result<()>;
+}
+
+/// Native `File`-backed AOF store with an optional background fsync thread.
+pub struct NativeFileStore {
+    fd: File,
+    fsync_thread: Option<FsyncThread>,
+}
+
+impl NativeFileStore {
+    fn new(fd: File) -> Self {
+        Self {
+            fd,
+            fsync_thread: None,
+        }
+    }
+
+    fn len(&self) -> io::Result<u64> {
+        Ok(self.fd.metadata()?.len())
+    }
+}
+
+impl AofDataStore for NativeFileStore {
+    fn append(&mut self, data: &[u8]) -> io::Result<()> {
+        self.fd.write_all(data)
+    }
+
+    fn sync_data(&mut self) -> io::Result<()> {
+        self.fd.sync_data()
+    }
+
+    fn sync_all(&mut self) -> io::Result<()> {
+        self.fd.sync_all()
+    }
+
+    fn set_len(&mut self, size: u64) -> io::Result<()> {
+        self.fd.set_len(size)
+    }
+
+    fn set_periodic_sync(&mut self, enabled: bool, final_sync_on_disable: bool) -> io::Result<()> {
+        if enabled {
+            if self.fsync_thread.is_none() {
+                let cloned = self.fd.try_clone()?;
+                self.fsync_thread = Some(FsyncThread::spawn(cloned));
+            }
+        } else if let Some(mut th) = self.fsync_thread.take() {
+            th.stop(final_sync_on_disable);
+        }
+        Ok(())
+    }
+}
+
 // ======================== AofAppender ========================
 
 pub struct AofAppender {
-    fd: File,
+    store: Box<dyn AofDataStore>,
     fsync_mode: AofFsync,
 
     buf: Vec<u8>,
@@ -160,25 +238,22 @@ pub struct AofAppender {
 
     last_write_ok: bool,
 
-    fsync_thread: Option<FsyncThread>,
-
     path: String,
 }
 
 impl AofAppender {
     fn from_open_file(fd: File, path: &Path, fsync_mode: AofFsync) -> io::Result<Self> {
-        let current_size = fd.metadata()?.len();
-        let fsync_thread = match fsync_mode {
-            AofFsync::EverySec => Some(FsyncThread::spawn(fd.try_clone()?)),
-            _ => None,
-        };
+        let mut store = NativeFileStore::new(fd);
+        let current_size = store.len()?;
+        if fsync_mode == AofFsync::EverySec {
+            store.set_periodic_sync(true, true)?;
+        }
         Ok(Self {
-            fd,
+            store: Box::new(store),
             fsync_mode,
             buf: Vec::with_capacity(8 * 1024),
             current_size,
             last_write_ok: true,
-            fsync_thread,
             path: path.to_string_lossy().into_owned(),
         })
     }
@@ -258,7 +333,7 @@ impl AofAppender {
             return Ok(());
         }
         if !self.buf.is_empty() {
-            match self.fd.write_all(&self.buf) {
+            match self.store.append(&self.buf) {
                 Ok(()) => {
                     self.current_size += self.buf.len() as u64;
                     self.buf.clear();
@@ -279,7 +354,7 @@ impl AofAppender {
             };
 
         if need_fsync_now {
-            match self.fd.sync_data() {
+            match self.store.sync_data() {
                 Ok(()) => {
                     self.last_write_ok = true;
                 }
@@ -293,7 +368,7 @@ impl AofAppender {
     }
 
     pub fn force_fsync(&mut self) -> io::Result<()> {
-        self.fd.sync_data()
+        self.store.sync_data()
     }
 
     pub fn set_fsync_mode(&mut self, mode: AofFsync) -> io::Result<()> {
@@ -305,12 +380,9 @@ impl AofAppender {
         self.fsync_mode = mode;
 
         if old_was_bg && !new_is_bg {
-            if let Some(mut th) = self.fsync_thread.take() {
-                th.stop(false);
-            }
+            self.store.set_periodic_sync(false, false)?;
         } else if new_is_bg && !old_was_bg {
-            let th_fd = self.fd.try_clone()?;
-            self.fsync_thread = Some(FsyncThread::spawn(th_fd));
+            self.store.set_periodic_sync(true, true)?;
         }
         Ok(())
     }
@@ -333,16 +405,14 @@ impl AofAppender {
     }
 
     pub fn shutdown(&mut self) -> io::Result<()> {
-        if let Some(mut th) = self.fsync_thread.take() {
-            th.stop(true);
-        }
+        self.store.set_periodic_sync(false, true)?;
         self.flush(true)?;
-        self.fd.sync_all()?;
+        self.store.sync_all()?;
         Ok(())
     }
 
     pub fn truncate(&mut self, size: u64) -> io::Result<()> {
-        self.fd.set_len(size)?;
+        self.store.set_len(size)?;
         self.current_size = size;
         Ok(())
     }
