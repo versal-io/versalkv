@@ -8,6 +8,7 @@ use crate::engine::extension::script::{
 };
 use crate::foundation::io::protocol::Value;
 use bytes::Bytes;
+use mlua::prelude::LuaValue;
 
 fn echo_host(
     request: crate::engine::host::HostRequest<'_>,
@@ -51,6 +52,7 @@ fn test_ctx() -> ScriptRunCtx {
         func_name: String::new(),
         caller_args: Vec::new(),
         script_slot: None,
+        env: None,
     }
 }
 
@@ -88,6 +90,267 @@ fn lua_redis_call_uses_the_scoped_host_dispatcher() {
         .unwrap();
 
     assert_eq!(result, Value::Bulk(Bytes::from_static(b"scoped")));
+}
+
+#[test]
+fn lua_redis_call_uses_direct_scoped_binding() {
+    reset_lua_runtime();
+    let mut ctx = test_ctx();
+    let mut host = echo_host;
+
+    let result = runtime::with_lua_runtime(false, |lua_runtime| {
+        let lua = &lua_runtime.lua;
+        runtime::with_lua_host(lua, &mut ctx, &mut host, || {
+            lua.unset_named_registry_value(runtime::HOST_CALLBACK_REGISTRY_KEY)?;
+            lua.load("return redis.call('echo', 'direct')")
+                .eval::<LuaValue>()
+        })
+        .map_err(|error| ScriptError::Runtime(error.to_string()))
+    })
+    .unwrap();
+
+    let LuaValue::String(result) = result else {
+        panic!("expected string reply");
+    };
+    assert_eq!(result.as_bytes().as_ref(), b"direct");
+}
+
+#[test]
+fn direct_scoped_binding_keeps_redis_table_readonly() {
+    let engine = LuaEngine;
+    let mut ctx = test_ctx();
+    let mut host = echo_host;
+
+    let error = engine
+        .eval_with_host(
+            "redis.call = function() return 1 end; return 1",
+            &mut ctx,
+            &mut host,
+        )
+        .unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("Attempt to modify a readonly table"));
+}
+
+#[test]
+fn rawset_cannot_override_runtime_redis_bindings() {
+    let engine = LuaEngine;
+    let mut ctx = test_ctx();
+    let mut host = echo_host;
+
+    let error = engine
+        .eval_with_host(
+            "rawset(redis, 'call', function() return 'forged' end); return 1",
+            &mut ctx,
+            &mut host,
+        )
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("Attempt to modify a readonly table"));
+
+    let error = engine
+        .eval_with_host(
+            "local saved = rawget(_G, '__vky_saved'); rawset(saved, 'redis', {}); return 1",
+            &mut ctx,
+            &mut host,
+        )
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("Attempt to modify a readonly table"));
+
+    let result = engine
+        .eval_with_host("return redis.call('echo', 'scoped')", &mut ctx, &mut host)
+        .unwrap();
+    assert_eq!(result, Value::Bulk(Bytes::from_static(b"scoped")));
+}
+
+#[test]
+fn scoped_pcall_returns_plain_error_table_without_raise_marker() {
+    let engine = LuaEngine;
+    let mut ctx = test_ctx();
+    let mut host = |request: crate::engine::host::HostRequest<'_>| match request {
+        crate::engine::host::HostRequest::ExecuteCommand { .. } => Ok(
+            crate::engine::host::HostReply::Command(Value::error("ERR simulated failure")),
+        ),
+        crate::engine::host::HostRequest::CheckAcl { .. } => {
+            Ok(crate::engine::host::HostReply::Allowed(true))
+        }
+        crate::engine::host::HostRequest::Yield(_) => Ok(crate::engine::host::HostReply::Continue),
+    };
+
+    let result = engine
+        .eval_with_host(
+            "local reply = redis.pcall('boom') \
+             if type(reply) ~= 'table' then return 'reply-not-table' end \
+             if reply.__err_raise ~= nil then return 'raise-marker-leaked' end \
+             return reply.err",
+            &mut ctx,
+            &mut host,
+        )
+        .unwrap();
+
+    assert_eq!(
+        result,
+        Value::Bulk(Bytes::from_static(b"ERR simulated failure"))
+    );
+}
+
+#[test]
+fn scoped_call_raises_a_plain_error_table_and_pcall_receives_message() {
+    let engine = LuaEngine;
+    let mut ctx = test_ctx();
+    let mut host = |request: crate::engine::host::HostRequest<'_>| match request {
+        crate::engine::host::HostRequest::ExecuteCommand { .. } => Ok(
+            crate::engine::host::HostReply::Command(Value::error("ERR simulated failure")),
+        ),
+        crate::engine::host::HostRequest::CheckAcl { .. } => {
+            Ok(crate::engine::host::HostReply::Allowed(true))
+        }
+        crate::engine::host::HostRequest::Yield(_) => Ok(crate::engine::host::HostReply::Continue),
+    };
+
+    let result = engine
+        .eval_with_host(
+            "local ok, err = pcall(function() return redis.call('boom') end) \
+             if ok then return 'unexpected-success' end \
+             if type(err) ~= 'string' then return 'error-not-string' end \
+             return err",
+            &mut ctx,
+            &mut host,
+        )
+        .unwrap();
+
+    assert_eq!(
+        result,
+        Value::Bulk(Bytes::from_static(b"ERR simulated failure"))
+    );
+}
+
+#[test]
+fn scoped_binding_forwards_exactly_one_return_value() {
+    let engine = LuaEngine;
+    let mut ctx = test_ctx();
+    let mut host = echo_host;
+
+    let result = engine
+        .eval_with_host(
+            "local first, second = redis.call('echo', 'one') \
+             if second ~= nil then return 'extra-return-leaked' end \
+             return first",
+            &mut ctx,
+            &mut host,
+        )
+        .unwrap();
+
+    assert_eq!(result, Value::Bulk(Bytes::from_static(b"one")));
+}
+
+#[test]
+fn scoped_setresp_rejects_invalid_version_by_raising() {
+    let engine = LuaEngine;
+    let mut ctx = test_ctx();
+
+    let error = eval_without_commands(&engine, "redis.setresp(9); return 1", &mut ctx).unwrap_err();
+
+    assert!(error.to_string().contains("RESP version must be 2 or 3"));
+}
+
+#[test]
+fn lua_redis_call_does_not_checkpoint_each_command() {
+    let engine = LuaEngine;
+    let mut ctx = test_ctx();
+    let mut command_count = 0;
+    let mut checkpoint_count = 0;
+    let mut host = |request: crate::engine::host::HostRequest<'_>| match request {
+        crate::engine::host::HostRequest::ExecuteCommand { .. } => {
+            command_count += 1;
+            Ok(crate::engine::host::HostReply::Command(Value::Null))
+        }
+        crate::engine::host::HostRequest::Yield(
+            crate::engine::host::HostYield::ScriptCheckpoint { .. },
+        ) => {
+            checkpoint_count += 1;
+            Ok(crate::engine::host::HostReply::Continue)
+        }
+        crate::engine::host::HostRequest::CheckAcl { .. } => {
+            Ok(crate::engine::host::HostReply::Allowed(true))
+        }
+        crate::engine::host::HostRequest::Yield(_) => Ok(crate::engine::host::HostReply::Continue),
+    };
+
+    engine
+        .eval_with_host(
+            "redis.call('ping'); redis.call('ping'); return 1",
+            &mut ctx,
+            &mut host,
+        )
+        .unwrap();
+
+    assert_eq!(command_count, 2);
+    assert_eq!(checkpoint_count, 0);
+}
+
+#[test]
+fn lua_instruction_hook_uses_valkey_checkpoint_interval() {
+    let engine = LuaEngine;
+    let mut ctx = test_ctx();
+    let mut short_script_checkpoints = 0;
+    let mut host = |request: crate::engine::host::HostRequest<'_>| match request {
+        crate::engine::host::HostRequest::Yield(
+            crate::engine::host::HostYield::ScriptCheckpoint { .. },
+        ) => {
+            short_script_checkpoints += 1;
+            Ok(crate::engine::host::HostReply::Continue)
+        }
+        crate::engine::host::HostRequest::ExecuteCommand { .. } => {
+            Ok(crate::engine::host::HostReply::Command(Value::Null))
+        }
+        crate::engine::host::HostRequest::CheckAcl { .. } => {
+            Ok(crate::engine::host::HostReply::Allowed(true))
+        }
+        crate::engine::host::HostRequest::Yield(_) => Ok(crate::engine::host::HostReply::Continue),
+    };
+
+    engine
+        .eval_with_host(
+            "local total = 0; for i = 1, 10000 do total = total + i end; return total",
+            &mut ctx,
+            &mut host,
+        )
+        .unwrap();
+
+    assert_eq!(short_script_checkpoints, 0);
+
+    let mut long_script_checkpoints = 0;
+    let mut host = |request: crate::engine::host::HostRequest<'_>| match request {
+        crate::engine::host::HostRequest::Yield(
+            crate::engine::host::HostYield::ScriptCheckpoint { .. },
+        ) => {
+            long_script_checkpoints += 1;
+            Ok(crate::engine::host::HostReply::Continue)
+        }
+        crate::engine::host::HostRequest::ExecuteCommand { .. } => {
+            Ok(crate::engine::host::HostReply::Command(Value::Null))
+        }
+        crate::engine::host::HostRequest::CheckAcl { .. } => {
+            Ok(crate::engine::host::HostReply::Allowed(true))
+        }
+        crate::engine::host::HostRequest::Yield(_) => Ok(crate::engine::host::HostReply::Continue),
+    };
+
+    engine
+        .eval_with_host(
+            "local total = 0; for i = 1, 100000 do total = total + i end; return total",
+            &mut ctx,
+            &mut host,
+        )
+        .unwrap();
+
+    assert!(long_script_checkpoints > 0);
 }
 
 #[test]

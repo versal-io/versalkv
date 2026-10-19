@@ -35,7 +35,7 @@ pub(crate) fn on_script_timeout_tick(
 
 pub fn install_script_hook(lua: &Lua) -> Result<(), ScriptError> {
     lua.set_hook(
-        mlua::HookTriggers::new().every_nth_instruction(10_000),
+        mlua::HookTriggers::new().every_nth_instruction(100_000),
         |lua, _debug| {
             let compile_timeout = COMPILE_TIMEOUT_MS.with(|c| c.get());
             if compile_timeout > 0 {

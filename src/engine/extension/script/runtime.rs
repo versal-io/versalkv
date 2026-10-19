@@ -1,11 +1,11 @@
 use crate::engine::command::context::CommandConn;
-use crate::engine::command::{CommandArgs, CommandDescriptor, CommandKeyIndices};
+use crate::engine::command::{CommandArgs, CommandDescriptor, CommandKeyIndices, ResolvedCommand};
 use crate::foundation::io::protocol::Value;
 use bytes::Bytes;
 use std::net::SocketAddr;
 
 pub trait ScriptRuntime {
-    fn lookup_command(&self, name: &[u8]) -> Option<CommandDescriptor>;
+    fn lookup_command(&self, name: &[u8]) -> Option<ResolvedCommand>;
     fn command_acl_categories(
         &self,
         command: CommandDescriptor,
@@ -28,7 +28,7 @@ pub trait ScriptRuntime {
     }
     fn execute_command(
         &mut self,
-        name: &[u8],
+        command: ResolvedCommand,
         conn: &mut dyn CommandConn,
         args: &CommandArgs,
     ) -> Value;
@@ -46,14 +46,11 @@ pub trait ScriptRuntime {
         let _ = args;
         command.name.to_ascii_lowercase()
     }
-    fn command_has_subcommands(&self, _name: &str) -> bool {
-        false
-    }
-    fn has_monitor_clients(&self) -> bool {
-        true
-    }
-    fn should_record_slow_command(&self, _duration_us: u64) -> bool {
-        true
+    /// Observation gates captured once when script invocation starts, so
+    /// nested commands never re-read slowlog/commandlog config or MONITOR
+    /// state per call.
+    fn script_log_gate(&self) -> super::ScriptLogGate {
+        super::ScriptLogGate::default()
     }
     fn remember_tracked_key(&mut self, token: usize, key: &[u8]);
     fn record_slow_command(

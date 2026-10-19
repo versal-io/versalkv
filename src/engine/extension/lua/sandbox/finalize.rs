@@ -101,6 +101,11 @@ pub(in crate::engine::extension::lua) fn finalize_sandbox(lua: &Lua) -> Result<(
     let redis_table: LuaTable = globals
         .get("redis")
         .map_err(|e| ScriptError::Runtime(e.to_string()))?;
+    lua.set_named_registry_value(
+        super::super::runtime::REDIS_RUNTIME_TABLE_REGISTRY_KEY,
+        redis_table.clone(),
+    )
+    .map_err(|e| ScriptError::Runtime(e.to_string()))?;
     let redis_proxy = make_readonly_proxy(lua, redis_table)?;
     globals
         .set("redis", redis_proxy.clone())
@@ -187,6 +192,12 @@ pub(in crate::engine::extension::lua) fn finalize_sandbox(lua: &Lua) -> Result<(
 
         _orig_setmetatable(_G, meta)
         protect(_G)
+        protect(saved)
+        protect(saved.redis)
+        protect(saved.server)
+        protect(saved.cjson)
+        protect(saved.cmsgpack)
+        protect(saved.bit)
 
         rawset(_G, '__vky_saved', saved)
 
@@ -247,6 +258,11 @@ pub(in crate::engine::extension::lua) fn finalize_sandbox(lua: &Lua) -> Result<(
         rawset(_G, '__vky_lib_api', lib_api)
         rawset(_G, '__vky_saved_runtime', saved)
         rawset(_G, '__vky_saved_runtime', saved)
+
+        saved.rawset = function(t, k, v)
+            if protected_tables[t] then readonly_err() end
+            return rawset(t, k, v)
+        end
 
         saved.setmetatable = function(t, mt)
             if protected_tables[t] then readonly_err() end

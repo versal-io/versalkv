@@ -34,6 +34,38 @@ pub struct CommandDescriptor {
     pub acl_categories: &'static [&'static str],
 }
 
+#[derive(Clone, Copy)]
+pub struct ResolvedCommand {
+    descriptor: CommandDescriptor,
+    registry_id: u64,
+    execution_id: usize,
+    generation: u64,
+}
+
+impl ResolvedCommand {
+    pub(crate) fn new(
+        descriptor: CommandDescriptor,
+        registry_id: u64,
+        execution_id: usize,
+        generation: u64,
+    ) -> Self {
+        Self {
+            descriptor,
+            registry_id,
+            execution_id,
+            generation,
+        }
+    }
+
+    pub fn descriptor(self) -> CommandDescriptor {
+        self.descriptor
+    }
+
+    pub(crate) fn execution_token(self) -> (u64, usize, u64) {
+        (self.registry_id, self.execution_id, self.generation)
+    }
+}
+
 impl CommandDescriptor {
     pub fn key_indices(self, args: &CommandArgs) -> Option<CommandKeyIndices> {
         if self.first_key <= 0 {

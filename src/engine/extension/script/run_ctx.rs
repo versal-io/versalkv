@@ -74,6 +74,7 @@ impl ScriptRunCtx {
             func_name: String::new(),
             caller_args: Vec::new(),
             script_slot: None,
+            env: None,
         }
     }
 
@@ -141,6 +142,37 @@ impl ScriptRunCtx {
             }
         }
         Ok(())
+    }
+
+    /// Captures the server facts that govern nested-command admission for the
+    /// whole invocation. Called once on the first `redis.call`; the event loop
+    /// cannot change configuration, ACL users, MONITOR registration or
+    /// replica role while a script executes, so the snapshot stays valid.
+    pub(crate) fn ensure_env_snapshot(
+        &mut self,
+        runtime: &dyn super::ScriptRuntime,
+        username: &str,
+    ) {
+        if self.env.is_some() {
+            return;
+        }
+        let privileged_user = {
+            // Single global-lock acquisition for the entire invocation; nested
+            // commands of the default user skip per-command ACL work entirely.
+            let users = crate::engine::extension::acl::acl_users().lock().unwrap();
+            users
+                .get(username)
+                .map(|user| user.is_factory_default_privileged())
+                .unwrap_or(false)
+        };
+        self.env = Some(super::ScriptEnvSnapshot {
+            privileged_user,
+            readonly_replica: runtime.is_readonly_replica(),
+            stale_replica: runtime.is_stale_replica(),
+            persistence_write_error: runtime.has_persistence_write_error(),
+            maxmemory_limit: runtime.has_maxmemory_limit(),
+            log_gate: runtime.script_log_gate(),
+        });
     }
 
     pub fn check_timeout(&mut self) {
