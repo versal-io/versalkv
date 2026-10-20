@@ -22,7 +22,6 @@ pub mod registry;
 #[cfg(not(feature = "wasm"))]
 pub mod spec;
 
-#[path = "spec/metadata.rs"]
 mod command_metadata;
 pub use command_metadata::{CommandMeta, GetKeysFn};
 
