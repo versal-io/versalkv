@@ -1,5 +1,5 @@
-import init, { BrowserVersal } from "./pkg/versal.js";
-import { installVersalWorker } from "./worker.mjs";
+import init, { BrowserVersal } from "../pkg/versal.js";
+import { installVersalWorker } from "./runtime.mjs";
 
 const wasmReady = init();
 

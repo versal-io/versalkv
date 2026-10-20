@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { OpfsAofBackend, AofStorageError } from "./aof-opfs.mjs";
+import { OpfsAofBackend, AofStorageError } from "../worker/aof-opfs.mjs";
 
 // A fake OPFS file backed by a growable byte array and a synchronous handle.
 function fakeFile() {

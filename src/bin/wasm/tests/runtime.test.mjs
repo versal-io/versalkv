@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { installVersalWorker } from "./worker.mjs";
+import { installVersalWorker } from "../worker/runtime.mjs";
 
 function fakeScope() {
   let nextTimer = 1;

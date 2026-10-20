@@ -1,5 +1,5 @@
 export class VersalClient {
-  static async create(worker = new Worker(new URL("./worker-entry.mjs", import.meta.url), { type: "module" })) {
+  static async create(worker = new Worker(new URL("../worker/entry.mjs", import.meta.url), { type: "module" })) {
     const client = new VersalClient(worker);
     try {
       await client.#request({ kind: "create" });
