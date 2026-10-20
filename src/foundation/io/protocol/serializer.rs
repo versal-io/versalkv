@@ -28,6 +28,26 @@ pub fn serialize_to_vec(value: &Value) -> Vec<u8> {
     buf.to_vec()
 }
 
+/// Encode a RESP command as a multi-bulk array (`*N` of `$len` bulk strings)
+/// into an existing buffer. This is the single wire-format primitive shared by
+/// the replication protocol, the AOF writer, and the embedded AOF frame
+/// encoder, so every path emits byte-identical command frames.
+pub fn serialize_command(parts: &[&[u8]], buf: &mut impl BufMut) {
+    buf.put_slice(format!("*{}\r\n", parts.len()).as_bytes());
+    for part in parts {
+        buf.put_slice(format!("${}\r\n", part.len()).as_bytes());
+        buf.put_slice(part);
+        buf.put_slice(b"\r\n");
+    }
+}
+
+/// Encode a RESP command into a freshly allocated `Vec`.
+pub fn serialize_command_to_vec(parts: &[&[u8]]) -> Vec<u8> {
+    let mut out = Vec::new();
+    serialize_command(parts, &mut out);
+    out
+}
+
 pub fn serialize_resp2(value: &Value, buf: &mut impl BufMut) {
     match value {
         Value::SimpleString(s) => {

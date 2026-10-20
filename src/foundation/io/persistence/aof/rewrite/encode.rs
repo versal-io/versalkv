@@ -343,14 +343,7 @@ fn append_stream_groups(
 }
 
 fn encode_command(parts: &[&[u8]]) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(format!("*{}\r\n", parts.len()).as_bytes());
-    for part in parts {
-        out.extend_from_slice(format!("${}\r\n", part.len()).as_bytes());
-        out.extend_from_slice(part);
-        out.extend_from_slice(b"\r\n");
-    }
-    out
+    crate::foundation::io::protocol::serializer::serialize_command_to_vec(parts)
 }
 
 #[cfg(test)]

@@ -8,10 +8,11 @@
 //!
 //! This module stays host-neutral so it compiles on the `wasm` target.
 
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{Bytes, BytesMut};
 
 use crate::engine::command::{CommandArgs, CMD_WRITE};
 use crate::engine::core::{CommandEffects, Value};
+use crate::foundation::io::protocol::serializer::serialize_command;
 use crate::framework::commands::command_runtime::lookup_command_name;
 
 /// Tracks which logical database the AOF stream last selected so a `SELECT`
@@ -50,22 +51,22 @@ impl AofFrameEncoder {
 
         let mut buffer = BytesMut::new();
         if self.selected_db != Some(selected_db) {
-            encode_command(
-                &mut buffer,
+            serialize_command(
                 &[b"SELECT", selected_db.to_string().as_bytes()],
+                &mut buffer,
             );
             self.selected_db = Some(selected_db);
         }
         if has_custom {
             for propagation in &effects.custom_propagations {
                 let parts = propagation.iter().map(Bytes::as_ref).collect::<Vec<_>>();
-                encode_command(&mut buffer, &parts);
+                serialize_command(&parts, &mut buffer);
             }
         } else {
             let mut parts = Vec::with_capacity(args.args.len() + 1);
             parts.push(args.name.as_ref());
             parts.extend(args.args.iter().map(Bytes::as_ref));
-            encode_command(&mut buffer, &parts);
+            serialize_command(&parts, &mut buffer);
         }
         Some(buffer.freeze())
     }
@@ -75,15 +76,6 @@ impl AofFrameEncoder {
             .ok()
             .and_then(lookup_command_name)
             .is_some_and(|spec| spec.meta.flags & CMD_WRITE != 0)
-    }
-}
-
-fn encode_command(buffer: &mut BytesMut, parts: &[&[u8]]) {
-    buffer.put_slice(format!("*{}\r\n", parts.len()).as_bytes());
-    for part in parts {
-        buffer.put_slice(format!("${}\r\n", part.len()).as_bytes());
-        buffer.put_slice(part);
-        buffer.put_slice(b"\r\n");
     }
 }
 

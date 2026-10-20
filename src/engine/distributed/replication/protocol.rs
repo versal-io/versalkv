@@ -9,14 +9,7 @@ pub fn generate_replid() -> String {
 }
 
 pub fn encode_command(parts: &[&[u8]]) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(format!("*{}\r\n", parts.len()).as_bytes());
-    for p in parts {
-        out.extend_from_slice(format!("${}\r\n", p.len()).as_bytes());
-        out.extend_from_slice(p);
-        out.extend_from_slice(b"\r\n");
-    }
-    out
+    crate::foundation::io::protocol::serializer::serialize_command_to_vec(parts)
 }
 
 pub fn build_ping() -> Vec<u8> {

@@ -1,16 +1,5 @@
 pub fn encode_command(args: &[&[u8]]) -> Vec<u8> {
-    let mut frame = Vec::new();
-    frame.extend_from_slice(b"*");
-    frame.extend_from_slice(args.len().to_string().as_bytes());
-    frame.extend_from_slice(b"\r\n");
-    for arg in args {
-        frame.extend_from_slice(b"$");
-        frame.extend_from_slice(arg.len().to_string().as_bytes());
-        frame.extend_from_slice(b"\r\n");
-        frame.extend_from_slice(arg);
-        frame.extend_from_slice(b"\r\n");
-    }
-    frame
+    crate::foundation::io::protocol::serializer::serialize_command_to_vec(args)
 }
 
 #[cfg(test)]
