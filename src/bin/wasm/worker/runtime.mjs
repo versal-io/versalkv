@@ -23,38 +23,28 @@ export function installVersalWorker(
     timer = null;
   };
 
-  // Release each reply, persisting its durable AOF frame first. Because the OPFS
-  // sync access handle is already open, append+flush are synchronous and happen
-  // before the reply is posted, so a reply never outruns its persisted write.
+  // Release every reply immediately. Durable frames no longer gate replies:
+  // the runtime hands each frame to the installed sink (`persist`) during
+  // dispatch, and that append+flush happens best-effort without blocking the
+  // reply, so a reply may now be posted before its frame reaches OPFS.
   const deliver = (step) => {
     for (const output of step.outputs) {
-      if (output.durable_frame) {
-        const error = persist(output.durable_frame);
-        if (error) {
-          scope.postMessage({
-            id: output.request_id,
-            ok: true,
-            value: { type: "error", value: `MISCONF AOF durable write failed: ${error}` },
-          });
-          continue;
-        }
-      }
       scope.postMessage({ id: output.request_id, ok: true, value: output.value });
     }
   };
 
-  // Append and flush a durable frame synchronously. Returns an error message on
-  // failure, or null on success.
+  // Durable-frame sink installed on the runtime. Appends and flushes a frame
+  // synchronously; failures are logged and swallowed because the reply has
+  // already been (or will be) released regardless.
   const persist = (frame) => {
-    if (!backend) return "persistence backend is not ready";
+    if (!backend) return;
     try {
       const bytes = frame instanceof Uint8Array ? frame : Uint8Array.from(frame);
       const seq = (sequence += 1);
       backend.append(seq, bytes);
       backend.flush(seq);
-      return null;
     } catch (error) {
-      return String(error?.message ?? error);
+      console.error("AOF durable write failed:", String(error?.message ?? error));
     }
   };
 
@@ -90,6 +80,9 @@ export function installVersalWorker(
       versal.replay_aof(increment);
     }
     await backend.openActiveIncrement(ACTIVE_GENERATION, ACTIVE_INCREMENT);
+    // Install the durable-frame sink before enabling persistence so the first
+    // write command's frame already has somewhere to go.
+    versal.set_durable_sink(persist);
     versal.enable_persistence();
   };
 

@@ -25,10 +25,6 @@ struct BrowserStep {
 struct BrowserOutput {
     request_id: u32,
     value: Reply,
-    /// When present, the encoded AOF frame the host must append to OPFS before
-    /// releasing this reply to the client.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    durable_frame: Option<Vec<u8>>,
 }
 
 #[derive(serde::Serialize)]
@@ -44,6 +40,11 @@ pub struct BrowserVersal {
     runtime: EmbeddedRuntime,
     input: Vec<u8>,
     output: Vec<u8>,
+    /// Fire-and-forget sink the host installs to receive durable AOF frames.
+    /// When set, a completed write command's frame is handed to this callback
+    /// instead of riding back on the dispatch reply; the host persists it
+    /// asynchronously, so a reply is no longer withheld until the frame lands.
+    durable_sink: Option<js_sys::Function>,
 }
 
 impl Default for BrowserVersal {
@@ -60,7 +61,16 @@ impl BrowserVersal {
             runtime: EmbeddedRuntime::new(),
             input: Vec::new(),
             output: Vec::new(),
+            durable_sink: None,
         }
+    }
+
+    /// Install the durable-frame sink. The host passes a JS function that takes
+    /// the encoded AOF frame (a `Uint8Array`) and appends it to OPFS. The
+    /// callback result is ignored and never awaited.
+    #[wasm_bindgen]
+    pub fn set_durable_sink(&mut self, sink: js_sys::Function) {
+        self.durable_sink = Some(sink);
     }
 
     /// Enable durable persistence. The host calls this once the OPFS storage
@@ -128,17 +138,23 @@ impl BrowserVersal {
                 EmbeddedOutput::Reply { request_id, value } => outputs.push(BrowserOutput {
                     request_id,
                     value: Reply::from_value(value),
-                    durable_frame: None,
                 }),
                 EmbeddedOutput::DurableReply {
                     request_id,
                     value,
                     frame,
-                } => outputs.push(BrowserOutput {
-                    request_id,
-                    value: Reply::from_value(value),
-                    durable_frame: Some(frame.to_vec()),
-                }),
+                } => {
+                    // Hand the frame to the host sink without awaiting it; the
+                    // reply is released immediately regardless of persistence.
+                    if let Some(sink) = &self.durable_sink {
+                        let bytes = js_sys::Uint8Array::from(frame.as_ref());
+                        let _ = sink.call1(&JsValue::NULL, &bytes);
+                    }
+                    outputs.push(BrowserOutput {
+                        request_id,
+                        value: Reply::from_value(value),
+                    });
+                }
             }
         }
         let wait = match step.wait {

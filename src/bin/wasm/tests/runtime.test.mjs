@@ -154,20 +154,25 @@ function fakeBackend(files = {}) {
   };
 }
 
-test("worker persists a durable frame before releasing its reply", async () => {
+test("worker hands a durable frame to the sink and releases the reply", async () => {
   const scope = fakeScope();
   const frame = [42, 1, 2, 3];
   const runtime = {
     enabled: false,
+    sink: null,
+    set_durable_sink(sink) {
+      this.sink = sink;
+    },
     enable_persistence() {
       this.enabled = true;
     },
     dispatch(input) {
       if (input.type === "execute") {
+        // The real runtime hands the frame to the installed sink during
+        // dispatch, then returns the reply without a durable_frame field.
+        if (this.sink) this.sink(Uint8Array.from(frame));
         return {
-          outputs: [
-            { request_id: input.request_id, value: { type: "simple", value: "OK" }, durable_frame: frame },
-          ],
+          outputs: [{ request_id: input.request_id, value: { type: "simple", value: "OK" } }],
           wait: { type: "event", deadline_ms: null },
         };
       }
@@ -179,6 +184,7 @@ test("worker persists a durable frame before releasing its reply", async () => {
 
   await scope.onmessage({ data: { id: 1, kind: "create" } });
   assert.equal(runtime.enabled, true);
+  assert.ok(typeof runtime.sink === "function");
   assert.deepEqual(backend.calls, [
     ["acquireLock"],
     ["readFile", "appendonly.aof.0000000001.base.rdb"],
@@ -188,11 +194,12 @@ test("worker persists a durable frame before releasing its reply", async () => {
 
   await scope.onmessage({ data: { id: 7, kind: "execute", argv: ["SET", "k", "v"] } });
 
-  // The append and flush happen before the reply is posted.
+  // The sink appended and flushed the frame.
   assert.deepEqual(backend.calls.slice(4), [
     ["append", 1, frame],
     ["flush", 1],
   ]);
+  // The reply is released as a normal OK regardless of persistence timing.
   assert.deepEqual(scope.messages.at(-1), {
     id: 7,
     ok: true,
@@ -205,6 +212,7 @@ test("worker replays the base RDB and increment on create", async () => {
   const replayed = [];
   const runtime = {
     enabled: false,
+    set_durable_sink() {},
     enable_persistence() {
       this.enabled = true;
     },
@@ -246,6 +254,7 @@ test("worker skips replay when no base or increment exists", async () => {
   const scope = fakeScope();
   const runtime = {
     enabled: false,
+    set_durable_sink() {},
     enable_persistence() {
       this.enabled = true;
     },
@@ -266,16 +275,19 @@ test("worker skips replay when no base or increment exists", async () => {
   assert.equal(runtime.enabled, true);
 });
 
-test("worker maps a persistence failure to a MISCONF reply", async () => {
+test("worker logs a persistence failure but still releases the reply", async () => {
   const scope = fakeScope();
   const runtime = {
+    sink: null,
+    set_durable_sink(sink) {
+      this.sink = sink;
+    },
     enable_persistence() {},
     dispatch(input) {
       if (input.type === "execute") {
+        if (this.sink) this.sink(Uint8Array.from([1]));
         return {
-          outputs: [
-            { request_id: input.request_id, value: { type: "simple", value: "OK" }, durable_frame: [1] },
-          ],
+          outputs: [{ request_id: input.request_id, value: { type: "simple", value: "OK" } }],
           wait: { type: "event", deadline_ms: null },
         };
       }
@@ -286,15 +298,25 @@ test("worker maps a persistence failure to a MISCONF reply", async () => {
   backend.append = () => {
     throw new Error("quota exceeded");
   };
-  installVersalWorker(scope, async () => runtime, () => 0, () => 0, () => backend);
+  const errors = [];
+  const originalError = console.error;
+  console.error = (...args) => errors.push(args);
+  try {
+    installVersalWorker(scope, async () => runtime, () => 0, () => 0, () => backend);
+    await scope.onmessage({ data: { id: 1, kind: "create" } });
+    await scope.onmessage({ data: { id: 9, kind: "execute", argv: ["SET", "k", "v"] } });
+  } finally {
+    console.error = originalError;
+  }
 
-  await scope.onmessage({ data: { id: 1, kind: "create" } });
-  await scope.onmessage({ data: { id: 9, kind: "execute", argv: ["SET", "k", "v"] } });
-
+  // The failure is logged, not turned into a client error.
+  assert.equal(errors.length, 1);
+  assert.match(errors[0].join(" "), /quota exceeded/);
+  // The reply is still a normal OK.
   assert.deepEqual(scope.messages.at(-1), {
     id: 9,
     ok: true,
-    value: { type: "error", value: "MISCONF AOF durable write failed: quota exceeded" },
+    value: { type: "simple", value: "OK" },
   });
 });
 
