@@ -1336,6 +1336,22 @@ mod tests {
     }
 
     #[test]
+    fn rebuild_view_hides_pre_psync_main_from_info_projection() {
+        let mut runtime = ReplicationRuntime::new();
+        let main = ConnectionId(62);
+        runtime.register_primary(main, replica_info(6380));
+
+        let view = runtime.rebuild_view();
+
+        assert_eq!(view.connected_replica_count, 0);
+        assert_eq!(view.replica_order, Vec::<usize>::new());
+        assert!(view.info_order.is_empty());
+        assert!(view.replica_info.is_empty());
+        assert!(view.channel_info.is_empty());
+        assert!(view.replica_ack_offsets.contains_key(&main.0));
+    }
+
+    #[test]
     fn rebuild_view_preserves_registration_order_for_mixed_replicas() {
         let mut runtime = ReplicationRuntime::new();
         let classic = ConnectionId(55);

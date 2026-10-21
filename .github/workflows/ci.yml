@@ -1,15 +1,10 @@
 name: CI
 
 on:
-  push:
-    paths-ignore:
-      - "docs/**"
-      - "docs/**/*.md"
   pull_request:
     paths-ignore:
       - "docs/**"
       - "docs/**/*.md"
-  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
