@@ -2196,6 +2196,12 @@ def selftest_runtest(ctx: RepoContext) -> None:
             "runtest must inject the scoped test-only TCP buffer settings",
         )
         _assert(call["args"] == ["tests/test_helper.tcl", "--skipunit", "unit/obuf-limits", "--skipunit", "unit/oom-score-adj", "--skip-leaks", "--baseport", "5111", "--portcount", "8000", "--timeout", "360", "--stop", "--dump-logs", "--dont-clean"], "unexpected Tcl invocation")
+        env["VERSAL_TCL_DENY_SLOW"] = "1"
+        result = run_command([str(root / "runtest")], cwd=root, env=env, capture=True)
+        _assert(result.returncode == EXIT_OK, result.stderr)
+        call = json.loads(read_text(tcl_log))
+        _assert(call["args"] == ["tests/test_helper.tcl", "--tags", "-slow", "--skipunit", "unit/obuf-limits", "--skipunit", "unit/oom-score-adj", "--skip-leaks", "--baseport", "5111", "--portcount", "8000", "--timeout", "360", "--stop", "--dump-logs", "--dont-clean"], "unexpected Tcl invocation with slow tag denied")
+        env.pop("VERSAL_TCL_DENY_SLOW", None)
         for binary in VERSAL_BINARIES:
             _assert(read_text(valkey_src / "valkey-{}".format(binary)) == "versal-debug-{}\n".format(binary), "binary not staged")
         env["FIXTURE_TCL_EXIT"] = "23"
@@ -2699,6 +2705,8 @@ def command_check_ci_support(_args: argparse.Namespace, ctx: RepoContext) -> int
         failures.append("runtest must skip unit/obuf-limits until Bulk reply copy avoidance is implemented")
     if "--skipunit unit/oom-score-adj" not in runtest:
         failures.append("runtest must skip unit/oom-score-adj")
+    if "VERSAL_TCL_DENY_SLOW" not in pipeline or "--tags -slow" not in runtest:
+        failures.append("GitHub Tcl runner must deny upstream slow tests")
     for unit in ("maxmemory-basic", "maxmemory", "io-threads", "memefficiency"):
         if "--skipunit unit/{}".format(unit) in runtest:
             failures.append("runtest must execute enabled unit/{}".format(unit))

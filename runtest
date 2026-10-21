@@ -28,6 +28,9 @@ cp tests/unit/*.tcl thirdparty/valkey/tests/unit/
     set -- \
         --skipunit unit/obuf-limits \
         --skipunit unit/oom-score-adj
+    if [ "${VERSAL_TCL_DENY_SLOW:-0}" = "1" ]; then
+        set -- --tags -slow "$@"
+    fi
     # Pin small TCP socket buffers for the harness-launched Rust server so
     # output-buffer-sensitive units (maxmemory, slot migration) accumulate
     # user-space backpressure instead of draining into oversized kernel
