@@ -3,12 +3,19 @@
 #[cfg(unix)]
 use crate::common::make_socket_test_dir;
 use crate::common::{command_status_with_timeout, TestServer};
+#[cfg(feature = "tls")]
 use openssl::asn1::Asn1Time;
+#[cfg(feature = "tls")]
 use openssl::hash::MessageDigest;
+#[cfg(feature = "tls")]
 use openssl::pkey::PKey;
+#[cfg(feature = "tls")]
 use openssl::rsa::Rsa;
+#[cfg(feature = "tls")]
 use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
+#[cfg(feature = "tls")]
 use openssl::x509::extension::{BasicConstraints, SubjectAlternativeName};
+#[cfg(feature = "tls")]
 use openssl::x509::{X509NameBuilder, X509};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -16,6 +23,7 @@ use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::net::{UnixDatagram, UnixStream};
+#[cfg(feature = "tls")]
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -38,6 +46,7 @@ fn free_tcp_port() -> u16 {
         .port()
 }
 
+#[cfg(feature = "tls")]
 fn write_tls_credentials(stem: &str) -> (PathBuf, PathBuf) {
     let rsa = Rsa::generate(2048).unwrap();
     let private_key = PKey::from_rsa(rsa).unwrap();
@@ -1290,6 +1299,7 @@ fn maxclients_rejects_new_connections_and_updates_info_stats() {
     );
 }
 
+#[cfg(feature = "tls")]
 #[test]
 fn tls_listener_serves_resp_over_the_configured_tls_port() {
     let unique = SystemTime::now()
@@ -1330,6 +1340,7 @@ fn tls_listener_serves_resp_over_the_configured_tls_port() {
     let _ = std::fs::remove_file(key_path);
 }
 
+#[cfg(feature = "tls")]
 #[test]
 fn config_set_tls_material_rebinds_the_tls_listener() {
     let unique = SystemTime::now()
@@ -1410,6 +1421,7 @@ fn config_set_tls_material_rebinds_the_tls_listener() {
     let _ = std::fs::remove_file(key_path);
 }
 
+#[cfg(feature = "tls")]
 #[test]
 fn replica_syncs_over_the_configured_tls_upstream() {
     let unique = SystemTime::now()
@@ -1504,6 +1516,7 @@ fn replica_syncs_over_the_configured_tls_upstream() {
     let _ = std::fs::remove_file(key_path);
 }
 
+#[cfg(feature = "tls")]
 #[test]
 fn cluster_meet_uses_the_configured_tls_bus_transport() {
     let unique = SystemTime::now()
@@ -1567,6 +1580,7 @@ fn cluster_meet_uses_the_configured_tls_bus_transport() {
     let _ = std::fs::remove_file(key_path);
 }
 
+#[cfg(feature = "tls")]
 #[test]
 fn tls_cluster_config_set_rebinds_the_cluster_bus() {
     let unique = SystemTime::now()

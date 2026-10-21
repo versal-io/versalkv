@@ -21,8 +21,12 @@ pub(crate) use api::{ReadOutcome, TransportPollMode, TransportWorkerBackend, Wri
 #[cfg(test)]
 mod tls_contract_tests {
     use super::TlsConfig;
+    #[cfg(not(feature = "tls"))]
+    use super::TransportRuntime;
+    #[cfg(feature = "tls")]
     use std::path::PathBuf;
 
+    #[cfg(feature = "tls")]
     #[test]
     fn tls_config_rejects_an_unpaired_certificate_or_private_key() {
         let config = TlsConfig {
@@ -39,5 +43,17 @@ mod tls_contract_tests {
         assert!(error
             .to_string()
             .contains("certificate and private key must be configured together"));
+    }
+
+    #[cfg(not(feature = "tls"))]
+    #[test]
+    fn tls_configuration_is_rejected_when_tls_is_not_compiled() {
+        let mut transport = super::PollingTransportRuntime::new().unwrap();
+        let error = transport
+            .configure_tls_server(TlsConfig::default())
+            .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+        assert!(error.to_string().contains("TLS support is not compiled in"));
     }
 }

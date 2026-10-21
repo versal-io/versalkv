@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::io::{self, Read};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 struct Xoshiro256StarStar {
@@ -62,10 +63,10 @@ thread_local! {
 
 static RANDOM_THREAD_ADDR: u8 = 0;
 
-/// Fill a buffer using OpenSSL's OS-seeded cryptographic random generator.
+/// Fill a buffer from the operating system cryptographic random source.
 /// An error leaves the buffer unsuitable for use as random data.
-pub fn fill_os_random_bytes(bytes: &mut [u8]) -> Result<(), openssl::error::ErrorStack> {
-    openssl::rand::rand_bytes(bytes)
+pub fn fill_os_random_bytes(bytes: &mut [u8]) -> io::Result<()> {
+    std::fs::File::open("/dev/urandom")?.read_exact(bytes)
 }
 
 pub fn random_usize(max: usize) -> usize {
