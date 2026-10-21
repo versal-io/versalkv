@@ -13,10 +13,10 @@ native-deps = [
   "dep:clap",
   "dep:env_logger",
   "dep:mlua",
-  "dep:openssl",
   "dep:polling",
   "dep:socket2",
 ]
+tls = ["native-deps", "dep:openssl"]
 wasm = ["dep:serde", "dep:serde-wasm-bindgen", "dep:wasm-bindgen"]
 
 [dependencies]

@@ -1,3 +1,4 @@
+#[cfg(feature = "tls")]
 use openssl::ssl::{
     SslAcceptor, SslConnector, SslContextBuilder, SslFiletype, SslMethod, SslOptions,
     SslSessionCacheMode, SslVerifyMode,
@@ -43,6 +44,7 @@ impl TlsContextPolicy {
             .collect()
     }
 
+    #[cfg(feature = "tls")]
     pub fn disabled_protocols(&self) -> io::Result<SslOptions> {
         let protocols = self.protocols()?;
         let mut disabled = SslOptions::empty();
@@ -61,6 +63,7 @@ impl TlsContextPolicy {
         Ok(disabled)
     }
 
+    #[cfg(feature = "tls")]
     fn apply_to(&self, builder: &mut SslContextBuilder) -> io::Result<()> {
         builder.set_options(self.disabled_protocols()?);
         if !self.ciphers.trim().is_empty() {
@@ -155,6 +158,7 @@ impl Default for TlsClientConfig {
 }
 
 impl TlsClientConfig {
+    #[cfg(feature = "tls")]
     pub fn connector(&self) -> io::Result<SslConnector> {
         let (cert_file, key_file) = match (&self.cert_file, &self.key_file) {
             (None, None) => (None, None),
@@ -200,6 +204,7 @@ impl TlsClientConfig {
 }
 
 impl TlsConfig {
+    #[cfg(feature = "tls")]
     pub fn server_acceptor(&self) -> io::Result<Option<SslAcceptor>> {
         let (cert_file, key_file) = match (&self.cert_file, &self.key_file) {
             (None, None) => return Ok(None),
@@ -261,17 +266,27 @@ impl TlsConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{TlsClientConfig, TlsContextPolicy, TlsProtocol};
+    #[cfg(feature = "tls")]
+    use super::TlsClientConfig;
+    use super::{TlsContextPolicy, TlsProtocol};
+    #[cfg(feature = "tls")]
     use openssl::ssl::SslOptions;
 
     #[test]
     fn default_tls_policy_allows_only_tls_1_2_and_1_3() {
-        let disabled = TlsContextPolicy::default().disabled_protocols().unwrap();
+        assert_eq!(
+            TlsContextPolicy::default().protocols().unwrap(),
+            vec![TlsProtocol::Tls1_2, TlsProtocol::Tls1_3]
+        );
 
-        assert!(disabled.contains(SslOptions::NO_TLSV1));
-        assert!(disabled.contains(SslOptions::NO_TLSV1_1));
-        assert!(!disabled.contains(SslOptions::NO_TLSV1_2));
-        assert!(!disabled.contains(SslOptions::NO_TLSV1_3));
+        #[cfg(feature = "tls")]
+        {
+            let disabled = TlsContextPolicy::default().disabled_protocols().unwrap();
+            assert!(disabled.contains(SslOptions::NO_TLSV1));
+            assert!(disabled.contains(SslOptions::NO_TLSV1_1));
+            assert!(!disabled.contains(SslOptions::NO_TLSV1_2));
+            assert!(!disabled.contains(SslOptions::NO_TLSV1_3));
+        }
     }
 
     #[test]
@@ -280,19 +295,21 @@ mod tests {
             protocols: "TLSv1.2 TLSv9".to_string(),
             ..TlsContextPolicy::default()
         };
-        assert!(invalid.disabled_protocols().is_err());
+        assert!(invalid.protocols().is_err());
 
         let tls_1_2_only = TlsContextPolicy {
             protocols: "TLSv1.2".to_string(),
             ..TlsContextPolicy::default()
         };
         assert_eq!(tls_1_2_only.protocols().unwrap(), vec![TlsProtocol::Tls1_2]);
+        #[cfg(feature = "tls")]
         assert!(tls_1_2_only
             .disabled_protocols()
             .unwrap()
             .contains(SslOptions::NO_TLSV1_3));
     }
 
+    #[cfg(feature = "tls")]
     #[test]
     fn tls_policy_rejects_an_invalid_openssl_cipher_list() {
         let config = TlsClientConfig {
@@ -306,6 +323,7 @@ mod tests {
         assert!(config.connector().is_err());
     }
 
+    #[cfg(feature = "tls")]
     #[test]
     fn verified_tls_client_requires_an_explicit_ca_source() {
         assert!(TlsClientConfig::default().connector().is_err());

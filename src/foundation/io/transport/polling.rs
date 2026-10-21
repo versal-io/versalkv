@@ -5,6 +5,7 @@ use super::{
     TlsClientConfig, TlsConfig, TransportEvent, TransportId, TransportPollMode, TransportPollState,
     TransportRuntime, TransportWakeHandle, TransportWorkerBackend, UnixBindOptions,
 };
+#[cfg(feature = "tls")]
 use openssl::ssl::{ErrorCode, Ssl, SslAcceptor, SslConnector, SslStream};
 use polling::{Event, Events, PollMode, Poller};
 use slab::Slab;
@@ -21,6 +22,7 @@ use std::time::Duration;
 
 enum Stream {
     Tcp(TcpStream),
+    #[cfg(feature = "tls")]
     Tls(SslStream<TcpStream>),
     Unix(std::os::unix::net::UnixStream),
 }
@@ -29,6 +31,7 @@ impl Read for Stream {
     fn read(&mut self, dst: &mut [u8]) -> io::Result<usize> {
         match self {
             Self::Tcp(stream) => stream.read(dst),
+            #[cfg(feature = "tls")]
             Self::Tls(stream) => stream.read(dst),
             Self::Unix(stream) => stream.read(dst),
         }
@@ -39,6 +42,7 @@ impl Write for Stream {
     fn write(&mut self, src: &[u8]) -> io::Result<usize> {
         match self {
             Self::Tcp(stream) => stream.write(src),
+            #[cfg(feature = "tls")]
             Self::Tls(stream) => stream.write(src),
             Self::Unix(stream) => stream.write(src),
         }
@@ -51,6 +55,7 @@ impl Write for Stream {
     fn write_vectored(&mut self, src: &[IoSlice<'_>]) -> io::Result<usize> {
         match self {
             Self::Tcp(stream) => stream.write_vectored(src),
+            #[cfg(feature = "tls")]
             Self::Tls(stream) => stream.write_vectored(src),
             Self::Unix(stream) => stream.write_vectored(src),
         }
@@ -59,6 +64,7 @@ impl Write for Stream {
 
 enum Registered {
     TcpListener(TcpListener),
+    #[cfg(feature = "tls")]
     TlsListener(TcpListener),
     UnixListener(std::os::unix::net::UnixListener),
     Stream(Stream),
@@ -149,7 +155,9 @@ pub(crate) struct PollingTransportRuntime {
     registered: Slab<Registered>,
     tcp_buffer_limits: Option<TcpBufferLimits>,
     tcp_backlog: i32,
+    #[cfg(feature = "tls")]
     tls_server: Option<SslAcceptor>,
+    #[cfg(feature = "tls")]
     tls_client: Option<SslConnector>,
     #[cfg(test)]
     interest_requests: Vec<(TransportId, Interest)>,
@@ -199,7 +207,9 @@ impl PollingTransportRuntime {
             registered: Slab::new(),
             tcp_buffer_limits,
             tcp_backlog: 511,
+            #[cfg(feature = "tls")]
             tls_server: None,
+            #[cfg(feature = "tls")]
             tls_client: None,
             #[cfg(test)]
             interest_requests: Vec::new(),
@@ -262,6 +272,7 @@ impl PollingTransportRuntime {
             Some(Registered::TcpListener(listener)) => {
                 poller.modify_with_mode(listener, Self::polling_event(id, interest), mode)
             }
+            #[cfg(feature = "tls")]
             Some(Registered::TlsListener(listener)) => {
                 poller.modify_with_mode(listener, Self::polling_event(id, interest), mode)
             }
@@ -271,6 +282,7 @@ impl PollingTransportRuntime {
             Some(Registered::Stream(Stream::Tcp(stream))) => {
                 poller.modify_with_mode(stream, Self::polling_event(id, interest), mode)
             }
+            #[cfg(feature = "tls")]
             Some(Registered::Stream(Stream::Tls(stream))) => {
                 let interest = if stream.ssl().is_init_finished() {
                     interest
@@ -310,7 +322,17 @@ impl PollingTransportRuntime {
         let id = TransportId::new(key + 1).expect("slab index plus one is nonzero");
         self.add_source_fd(listener.as_raw_fd(), id, Interest::Readable)?;
         let inserted = if tls {
-            self.registered.insert(Registered::TlsListener(listener))
+            #[cfg(feature = "tls")]
+            {
+                self.registered.insert(Registered::TlsListener(listener))
+            }
+            #[cfg(not(feature = "tls"))]
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "TLS support is not compiled in",
+                ));
+            }
         } else {
             self.registered.insert(Registered::TcpListener(listener))
         };
@@ -394,6 +416,7 @@ impl PollingTransportRuntime {
     fn stream_read_closed(&self, id: TransportId) -> bool {
         let fd = match self.registered.get(id.get() - 1) {
             Some(Registered::Stream(Stream::Tcp(stream))) => stream.as_raw_fd(),
+            #[cfg(feature = "tls")]
             Some(Registered::Stream(Stream::Tls(stream))) => stream.get_ref().as_raw_fd(),
             Some(Registered::Stream(Stream::Unix(stream))) => stream.as_raw_fd(),
             Some(Registered::OwnedSource { file, .. }) => {
@@ -430,23 +453,56 @@ impl TransportRuntime for PollingTransportRuntime {
     }
 
     fn configure_tls_server(&mut self, config: TlsConfig) -> io::Result<()> {
-        self.tls_server = config.server_acceptor()?;
-        Ok(())
+        #[cfg(feature = "tls")]
+        {
+            self.tls_server = config.server_acceptor()?;
+            Ok(())
+        }
+        #[cfg(not(feature = "tls"))]
+        {
+            let _ = config;
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "TLS support is not compiled in",
+            ))
+        }
     }
 
     fn bind_tls(&mut self, addr: SocketAddr) -> io::Result<ListenerHandle> {
-        if self.tls_server.is_none() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "TLS server context must be configured before binding a TLS listener",
-            ));
+        #[cfg(feature = "tls")]
+        {
+            if self.tls_server.is_none() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "TLS server context must be configured before binding a TLS listener",
+                ));
+            }
+            self.bind_tcp_listener(addr, true)
         }
-        self.bind_tcp_listener(addr, true)
+        #[cfg(not(feature = "tls"))]
+        {
+            let _ = addr;
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "TLS support is not compiled in",
+            ))
+        }
     }
 
     fn configure_tls_client(&mut self, config: TlsClientConfig) -> io::Result<()> {
-        self.tls_client = Some(config.connector()?);
-        Ok(())
+        #[cfg(feature = "tls")]
+        {
+            self.tls_client = Some(config.connector()?);
+            Ok(())
+        }
+        #[cfg(not(feature = "tls"))]
+        {
+            let _ = config;
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "TLS support is not compiled in",
+            ))
+        }
     }
 
     fn bind_mptcp(&mut self, addr: SocketAddr) -> io::Result<ListenerHandle> {
@@ -572,37 +628,49 @@ impl TransportRuntime for PollingTransportRuntime {
         source_ip: Option<std::net::IpAddr>,
         server_name: &str,
     ) -> io::Result<ConnectedPeer> {
-        self.ensure_poll_attached()?;
-        let connector = self.tls_client.as_ref().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "TLS client context must be configured before connecting",
-            )
-        })?;
-        let tcp = self.open_tcp_stream(addr, source_ip, Protocol::TCP)?;
-        let mut ssl = connector
-            .configure()
-            .map_err(io::Error::other)?
-            .into_ssl(server_name)
-            .map_err(io::Error::other)?;
-        ssl.set_connect_state();
-        let mut stream = SslStream::new(ssl, tcp).map_err(io::Error::other)?;
-        match stream.connect() {
-            Ok(()) => {}
-            Err(error) if matches!(error.code(), ErrorCode::WANT_READ | ErrorCode::WANT_WRITE) => {}
-            Err(error) => return Err(io::Error::other(error)),
+        #[cfg(feature = "tls")]
+        {
+            self.ensure_poll_attached()?;
+            let connector = self.tls_client.as_ref().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "TLS client context must be configured before connecting",
+                )
+            })?;
+            let tcp = self.open_tcp_stream(addr, source_ip, Protocol::TCP)?;
+            let mut ssl = connector
+                .configure()
+                .map_err(io::Error::other)?
+                .into_ssl(server_name)
+                .map_err(io::Error::other)?;
+            ssl.set_connect_state();
+            let mut stream = SslStream::new(ssl, tcp).map_err(io::Error::other)?;
+            match stream.connect() {
+                Ok(()) => {}
+                Err(error)
+                    if matches!(error.code(), ErrorCode::WANT_READ | ErrorCode::WANT_WRITE) => {}
+                Err(error) => return Err(io::Error::other(error)),
+            }
+            let key = self.registered.vacant_key();
+            let id = TransportId::new(key + 1).expect("slab index plus one is nonzero");
+            self.add_source_fd(stream.get_ref().as_raw_fd(), id, Interest::ReadWritable)?;
+            let inserted = self
+                .registered
+                .insert(Registered::Stream(Stream::Tls(stream)));
+            debug_assert_eq!(inserted, key);
+            Ok(ConnectedPeer {
+                id,
+                peer_addr: addr,
+            })
         }
-        let key = self.registered.vacant_key();
-        let id = TransportId::new(key + 1).expect("slab index plus one is nonzero");
-        self.add_source_fd(stream.get_ref().as_raw_fd(), id, Interest::ReadWritable)?;
-        let inserted = self
-            .registered
-            .insert(Registered::Stream(Stream::Tls(stream)));
-        debug_assert_eq!(inserted, key);
-        Ok(ConnectedPeer {
-            id,
-            peer_addr: addr,
-        })
+        #[cfg(not(feature = "tls"))]
+        {
+            let _ = (addr, source_ip, server_name);
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "TLS support is not compiled in",
+            ))
+        }
     }
 
     fn connect_tcp_bound(
@@ -649,6 +717,7 @@ impl TransportRuntime for PollingTransportRuntime {
         self.ensure_poll_attached()?;
         enum AcceptedStream {
             Tcp(TcpStream),
+            #[cfg(feature = "tls")]
             Tls(TcpStream),
             Unix(std::os::unix::net::UnixStream),
         }
@@ -657,6 +726,7 @@ impl TransportRuntime for PollingTransportRuntime {
             Some(Registered::TcpListener(listener)) => listener
                 .accept()
                 .map(|(stream, addr)| (AcceptedStream::Tcp(stream), addr)),
+            #[cfg(feature = "tls")]
             Some(Registered::TlsListener(listener)) => listener
                 .accept()
                 .map(|(stream, addr)| (AcceptedStream::Tls(stream), addr)),
@@ -680,6 +750,7 @@ impl TransportRuntime for PollingTransportRuntime {
         };
         let stream = match accepted {
             AcceptedStream::Tcp(stream) => Stream::Tcp(stream),
+            #[cfg(feature = "tls")]
             AcceptedStream::Tls(stream) => {
                 let acceptor = self.tls_server.as_ref().ok_or_else(|| {
                     io::Error::new(
@@ -700,6 +771,7 @@ impl TransportRuntime for PollingTransportRuntime {
             Stream::Tcp(stream) => {
                 self.add_source_fd(stream.as_raw_fd(), id, Interest::Readable)?
             }
+            #[cfg(feature = "tls")]
             Stream::Tls(stream) => {
                 self.add_source_fd(stream.get_ref().as_raw_fd(), id, Interest::ReadWritable)?
             }
@@ -785,9 +857,9 @@ impl TransportRuntime for PollingTransportRuntime {
     }
 
     fn has_pending_data(&self) -> bool {
-        self.registered.iter().any(|(_, registered)| {
-            matches!(registered, Registered::Stream(Stream::Tls(stream)) if stream.ssl().pending() > 0)
-        })
+        self.registered
+            .iter()
+            .any(|(_, registered)| tls_has_pending_data(registered))
     }
 
     fn process_pending_data(&mut self, out: &mut Vec<TransportEvent>) -> usize {
@@ -795,9 +867,7 @@ impl TransportRuntime for PollingTransportRuntime {
         out.extend(
             self.registered
                 .iter()
-                .filter(|(_, registered)| {
-                    matches!(*registered, Registered::Stream(Stream::Tls(stream)) if stream.ssl().pending() > 0)
-                })
+                .filter(|(_, registered)| tls_has_pending_data(registered))
                 .map(|(index, _)| {
                     TransportEvent::ready(
                         TransportId::new(index + 1).expect("slab index plus one is nonzero"),
@@ -856,6 +926,7 @@ impl TransportRuntime for PollingTransportRuntime {
     fn take_connect_error(&mut self, id: TransportId) -> io::Result<Option<io::Error>> {
         match self.registered.get_mut(id.get() - 1) {
             Some(Registered::Stream(Stream::Tcp(stream))) => stream.take_error(),
+            #[cfg(feature = "tls")]
             Some(Registered::Stream(Stream::Tls(stream))) => stream.get_ref().take_error(),
             Some(Registered::Stream(Stream::Unix(stream))) => stream.take_error(),
             _ => Ok(Some(io::Error::new(
@@ -870,6 +941,7 @@ impl TransportRuntime for PollingTransportRuntime {
             Some(Registered::Stream(Stream::Tcp(stream))) => {
                 stream.shutdown(std::net::Shutdown::Both)
             }
+            #[cfg(feature = "tls")]
             Some(Registered::Stream(Stream::Tls(stream))) => {
                 stream.get_ref().shutdown(std::net::Shutdown::Both)
             }
@@ -892,9 +964,11 @@ impl TransportRuntime for PollingTransportRuntime {
         {
             match self.registered.get_mut(id.get() - 1) {
                 Some(Registered::TcpListener(listener)) => self.poller.delete(&*listener)?,
+                #[cfg(feature = "tls")]
                 Some(Registered::TlsListener(listener)) => self.poller.delete(&*listener)?,
                 Some(Registered::UnixListener(listener)) => self.poller.delete(&*listener)?,
                 Some(Registered::Stream(Stream::Tcp(stream))) => self.poller.delete(&*stream)?,
+                #[cfg(feature = "tls")]
                 Some(Registered::Stream(Stream::Tls(stream))) => {
                     self.poller.delete(stream.get_ref())?
                 }
@@ -919,6 +993,7 @@ impl TransportRuntime for PollingTransportRuntime {
     fn raw_fd(&self, id: TransportId) -> io::Result<std::os::fd::RawFd> {
         match self.registered.get(id.get() - 1) {
             Some(Registered::Stream(Stream::Tcp(stream))) => Ok(stream.as_raw_fd()),
+            #[cfg(feature = "tls")]
             Some(Registered::Stream(Stream::Tls(stream))) => Ok(stream.get_ref().as_raw_fd()),
             Some(Registered::Stream(Stream::Unix(_))) => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -939,9 +1014,11 @@ impl super::TransportTestBackend for PollingTransportRuntime {
         self.ensure_poll_attached()?;
         match self.registered.get_mut(id.get() - 1) {
             Some(Registered::TcpListener(listener)) => self.poller.delete(&*listener),
+            #[cfg(feature = "tls")]
             Some(Registered::TlsListener(listener)) => self.poller.delete(&*listener),
             Some(Registered::UnixListener(listener)) => self.poller.delete(&*listener),
             Some(Registered::Stream(Stream::Tcp(stream))) => self.poller.delete(&*stream),
+            #[cfg(feature = "tls")]
             Some(Registered::Stream(Stream::Tls(stream))) => self.poller.delete(stream.get_ref()),
             Some(Registered::Stream(Stream::Unix(stream))) => self.poller.delete(&*stream),
             Some(Registered::OwnedSource {
@@ -979,6 +1056,7 @@ impl super::TransportTestBackend for PollingTransportRuntime {
                     mode,
                 )
             }
+            #[cfg(feature = "tls")]
             Some(Registered::TlsListener(listener)) => {
                 crate::foundation::io::sys::polling::add_with_mode(
                     &self.poller,
@@ -1003,6 +1081,7 @@ impl super::TransportTestBackend for PollingTransportRuntime {
                     mode,
                 )
             }
+            #[cfg(feature = "tls")]
             Some(Registered::Stream(Stream::Tls(stream))) => {
                 crate::foundation::io::sys::polling::add_with_mode(
                     &self.poller,
@@ -1178,6 +1257,7 @@ fn apply_accepted_stream_options(
 ) -> io::Result<()> {
     match stream {
         Stream::Tcp(stream) => stream.set_nonblocking(true)?,
+        #[cfg(feature = "tls")]
         Stream::Tls(stream) => stream.get_ref().set_nonblocking(true)?,
         Stream::Unix(stream) => stream.set_nonblocking(true)?,
     }
@@ -1190,6 +1270,7 @@ fn apply_accepted_stream_options(
                 socket.set_recv_buffer_size(limits.receive_bytes)?;
             }
         }
+        #[cfg(feature = "tls")]
         Stream::Tls(stream) => {
             stream.get_ref().set_nodelay(true)?;
             if let Some(limits) = limits {
@@ -1206,12 +1287,23 @@ fn apply_accepted_stream_options(
 fn tcp_stream_ref(registered: Option<&Registered>) -> io::Result<&TcpStream> {
     match registered {
         Some(Registered::Stream(Stream::Tcp(stream))) => Ok(stream),
+        #[cfg(feature = "tls")]
         Some(Registered::Stream(Stream::Tls(stream))) => Ok(stream.get_ref()),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "transport is not a TCP stream",
         )),
     }
+}
+
+#[cfg(feature = "tls")]
+fn tls_has_pending_data(registered: &Registered) -> bool {
+    matches!(registered, Registered::Stream(Stream::Tls(stream)) if stream.ssl().pending() > 0)
+}
+
+#[cfg(not(feature = "tls"))]
+fn tls_has_pending_data(_registered: &Registered) -> bool {
+    false
 }
 
 fn test_tcp_buffer_limits_from_env() -> io::Result<Option<TcpBufferLimits>> {
