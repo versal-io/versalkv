@@ -345,12 +345,11 @@ impl ReplicationRuntime {
         boundary: SnapshotBoundary,
         backlog: &mut ReplicationBacklog,
     ) {
-        // `ReplicationBacklog` history is retained independently from C's
-        // replication-buffer block list. A PSYNC-wait candidate references a
-        // block only when this runtime has observed that live buffer tail.
-        // Backlog bytes left from earlier propagation must not change the
-        // ENDOFF/refcount classification.
-        let has_repl_buffer_tail = self.repl_buffer_tail_exists && backlog.history_len() > 0;
+        // A non-empty Rust backlog is the flat-buffer equivalent of C's
+        // non-empty repl_buffer_blocks list. A PSYNC-wait candidate can pin
+        // that tail immediately; otherwise it waits for the first later frame
+        // to create history and backfill the pin.
+        let has_repl_buffer_tail = backlog.history_len() > 0;
         self.rdb_psync_waits.insert(
             rdb_connection_id,
             RdbPsyncWait::new(

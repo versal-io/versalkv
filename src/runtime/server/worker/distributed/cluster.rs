@@ -519,7 +519,7 @@ impl ServerWorkerState {
                 self.ctx.replication().slave_repl_offset.get()
             }
         } else {
-            self.ctx.replication().backlog.reported_offset().get()
+            self.ctx.replication().primary_repl_offset().get()
         };
         (status, replication_offset)
     }

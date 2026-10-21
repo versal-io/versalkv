@@ -74,9 +74,8 @@ impl ServerWorkerState {
                     self.ctx.client_pause_mut().action = PauseAction::Write;
                     self.ctx.client_pause_mut().end_time_ms = until_ms;
                     self.ctx.client_pause_mut().reason = "failover_in_progress";
-                    state.set_local_replication_offset(
-                        self.ctx.replication().backlog.reported_offset(),
-                    );
+                    state
+                        .set_local_replication_offset(self.ctx.replication().primary_repl_offset());
                     state.commit_manual_primary_pause();
                     self.cluster_bus.queue_paused_pong(state, &requester);
                 }
@@ -307,7 +306,7 @@ impl ServerWorkerState {
             }
             None => Some((
                 self.ctx.replication().backlog.replid().to_string(),
-                self.ctx.replication().backlog.reported_offset(),
+                self.ctx.replication().primary_repl_offset(),
                 0,
             )),
         }

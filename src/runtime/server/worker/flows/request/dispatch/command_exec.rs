@@ -1,5 +1,6 @@
 use super::side_effects::CommandEffects;
 use super::ServerWorkerState;
+use crate::engine::command::context::CommandConn;
 use crate::engine::command::{CommandArgs, DispatchGroup, CMD_TOUCHES_ARBITRARY_KEYS, CMD_WRITE};
 use crate::engine::extension::script::{PropagationOp, PropagationTargets};
 use crate::foundation::io::protocol::Value;
@@ -140,7 +141,7 @@ impl ServerWorkerState {
             return Ok(None);
         }
         self.propagate_to_replicas_with_ack(&encode_command_args(args), true);
-        let target_offset = self.ctx.replication().backlog.reported_offset();
+        let target_offset = self.ctx.replication().primary_repl_offset();
         let connection = self.connection_registry.get_mut(token).ok_or(Value::Null)?;
         connection.set_skip_propagation(true);
         // C cluster_legacy.c protects the SETSLOT client across state changes
@@ -602,6 +603,20 @@ impl ServerWorkerState {
                 self.ctx.repl_seldb(),
                 self.ctx.persistence().aof_selected_db(),
             );
+            let replication_bytes = sequenced.replication_frames.iter().map(Vec::len).sum();
+            let is_aof_enabled = self.ctx.config().persistence.aof_enabled;
+            if self
+                .ctx
+                .replication_mut()
+                .record_local_propagation(replication_bytes, is_aof_enabled)
+                .is_err()
+            {
+                crate::server_log!(
+                    warning,
+                    "Primary replication offset overflow; requesting server shutdown"
+                );
+                self.ctx.set_shutdown_requested(true);
+            }
             self.ctx.set_repl_seldb(sequenced.replication_selected_db);
             self.ctx
                 .persistence_mut()
@@ -685,6 +700,7 @@ impl ServerWorkerState {
             command_flags,
             rejected,
         );
+        let offset_before = self.ctx.replication().primary_repl_offset();
         let capture = self.capture_command_propagation(
             connection_token,
             &plan,
@@ -696,6 +712,11 @@ impl ServerWorkerState {
         let units = arrange_propagation_units(capture.operations, expired_ops, &plan);
         let migration_ops = units.iter().flatten().cloned().collect::<Vec<_>>();
         self.sequence_propagation_units(units, fx);
+        let offset_after = self.ctx.replication().primary_repl_offset();
+        if offset_after != offset_before {
+            self.connection_registry[crate::framework::capabilities::io::Token(connection_token)]
+                .set_last_write_offset(offset_after);
+        }
         self.reset_connection_after_command(connection_token, token_value, name_lower, rejected);
         self.queue_slot_migration_mutations(&migration_ops);
         capture.swapdb

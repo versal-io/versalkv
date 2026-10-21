@@ -15,6 +15,52 @@ fn replication_role_is_canonical_runtime_state() {
 }
 
 #[test]
+fn aof_only_primary_propagation_advances_without_retaining_history() {
+    let mut state = ReplicationState::new("replid".to_string(), 16);
+
+    assert_eq!(
+        state.record_local_propagation(128, true).unwrap(),
+        Some(offset(1))
+    );
+    assert_eq!(
+        state.record_local_propagation(256, true).unwrap(),
+        Some(offset(2))
+    );
+
+    assert_eq!(state.primary_repl_offset(), offset(2));
+    assert_eq!(state.backlog.reported_offset(), offset(2));
+    assert!(!state.backlog.is_active());
+    assert_eq!(state.backlog.history_len(), 0);
+}
+
+#[test]
+fn inactive_primary_without_aof_does_not_advance() {
+    let mut state = ReplicationState::new("replid".to_string(), 16);
+
+    assert_eq!(state.record_local_propagation(128, false).unwrap(), None);
+
+    assert_eq!(state.primary_repl_offset(), ReplicationOffset::ZERO);
+    assert_eq!(state.backlog.reported_offset(), ReplicationOffset::ZERO);
+}
+
+#[test]
+fn active_backlog_primary_propagation_advances_by_encoded_bytes() {
+    let mut state = ReplicationState::new("replid".to_string(), 16);
+    state.backlog.activate();
+
+    assert_eq!(
+        state.record_local_propagation(7, false).unwrap(),
+        Some(offset(7))
+    );
+    assert_eq!(state.primary_repl_offset(), offset(7));
+    assert_eq!(state.backlog.reported_offset(), ReplicationOffset::ZERO);
+
+    state.backlog.append(b"1234567").unwrap();
+    assert_eq!(state.primary_repl_offset(), offset(7));
+    assert_eq!(state.backlog.reported_offset(), offset(7));
+}
+
+#[test]
 fn switching_primary_to_replica_preserves_the_known_stream_offset() {
     let mut state = ReplicationState::new("replid".to_string(), 16);
     state.backlog.activate();

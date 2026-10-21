@@ -425,7 +425,7 @@ fn full_sync_aof_base_success_resets_cursors_and_installs_journal() {
     assert_ne!(journal_path, fixture.old_journal_path.to_string_lossy());
     assert_eq!(
         fixture.backend.ctx.aof().fsynced_repl_offset,
-        Some(fixture.link.applied_position().get()),
+        Some(19),
         "a synced RDB installed as the AOF base must publish its durable replication offset"
     );
     let queued: Vec<u8> = fixture.backend.connection_registry

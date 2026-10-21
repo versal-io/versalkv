@@ -59,7 +59,7 @@ fn primary_role(ctx: &ServerContext) -> Value {
         .collect();
     Value::Array(vec![
         Value::bulk(Bytes::from_static(b"master")),
-        Value::integer(ctx.replication().backlog.reported_offset().get()),
+        Value::integer(ctx.replication().primary_repl_offset().get()),
         Value::Array(replicas),
     ])
 }

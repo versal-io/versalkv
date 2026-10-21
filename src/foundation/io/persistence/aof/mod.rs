@@ -16,7 +16,7 @@ pub use manifest_install::{
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 
@@ -77,7 +77,7 @@ struct FsyncThread {
 }
 
 impl FsyncThread {
-    fn spawn(fd: File) -> Self {
+    fn spawn(fd: File, fsync_target: Arc<AtomicI64>, fsynced_reported: Arc<AtomicI64>) -> Self {
         let shutdown = Arc::new(AtomicBool::new(false));
         let final_sync = Arc::new(AtomicBool::new(true));
         let done = Arc::new((Mutex::new(false), Condvar::new()));
@@ -97,7 +97,14 @@ impl FsyncThread {
                     let now = crate::foundation::io::store::kv_engine::now_ms();
                     let elapsed = now.saturating_sub(last_fsync);
                     if elapsed >= 1000 {
-                        let _ = fd.sync_data();
+                        // Snapshot the write-through offset before syncing so the
+                        // reported durable offset never claims bytes that were
+                        // written after this fsync began. Mirrors C's bio worker
+                        // storing the offset captured when the job was created.
+                        let target = fsync_target.load(Ordering::Acquire);
+                        if fd.sync_data().is_ok() && target >= 0 {
+                            fsynced_reported.store(target, Ordering::Release);
+                        }
                         last_fsync = crate::foundation::io::store::kv_engine::now_ms();
                     }
                     let sleep_ms = if elapsed >= 1000 { 1 } else { 1000 - elapsed };
@@ -105,7 +112,10 @@ impl FsyncThread {
                     thread::sleep(std::time::Duration::from_millis(wait_ms));
                 }
                 if th_final_sync.load(Ordering::Acquire) {
-                    let _ = fd.sync_data();
+                    let target = fsync_target.load(Ordering::Acquire);
+                    if fd.sync_data().is_ok() && target >= 0 {
+                        fsynced_reported.store(target, Ordering::Release);
+                    }
                 }
                 let (lock, cvar) = &*th_done;
                 if let Ok(mut done_flag) = lock.lock() {
@@ -162,14 +172,30 @@ pub struct AofAppender {
 
     fsync_thread: Option<FsyncThread>,
 
+    /// Replication offset the main thread has written through and wants the
+    /// next successful fsync to report as durable. Shared with the everysec
+    /// background thread. `-1` means "nothing to report yet".
+    fsync_target: Arc<AtomicI64>,
+    /// Replication offset confirmed durable by the last successful fsync,
+    /// whether performed inline (`always`) or by the background thread
+    /// (`everysec`). Mirrors C's `fsynced_reploff_pending` atomic. `-1` means
+    /// "nothing confirmed yet".
+    fsynced_reported: Arc<AtomicI64>,
+
     path: String,
 }
 
 impl AofAppender {
     fn from_open_file(fd: File, path: &Path, fsync_mode: AofFsync) -> io::Result<Self> {
         let current_size = fd.metadata()?.len();
+        let fsync_target = Arc::new(AtomicI64::new(-1));
+        let fsynced_reported = Arc::new(AtomicI64::new(-1));
         let fsync_thread = match fsync_mode {
-            AofFsync::EverySec => Some(FsyncThread::spawn(fd.try_clone()?)),
+            AofFsync::EverySec => Some(FsyncThread::spawn(
+                fd.try_clone()?,
+                Arc::clone(&fsync_target),
+                Arc::clone(&fsynced_reported),
+            )),
             _ => None,
         };
         Ok(Self {
@@ -179,6 +205,8 @@ impl AofAppender {
             current_size,
             last_write_ok: true,
             fsync_thread,
+            fsync_target,
+            fsynced_reported,
             path: path.to_string_lossy().into_owned(),
         })
     }
@@ -253,6 +281,24 @@ impl AofAppender {
         self.buf.extend_from_slice(frame);
     }
 
+    /// Record the replication offset the next successful fsync should report as
+    /// durable. The main thread calls this before `flush`; mirrors C passing
+    /// `server.primary_repl_offset` into the fsync job / inline store.
+    pub fn set_fsync_target(&self, offset: i64) {
+        self.fsync_target.store(offset, Ordering::Release);
+    }
+
+    /// Replication offset confirmed durable by the most recent successful
+    /// fsync (inline for `always`, background for `everysec`), or `None` when
+    /// nothing has been confirmed yet. Mirrors reading C's
+    /// `fsynced_reploff_pending` atomic.
+    pub fn fsynced_reported_offset(&self) -> Option<i64> {
+        match self.fsynced_reported.load(Ordering::Acquire) {
+            value if value >= 0 => Some(value),
+            _ => None,
+        }
+    }
+
     pub fn flush(&mut self, force: bool) -> io::Result<()> {
         if self.buf.is_empty() && !force {
             return Ok(());
@@ -282,6 +328,13 @@ impl AofAppender {
             match self.fd.sync_data() {
                 Ok(()) => {
                     self.last_write_ok = true;
+                    // An inline fsync durably covers everything written so far,
+                    // so publish the pending target immediately (C's inline
+                    // `atomic_store(fsynced_reploff_pending, ...)` for `always`).
+                    let target = self.fsync_target.load(Ordering::Acquire);
+                    if target >= 0 {
+                        self.fsynced_reported.store(target, Ordering::Release);
+                    }
                 }
                 Err(e) => {
                     self.last_write_ok = false;
@@ -310,7 +363,11 @@ impl AofAppender {
             }
         } else if new_is_bg && !old_was_bg {
             let th_fd = self.fd.try_clone()?;
-            self.fsync_thread = Some(FsyncThread::spawn(th_fd));
+            self.fsync_thread = Some(FsyncThread::spawn(
+                th_fd,
+                Arc::clone(&self.fsync_target),
+                Arc::clone(&self.fsynced_reported),
+            ));
         }
         Ok(())
     }

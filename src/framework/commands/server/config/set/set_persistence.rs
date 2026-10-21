@@ -16,6 +16,10 @@ where
         return Ok(());
     }
 
+    // OFF -> ON transition enters C's AOF_WAIT_REWRITE state: the confirmed
+    // fsynced offset must stay frozen until the initial rewrite completes.
+    ctx.aof_mut().aof_wait_rewrite = true;
+
     if ctx.persistence().has_active_child() {
         ctx.persistence_mut().set_aof_rewrite_scheduled(true);
         ctx.config_mut().persistence.aof_enabled = true;
@@ -48,6 +52,7 @@ where
     ctx.config_mut().persistence.aof_enabled = false;
     ctx.persistence_mut().set_aof_rewrite_scheduled(false);
     ctx.persistence_mut().reset_aof_selected_db();
+    ctx.aof_mut().reset_fsynced_disabled();
     match result {
         Ok(()) => Err("ERR initial AOF rewrite did not establish a write sink".to_string()),
         Err(error) if error.starts_with("ERR ") => Err(error),
@@ -104,6 +109,10 @@ pub(super) fn config_set_persistence(
                 if let Some(mut journal) = ctx.aof_mut().journal.take() {
                     let _ = journal.appender.shutdown();
                 }
+                // Mirror C's stopAppendOnly: once AOF is off the confirmed
+                // fsynced offset reverts to the "-1"/None sentinel (never ack)
+                // and the optimistic pending offset resets to 0.
+                ctx.aof_mut().reset_fsynced_disabled();
                 ctx.persistence_mut().reset_aof_selected_db();
             }
         }

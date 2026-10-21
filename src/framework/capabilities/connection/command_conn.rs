@@ -30,6 +30,17 @@ impl CommandConn for Connection {
         self.command_seq
     }
 
+    fn last_write_offset(&self) -> crate::engine::distributed::replication::ReplicationOffset {
+        self.last_write_offset
+    }
+
+    fn set_last_write_offset(
+        &mut self,
+        offset: crate::engine::distributed::replication::ReplicationOffset,
+    ) {
+        self.last_write_offset = offset;
+    }
+
     fn peer_addr(&self) -> SocketAddr {
         self.peer_addr
     }

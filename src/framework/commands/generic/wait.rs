@@ -26,7 +26,7 @@ pub fn wait(conn: &mut dyn CommandConn, args: &CommandArgs, ctx: &mut ServerCont
         return Value::integer(ctx.replication().live_replica_count() as i64);
     }
 
-    let target_offset = ctx.replication().backlog.reported_offset();
+    let target_offset = conn.last_write_offset();
     let acked = ctx.replication().count_replicas_acked_to(target_offset);
     if acked >= required || conn.in_transaction() || ctx.has_running_script() {
         return Value::integer(acked);

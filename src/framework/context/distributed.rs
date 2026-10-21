@@ -33,7 +33,7 @@ impl ServerContext {
         let offset = if self.replication.is_replica() {
             self.replication.slave_repl_offset.get()
         } else {
-            self.replication.backlog.reported_offset().get()
+            self.replication.primary_repl_offset().get()
         };
         let mut info = crate::foundation::io::persistence::RdbReplicationInfo {
             repl_stream_db: self.repl_seldb().max(0),

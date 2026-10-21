@@ -560,6 +560,20 @@ impl ServerWorkerState {
             self.ctx.repl_seldb(),
             self.ctx.persistence().aof_selected_db(),
         );
+        let replication_bytes = sequenced.replication_frames.iter().map(Vec::len).sum();
+        let is_aof_enabled = self.ctx.config().persistence.aof_enabled;
+        if self
+            .ctx
+            .replication_mut()
+            .record_local_propagation(replication_bytes, is_aof_enabled)
+            .is_err()
+        {
+            crate::server_log!(
+                warning,
+                "Primary replication offset overflow; requesting server shutdown"
+            );
+            self.ctx.set_shutdown_requested(true);
+        }
         self.ctx.set_repl_seldb(sequenced.replication_selected_db);
         self.ctx
             .persistence_mut()

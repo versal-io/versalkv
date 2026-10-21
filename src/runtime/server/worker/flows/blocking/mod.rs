@@ -575,7 +575,7 @@ impl ServerWorkerState {
                     numreplicas,
                     target_offset,
                 } => {
-                    let local = self.waitaof_local_ack(numlocal);
+                    let local = self.waitaof_local_ack(target_offset);
                     let replicas = self
                         .ctx
                         .replication()
@@ -610,13 +610,9 @@ impl ServerWorkerState {
                         .count_replicas_acked_to(target_offset),
                 ),
             ),
-            BlockedCmd::WaitAof {
-                numlocal,
-                target_offset,
-                ..
-            } => Some(
+            BlockedCmd::WaitAof { target_offset, .. } => Some(
                 self.waitaof_reply(
-                    self.waitaof_local_ack(numlocal),
+                    self.waitaof_local_ack(target_offset),
                     self.ctx
                         .replication()
                         .count_replicas_aof_acked_to(target_offset),
@@ -634,16 +630,23 @@ impl ServerWorkerState {
         Value::Array(vec![Value::integer(local), Value::integer(replicas)])
     }
 
-    fn waitaof_local_ack(&self, _numlocal: i64) -> i64 {
-        if !self.ctx.config().persistence.aof_enabled || self.ctx.aof().journal.is_none() {
-            return 0;
-        }
-        if self.ctx.config().persistence.aof_fsync
-            == crate::foundation::io::persistence::AofFsync::No
+    fn waitaof_local_ack(
+        &self,
+        target_offset: crate::engine::distributed::replication::ReplicationOffset,
+    ) -> i64 {
+        if !self.ctx.config().persistence.aof_enabled
+            || self.ctx.aof().journal.is_none()
+            || self.ctx.config().persistence.aof_fsync
+                == crate::foundation::io::persistence::AofFsync::No
         {
             return 0;
         }
-        1
+        i64::from(
+            self.ctx
+                .aof()
+                .fsynced_repl_offset
+                .is_some_and(|offset| offset >= target_offset.get()),
+        )
     }
 
     pub(crate) fn reject_blocked_waitaof_local_if_aof_disabled(&mut self) {

@@ -213,6 +213,25 @@ mod tests {
     }
 
     #[test]
+    fn rdb_psync_wait_tracks_existing_backlog_history_tail() {
+        let mut runtime = ReplicationRuntime::new();
+        let main = ConnectionId(30);
+        let rdb = ConnectionId(31);
+        register_waiting_dual_main(&mut runtime, main);
+        runtime.register_rdb_candidate(rdb).unwrap();
+        let mut backlog = ReplicationBacklog::new("local".to_string(), 64);
+        backlog.activate();
+        backlog.append(b"tail").unwrap();
+        let tail = backlog.tail_block_start_cursor();
+
+        assert!(runtime
+            .take_endoff_for_rdb_candidate_if_unambiguous(rdb, true, &mut backlog)
+            .is_some());
+
+        assert_eq!(runtime.min_protected_backlog_cursor(), Some(tail));
+    }
+
+    #[test]
     fn restored_rdb_endoff_carries_boundary_through_association() {
         let mut runtime = ReplicationRuntime::new();
         let main = ConnectionId(40);

@@ -389,8 +389,17 @@ impl ServerWorkerState {
             prepared.repl_stream_db,
             rdb_apply_position,
         );
-        self.ctx.aof_mut().fsynced_repl_offset =
-            reused_aof_base.then_some(link.applied_position().get());
+        // Mirror C's full-sync RDB-as-AOF-base reuse (aof.c:1068-1073): publish
+        // the current replication offset as both the optimistic pending and the
+        // confirmed fsynced offset. When the base is not reused there is nothing
+        // durable yet, so the confirmed offset reverts to the None/"-1" sentinel.
+        if reused_aof_base {
+            let rdb_offset = rdb_apply_position.get();
+            self.ctx.aof_mut().set_fsynced_pending(rdb_offset);
+            self.ctx.aof_mut().fsynced_repl_offset = Some(rdb_offset);
+        } else {
+            self.ctx.aof_mut().fsynced_repl_offset = None;
+        }
         if is_dual && !matches!(link.rdb_channel_state(), ReplicaRdbChannelState::RdbLoaded) {
             link.transition_rdb_channel_state(ReplicaRdbChannelState::RdbLoaded)
                 .map_err(|_| ())?;
@@ -678,9 +687,6 @@ impl ServerWorkerState {
             return Ok(());
         }
 
-        let aof_offset = replica_aof_ack_offset(&self.ctx, link.applied_position());
-        let ack = link.acknowledge_applied(aof_offset);
-        self.queue_replica_actions(main_connection_token, vec![ack]);
         self.ctx.replication_mut().async_loading = false;
         self.ctx.set_loading(false);
 
@@ -699,6 +705,10 @@ impl ServerWorkerState {
         self.ctx.config_mut().replication.master_link_status = "up".to_string();
         self.ctx.replication_mut().mark_failover_complete();
         self.replication_runtime.reset_master_reconnect_backoff();
+
+        let aof_offset = replica_aof_ack_offset(&self.ctx, link.applied_position());
+        let ack = link.acknowledge_applied(aof_offset);
+        self.queue_replica_actions(main_connection_token, vec![ack]);
 
         Ok(())
     }
@@ -1000,16 +1010,8 @@ impl ServerWorkerState {
         &mut self,
         connection_token: usize,
         link: &mut ReplicaLink,
-        buffered_getack: bool,
+        _buffered_getack: bool,
     ) -> Result<(), ()> {
-        if buffered_getack {
-            let aof_offset = replica_aof_ack_offset(&self.ctx, link.applied_position());
-            let ack = link.acknowledge_applied(aof_offset);
-            self.queue_replica_actions(connection_token, vec![ack]);
-        }
-        let aof_offset = replica_aof_ack_offset(&self.ctx, link.applied_position());
-        let ack = link.acknowledge_applied(aof_offset);
-        self.queue_replica_actions(connection_token, vec![ack]);
         self.ctx.replication_mut().async_loading = false;
         self.ctx.set_loading(false);
         self.close_replica_rdb_transport_after_load();
@@ -1024,6 +1026,11 @@ impl ServerWorkerState {
         self.ctx.replication_mut().mark_failover_complete();
         self.replication_runtime.reset_master_reconnect_backoff();
         self.clear_pending_replication_replay();
+
+        let aof_offset = replica_aof_ack_offset(&self.ctx, link.applied_position());
+        let ack = link.acknowledge_applied(aof_offset);
+        self.queue_replica_actions(connection_token, vec![ack]);
+
         Ok(())
     }
 

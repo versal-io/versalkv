@@ -20,14 +20,14 @@ impl ServerWorkerState {
 
         if self.ctx.replication().failover_sync_offset().is_none() {
             self.propagate_to_replicas_with_ack(&[], true);
-            let offset = self.ctx.replication().backlog.reported_offset();
+            let offset = self.ctx.replication().primary_repl_offset();
             self.ctx.replication_mut().set_failover_sync_offset(offset);
             return;
         }
         // C compares each replica ACK against the live primary offset. The
         // pause stops client writes, but replication keepalives may still move
         // the offset while we wait, so a one-time snapshot can become stale.
-        let sync_offset = self.ctx.replication().backlog.reported_offset();
+        let sync_offset = self.ctx.replication().primary_repl_offset();
         self.ctx
             .replication_mut()
             .set_failover_sync_offset(sync_offset);
@@ -115,7 +115,7 @@ impl ServerWorkerState {
             port,
         };
         let replid = self.ctx.replication().backlog.replid().to_string();
-        let offset = self.ctx.replication().backlog.reported_offset();
+        let offset = self.ctx.replication().primary_repl_offset();
         let selected_db = self.ctx.repl_seldb().max(0) as u32;
         // Match C replicationSetPrimary(): a primary synthesizes a cached
         // primary from its own current history before following the promoted

@@ -120,7 +120,7 @@ pub(super) fn gen_replication_section(
     let master_repl_offset = if replication.is_replica() {
         replication.slave_repl_offset.get()
     } else {
-        replication.backlog.reported_offset().get()
+        replication.primary_repl_offset().get()
     };
     emit_line(&mut s, "master_repl_offset", master_repl_offset);
     emit_line(
