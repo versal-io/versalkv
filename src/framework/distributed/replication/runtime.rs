@@ -1437,8 +1437,9 @@ mod tests {
         let view = runtime.rebuild_view();
 
         assert_eq!(view.live_replica_count, 0);
-        assert_eq!(view.replica_info[&main.0].state, "bg_transfer");
-        assert_eq!(view.replica_info[&main.0].lag_ms, 0);
+        assert!(!view.replica_info.contains_key(&main.0));
+        assert_eq!(view.channel_info[&main.0].channel_type, "main-channel");
+        assert_eq!(view.channel_info[&main.0].state, "bg_transfer");
     }
 
     #[test]
@@ -1477,11 +1478,13 @@ mod tests {
 
         let view = runtime.rebuild_view();
 
-        assert!(view.replica_info.contains_key(&main_one.0));
-        assert!(view.replica_info.contains_key(&main_two.0));
-        assert!(!view.channel_info.contains_key(&main_one.0));
-        assert!(!view.channel_info.contains_key(&main_two.0));
-        assert_eq!(view.channel_info.len(), 1);
+        assert!(!view.replica_info.contains_key(&main_one.0));
+        assert!(!view.replica_info.contains_key(&main_two.0));
+        assert_eq!(view.channel_info[&main_one.0].channel_type, "main-channel");
+        assert_eq!(view.channel_info[&main_one.0].state, "bg_transfer");
+        assert_eq!(view.channel_info[&main_two.0].channel_type, "main-channel");
+        assert_eq!(view.channel_info[&main_two.0].state, "bg_transfer");
+        assert_eq!(view.channel_info.len(), 3);
         assert_eq!(view.channel_info[&candidate.0].channel_type, "rdb-channel");
         assert_eq!(runtime.channel_pair_for(main_one), None);
         assert_eq!(runtime.channel_pair_for(main_two), None);

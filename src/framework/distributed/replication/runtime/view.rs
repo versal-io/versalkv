@@ -171,6 +171,16 @@ impl ReplicationRuntime {
                         port: rdb_port,
                     },
                 );
+            } else if is_dual_main_channel(link) {
+                view.channel_info.insert(
+                    connection_id,
+                    crate::engine::distributed::replication::ReplicationChannelInfo {
+                        channel_type: "main-channel",
+                        state: main_channel_state_name(link).to_string(),
+                        ip: link.replica().ip.clone(),
+                        port: link.replica().port,
+                    },
+                );
             } else {
                 view.replica_info.insert(
                     connection_id,
@@ -385,6 +395,16 @@ pub(super) fn main_channel_state_name(link: &PrimaryLink) -> &'static str {
         return "bg_transfer";
     }
     primary_link_state_name(link.state())
+}
+
+fn is_dual_main_channel(link: &PrimaryLink) -> bool {
+    matches!(
+        link.dual_state(),
+        PrimaryDualChannelState::WaitingForRdbChannel
+            | PrimaryDualChannelState::SendingRdb
+            | PrimaryDualChannelState::WaitingForMainPsync
+            | PrimaryDualChannelState::WaitingForReplicaAck
+    )
 }
 
 #[cfg(test)]
