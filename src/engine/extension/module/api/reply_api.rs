@@ -343,7 +343,7 @@ pub unsafe extern "C" fn ValkeyModule_ReplyWithStringBuffer(
         let data = if buf.is_null() || len == 0 {
             Bytes::new()
         } else {
-            let slice = std::slice::from_raw_parts(buf as *const u8, len);
+            let slice = std::slice::from_raw_parts(buf.cast::<u8>(), len);
             Bytes::copy_from_slice(slice)
         };
         match get_reply_builder(ctx) {
