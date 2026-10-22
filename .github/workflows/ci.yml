@@ -1,6 +1,10 @@
 name: CI
 
 on:
+  push:
+    paths-ignore:
+      - "docs/**"
+      - "docs/**/*.md"
   pull_request:
     paths-ignore:
       - "docs/**"
