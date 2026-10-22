@@ -146,10 +146,11 @@ fn config_runtime_settings_round_trip_and_startup_only_backlog_is_rejected() {
     assert!(client
         .command_str(&[b"CONFIG", b"SET", b"tls-port", b"6380"])
         .contains("Unable to update TLS configuration"));
-    assert_eq!(
-        client.command(&[b"CONFIG", b"SET", b"tls-cluster", b"yes"]),
-        b"+OK\r\n"
-    );
+    let tls_cluster_reply = client.command_str(&[b"CONFIG", b"SET", b"tls-cluster", b"yes"]);
+    #[cfg(feature = "tls")]
+    assert_eq!(tls_cluster_reply, "+OK\r\n");
+    #[cfg(not(feature = "tls"))]
+    assert!(tls_cluster_reply.contains("TLS support is not compiled in"));
 }
 
 #[test]
