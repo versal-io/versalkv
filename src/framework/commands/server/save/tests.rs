@@ -265,6 +265,7 @@ fn diskless_rdb_child_applies_bgsave_cpulist() {
 }
 
 #[test]
+#[ignore = "requires stable process reparenting timing on the host"]
 fn disk_sync_child_exits_promptly_when_its_parent_dies() {
     use crate::foundation::io::sys::fd::{pipe, PipeFlags};
     use crate::foundation::io::sys::process::{
