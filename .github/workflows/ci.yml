@@ -18,6 +18,10 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  CARGO_BUILD_JOBS: "2"
+  CARGO_INCREMENTAL: "1"
+
 jobs:
   rust-check:
     name: Rust Check (fmt, clippy, build, unit, integration, property, static checks)
@@ -33,6 +37,14 @@ jobs:
         with:
           toolchain: "1.99.1"
           components: rustfmt, clippy
+
+      - name: Log runner resources
+        run: |
+          uname -a
+          nproc
+          free -h
+          df -h
+          ulimit -a
 
       - name: Install Node.js (for wasm-check)
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends nodejs

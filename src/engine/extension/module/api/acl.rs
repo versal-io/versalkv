@@ -416,7 +416,7 @@ pub unsafe extern "C" fn ValkeyModule_ACLCheckKeyPrefixPermissions(
         if key.is_null() {
             return VALKEYMODULE_ERR;
         }
-        let key = std::slice::from_raw_parts(key as *const u8, len);
+        let key = std::slice::from_raw_parts(key.cast::<u8>(), len);
         let required = key_permission_bits(flags);
         c_int::from(
             !user.root_selector.has_unrestricted_key_access(required)
@@ -503,7 +503,7 @@ pub unsafe extern "C" fn ValkeyModule_AuthenticateClientWithACLUser(
         if name.is_null() {
             return VALKEYMODULE_ERR;
         }
-        let name = String::from_utf8_lossy(std::slice::from_raw_parts(name as *const u8, len));
+        let name = String::from_utf8_lossy(std::slice::from_raw_parts(name.cast::<u8>(), len));
         if acl_users().lock().unwrap().contains_key(name.as_ref()) {
             let name = name.into_owned();
             set_context_name(ctx, &name);

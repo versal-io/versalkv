@@ -16,7 +16,7 @@ pub unsafe extern "C" fn ValkeyModule_CreateString(
         if ptr.is_null() || len == 0 {
             return Box::into_raw(ValkeyModuleString::from_bytes(b"" as &[u8]));
         }
-        let slice = std::slice::from_raw_parts(ptr as *const u8, len);
+        let slice = std::slice::from_raw_parts(ptr.cast::<u8>(), len);
         Box::into_raw(ValkeyModuleString::from_bytes(slice))
     }
 }

@@ -22,7 +22,7 @@ pub unsafe extern "C" fn VM_CreateStringFromBuffer(
         if data.is_null() || len == 0 {
             return Box::into_raw(ValkeyModuleString::from_bytes(b"" as &[u8]));
         }
-        let slice = std::slice::from_raw_parts(data as *const u8, len);
+        let slice = std::slice::from_raw_parts(data.cast::<u8>(), len);
         Box::into_raw(ValkeyModuleString::from_bytes(slice))
     }
 }
