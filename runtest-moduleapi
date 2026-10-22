@@ -54,7 +54,9 @@ if [ "${1:-}" = "--release" ]; then
 fi
 
 echo "==>  VersalKV $CARGO_TARGET_SUBDIR..."
-cargo build $CARGO_PROFILE_FLAG --bins
+if [ "${VERSAL_TCL_SKIP_BUILD:-0}" != "1" ]; then
+    cargo build $CARGO_PROFILE_FLAG --bins
+fi
 
 scratch_dir=$(mktemp -d)
 binary_state="$scratch_dir/binaries"

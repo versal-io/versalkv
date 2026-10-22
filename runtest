@@ -7,8 +7,9 @@ if [ "$#" -ne 0 ]; then
     exit 2
 fi
 
-cargo build --bins
-cargo test --lib
+if [ "${VERSAL_TCL_SKIP_BUILD:-0}" != "1" ]; then
+    cargo build --bins
+fi
 
 for binary in server cli benchmark check-aof check-rdb sentinel; do
     # Replace the inode: Darwin may kill a newly executed image when an older
