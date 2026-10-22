@@ -601,7 +601,7 @@ impl ServerWorkerState {
         if self.ctx.is_loading() || self.ctx.replication().async_loading {
             return true;
         }
-        self.replication_runtime.replica_link().map_or(true, |link| {
+        self.replication_runtime.replica_link().is_none_or(|link| {
                 link.is_receiving_rdb()
                     || link.has_pending_rdb_receive()
                     || matches!(
