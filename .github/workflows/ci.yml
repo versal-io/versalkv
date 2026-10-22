@@ -16,6 +16,7 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
+  actions: read
   contents: read
 
 env:
@@ -103,21 +104,20 @@ jobs:
       - name: Build Tcl test binaries
         run: |
           cargo build --bins
-          mkdir -p ci-artifacts/versal-binaries
-          cp -p \
-            target/debug/versal-server \
-            target/debug/versal-cli \
-            target/debug/versal-benchmark \
-            target/debug/versal-check-aof \
-            target/debug/versal-check-rdb \
-            target/debug/versal-sentinel \
-            ci-artifacts/versal-binaries/
+          mkdir -p ci-artifacts
+          tar -C target/debug -czf ci-artifacts/versal-debug-binaries.tar.gz \
+            versal-server \
+            versal-cli \
+            versal-benchmark \
+            versal-check-aof \
+            versal-check-rdb \
+            versal-sentinel
 
       - name: Upload Tcl test binaries
         uses: actions/upload-artifact@v4
         with:
           name: versal-debug-binaries
-          path: ci-artifacts/versal-binaries/
+          path: ci-artifacts/versal-debug-binaries.tar.gz
           if-no-files-found: error
           retention-days: 1
 
@@ -135,21 +135,33 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential ca-certificates coreutils hostname openssl \
+            build-essential ca-certificates coreutils gh hostname openssl \
             procps psmisc tcl8.6 tcl-tls tclx
           sudo ln -sf /usr/bin/tclsh8.6 /usr/bin/tclsh
 
       - name: Download Tcl test binaries
-        uses: actions/download-artifact@v4
-        with:
-          name: versal-debug-binaries
-          path: target/debug
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          rm -rf ci-artifacts target/debug
+          mkdir -p ci-artifacts target/debug
+          for attempt in 1 2 3; do
+            rm -f ci-artifacts/versal-debug-binaries.tar.gz
+            if gh run download "$GITHUB_RUN_ID" \
+              --name versal-debug-binaries \
+              --dir ci-artifacts; then
+              tar -xzf ci-artifacts/versal-debug-binaries.tar.gz -C target/debug
+              chmod +x target/debug/versal-*
+              exit 0
+            fi
+            sleep $((attempt * 20))
+          done
+          exit 1
 
       - name: Run Tcl regression suite
         env:
           VERSAL_TCL_SKIP_BUILD: "1"
         run: |
-          chmod +x target/debug/versal-*
           rm -rf thirdparty/valkey/tests/tmp/* || true
           ./runtest
 
@@ -168,21 +180,33 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential ca-certificates coreutils hostname openssl \
+            build-essential ca-certificates coreutils gh hostname openssl \
             procps psmisc tcl8.6 tcl-tls tclx
           sudo ln -sf /usr/bin/tclsh8.6 /usr/bin/tclsh
 
       - name: Download Tcl test binaries
-        uses: actions/download-artifact@v4
-        with:
-          name: versal-debug-binaries
-          path: target/debug
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          rm -rf ci-artifacts target/debug
+          mkdir -p ci-artifacts target/debug
+          for attempt in 1 2 3; do
+            rm -f ci-artifacts/versal-debug-binaries.tar.gz
+            if gh run download "$GITHUB_RUN_ID" \
+              --name versal-debug-binaries \
+              --dir ci-artifacts; then
+              tar -xzf ci-artifacts/versal-debug-binaries.tar.gz -C target/debug
+              chmod +x target/debug/versal-*
+              exit 0
+            fi
+            sleep $((attempt * 20))
+          done
+          exit 1
 
       - name: Run Sentinel regression suite
         env:
           VERSAL_TCL_SKIP_BUILD: "1"
         run: |
-          chmod +x target/debug/versal-*
           make check-sentinel-tcl-support
           ./runtest-sentinel
 
@@ -200,21 +224,33 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential ca-certificates coreutils hostname openssl \
+            build-essential ca-certificates coreutils gh hostname openssl \
             procps psmisc tcl8.6 tcl-tls tclx
           sudo ln -sf /usr/bin/tclsh8.6 /usr/bin/tclsh
 
       - name: Download Tcl test binaries
-        uses: actions/download-artifact@v4
-        with:
-          name: versal-debug-binaries
-          path: target/debug
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          rm -rf ci-artifacts target/debug
+          mkdir -p ci-artifacts target/debug
+          for attempt in 1 2 3; do
+            rm -f ci-artifacts/versal-debug-binaries.tar.gz
+            if gh run download "$GITHUB_RUN_ID" \
+              --name versal-debug-binaries \
+              --dir ci-artifacts; then
+              tar -xzf ci-artifacts/versal-debug-binaries.tar.gz -C target/debug
+              chmod +x target/debug/versal-*
+              exit 0
+            fi
+            sleep $((attempt * 20))
+          done
+          exit 1
 
       - name: Run Module API regression suite
         env:
           VERSAL_TCL_SKIP_BUILD: "1"
         run: |
-          chmod +x target/debug/versal-*
           ./runtest-moduleapi
 
   daily-performance:

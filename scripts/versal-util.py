@@ -2708,6 +2708,14 @@ def command_check_ci_support(_args: argparse.Namespace, ctx: RepoContext) -> int
         failures.append("Tcl runner jobs are missing from CI")
     if "run: cargo test --lib" not in pipeline:
         failures.append("Rust Check must run cargo test --lib")
+    if "actions: read" not in pipeline:
+        failures.append("CI artifact download retries require actions: read permission")
+    if "actions/download-artifact" in pipeline:
+        failures.append("CI Tcl artifact downloads must use retryable gh run download")
+    if "gh run download \"$GITHUB_RUN_ID\"" not in pipeline:
+        failures.append("CI Tcl artifact download retry loop is missing")
+    if "versal-debug-binaries.tar.gz" not in pipeline:
+        failures.append("CI Tcl binaries must be packaged as a single tar archive")
     if "git submodule update --init --recursive" not in docs_pipeline and "submodules: recursive" not in docs_pipeline:
         failures.append("documentation CI must initialize submodules")
     if "$(MAKE) property" not in makefile or "test --test integration" not in makefile:
