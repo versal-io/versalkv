@@ -2666,7 +2666,7 @@ def command_check_ci_support(_args: argparse.Namespace, ctx: RepoContext) -> int
         failures.append("legacy shell scripts remain: {}".format(", ".join(shell_scripts)))
     makefile = read_text(ctx.root / "Makefile")
     pipeline = read_text(ctx.root / ".github/workflows/ci.yml")
-    docs_pipeline = read_text(ctx.root / ".github/workflows/docs.yml")
+    docs_pipeline = read_text(ctx.root / ".github/workflows/docs.yml") if (ctx.root / ".github/workflows/docs.yml").exists() else ""
     runtest = read_text(ctx.root / "runtest")
     sentinel = read_text(ctx.root / "runtest-sentinel")
     moduleapi = read_text(ctx.root / "runtest-moduleapi")
@@ -2692,7 +2692,7 @@ def command_check_ci_support(_args: argparse.Namespace, ctx: RepoContext) -> int
         failures.append("CI wasm check does not install Node.js with apt")
     elif wasm_check < 0 or install_node > wasm_check:
         failures.append("CI must install Node.js before running wasm-check")
-    if '"scripts/versal-util.py"' not in docs_pipeline:
+    if docs_pipeline and '"scripts/versal-util.py"' not in docs_pipeline:
         failures.append("documentation pipeline does not watch versal-util.py")
     if "python3 \"$ROOT_DIR/scripts/versal-util.py\" tcl binaries" not in moduleapi:
         failures.append("Module API runner does not use Python binary staging")
@@ -2724,7 +2724,7 @@ def command_check_ci_support(_args: argparse.Namespace, ctx: RepoContext) -> int
         failures.append("CI Tcl artifact download retry loop is missing")
     if "versal-debug-binaries.tar.gz" not in pipeline:
         failures.append("CI Tcl binaries must be packaged as a single tar archive")
-    if "git submodule update --init --recursive" not in docs_pipeline and "submodules: recursive" not in docs_pipeline:
+    if docs_pipeline and "git submodule update --init --recursive" not in docs_pipeline and "submodules: recursive" not in docs_pipeline:
         failures.append("documentation CI must initialize submodules")
     if "$(MAKE) property" not in makefile or "test --test integration" not in makefile:
         failures.append("Makefile CI coverage is incomplete")

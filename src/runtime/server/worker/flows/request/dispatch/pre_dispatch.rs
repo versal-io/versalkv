@@ -185,6 +185,9 @@ impl ServerWorkerState {
         if internal_loading && !async_loading && (meta.flags & CMD_LOADING) == 0 {
             return reject();
         }
+        if self.ctx.is_host_task_loading() && matches!(meta.name, "replicaof" | "slaveof") {
+            return reject();
+        }
         if async_loading && (meta.flags & CMD_NO_ASYNC_LOADING) != 0 {
             return reject();
         }

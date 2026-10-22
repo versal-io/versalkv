@@ -1928,6 +1928,25 @@ fn loading_cluster_node_redirects_remote_slot_before_loading_gate() {
 }
 
 #[test]
+fn host_task_loading_rejects_replicaof_until_startup_load_finishes() {
+    let mut backend = ServerWorkerState::new(1).unwrap();
+    crate::framework::commands::register_all(&mut backend.registry);
+    backend.ctx.set_host_task_loading(true);
+    let connection = add_fake_connection(&mut backend);
+    let args = make_args(&[b"REPLICAOF", b"127.0.0.1", b"6379"]);
+    let spec = backend.registry.lookup(b"replicaof").unwrap();
+
+    let outcome = backend.pre_dispatch_exec(connection, meta_from_spec(spec), &args);
+
+    assert_eq!(
+        outcome.reject_reply,
+        Some(Value::error(
+            "LOADING Valkey is loading the dataset in memory"
+        ))
+    );
+}
+
+#[test]
 fn cluster_redirect_uses_one_shot_asking_on_importing_replica() {
     use crate::engine::distributed::cluster::node::{
         key_hash_slot, ClusterNode, CLUSTER_NODE_MYSELF, CLUSTER_NODE_PRIMARY, CLUSTER_NODE_REPLICA,
