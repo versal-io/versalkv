@@ -63,6 +63,8 @@ jobs:
       - name: Unit tests
         env:
           CARGO_BUILD_JOBS: "1"
+          CARGO_INCREMENTAL: "0"
+          RUSTFLAGS: "-C opt-level=0 -C debuginfo=0"
         run: cargo test --lib -- --test-threads=2
 
       - name: Integration tests
