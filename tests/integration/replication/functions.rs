@@ -40,11 +40,12 @@ fn function_load_propagates_to_replica_stream() {
     let code = b"#!lua name=test\nserver.register_function('test', function() return 'hello2' end)";
     assert_eq!(mc.command(&[b"FUNCTION", b"LOAD", code]), b"$4\r\ntest\r\n");
 
-    // The stream may contain the primary's DB selection and GETACK control
-    // frames before the verbatim FUNCTION frame.
+    // The stream may contain bootstrap and control frames before the verbatim
+    // FUNCTION frame.
     let got = loop {
         let frame = sub.read_repl_command();
-        if frame[0].eq_ignore_ascii_case(b"SELECT")
+        if frame[0].eq_ignore_ascii_case(b"PING")
+            || frame[0].eq_ignore_ascii_case(b"SELECT")
             || (frame[0].eq_ignore_ascii_case(b"REPLCONF")
                 && frame.len() >= 2
                 && frame[1].eq_ignore_ascii_case(b"GETACK"))
