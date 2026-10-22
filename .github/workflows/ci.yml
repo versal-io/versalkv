@@ -60,11 +60,10 @@ jobs:
       - name: Clippy
         run: make clippy
 
-      - name: Build
-        run: cargo build --bins
-
       - name: Unit tests
-        run: cargo test --lib
+        env:
+          CARGO_BUILD_JOBS: "1"
+        run: cargo test --lib -- --test-threads=2
 
       - name: Integration tests
         run: cargo test --test integration
@@ -149,7 +148,6 @@ jobs:
           VERSAL_TCL_SKIP_BUILD: "1"
         run: |
           chmod +x target/debug/versal-*
-          pkill -f target/debug/versal-server || true
           rm -rf thirdparty/valkey/tests/tmp/* || true
           ./runtest
 
