@@ -84,8 +84,8 @@ jobs:
       - name: CI support wiring
         run: make check-ci-support
 
-  runtest:
-    name: Tcl Regression (runtest)
+  tcl-build:
+    name: Tcl Binary Build
     runs-on: self-hosted
     steps:
       - name: Checkout repository and submodules
@@ -99,6 +99,37 @@ jobs:
           toolchain: "1.99.1"
           components: rustfmt
 
+      - name: Build Tcl test binaries
+        run: |
+          cargo build --bins
+          mkdir -p ci-artifacts/versal-binaries
+          cp -p \
+            target/debug/versal-server \
+            target/debug/versal-cli \
+            target/debug/versal-benchmark \
+            target/debug/versal-check-aof \
+            target/debug/versal-check-rdb \
+            target/debug/versal-sentinel \
+            ci-artifacts/versal-binaries/
+
+      - name: Upload Tcl test binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: versal-debug-binaries
+          path: ci-artifacts/versal-binaries/
+          if-no-files-found: error
+          retention-days: 1
+
+  runtest:
+    name: Tcl Regression (runtest)
+    runs-on: self-hosted
+    needs: tcl-build
+    steps:
+      - name: Checkout repository and submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
       - name: Install test dependencies
         run: |
           sudo apt-get update
@@ -107,8 +138,17 @@ jobs:
             procps psmisc tcl8.6 tcl-tls tclx
           sudo ln -sf /usr/bin/tclsh8.6 /usr/bin/tclsh
 
+      - name: Download Tcl test binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: versal-debug-binaries
+          path: target/debug
+
       - name: Run Tcl regression suite
+        env:
+          VERSAL_TCL_SKIP_BUILD: "1"
         run: |
+          chmod +x target/debug/versal-*
           pkill -f target/debug/versal-server || true
           rm -rf thirdparty/valkey/tests/tmp/* || true
           ./runtest
@@ -116,6 +156,7 @@ jobs:
   runtest-sentinel:
     name: Sentinel Tcl Regression
     runs-on: self-hosted
+    needs: tcl-build
     continue-on-error: true
     steps:
       - name: Checkout repository and submodules
@@ -123,12 +164,6 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: "1.99.1"
-          components: rustfmt
-
       - name: Install test dependencies
         run: |
           sudo apt-get update
@@ -137,25 +172,29 @@ jobs:
             procps psmisc tcl8.6 tcl-tls tclx
           sudo ln -sf /usr/bin/tclsh8.6 /usr/bin/tclsh
 
+      - name: Download Tcl test binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: versal-debug-binaries
+          path: target/debug
+
       - name: Run Sentinel regression suite
+        env:
+          VERSAL_TCL_SKIP_BUILD: "1"
         run: |
+          chmod +x target/debug/versal-*
           make check-sentinel-tcl-support
           ./runtest-sentinel
 
   runtest-moduleapi:
     name: Module API Tcl Tests
     runs-on: self-hosted
+    needs: tcl-build
     steps:
       - name: Checkout repository and submodules
         uses: actions/checkout@v4
         with:
           submodules: recursive
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: "1.99.1"
-          components: rustfmt
 
       - name: Install test dependencies
         run: |
@@ -165,8 +204,18 @@ jobs:
             procps psmisc tcl8.6 tcl-tls tclx
           sudo ln -sf /usr/bin/tclsh8.6 /usr/bin/tclsh
 
+      - name: Download Tcl test binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: versal-debug-binaries
+          path: target/debug
+
       - name: Run Module API regression suite
-        run: ./runtest-moduleapi
+        env:
+          VERSAL_TCL_SKIP_BUILD: "1"
+        run: |
+          chmod +x target/debug/versal-*
+          ./runtest-moduleapi
 
   daily-performance:
     name: Daily Performance Baseline

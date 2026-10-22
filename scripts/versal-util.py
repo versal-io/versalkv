@@ -2187,7 +2187,7 @@ def selftest_runtest(ctx: RepoContext) -> None:
         result = run_command([str(root / "runtest")], cwd=root, env=env, capture=True)
         _assert(result.returncode == EXIT_OK, result.stderr)
         cargo_calls = [json.loads(line) for line in read_text(cargo_log).splitlines()]
-        _assert(cargo_calls == [["build", "--bins"], ["test", "--lib"]], "unexpected Cargo calls")
+        _assert(cargo_calls == [["build", "--bins"]], "unexpected Cargo calls")
         call = json.loads(read_text(tcl_log))
         _assert(os.path.realpath(call["cwd"]) == os.path.realpath(str(root / "thirdparty/valkey")), "wrong Tcl cwd")
         _assert(call["valkey_bin_dir"] is None, "VALKEY_BIN_DIR must be unset")
@@ -2706,6 +2706,8 @@ def command_check_ci_support(_args: argparse.Namespace, ctx: RepoContext) -> int
         failures.append("Sentinel runner wiring is incomplete")
     if "./runtest-moduleapi" not in pipeline or not re.search(r"^\s*\./runtest\s*$", pipeline, re.MULTILINE):
         failures.append("Tcl runner jobs are missing from CI")
+    if "run: cargo test --lib" not in pipeline:
+        failures.append("Rust Check must run cargo test --lib")
     if "git submodule update --init --recursive" not in docs_pipeline and "submodules: recursive" not in docs_pipeline:
         failures.append("documentation CI must initialize submodules")
     if "$(MAKE) property" not in makefile or "test --test integration" not in makefile:
