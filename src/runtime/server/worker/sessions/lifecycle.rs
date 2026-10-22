@@ -601,9 +601,7 @@ impl ServerWorkerState {
         if self.ctx.is_loading() || self.ctx.replication().async_loading {
             return true;
         }
-        self.replication_runtime
-            .replica_link()
-            .is_some_and(|link| {
+        self.replication_runtime.replica_link().map_or(true, |link| {
                 link.is_receiving_rdb()
                     || link.has_pending_rdb_receive()
                     || matches!(
@@ -2024,6 +2022,13 @@ mod tests {
         backend.ctx.set_loading(false);
 
         assert!(!backend.current_master_link_short_read(true));
+
+        let held_link = backend
+            .replication_runtime
+            .take_replica_link()
+            .expect("replica link exists");
+        assert!(backend.current_master_link_short_read(true));
+        backend.replication_runtime.set_replica_link(held_link);
 
         backend.ctx.set_loading(true);
 

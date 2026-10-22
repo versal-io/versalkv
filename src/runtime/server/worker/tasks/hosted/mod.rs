@@ -479,6 +479,10 @@ impl ServerWorkerState {
     fn process_host_yield(&mut self, scope: HostTaskScope) {
         if let Some(operation) = scope.blocked_operation {
             self.process_events_while_blocked(operation);
+        } else if self.ctx.is_host_task_loading() {
+            self.process_events_while_loading_host_task(
+                scope.protected_client.unwrap_or(Token(usize::MAX)),
+            );
         } else {
             self.process_events_while_command_blocked(
                 scope.protected_client.unwrap_or(Token(usize::MAX)),

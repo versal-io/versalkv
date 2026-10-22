@@ -12,6 +12,7 @@ use super::super::{
 use crate::framework::capabilities::io::Token;
 
 const BLOCKED_EMPTY_POLL_THRESHOLD: u32 = 64;
+const HOST_LOADING_EXTRA_EVENT_PASSES: usize = 8;
 
 pub(super) fn blocked_event_poll_timeout(
     requested: Option<Duration>,
@@ -48,6 +49,19 @@ impl ServerWorkerState {
             protected_token,
             Some(Duration::ZERO),
         );
+    }
+
+    pub(crate) fn process_events_while_loading_host_task(&mut self, protected_token: Token) {
+        self.process_events_while_command_blocked(protected_token);
+        for _ in 0..HOST_LOADING_EXTRA_EVENT_PASSES {
+            if !self.ctx.is_loading()
+                || self.ctx.is_shutdown_requested()
+                || self.connected_clients() == 0
+            {
+                break;
+            }
+            self.process_events_while_command_blocked(protected_token);
+        }
     }
 
     pub(crate) fn process_events_while_command_blocked_with_timeout(
@@ -498,6 +512,43 @@ mod tests {
             .read_exact(&mut reply)
             .expect("blocked event service must flush the accepted client reply");
         assert_eq!(&reply, b"+PONG\r\n");
+    }
+
+    #[test]
+    fn loading_host_task_drains_clients_that_close_after_loading_allowed_command() {
+        let mut backend = ServerWorkerState::new(1).expect("create runtime");
+        crate::framework::commands::register_all(&mut backend.registry);
+        backend.ctx.config_mut().server.enable_debug_command =
+            crate::engine::extension::config::server::ProtectedAction::Yes;
+        backend.ctx.set_host_task_loading(true);
+        let mut clients = Vec::new();
+        for _ in 0..5 {
+            let (mut client, token) = connected_client(&mut backend);
+            client
+                .write_all(b"*3\r\n$5\r\nDEBUG\r\n$3\r\nLOG\r\n$3\r\nbla\r\n")
+                .expect("write debug log while loading");
+            backend.transport.wait_readable_for_test(token);
+            backend.transport.queue_test_pending_data_event(token);
+            clients.push((client, token));
+        }
+
+        backend.process_events_while_loading_host_task(Token(usize::MAX));
+        for (mut client, token) in clients {
+            let mut reply = [0_u8; 5];
+            client
+                .read_exact(&mut reply)
+                .expect("read loading-time debug reply");
+            assert_eq!(&reply, b"+OK\r\n");
+            drop(client);
+            backend.transport.wait_readable_for_test(token);
+            backend
+                .transport
+                .queue_test_transport_event_batch(&[(token, true, false, true, false)]);
+        }
+
+        backend.process_events_while_loading_host_task(Token(usize::MAX));
+
+        assert_eq!(backend.connected_clients(), 0);
     }
 
     #[test]

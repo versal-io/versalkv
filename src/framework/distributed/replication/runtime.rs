@@ -1291,8 +1291,18 @@ mod tests {
         let mut runtime = ReplicationRuntime::new();
         let main = ConnectionId(50);
         let rdb = ConnectionId(51);
-        runtime.register_primary(main, replica_info(6380));
+        let replica_id = runtime.register_primary(main, replica_info(6380));
         runtime.register_rdb_channel(rdb, main).unwrap();
+        runtime
+            .primary_link_mut(replica_id)
+            .expect("main link must be registered")
+            .transition_to_waiting_for_rdb_channel()
+            .expect("main link waits for RDB channel");
+        runtime
+            .primary_link_mut(replica_id)
+            .expect("main link must be registered")
+            .transition_to_waiting_for_main_psync()
+            .expect("main link waits for PSYNC after RDB channel");
         runtime.set_channel_endpoint(rdb, "192.0.2.51".to_string(), 6381);
         runtime.set_channel_state(rdb, "sending_rdb".to_string());
 
