@@ -161,6 +161,10 @@ impl DirectDualCompletionState {
             && self.metrics_drained
     }
 
+    fn completed_socket_close_satisfied_child_exit(&self) -> bool {
+        !self.cohort_failed && self.child_succeeded && self.marker_phase_seen
+    }
+
     fn mark_published(&mut self) {
         self.published = true;
     }
@@ -602,7 +606,10 @@ impl ServerWorkerState {
         self.finalize_child_registry_entry(handle);
         let phase_source = child.phase_source.take();
         self.retire_direct_dual_phase_source(phase_source);
-        if succeeded {
+        let completed_socket_close = child
+            .completion_state
+            .completed_socket_close_satisfied_child_exit();
+        if succeeded || completed_socket_close {
             use std::io::Read;
             let mut metric = [0u8; 8];
             let bytes = child
@@ -844,6 +851,15 @@ impl ServerWorkerState {
             self.abort_orphaned_direct_dual_rdb_child();
             return DirectDualRdbDropOutcome::Failed;
         }
+        let observed_completed_body = self
+            .full_sync
+            .direct_dual_rdb_child
+            .as_ref()
+            .is_some_and(|child| {
+                child.phases.contains(
+                    &crate::framework::commands::server::save::DirectDualRdbChildPhase::SerializeDone,
+                )
+            });
         let marker_sent = self
             .full_sync
             .direct_dual_rdb_child
@@ -874,7 +890,7 @@ impl ServerWorkerState {
             }
             return DirectDualRdbDropOutcome::CompletedUnpaired;
         }
-        let marker_allows_close = replica_id.is_some_and(|id| {
+        let completed_body_allows_close = replica_id.is_some_and(|id| {
             let waiting_for_terminal_ack =
                 self.replication_runtime
                     .primary_link(id)
@@ -885,9 +901,9 @@ impl ServerWorkerState {
                                 | crate::framework::distributed::replication::PrimaryDualChannelState::WaitingForReplicaAck
                         )
                     });
-            marker_sent && waiting_for_terminal_ack
+            waiting_for_terminal_ack && (marker_sent || observed_completed_body)
         });
-        if !marker_allows_close {
+        if !completed_body_allows_close {
             if let Some(id) = replica_id {
                 let is_last_target = self
                     .full_sync
@@ -911,6 +927,16 @@ impl ServerWorkerState {
             }
             self.abort_failed_direct_dual_rdb_child();
             return DirectDualRdbDropOutcome::Failed;
+        }
+        if observed_completed_body && !marker_sent {
+            if let Some(child) = self.full_sync.direct_dual_rdb_child.as_mut() {
+                child
+                    .completion_state
+                    .apply_fact(DirectDualFact::ChildSucceeded);
+                child
+                    .completion_state
+                    .apply_fact(DirectDualFact::MarkerPhase);
+            }
         }
         if let Some(child) = self.full_sync.direct_dual_rdb_child.as_mut() {
             child

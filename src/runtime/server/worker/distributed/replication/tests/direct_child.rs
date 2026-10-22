@@ -1,13 +1,9 @@
-#[cfg(target_os = "linux")]
 use super::*;
-#[cfg(target_os = "linux")]
 use crate::framework::distributed::replication::ReplicaId;
-#[cfg(target_os = "linux")]
 use crate::runtime::server::worker::distributed::replication::diskless_child::DirectDualRdbChild;
 use crate::runtime::server::worker::distributed::replication::diskless_child::{
-    DirectDualCompletionState, DirectDualFact,
+    DirectDualCompletionState, DirectDualFact, DirectDualRdbDropOutcome,
 };
-#[cfg(target_os = "linux")]
 use std::fs::File;
 #[cfg(target_os = "linux")]
 use std::process::{Child, Command};
@@ -15,6 +11,36 @@ use std::process::{Child, Command};
 use std::thread::sleep;
 #[cfg(target_os = "linux")]
 use std::time::Duration;
+
+fn install_fake_child(
+    backend: &mut ServerWorkerState,
+    pid: i32,
+    rdb_connections: Vec<ConnectionId>,
+    targets: Vec<ReplicaId>,
+) {
+    backend
+        .ctx
+        .persistence_mut()
+        .begin_diskless_child(pid)
+        .unwrap();
+    let handle = backend.install_test_child(
+        crate::runtime::server::worker::reactor::sources::ChildOwner::DirectDualRdb,
+        pid,
+    );
+    backend.full_sync.direct_dual_rdb_child = Some(DirectDualRdbChild {
+        pid,
+        child: handle,
+        rdb_connections,
+        targets,
+        shared_replication_buffer_bytes: 0,
+        reaped_successfully: false,
+        metric_read_end: File::open("/dev/null").unwrap(),
+        phase_read_end: File::open("/dev/null").unwrap(),
+        phase_source: None,
+        phases: Vec::new(),
+        completion_state: crate::runtime::server::worker::distributed::replication::diskless_child::DirectDualCompletionState::default(),
+    });
+}
 
 #[cfg(target_os = "linux")]
 fn install_child(
@@ -52,7 +78,6 @@ fn install_child(
     child
 }
 
-#[cfg(target_os = "linux")]
 fn register_primary(backend: &mut ServerWorkerState, main: ConnectionId) -> ReplicaId {
     backend.replication_runtime.register_primary(
         main,
@@ -250,4 +275,48 @@ fn target_drop_before_publication_aborts_direct_child_cohort() {
         )));
     assert_eq!(backend.replication_runtime.role(remaining_candidate), None);
     let _ = child.wait();
+}
+
+#[test]
+fn completed_rdb_socket_close_after_serialize_done_keeps_direct_child() {
+    use crate::framework::commands::server::save::DirectDualRdbChildPhase;
+    use crate::framework::distributed::replication::PrimaryDualChannelState;
+
+    let mut backend = ServerWorkerState::new(1).unwrap();
+    let main = ConnectionId(56);
+    let rdb = ConnectionId(57);
+    for connection in [main, rdb] {
+        add_connection(&mut backend, connection.0);
+    }
+    let replica_id = register_primary(&mut backend, main);
+    let link = backend
+        .replication_runtime
+        .primary_link_mut(replica_id)
+        .expect("primary link exists");
+    link.transition_to_waiting_for_rdb_channel().unwrap();
+    backend
+        .replication_runtime
+        .register_rdb_channel(rdb, main)
+        .unwrap();
+    let link = backend
+        .replication_runtime
+        .primary_link_mut(replica_id)
+        .expect("primary link exists");
+    link.transition_to_waiting_for_main_psync().unwrap();
+    link.transition_dual_state(PrimaryDualChannelState::WaitingForReplicaAck)
+        .unwrap();
+    install_fake_child(&mut backend, 123_456, vec![rdb], vec![replica_id]);
+    backend
+        .full_sync
+        .direct_dual_rdb_child
+        .as_mut()
+        .expect("direct child installed")
+        .phases
+        .push(DirectDualRdbChildPhase::SerializeDone);
+
+    let outcome = backend.drop_direct_dual_rdb_child_connection(rdb);
+
+    assert_eq!(outcome, DirectDualRdbDropOutcome::CompletedPaired);
+    assert!(backend.full_sync.direct_dual_rdb_child.is_some());
+    assert!(backend.ctx.persistence().has_active_child());
 }
