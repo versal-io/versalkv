@@ -97,8 +97,7 @@ impl ReplicaEligibility {
     }
 
     pub fn rank_key(&self) -> Option<ReplicaRankKey> {
-        self.is_eligible().then(|| ReplicaRankKey {
-            priority: self.priority,
+        (!self.no_failover).then(|| ReplicaRankKey {
             replication_offset: self.replication_offset,
             node_id: self.node_id.clone(),
         })
@@ -107,16 +106,15 @@ impl ReplicaEligibility {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReplicaRankKey {
-    pub priority: i64,
     pub replication_offset: i64,
     pub node_id: NodeId,
 }
 
 impl Ord for ReplicaRankKey {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.priority
-            .cmp(&other.priority)
-            .then_with(|| other.replication_offset.cmp(&self.replication_offset))
+        other
+            .replication_offset
+            .cmp(&self.replication_offset)
             .then_with(|| self.node_id.as_str().cmp(other.node_id.as_str()))
     }
 }

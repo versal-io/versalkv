@@ -170,7 +170,7 @@ fn cluster_shards(conn: &mut dyn CommandConn, ctx: &mut ServerContext) -> Value 
     let local_replication_offset = if replication.is_replica() {
         replication.slave_repl_offset.get()
     } else {
-        replication.backlog.reported_offset().get()
+        replication.primary_repl_offset().get()
     };
     let replication_views = &replication.view.cluster_replica_views;
     ctx.cluster_state()

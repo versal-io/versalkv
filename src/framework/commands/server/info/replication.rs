@@ -81,18 +81,7 @@ pub(super) fn gen_replication_section(
     );
     let mut slave_index = 0;
     for key in &replication.view.info_order {
-        if let Some(info) = replica_info.get(key) {
-            s.push_str(&format!(
-                "slave{}:ip={},port={},state={},offset={},lag={},type=replica\r\n",
-                slave_index,
-                info.ip,
-                info.port,
-                info.state,
-                info.offset.map_or(-1, |offset| offset.get()),
-                info.lag_ms
-            ));
-            slave_index += 1;
-        } else if let Some(channel) = replication.view.channel_info.get(key) {
+        if let Some(channel) = replication.view.channel_info.get(key) {
             let (offset, lag_ms) = replica_info
                 .get(key)
                 .map(|info| (info.offset.map_or(-1, |offset| offset.get()), info.lag_ms))
@@ -108,6 +97,17 @@ pub(super) fn gen_replication_section(
                 channel.channel_type
             ));
             slave_index += 1;
+        } else if let Some(info) = replica_info.get(key) {
+            s.push_str(&format!(
+                "slave{}:ip={},port={},state={},offset={},lag={},type=replica\r\n",
+                slave_index,
+                info.ip,
+                info.port,
+                info.state,
+                info.offset.map_or(-1, |offset| offset.get()),
+                info.lag_ms
+            ));
+            slave_index += 1;
         }
     }
     emit_line(&mut s, "master_replid", replication.backlog.replid());
@@ -120,7 +120,7 @@ pub(super) fn gen_replication_section(
     let master_repl_offset = if replication.is_replica() {
         replication.slave_repl_offset.get()
     } else {
-        replication.backlog.reported_offset().get()
+        replication.primary_repl_offset().get()
     };
     emit_line(&mut s, "master_repl_offset", master_repl_offset);
     emit_line(

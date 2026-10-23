@@ -4,6 +4,7 @@ use std::time::Instant;
 
 use crate::engine::command::{CommandArgs, SessionId};
 use crate::engine::distributed::cluster::migration::SlotMigrationConnectionRole;
+use crate::engine::distributed::replication::ReplicationOffset;
 use crate::engine::extension::script::PropagationOp;
 use crate::foundation::io::protocol::Value;
 use crate::foundation::io::store::Robj;
@@ -54,6 +55,10 @@ pub trait CommandConn {
     fn command_seq(&self) -> u64 {
         0
     }
+    fn last_write_offset(&self) -> ReplicationOffset {
+        ReplicationOffset::ZERO
+    }
+    fn set_last_write_offset(&mut self, _offset: ReplicationOffset) {}
     fn file_descriptor(&self) -> i64 {
         i64::try_from(self.token().0).unwrap_or(-1)
     }

@@ -93,6 +93,8 @@ pub struct Connection {
     client_id: u64,
     /// Monotonic sequence of the command currently being processed.
     pub command_seq: u64,
+    /// Replication offset produced by this connection's latest propagated write.
+    last_write_offset: crate::engine::distributed::replication::ReplicationOffset,
     pub peer_addr: SocketAddr,
     pub state: ConnectionState,
     pub parser: Parser,
@@ -181,6 +183,7 @@ impl Connection {
             token,
             client_id,
             command_seq: 0,
+            last_write_offset: crate::engine::distributed::replication::ReplicationOffset::ZERO,
             peer_addr,
             state: ConnectionState::Connected,
             parser: Parser::new(),
@@ -870,6 +873,7 @@ impl Connection {
             token: Token(usize::MAX),
             client_id: usize::MAX as u64,
             command_seq: 0,
+            last_write_offset: crate::engine::distributed::replication::ReplicationOffset::ZERO,
             peer_addr: ([127, 0, 0, 1], 0).into(),
             state: ConnectionState::Connected,
             parser: Parser::new(),

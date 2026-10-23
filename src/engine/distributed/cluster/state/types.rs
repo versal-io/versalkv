@@ -640,12 +640,10 @@ impl ClusterState {
             return false;
         };
         let requester_rank = super::failover::ReplicaRankKey {
-            priority: requester_node.replica_priority,
             replication_offset: requester_node.repl_offset,
             node_id: requester.clone(),
         };
         let local_rank = super::failover::ReplicaRankKey {
-            priority: self.myself.replica_priority,
             replication_offset: self.myself.repl_offset,
             node_id: local_id,
         };

@@ -539,11 +539,12 @@ impl ServerWorkerState {
         }
         self.refresh_replication_view();
         if plan.was_master_link {
+            let short_read_master = self.current_master_link_short_read(plan.short_read_master);
             self.ctx
                 .replication_mut()
                 .observe_primary_disconnected(crate::foundation::io::sys::time::mstime());
             self.ctx.config_mut().replication.master_link_status = "down".to_string();
-            if plan.short_read_master {
+            if short_read_master {
                 if !plan.preserve_serving_db_on_short_read {
                     self.ctx.flush_all_dbs();
                 }
@@ -563,7 +564,7 @@ impl ServerWorkerState {
             self.ctx.replication_mut().async_loading = false;
             self.ctx.set_loading(false);
             let now_ms = crate::foundation::io::sys::time::mstime();
-            let inferred_cause = if plan.short_read_master {
+            let inferred_cause = if short_read_master {
                 MasterReconnectCause::RdbTransferFailed
             } else if plan.master_link_was_established {
                 MasterReconnectCause::EstablishedLinkLost
@@ -591,6 +592,23 @@ impl ServerWorkerState {
         self.ctx.client_infos_mut().remove(&plan.token_value);
         self.ctx.pubsub_mut().remove_client(plan.token_value);
         self.ctx.tracking_mut().clear_client(plan.token_value);
+    }
+
+    fn current_master_link_short_read(&self, planned_short_read: bool) -> bool {
+        if !planned_short_read {
+            return false;
+        }
+        if self.ctx.is_loading() || self.ctx.replication().async_loading {
+            return true;
+        }
+        self.replication_runtime.replica_link().is_none_or(|link| {
+                link.is_receiving_rdb()
+                    || link.has_pending_rdb_receive()
+                    || matches!(
+                        link.rdb_channel_state(),
+                        crate::framework::distributed::replication::ReplicaRdbChannelState::ReceivingRdb
+                    )
+            })
     }
 
     pub(crate) fn handle_listener_token(&mut self, listener: Token) {
@@ -1977,6 +1995,44 @@ mod tests {
                 .master_connect_allowed(crate::foundation::io::sys::time::mstime()),
             "an established master link must be eligible to reconnect immediately"
         );
+    }
+
+    #[test]
+    fn stale_short_read_plan_is_cleared_after_rdb_commit() {
+        let mut backend = ServerWorkerState::new(1).unwrap();
+        let main = ConnectionId(95);
+        let mut link = ReplicaLink::new(
+            main,
+            MasterInfo {
+                host: "127.0.0.1".to_string(),
+                port: 6379,
+            },
+        );
+        link.connected(None, None);
+        link.on_bytes(b"+PONG\r\n+OK\r\n+OK\r\n", 6379)
+            .expect("advance handshake to PSYNC");
+        link.on_bytes(
+            b"+CONTINUE 0123456789abcdef0123456789abcdef01234567\r\n",
+            6379,
+        )
+        .expect("accept partial resynchronization");
+        assert!(link.is_streaming());
+        backend.replication_runtime.set_replica_link(link);
+        backend.ctx.replication_mut().async_loading = false;
+        backend.ctx.set_loading(false);
+
+        assert!(!backend.current_master_link_short_read(true));
+
+        let held_link = backend
+            .replication_runtime
+            .take_replica_link()
+            .expect("replica link exists");
+        assert!(backend.current_master_link_short_read(true));
+        backend.replication_runtime.set_replica_link(held_link);
+
+        backend.ctx.set_loading(true);
+
+        assert!(backend.current_master_link_short_read(true));
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! EXEC admission, execution, and completion as an explicit linear pipeline.
 
 use super::{ExecPrechecks, ServerWorkerState};
+use crate::engine::command::context::CommandConn;
 use crate::engine::distributed::cluster::ClusterRouteDecision;
 use crate::foundation::io::protocol::serializer::{serialize_to_vec_resp2, serialize_to_vec_resp3};
 use crate::foundation::io::protocol::Value;
@@ -248,6 +249,7 @@ impl ServerWorkerState {
         effects: &mut CommandEffects,
     ) -> ExecExecution {
         self.connection_registry[context.target.token()].discard_command_effects();
+        let offset_before = self.ctx.replication().primary_repl_offset();
         let (replies, publish, publish_shard) = {
             let sinks = effects.exec_sinks();
             let output = self.exec_run_commands(context.target, sinks.wakeup_only);
@@ -259,6 +261,10 @@ impl ServerWorkerState {
             sinks.watch_dirty.extend(output.dirty_keys);
             (output.results, output.publish, output.publish_shard)
         };
+        let offset_after = self.ctx.replication().primary_repl_offset();
+        if offset_after != offset_before {
+            self.connection_registry[context.target.token()].set_last_write_offset(offset_after);
+        }
         effects.publish.extend(publish);
         effects.publish_shard.extend(publish_shard);
 

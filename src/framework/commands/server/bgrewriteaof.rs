@@ -126,6 +126,15 @@ pub(crate) fn start_aof_rewrite(ctx: &mut ServerContext) -> Result<(), String> {
     ctx.persistence_mut()
         .begin_aof_rewrite_child(pid, now_ms() as i64)
         .map_err(|_| "background persistence operation already in progress".to_string())?;
+    // During the initial rewrite that enables AOF (C's AOF_WAIT_REWRITE) the
+    // confirmed fsynced offset is pinned to 0 while the optimistic pending
+    // offset captures the current replication offset. The confirmed value is
+    // promoted from pending only once the rewrite finishes.
+    if ctx.aof().aof_wait_rewrite {
+        let repl_offset = ctx.replication().primary_repl_offset().get();
+        ctx.aof_mut().set_fsynced_pending(repl_offset);
+        ctx.aof_mut().fsynced_repl_offset = Some(0);
+    }
     Ok(())
 }
 
@@ -333,6 +342,15 @@ pub(crate) fn apply_aof_rewrite_child_completion(
             ctx.persistence_mut()
                 .record_aof_rewrite_commit_success();
             ctx.aof_mut().started_this_session = true;
+            // C's backgroundRewriteDoneHandler leaves AOF_WAIT_REWRITE for
+            // AOF_ON and promotes the confirmed fsynced offset to whatever the
+            // optimistic pending value now holds (set in startAppendOnly or
+            // advanced by a bio fsync in the meantime).
+            if ctx.aof().aof_wait_rewrite {
+                ctx.aof_mut().aof_wait_rewrite = false;
+                let pending = ctx.aof().fsynced_repl_offset_pending;
+                ctx.aof_mut().fsynced_repl_offset = Some(pending);
+            }
             ctx.aof_mut().journal = Some(crate::foundation::io::persistence::journal::AofJournal::new(app));
             crate::server_log!(
                 notice,

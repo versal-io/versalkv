@@ -126,8 +126,7 @@ pub(super) fn render_slots(
                     .filter(|node| {
                         node.role == ClusterNodeRole::Replica
                             && node.replica_of.as_ref() == Some(owner_id)
-                            && node.health != ClusterNodeHealth::Fail
-                            && node.health != ClusterNodeHealth::Loading
+                            && is_node_available_for_slots(node)
                     })
                     .map(|replica| {
                         Value::Array(slot_node_entry(replica, preference, transport, prefer_ipv6))
@@ -138,6 +137,10 @@ pub(super) fn render_slots(
         slot += 1;
     }
     ranges
+}
+
+fn is_node_available_for_slots(node: &NodeView) -> bool {
+    node.health != ClusterNodeHealth::Fail && node.replication_offset != 0
 }
 
 pub(super) fn render_shards(
@@ -370,9 +373,13 @@ mod tests {
         ClusterNode, CLUSTER_NODE_MYSELF, CLUSTER_NODE_PRIMARY, CLUSTER_NODE_REPLICA,
     };
     use crate::engine::distributed::cluster::state::{
-        ClusterReplicaHealth, ClusterReplicationView,
+        ClusterHealth, ClusterReplicaHealth, ClusterReplicationView,
     };
-    use crate::engine::distributed::cluster::{ClientTransport, ClusterState, PreferredEndpoint};
+    use crate::engine::distributed::cluster::{
+        ClientTransport, ClusterEndpoints, ClusterNodeHealth, ClusterNodeRole,
+        ClusterTopologySnapshot, NodeId, NodeView, PreferredEndpoint,
+    };
+    use crate::engine::distributed::cluster::{ClusterState, ShardView};
 
     fn offset(value: i64) -> crate::engine::distributed::replication::ReplicationOffset {
         crate::engine::distributed::replication::ReplicationOffset::try_from(value)
@@ -458,5 +465,72 @@ mod tests {
 
         assert_eq!(ranges.len(), 1);
         assert_eq!(ranges[0].len(), 4);
+    }
+
+    #[test]
+    fn slots_uses_replication_offset_not_health_for_replica_availability() {
+        let primary = NodeId::parse(b"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+            .expect("valid primary id");
+        let replica = NodeId::parse(b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            .expect("valid replica id");
+        let mut slot_owners = vec![None; crate::engine::distributed::cluster::state::CLUSTER_SLOTS];
+        slot_owners[0] = Some(primary.clone());
+        let owner = NodeView {
+            id: primary.clone(),
+            shard_id: primary.clone(),
+            endpoints: ClusterEndpoints::new("127.0.0.1".to_string(), 6379, 16_379),
+            role: ClusterNodeRole::Primary,
+            health: ClusterNodeHealth::Online,
+            flags: CLUSTER_NODE_PRIMARY,
+            replica_of: None,
+            config_epoch: 1,
+            replication_offset: 42,
+            ping_sent: 0,
+            pong_received: 0,
+            outbound_connected: true,
+            slots: vec![true; crate::engine::distributed::cluster::state::CLUSTER_SLOTS],
+        };
+        let loading_replica = NodeView {
+            id: replica.clone(),
+            shard_id: primary.clone(),
+            endpoints: ClusterEndpoints::new("127.0.0.1".to_string(), 6380, 16_380),
+            role: ClusterNodeRole::Replica,
+            health: ClusterNodeHealth::Loading,
+            flags: CLUSTER_NODE_REPLICA,
+            replica_of: Some(primary.clone()),
+            config_epoch: 0,
+            replication_offset: 42,
+            ping_sent: 0,
+            pong_received: 0,
+            outbound_connected: false,
+            slots: vec![false; crate::engine::distributed::cluster::state::CLUSTER_SLOTS],
+        };
+        let snapshot = ClusterTopologySnapshot {
+            generation: 0,
+            health: ClusterHealth::Ok,
+            slot_owners,
+            nodes: vec![loading_replica.clone(), owner.clone()],
+            shards: vec![ShardView {
+                id: primary.clone(),
+                slot_ranges: vec![],
+                nodes: vec![owner, loading_replica],
+            }],
+            migrating_slots_to: Vec::new(),
+            importing_slots_from: Vec::new(),
+        };
+
+        let ranges = render_slots(
+            &snapshot,
+            PreferredEndpoint::Ip,
+            ClientTransport::Tcp,
+            false,
+        );
+
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(
+            ranges[0].len(),
+            4,
+            "CLUSTER SLOTS mirrors C isNodeAvailable and keeps nonzero-offset replicas visible"
+        );
     }
 }

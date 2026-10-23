@@ -16,6 +16,14 @@ pub(crate) enum AofTaskError {
     Load(AofLoadError),
     Host(HostError),
     Aborted(HostAbort),
+    /// A replayed command returned an error while `propagation-error-behavior`
+    /// is `panic`. Mirrors C `afterErrorReply`'s `panic_in_aof` branch: during
+    /// startup load this is fatal and must terminate the process. We propagate
+    /// instead of `panic!` so termination does not depend on the global panic
+    /// hook (which may block while flushing the crash report).
+    PropagationError {
+        command: String,
+    },
 }
 
 #[derive(Debug)]
@@ -188,10 +196,9 @@ impl AofReplayTask {
                             String::from_utf8_lossy(&args.name)
                         );
                         if self.panic_on_propagation_error {
-                            panic!(
-                                "This server panicked applying an error during AOF replay after command '{}'",
-                                String::from_utf8_lossy(&args.name)
-                            );
+                            return Err(AofTaskError::PropagationError {
+                                command: String::from_utf8_lossy(&args.name).into_owned(),
+                            });
                         }
                     }
                     crate::foundation::io::sys::time::sleep_debug_delay_interruptible(
@@ -308,8 +315,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "panicked applying an error during AOF replay")]
-    fn replay_panics_after_command_error_with_panic_policy() {
+    fn replay_reports_propagation_error_with_panic_policy() {
         let bytes = b"*1\r\n$7\r\nUNKNOWN\r\n".to_vec();
         let mut task = AofReplayTask::with_key_load_delay_and_panic_on_error(bytes, 0, true);
         let mut dispatcher = |request: HostRequest<'_>| match request {
@@ -323,7 +329,13 @@ mod tests {
             _ => Err(HostError::Invariant("unexpected AOF request")),
         };
 
-        let _ = task.run(&mut dispatcher);
+        // The panic policy must surface as a fatal error the startup layer can
+        // turn into a deterministic process exit, not a `panic!` that depends on
+        // the global panic hook terminating the process.
+        assert!(matches!(
+            task.run(&mut dispatcher),
+            Err(AofTaskError::PropagationError { command }) if command.eq_ignore_ascii_case("UNKNOWN")
+        ));
     }
 
     #[test]

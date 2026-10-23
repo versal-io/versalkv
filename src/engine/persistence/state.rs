@@ -65,9 +65,21 @@ pub struct AofState {
     pub started_this_session: bool,
     pub current_size: u64,
     pub rewrite_base_size: u64,
-    /// Upstream replication offset represented by this session's durable AOF
-    /// base. This stays fixed while `appendfsync no` is active.
+    /// Largest replication offset confirmed to be fsynced to the AOF. Mirrors
+    /// C's `server.fsynced_reploff`: `None` matches C's `-1` sentinel meaning
+    /// "do not report an AOF ack" (AOF disabled, or an initial rewrite has not
+    /// yet completed). Only this value is consumed by WAITAOF / FACK.
     pub fsynced_repl_offset: Option<i64>,
+    /// Optimistic companion to `fsynced_repl_offset`. Mirrors C's atomic
+    /// `server.fsynced_reploff_pending`: the largest replication offset whose
+    /// data has been handed to an fsync. It is promoted into
+    /// `fsynced_repl_offset` only while the AOF is fully on (not during the
+    /// initial rewrite). Stays frozen while `appendfsync no` is active.
+    pub fsynced_repl_offset_pending: i64,
+    /// True while an initial AOF rewrite is outstanding (C's AOF_WAIT_REWRITE).
+    /// While set, `fsynced_repl_offset_pending` must not be promoted into
+    /// `fsynced_repl_offset`, because not all data is guaranteed durable yet.
+    pub aof_wait_rewrite: bool,
     pub last_fsync_sec: i64,
     pub last_write_status: OperationStatus,
     pub delayed_fsync: u64,
@@ -80,6 +92,39 @@ impl AofState {
         self.journal
             .as_ref()
             .map_or(0, |journal| journal.appender.buffer_allocation_bytes())
+    }
+
+    /// Optimistically record that data up to `offset` has been handed to an
+    /// fsync. Mirrors the `atomic_store(fsynced_reploff_pending, ...)` calls in
+    /// C's `flushAppendOnlyFile`, `aof_background_fsync`, and the bio worker.
+    pub fn set_fsynced_pending(&mut self, offset: i64) {
+        self.fsynced_repl_offset_pending = offset;
+    }
+
+    /// Promote the optimistic pending offset into the confirmed one. Mirrors
+    /// C's `beforeSleep` advance: it is a no-op while an initial rewrite is
+    /// outstanding (`aof_wait_rewrite`) or while the AOF reports nothing
+    /// (`fsynced_repl_offset == None`, i.e. C's `-1`). Returns the new
+    /// confirmed offset when it actually changed, so callers can wake blocked
+    /// WAITAOF clients.
+    pub fn advance_fsynced_from_pending(&mut self) -> Option<i64> {
+        if self.aof_wait_rewrite || self.fsynced_repl_offset.is_none() {
+            return None;
+        }
+        let pending = self.fsynced_repl_offset_pending;
+        if self.fsynced_repl_offset == Some(pending) {
+            return None;
+        }
+        self.fsynced_repl_offset = Some(pending);
+        Some(pending)
+    }
+
+    /// Reset both offsets to C's "AOF disabled" state: confirmed `-1` (never
+    /// report a FACK) and pending `0`. Mirrors `stopAppendOnly`.
+    pub fn reset_fsynced_disabled(&mut self) {
+        self.fsynced_repl_offset = None;
+        self.fsynced_repl_offset_pending = 0;
+        self.aof_wait_rewrite = false;
     }
 }
 
@@ -122,6 +167,8 @@ impl PersistenceState {
                 current_size: 0,
                 rewrite_base_size: 0,
                 fsynced_repl_offset: None,
+                fsynced_repl_offset_pending: 0,
+                aof_wait_rewrite: false,
                 last_fsync_sec: 0,
                 last_write_status: OperationStatus::Ok,
                 delayed_fsync: 0,

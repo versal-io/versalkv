@@ -213,6 +213,25 @@ mod tests {
     }
 
     #[test]
+    fn rdb_psync_wait_tracks_existing_backlog_history_tail() {
+        let mut runtime = ReplicationRuntime::new();
+        let main = ConnectionId(30);
+        let rdb = ConnectionId(31);
+        register_waiting_dual_main(&mut runtime, main);
+        runtime.register_rdb_candidate(rdb).unwrap();
+        let mut backlog = ReplicationBacklog::new("local".to_string(), 64);
+        backlog.activate();
+        backlog.append(b"tail").unwrap();
+        let tail = backlog.tail_block_start_cursor();
+
+        assert!(runtime
+            .take_endoff_for_rdb_candidate_if_unambiguous(rdb, true, &mut backlog)
+            .is_some());
+
+        assert_eq!(runtime.min_protected_backlog_cursor(), Some(tail));
+    }
+
+    #[test]
     fn restored_rdb_endoff_carries_boundary_through_association() {
         let mut runtime = ReplicationRuntime::new();
         let main = ConnectionId(40);
@@ -1272,8 +1291,18 @@ mod tests {
         let mut runtime = ReplicationRuntime::new();
         let main = ConnectionId(50);
         let rdb = ConnectionId(51);
-        runtime.register_primary(main, replica_info(6380));
+        let replica_id = runtime.register_primary(main, replica_info(6380));
         runtime.register_rdb_channel(rdb, main).unwrap();
+        runtime
+            .primary_link_mut(replica_id)
+            .expect("main link must be registered")
+            .transition_to_waiting_for_rdb_channel()
+            .expect("main link waits for RDB channel");
+        runtime
+            .primary_link_mut(replica_id)
+            .expect("main link must be registered")
+            .transition_to_waiting_for_main_psync()
+            .expect("main link waits for PSYNC after RDB channel");
         runtime.set_channel_endpoint(rdb, "192.0.2.51".to_string(), 6381);
         runtime.set_channel_state(rdb, "sending_rdb".to_string());
 
@@ -1314,6 +1343,22 @@ mod tests {
         assert_eq!(view.channel_info[&main.0].state, "bg_transfer");
         assert_eq!(view.channel_info[&rdb.0].channel_type, "rdb-channel");
         assert_eq!(view.channel_info[&rdb.0].state, "wait_bgsave");
+    }
+
+    #[test]
+    fn rebuild_view_hides_pre_psync_main_from_info_projection() {
+        let mut runtime = ReplicationRuntime::new();
+        let main = ConnectionId(62);
+        runtime.register_primary(main, replica_info(6380));
+
+        let view = runtime.rebuild_view();
+
+        assert_eq!(view.connected_replica_count, 0);
+        assert_eq!(view.replica_order, Vec::<usize>::new());
+        assert!(view.info_order.is_empty());
+        assert!(view.replica_info.is_empty());
+        assert!(view.channel_info.is_empty());
+        assert!(view.replica_ack_offsets.contains_key(&main.0));
     }
 
     #[test]
@@ -1418,8 +1463,9 @@ mod tests {
         let view = runtime.rebuild_view();
 
         assert_eq!(view.live_replica_count, 0);
-        assert_eq!(view.replica_info[&main.0].state, "bg_transfer");
-        assert_eq!(view.replica_info[&main.0].lag_ms, 0);
+        assert!(!view.replica_info.contains_key(&main.0));
+        assert_eq!(view.channel_info[&main.0].channel_type, "main-channel");
+        assert_eq!(view.channel_info[&main.0].state, "bg_transfer");
     }
 
     #[test]
@@ -1458,11 +1504,13 @@ mod tests {
 
         let view = runtime.rebuild_view();
 
-        assert!(view.replica_info.contains_key(&main_one.0));
-        assert!(view.replica_info.contains_key(&main_two.0));
-        assert!(!view.channel_info.contains_key(&main_one.0));
-        assert!(!view.channel_info.contains_key(&main_two.0));
-        assert_eq!(view.channel_info.len(), 1);
+        assert!(!view.replica_info.contains_key(&main_one.0));
+        assert!(!view.replica_info.contains_key(&main_two.0));
+        assert_eq!(view.channel_info[&main_one.0].channel_type, "main-channel");
+        assert_eq!(view.channel_info[&main_one.0].state, "bg_transfer");
+        assert_eq!(view.channel_info[&main_two.0].channel_type, "main-channel");
+        assert_eq!(view.channel_info[&main_two.0].state, "bg_transfer");
+        assert_eq!(view.channel_info.len(), 3);
         assert_eq!(view.channel_info[&candidate.0].channel_type, "rdb-channel");
         assert_eq!(runtime.channel_pair_for(main_one), None);
         assert_eq!(runtime.channel_pair_for(main_two), None);

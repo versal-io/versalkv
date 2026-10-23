@@ -1,4 +1,40 @@
 use super::*;
+use crate::engine::command::context::CommandConn;
+
+#[test]
+fn aof_write_without_backlog_records_one_logical_offset_on_the_connection() {
+    let mut backend = ServerWorkerState::new(1).unwrap();
+    crate::framework::commands::register_all(&mut backend.registry);
+    backend.ctx.config_mut().persistence.aof_enabled = true;
+    let connection_token = add_fake_connection(&mut backend);
+    backend.connection_registry[Token(connection_token)].set_skip_propagation(false);
+    let args = make_args(&[b"SET", b"key", b"value"]);
+    let flags = backend.registry.lookup(b"set").unwrap().flags;
+    let mut effects = DispatchSideEffects::default();
+    let connection_effects = take_connection_command_effects(&mut backend, connection_token);
+
+    backend.build_command_propagation(
+        CommandPropagationInput {
+            connection_token,
+            token_value: 42,
+            args: &args,
+            name: "set",
+            command_flags: flags,
+            rejected: false,
+        },
+        connection_effects,
+        &mut effects,
+    );
+
+    assert_eq!(
+        backend.connection_registry[Token(connection_token)]
+            .last_write_offset()
+            .get(),
+        1
+    );
+    assert!(!backend.ctx.replication().backlog.is_active());
+    assert_eq!(backend.ctx.replication().backlog.history_len(), 0);
+}
 
 #[test]
 fn may_replicate_command_builds_propagation_without_dirty_write() {

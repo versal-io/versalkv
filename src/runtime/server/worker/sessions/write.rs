@@ -1065,10 +1065,21 @@ impl ServerWorkerState {
             }
         }
         let fsync_mode = aof.appender.fsync_mode();
+        // The replication offset that the data about to be flushed represents.
+        // Mirrors C passing `server.primary_repl_offset` into the fsync path.
+        let repl_offset = self.ctx.replication().primary_repl_offset().get();
+        let aof = self.ctx.aof_mut().journal.as_mut().expect("checked above");
+        // Record the offset the next successful fsync should report as durable.
+        // Skipped while `no` (or the no-appendfsync-on-rewrite gate) is active so
+        // the reported offset stays frozen, matching C's `aof_fsync != NO` guard.
+        if fsync_mode != crate::foundation::io::persistence::AofFsync::No {
+            aof.appender.set_fsync_target(repl_offset);
+        }
         let aof_flush_start = std::time::Instant::now();
         let flush_result = aof.appender.flush(false);
         let aof_flush_duration_usec = aof_flush_start.elapsed().as_micros() as u64;
         let current_size = aof.appender.current_size();
+        let reported_fsync_offset = aof.appender.fsynced_reported_offset();
         let _ = aof;
         self.ctx.record_eventloop_aof(aof_flush_duration_usec);
 
@@ -1083,6 +1094,24 @@ impl ServerWorkerState {
                     self.ctx.aof_mut().last_fsync_sec =
                         (crate::foundation::io::store::kv_engine::now_ms() / 1000) as i64;
                 }
+                // Advance the two-phase fsynced offset. `always` fsyncs inline,
+                // so everything up to the flushed replication offset is durable
+                // immediately. `everysec` adopts whatever the background fsync
+                // thread last confirmed. `no` never reports, so the confirmed
+                // offset stays frozen. The confirmed value is then promoted from
+                // pending unless an initial rewrite is still outstanding.
+                match fsync_mode {
+                    crate::foundation::io::persistence::AofFsync::Always => {
+                        self.ctx.aof_mut().set_fsynced_pending(repl_offset);
+                    }
+                    crate::foundation::io::persistence::AofFsync::EverySec => {
+                        if let Some(reported) = reported_fsync_offset {
+                            self.ctx.aof_mut().set_fsynced_pending(reported);
+                        }
+                    }
+                    crate::foundation::io::persistence::AofFsync::No => {}
+                }
+                self.ctx.aof_mut().advance_fsynced_from_pending();
                 self.check_wait_replica_wakeups();
             }
             Err(e) => {

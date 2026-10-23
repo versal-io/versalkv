@@ -59,18 +59,17 @@ fn resolve_master_addr(host: &str, port: u16) -> Option<SocketAddr> {
 
 fn replica_aof_ack_offset(
     ctx: &crate::framework::context::ServerContext,
-    applied_offset: ReplicationOffset,
+    _applied_offset: ReplicationOffset,
 ) -> Option<ReplicationOffset> {
     if !ctx.config().persistence.aof_enabled || ctx.aof().journal.is_none() {
         return None;
     }
-    if ctx.config().persistence.aof_fsync == crate::foundation::io::persistence::AofFsync::No {
-        return ctx
-            .aof()
-            .fsynced_repl_offset
-            .and_then(|offset| ReplicationOffset::try_from(offset).ok());
-    }
-    Some(applied_offset)
+    // FACK always reports the two-phase confirmed fsynced offset, never the
+    // merely-applied offset. Mirrors C's `replicationSendAck` sending
+    // `server.fsynced_reploff`. `None` (C's `-1`) suppresses the FACK field.
+    ctx.aof()
+        .fsynced_repl_offset
+        .and_then(|offset| ReplicationOffset::try_from(offset).ok())
 }
 
 fn min_protected_cursor(

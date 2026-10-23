@@ -143,11 +143,11 @@ fn cron_starts_election_through_automatic_state_machine() {
 }
 
 #[test]
-fn automatic_election_uses_runtime_replica_priority() {
+fn automatic_election_ignores_nonzero_runtime_priority_for_ranking() {
     let mut bus = ClusterBusManager::new();
     let mut state = ClusterState::new("127.0.0.1", 6380, 16380);
     let primary_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    let sibling_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let sibling_id = "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz";
     let voter_id = "cccccccccccccccccccccccccccccccccccccccc";
     state
         .nodes
@@ -192,7 +192,7 @@ fn automatic_election_uses_runtime_replica_priority() {
         state.automatic_failover.phase(),
         AutomaticFailoverPhase::WaitingRankDelay
     );
-    assert_eq!(state.automatic_failover.rank(), 1);
+    assert_eq!(state.automatic_failover.rank(), 0);
     assert!(state.automatic_failover.deadline_ms() > 1_000);
 }
 

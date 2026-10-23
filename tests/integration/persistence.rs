@@ -322,7 +322,11 @@ fn startup_rdb_services_loading_commands_and_rejects_role_change_before_ready() 
     let count = denied
         .read(&mut replicaof_reply)
         .expect("read REPLICAOF reply");
-    assert_eq!(&replicaof_reply[..count], b"+OK\r\n");
+    assert!(
+        String::from_utf8_lossy(&replicaof_reply[..count]).contains("LOADING"),
+        "REPLICAOF must remain blocked during startup RDB loading: {:?}",
+        String::from_utf8_lossy(&replicaof_reply[..count])
+    );
 
     denied
         .write_all(b"*3\r\n$3\r\nSET\r\n$1\r\nx\r\n$1\r\ny\r\n")
@@ -337,25 +341,21 @@ fn startup_rdb_services_loading_commands_and_rejects_role_change_before_ready() 
         String::from_utf8_lossy(&loading[..count])
     );
 
-    let exit_deadline = Instant::now() + Duration::from_secs(8);
-    let status = loop {
-        if let Some(status) = child.try_wait().expect("wait for startup role rejection") {
-            break status;
-        }
-        if Instant::now() >= exit_deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("server did not reject the startup replication role change");
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    };
-    assert!(!status.success());
+    assert!(
+        child
+            .try_wait()
+            .expect("check server is still loading")
+            .is_none(),
+        "startup role-change rejection must keep the server alive"
+    );
     let startup_log = std::fs::read_to_string(&stdout_path).unwrap_or_default();
     assert!(
-        startup_log.contains("replication role changed during startup RDB load"),
-        "missing startup role invariant failure:\n{startup_log}"
+        !startup_log.contains("replication role changed during startup RDB load"),
+        "blocked role change must not trip the startup invariant:\n{startup_log}"
     );
     assert!(!startup_log.contains("Ready to accept connections"));
+    let _ = child.kill();
+    let _ = child.wait();
     let _ = std::fs::remove_dir_all(dir);
 }
 

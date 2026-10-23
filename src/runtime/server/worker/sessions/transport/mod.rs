@@ -2313,6 +2313,12 @@ mod tests {
             replies,
             vec![b"-ERR REPLCONF rdb-channel expects 0 or 1\r\n".to_vec()]
         );
+        backend
+            .replication_runtime
+            .primary_for_connection_mut(ConnectionId(token.0))
+            .expect("replica link registered by REPLCONF")
+            .finish_full_resync();
+        backend.refresh_replication_view();
         assert_eq!(
             backend
                 .ctx

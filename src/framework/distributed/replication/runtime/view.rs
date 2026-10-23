@@ -92,6 +92,9 @@ impl ReplicationRuntime {
                 .insert(connection_id, link.last_ack_position());
             view.replica_aof_ack_offsets
                 .insert(connection_id, link.last_aof_ack_position());
+            if is_pre_psync_main_link(link) {
+                continue;
+            }
             let lag = if is_online {
                 match link.last_ack_time_ms() {
                     0 => i64::MAX,
@@ -171,6 +174,16 @@ impl ReplicationRuntime {
                         port: rdb_port,
                     },
                 );
+            } else if is_dual_main_channel(link) {
+                view.channel_info.insert(
+                    connection_id,
+                    crate::engine::distributed::replication::ReplicationChannelInfo {
+                        channel_type: "main-channel",
+                        state: main_channel_state_name(link).to_string(),
+                        ip: link.replica().ip.clone(),
+                        port: link.replica().port,
+                    },
+                );
             } else {
                 view.replica_info.insert(
                     connection_id,
@@ -217,9 +230,13 @@ impl ReplicationRuntime {
         ordered_links.sort_by_key(|(replica_id, _)| replica_id.0);
         view.replica_order = ordered_links
             .iter()
+            .filter(|(_, link)| !is_pre_psync_main_link(link))
             .map(|(_, link)| link.connection_id().0)
             .collect();
         for (_, link) in &ordered_links {
+            if is_pre_psync_main_link(link) {
+                continue;
+            }
             let main = link.connection_id();
             if let Some(rdb) = self.rdb_channel_for_main(main) {
                 view.info_order.push(rdb.0);
@@ -256,7 +273,9 @@ impl ReplicationRuntime {
     pub fn connected_replica_count(&self) -> usize {
         self.primary_links
             .values()
-            .filter(|link| link.state() != PrimaryLinkState::Closing)
+            .filter(|link| {
+                link.state() != PrimaryLinkState::Closing && !is_pre_psync_main_link(link)
+            })
             .map(|link| 1 + usize::from(self.rdb_channel_for_main(link.connection_id()).is_some()))
             .sum()
     }
@@ -385,6 +404,24 @@ pub(super) fn main_channel_state_name(link: &PrimaryLink) -> &'static str {
         return "bg_transfer";
     }
     primary_link_state_name(link.state())
+}
+
+fn is_dual_main_channel(link: &PrimaryLink) -> bool {
+    matches!(
+        link.dual_state(),
+        PrimaryDualChannelState::WaitingForRdbChannel
+            | PrimaryDualChannelState::SendingRdb
+            | PrimaryDualChannelState::WaitingForMainPsync
+            | PrimaryDualChannelState::WaitingForReplicaAck
+    )
+}
+
+fn is_pre_psync_main_link(link: &PrimaryLink) -> bool {
+    link.state() == PrimaryLinkState::AwaitingPsync
+        && matches!(
+            link.dual_state(),
+            PrimaryDualChannelState::Disabled | PrimaryDualChannelState::Negotiating
+        )
 }
 
 #[cfg(test)]

@@ -40,6 +40,18 @@ fn replconf_accepts_replica_version() {
     );
 }
 
+fn assert_info_hides_pre_psync_channels(server: &TestServer, context: &str) {
+    let info = server.connect().command_str(&[b"INFO", b"replication"]);
+    assert!(
+        info.contains("connected_slaves:0\r\n")
+            && !info
+                .lines()
+                .any(|line| line.starts_with("slave") && line.contains("type="))
+            && !info.lines().any(|line| line.starts_with("channel")),
+        "{context}: {info}"
+    );
+}
+
 fn assert_replconf_rdb_channel_option_order_preserves_candidate(rdb_channel_first: bool) {
     let server = TestServer::start_default();
     let mut main = server.connect();
@@ -104,35 +116,9 @@ fn assert_replconf_rdb_channel_option_order_preserves_candidate(rdb_channel_firs
         "main channel must associate the preserved RDB candidate"
     );
 
-    let info = server.connect().command_str(&[b"INFO", b"replication"]);
-    assert!(
-        info.lines().any(|line| {
-            line.starts_with("slave")
-                && line.contains("ip=127.0.0.1,port=6380")
-                && line.contains("state=wait_bgsave")
-                && line.contains("type=main-channel")
-        }),
-        "INFO must expose the main channel as a Valkey-compatible slave row: {info}"
-    );
-    assert!(
-        info.lines().any(|line| {
-            line.starts_with("slave")
-                && line.contains("ip=198.51.100.8,port=6381")
-                && line.contains("state=wait_bgsave")
-                && line.contains("type=rdb-channel")
-        }),
-        "INFO must expose the RDB channel as a Valkey-compatible slave row: {info}"
-    );
-    assert_eq!(
-        info.lines()
-            .filter(|line| line.starts_with("slave") && line.contains("type="))
-            .count(),
-        2,
-        "INFO must expose exactly one row per associated channel: {info}"
-    );
-    assert!(
-        !info.lines().any(|line| line.starts_with("channel")),
-        "{info}"
+    assert_info_hides_pre_psync_channels(
+        &server,
+        "RDB-channel REPLCONF option order must preserve the candidate before PSYNC",
     );
 }
 
@@ -196,13 +182,9 @@ fn replconf_mixed_case_rdb_channel_option_order_preserves_candidate() {
         b"+OK\r\n"
     );
 
-    let info = server.connect().command_str(&[b"INFO", b"replication"]);
-    assert_eq!(
-        info.lines()
-            .filter(|line| line.starts_with("slave") && line.contains("type="))
-            .count(),
-        2,
-        "mixed-case option order must preserve both channel rows: {info}"
+    assert_info_hides_pre_psync_channels(
+        &server,
+        "mixed-case option order must preserve the candidate before PSYNC",
     );
 }
 
@@ -220,11 +202,9 @@ fn replconf_rdb_channel_zero_from_rdb_client_keeps_main_channel() {
         rdb.command(&[b"REPLCONF", b"rdb-channel", b"0"]),
         b"+OK\r\n"
     );
-    let info = server.connect().command_str(&[b"INFO", b"replication"]);
-    assert!(
-        info.lines()
-            .any(|line| line.starts_with("slave") && line.contains("port=6380")),
-        "disabling an RDB channel must preserve the main replica link: {info}"
+    assert_info_hides_pre_psync_channels(
+        &server,
+        "disabling an RDB channel must preserve the hidden pre-PSYNC main link",
     );
 }
 
@@ -269,22 +249,9 @@ fn replconf_rdb_candidate_metadata_survives_separate_frames() {
         b"+OK\r\n"
     );
 
-    let info = server.connect().command_str(&[b"INFO", b"replication"]);
-    assert!(
-        info.lines().any(|line| {
-            line.starts_with("slave")
-                && line.contains("ip=203.0.113.8,port=6382")
-                && line.contains("type=rdb-channel")
-        }),
-        "repeated associated RDB metadata must update only the RDB endpoint: {info}"
-    );
-    assert!(
-        info.lines().any(|line| {
-            line.starts_with("slave")
-                && line.contains("ip=127.0.0.1,port=6380")
-                && line.contains("type=main-channel")
-        }),
-        "repeated associated RDB metadata must preserve main-channel ownership: {info}"
+    assert_info_hides_pre_psync_channels(
+        &server,
+        "repeated associated RDB metadata must preserve the candidate before PSYNC",
     );
 }
 
@@ -322,19 +289,9 @@ fn replconf_listening_port_then_rdb_channel_preserves_candidate_ownership() {
         b"+OK\r\n"
     );
 
-    let info = server.connect().command_str(&[b"INFO", b"replication"]);
-    assert!(
-        info.lines()
-            .any(|line| line.starts_with("slave") && line.contains("type=main-channel")),
-        "main channel ownership must survive separate RDB-channel frames: {info}"
-    );
-    assert!(
-        info.lines().any(|line| {
-            line.starts_with("slave")
-                && line.contains("ip=127.0.0.1,port=6381")
-                && line.contains("type=rdb-channel")
-        }),
-        "listening-port then rdb-channel must preserve candidate ownership: {info}"
+    assert_info_hides_pre_psync_channels(
+        &server,
+        "listening-port then rdb-channel must preserve the candidate before PSYNC",
     );
 }
 
@@ -471,16 +428,9 @@ fn replconf_dual_channel_association_rejects_bad_ids_and_is_reported() {
         b"+OK\r\n"
     );
 
-    let info = server.connect().command_str(&[b"INFO", b"replication"]);
-    assert!(info.contains("type=main-channel"), "{info}");
-    assert!(info.contains("type=rdb-channel"), "{info}");
-    assert!(!info.contains("rdb_channel_state:none"), "{info}");
-    assert_eq!(
-        info.lines()
-            .filter(|line| line.starts_with("slave") && line.contains("type="))
-            .count(),
-        2,
-        "INFO must expose one Valkey-compatible row per associated channel: {info}"
+    assert_info_hides_pre_psync_channels(
+        &server,
+        "associated RDB metadata must stay hidden from INFO before PSYNC",
     );
 }
 

@@ -479,6 +479,10 @@ impl ServerWorkerState {
     fn process_host_yield(&mut self, scope: HostTaskScope) {
         if let Some(operation) = scope.blocked_operation {
             self.process_events_while_blocked(operation);
+        } else if self.ctx.is_host_task_loading() {
+            self.process_events_while_loading_host_task(
+                scope.protected_client.unwrap_or(Token(usize::MAX)),
+            );
         } else {
             self.process_events_while_command_blocked(
                 scope.protected_client.unwrap_or(Token(usize::MAX)),
@@ -653,8 +657,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "panicked applying an error during AOF replay")]
-    fn aof_replay_panics_after_command_error_for_panic_policy() {
+    fn aof_replay_reports_propagation_error_for_panic_policy() {
         let mut runtime = ServerWorkerState::new(1).expect("create runtime");
         crate::framework::commands::register_all(&mut runtime.registry);
         runtime.ctx.set_command_registry_snapshot(&runtime.registry);
@@ -668,7 +671,16 @@ mod tests {
         ]);
         let mut replay_conn = Connection::new_fake();
 
-        let _ = runtime.run_aof_file_task(bytes, &mut replay_conn, None);
+        // Under the panic policy a replay error is fatal, but it must surface as
+        // an error the startup layer turns into a deterministic process exit,
+        // rather than a `panic!` that relies on the global panic hook.
+        let result = runtime.run_aof_file_task(bytes, &mut replay_conn, None);
+        assert!(matches!(
+            result,
+            Err(crate::framework::host_tasks::AofFileTaskError::Aof(
+                crate::framework::host_tasks::AofTaskError::PropagationError { .. }
+            ))
+        ));
     }
 
     #[test]

@@ -181,18 +181,41 @@ fn replica_eligibility_rejects_each_disqualifying_fact() {
 }
 
 #[test]
-fn replica_ranking_uses_priority_offset_and_node_id_in_order() {
-    let mut lower_priority = eligible_replica(b'd', 1);
-    lower_priority.priority = 50;
+fn replica_ranking_uses_offset_and_node_id_and_only_skips_nofailover() {
+    let mut zero_priority = eligible_replica(b'd', 1);
+    zero_priority.priority = 0;
     let high_offset = eligible_replica(b'c', 20);
     let low_id = eligible_replica(b'a', 10);
     let high_id = eligible_replica(b'b', 10);
-    let mut ignored = eligible_replica(b'e', 1_000);
-    ignored.loading = true;
+    let mut loading = eligible_replica(b'e', 1_000);
+    loading.loading = true;
+    let mut disconnected = eligible_replica(b'f', 2_000);
+    disconnected.cluster_link_connected = false;
+    let mut stale = eligible_replica(b'g', 3_000);
+    stale.cluster_view_stale = true;
+    let mut ignored = eligible_replica(b'h', 4_000);
+    ignored.no_failover = true;
 
     assert_eq!(
-        rank_replicas(&[high_id, ignored, low_id, high_offset, lower_priority]),
-        vec![node_id(b'd'), node_id(b'c'), node_id(b'a'), node_id(b'b')]
+        rank_replicas(&[
+            high_id,
+            ignored,
+            low_id,
+            high_offset,
+            zero_priority,
+            loading,
+            disconnected,
+            stale,
+        ]),
+        vec![
+            node_id(b'g'),
+            node_id(b'f'),
+            node_id(b'e'),
+            node_id(b'c'),
+            node_id(b'a'),
+            node_id(b'b'),
+            node_id(b'd'),
+        ]
     );
 }
 
@@ -203,7 +226,6 @@ fn rank_key_is_explicit() {
     assert_eq!(
         established.rank_key(),
         Some(ReplicaRankKey {
-            priority: 100,
             replication_offset: 1,
             node_id: node_id(b'a'),
         })

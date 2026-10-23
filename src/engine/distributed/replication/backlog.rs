@@ -132,6 +132,24 @@ impl ReplicationBacklog {
         self.active
     }
 
+    /// Align an inactive empty backlog with the server's independent primary
+    /// replication offset without retaining history.
+    pub fn align_inactive_offset(
+        &mut self,
+        offset: ReplicationOffset,
+    ) -> Result<(), InvalidReplicationPosition> {
+        if self.active || !self.bytes.is_empty() {
+            return Err(InvalidReplicationPosition);
+        }
+        self.next_cursor =
+            BacklogCursor::try_from(offset.get()).map_err(|_| InvalidReplicationPosition)?;
+        self.restored_reported_offset = None;
+        self.history_valid = false;
+        self.empty_cursor_valid = false;
+        self.min_protected_cursor = None;
+        Ok(())
+    }
+
     /// Create the first history accepted by a replica full-sync session.
     /// C Valkey changes both replication IDs when the first replica creates a
     /// backlog, because the identity advertised before that point has no

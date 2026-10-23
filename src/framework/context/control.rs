@@ -19,6 +19,9 @@ impl ServerContext {
     pub fn is_loading(&self) -> bool {
         self.loading || self.host_task_loading
     }
+    pub(crate) fn is_host_task_loading(&self) -> bool {
+        self.host_task_loading
+    }
     pub fn set_loading(&mut self, loading: bool) {
         self.loading = loading;
     }

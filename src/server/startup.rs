@@ -329,6 +329,12 @@ impl Server {
         if backend.ctx.config_mut().persistence.aof_enabled {
             backend.ctx.aof_mut().journal = self.load_aof(backend);
             backend.ctx.aof_mut().started_this_session = true;
+            // Mirror C's `server.fsynced_reploff = aof_enabled ? 0 : -1`: with
+            // AOF on from boot the base is considered durable at offset 0, so the
+            // confirmed two-phase offset starts at 0 rather than the `-1`/None
+            // "never ack" sentinel.
+            backend.ctx.aof_mut().fsynced_repl_offset = Some(0);
+            backend.ctx.aof_mut().fsynced_repl_offset_pending = 0;
         } else {
             self.load_rdb(backend);
         }
@@ -720,6 +726,15 @@ impl Server {
                 crate::framework::host_tasks::AofTaskError::Aborted(reason),
             ) => {
                 crate::server_log!(warning, "AOF load aborted: {:?}", reason);
+            }
+            crate::framework::host_tasks::AofFileTaskError::Aof(
+                crate::framework::host_tasks::AofTaskError::PropagationError { command },
+            ) => {
+                crate::server_log!(
+                    warning,
+                    "This server panicked applying an error during AOF replay after command '{}'",
+                    command
+                );
             }
             crate::framework::host_tasks::AofFileTaskError::Rdb(error) => {
                 crate::server_log!(warning, "Error loading RDB preamble in AOF: {:?}", error);

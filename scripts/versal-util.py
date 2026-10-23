@@ -2196,6 +2196,12 @@ def selftest_runtest(ctx: RepoContext) -> None:
             "runtest must inject the scoped test-only TCP buffer settings",
         )
         _assert(call["args"] == ["tests/test_helper.tcl", "--skipunit", "unit/obuf-limits", "--skipunit", "unit/oom-score-adj", "--skip-leaks", "--baseport", "5111", "--portcount", "8000", "--timeout", "360", "--stop", "--dump-logs", "--dont-clean"], "unexpected Tcl invocation")
+        env["VERSAL_TCL_DENY_SLOW"] = "1"
+        result = run_command([str(root / "runtest")], cwd=root, env=env, capture=True)
+        _assert(result.returncode == EXIT_OK, result.stderr)
+        call = json.loads(read_text(tcl_log))
+        _assert(call["args"] == ["tests/test_helper.tcl", "--tags", "-slow", "--skipunit", "unit/obuf-limits", "--skipunit", "unit/oom-score-adj", "--skip-leaks", "--baseport", "5111", "--portcount", "8000", "--timeout", "360", "--stop", "--dump-logs", "--dont-clean"], "unexpected Tcl invocation with slow tag denied")
+        env.pop("VERSAL_TCL_DENY_SLOW", None)
         for binary in VERSAL_BINARIES:
             _assert(read_text(valkey_src / "valkey-{}".format(binary)) == "versal-debug-{}\n".format(binary), "binary not staged")
         env["FIXTURE_TCL_EXIT"] = "23"
@@ -2660,7 +2666,7 @@ def command_check_ci_support(_args: argparse.Namespace, ctx: RepoContext) -> int
         failures.append("legacy shell scripts remain: {}".format(", ".join(shell_scripts)))
     makefile = read_text(ctx.root / "Makefile")
     pipeline = read_text(ctx.root / ".github/workflows/ci.yml")
-    docs_pipeline = read_text(ctx.root / ".github/workflows/docs.yml")
+    docs_pipeline = read_text(ctx.root / ".github/workflows/docs.yml") if (ctx.root / ".github/workflows/docs.yml").exists() else ""
     runtest = read_text(ctx.root / "runtest")
     sentinel = read_text(ctx.root / "runtest-sentinel")
     moduleapi = read_text(ctx.root / "runtest-moduleapi")
@@ -2686,7 +2692,7 @@ def command_check_ci_support(_args: argparse.Namespace, ctx: RepoContext) -> int
         failures.append("CI wasm check does not install Node.js with apt")
     elif wasm_check < 0 or install_node > wasm_check:
         failures.append("CI must install Node.js before running wasm-check")
-    if '"scripts/versal-util.py"' not in docs_pipeline:
+    if docs_pipeline and '"scripts/versal-util.py"' not in docs_pipeline:
         failures.append("documentation pipeline does not watch versal-util.py")
     if "python3 \"$ROOT_DIR/scripts/versal-util.py\" tcl binaries" not in moduleapi:
         failures.append("Module API runner does not use Python binary staging")
@@ -2699,6 +2705,8 @@ def command_check_ci_support(_args: argparse.Namespace, ctx: RepoContext) -> int
         failures.append("runtest must skip unit/obuf-limits until Bulk reply copy avoidance is implemented")
     if "--skipunit unit/oom-score-adj" not in runtest:
         failures.append("runtest must skip unit/oom-score-adj")
+    if "VERSAL_TCL_DENY_SLOW" not in pipeline or "--tags -slow" not in runtest:
+        failures.append("GitHub Tcl runner must deny upstream slow tests")
     for unit in ("maxmemory-basic", "maxmemory", "io-threads", "memefficiency"):
         if "--skipunit unit/{}".format(unit) in runtest:
             failures.append("runtest must execute enabled unit/{}".format(unit))
@@ -2716,7 +2724,7 @@ def command_check_ci_support(_args: argparse.Namespace, ctx: RepoContext) -> int
         failures.append("CI Tcl artifact download retry loop is missing")
     if "versal-debug-binaries.tar.gz" not in pipeline:
         failures.append("CI Tcl binaries must be packaged as a single tar archive")
-    if "git submodule update --init --recursive" not in docs_pipeline and "submodules: recursive" not in docs_pipeline:
+    if docs_pipeline and "git submodule update --init --recursive" not in docs_pipeline and "submodules: recursive" not in docs_pipeline:
         failures.append("documentation CI must initialize submodules")
     if "$(MAKE) property" not in makefile or "test --test integration" not in makefile:
         failures.append("Makefile CI coverage is incomplete")

@@ -161,6 +161,7 @@ jobs:
       - name: Run Tcl regression suite
         env:
           VERSAL_TCL_SKIP_BUILD: "1"
+          VERSAL_TCL_DENY_SLOW: "1"
         run: |
           rm -rf thirdparty/valkey/tests/tmp/* || true
           ./runtest

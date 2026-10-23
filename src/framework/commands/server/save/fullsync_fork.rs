@@ -473,6 +473,7 @@ pub fn fork_direct_diskless_rdb_child(
         exit_child_if_parent_is_gone(parent_pid);
         child_write_direct_dual_rdb_phase(phase_write_fd, DirectDualRdbChildPhase::Started);
         let mut bytes = (b"$EOF:".len() + marker.len() + b"\r\n".len()) as u64;
+        let mut metric_written = false;
         let mut ok = child_write_active_sockets(&mut child_fds, b"$EOF:", send_timeout_ms)
             && child_write_active_sockets(&mut child_fds, marker, send_timeout_ms)
             && child_write_active_sockets(&mut child_fds, b"\r\n", send_timeout_ms);
@@ -487,6 +488,7 @@ pub fn fork_direct_diskless_rdb_child(
         }
         if ok {
             child_write_direct_dual_rdb_phase(phase_write_fd, DirectDualRdbChildPhase::SerializeDone);
+            metric_written = child_write_all(metric_write_fd, &bytes.to_ne_bytes());
         }
         if ok {
             bytes = bytes.saturating_add(marker.len() as u64);
@@ -495,7 +497,7 @@ pub fn fork_direct_diskless_rdb_child(
         if ok {
             child_write_direct_dual_rdb_phase(phase_write_fd, DirectDualRdbChildPhase::MarkerSent);
         }
-        if ok {
+        if ok && !metric_written {
             let _ = child_write_all(metric_write_fd, &bytes.to_ne_bytes());
         }
             drop(metric_write_end);

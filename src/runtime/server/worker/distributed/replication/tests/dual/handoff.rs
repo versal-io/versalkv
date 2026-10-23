@@ -1235,20 +1235,14 @@ fn dual_commit_handoff_ordering_a_buffered_then_commit() {
     .iter()
     .flat_map(|chunk| chunk.iter().copied())
     .collect();
-    let expected_getack_ack = crate::engine::distributed::replication::protocol::build_replconf_ack(
-        offset(max_end_offset),
-        None,
-    );
     let expected_terminal_ack =
         crate::engine::distributed::replication::protocol::build_replconf_ack(
             offset(max_end_offset),
             None,
         );
-    let mut expected_acks = expected_getack_ack;
-    expected_acks.extend_from_slice(&expected_terminal_ack);
     assert_eq!(
-        queued_main, expected_acks,
-        "nonempty handoff must preserve the buffered GETACK ACK before terminal ACK"
+        queued_main, expected_terminal_ack,
+        "terminal ACK must satisfy buffered GETACK after replay reaches steady state"
     );
 
     backend
@@ -1262,7 +1256,7 @@ fn dual_commit_handoff_ordering_a_buffered_then_commit() {
     .flat_map(|chunk| chunk.iter().copied())
     .collect();
     assert_eq!(
-        queued_after_repeat, expected_acks,
+        queued_after_repeat, expected_terminal_ack,
         "terminal dual handoff must be idempotent after RDB state becomes None"
     );
 

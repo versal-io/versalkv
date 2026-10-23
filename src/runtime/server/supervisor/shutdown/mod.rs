@@ -249,7 +249,7 @@ fn cancel_failed_shutdown(ctx: &mut ServerContext) {
 }
 
 fn replicas_are_ready_for_shutdown(ctx: &ServerContext) -> bool {
-    let primary_offset = ctx.replication().backlog.reported_offset();
+    let primary_offset = ctx.replication().primary_repl_offset();
     let replicas: Vec<_> = ctx
         .replication()
         .view
@@ -261,7 +261,7 @@ fn replicas_are_ready_for_shutdown(ctx: &ServerContext) -> bool {
 }
 
 fn log_replica_shutdown_status(ctx: &ServerContext) {
-    let primary_offset = ctx.replication().backlog.reported_offset();
+    let primary_offset = ctx.replication().primary_repl_offset();
     let mut total = 0usize;
     let mut in_sync = 0usize;
     for info in ctx.replication().view.replica_info.values() {
@@ -315,7 +315,7 @@ impl crate::runtime::server::worker::ServerWorkerState {
             return;
         }
 
-        let primary_offset = self.ctx.replication().backlog.reported_offset();
+        let primary_offset = self.ctx.replication().primary_repl_offset();
         let replicas: Vec<_> = self
             .replication_runtime
             .primary_links()
@@ -400,7 +400,7 @@ impl crate::runtime::server::worker::ServerWorkerState {
         }
         self.refresh_replication_view();
         let now = crate::foundation::io::sys::time::mstime();
-        let primary_offset = self.ctx.replication().backlog.reported_offset();
+        let primary_offset = self.ctx.replication().primary_repl_offset();
         let replicas: Vec<_> = self
             .ctx
             .replication()

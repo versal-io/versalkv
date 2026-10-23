@@ -62,6 +62,7 @@ pub struct ReplicationState {
     pub force_failover: bool,
     pub disconnect_clients_until_ms: i64,
     pub backlog: ReplicationBacklog,
+    primary_repl_offset: ReplicationOffset,
     pub slave_repl_offset: ReplicationOffset,
     pub slave_read_repl_offset: ReplicationOffset,
     pub async_loading: bool,
@@ -95,6 +96,7 @@ impl ReplicationState {
             force_failover: false,
             disconnect_clients_until_ms: 0,
             backlog: ReplicationBacklog::new(replid, backlog_capacity),
+            primary_repl_offset: zero,
             slave_repl_offset: zero,
             slave_read_repl_offset: zero,
             async_loading: false,
@@ -120,6 +122,36 @@ impl ReplicationState {
                 .history_len()
                 .max(self.replica_output_buffer_bytes)
         }
+    }
+
+    pub fn primary_repl_offset(&self) -> ReplicationOffset {
+        self.primary_repl_offset.max(self.backlog.reported_offset())
+    }
+
+    pub fn record_local_propagation(
+        &mut self,
+        replication_bytes: usize,
+        is_aof_enabled: bool,
+    ) -> Result<Option<ReplicationOffset>, InvalidReplicationPosition> {
+        if self.is_replica() || replication_bytes == 0 {
+            return Ok(None);
+        }
+        let delta = if self.backlog.is_active() {
+            replication_bytes
+        } else if is_aof_enabled {
+            1
+        } else {
+            return Ok(None);
+        };
+        let next = self
+            .primary_repl_offset()
+            .checked_advance(delta)
+            .ok_or(InvalidReplicationPosition)?;
+        self.primary_repl_offset = next;
+        if !self.backlog.is_active() {
+            self.backlog.align_inactive_offset(next)?;
+        }
+        Ok(Some(next))
     }
 
     pub fn is_waiting_for_failover_sync(&self) -> bool {
@@ -221,7 +253,7 @@ impl ReplicationState {
             // C `replicationSetPrimary()` keeps `primary_repl_offset` visible
             // until a successful full sync adopts the upstream cursor. Mirror
             // that unified offset here instead of publishing a false zero.
-            let reported_offset = self.backlog.reported_offset();
+            let reported_offset = self.primary_repl_offset();
             self.slave_repl_offset = reported_offset;
             self.slave_read_repl_offset = reported_offset;
             self.primary_down_since_ms = 0;
@@ -240,6 +272,7 @@ impl ReplicationState {
         if self.role == ReplicationRole::Primary {
             return false;
         }
+        self.primary_repl_offset = self.slave_repl_offset;
         self.backlog.shift_replication_id();
         self.role = ReplicationRole::Primary;
         self.backlog_idle_deadline_ms = 0;
