@@ -569,7 +569,8 @@ impl ServerWorkerState {
             // old replication backlog is discarded before the new dataset is
             // installed.
             if let Some(replid) = link.master_replid() {
-                let boundary = ReplicationBacklog::rdb_snapshot_boundary(link.applied_position())
+                let snapshot_position = link.prevalidate_rdb_apply_position()?;
+                let boundary = ReplicationBacklog::rdb_snapshot_boundary(snapshot_position)
                     .map_err(|_| LinkError::Protocol)?;
                 self.ctx
                     .replication_mut()
@@ -1194,6 +1195,82 @@ mod tests {
         )
         .expect("enter classic RDB receive");
         link
+    }
+
+    #[test]
+    fn classic_fullresync_dispatch_does_not_publish_uncommitted_snapshot_offset() {
+        use crate::framework::capabilities::connection::Connection;
+
+        for cached_offset in [0, 42] {
+            let mut runtime = ServerWorkerState::new(1).unwrap();
+            runtime.ctx.replication_mut().switch_to_replica();
+            runtime.ctx.replication_mut().slave_repl_offset = offset(cached_offset);
+            let mut connection = Connection::new_fake();
+            connection.set_token_for_test(Token(41));
+            let connection_token = runtime.connection_registry.insert(connection);
+            let mut link = ReplicaLink::new(
+                ConnectionId(41),
+                MasterInfo {
+                    host: "127.0.0.1".to_string(),
+                    port: 6379,
+                },
+            );
+            if cached_offset != 0 {
+                link.set_resume_position("cached-replid".to_string(), offset(cached_offset), 0);
+            }
+            link.connected(None, None);
+            let (events, actions) = link
+                .on_bytes(
+                    b"+PONG\r\n+OK\r\n+OK\r\n+FULLRESYNC 0123456789abcdef0123456789abcdef01234567 1563\r\n",
+                    6380,
+                )
+                .unwrap();
+            runtime.finish_classic_rdb_dispatch(
+                41,
+                connection_token,
+                ClassicDispatchResult {
+                    link,
+                    events,
+                    actions,
+                    peer_closed: false,
+                },
+            );
+            assert!(!runtime.ctx.is_loading());
+            assert_eq!(
+                runtime.ctx.replication().slave_repl_offset,
+                offset(cached_offset),
+                "the runtime must publish processed history until the RDB commit"
+            );
+        }
+    }
+
+    #[test]
+    fn direct_full_sync_seeds_backlog_without_applying_snapshot_position() {
+        let mut runtime = ServerWorkerState::new(1).unwrap();
+        runtime.ctx.replication_mut().switch_to_replica();
+        let mut link = ReplicaLink::new(
+            ConnectionId(41),
+            MasterInfo {
+                host: "127.0.0.1".to_string(),
+                port: 6379,
+            },
+        );
+        link.set_resume_position("cached-replid".to_string(), offset(42), 0);
+        link.connected(None, None);
+        link.on_bytes(
+            b"+PONG\r\n+OK\r\n+OK\r\n+FULLRESYNC 0123456789abcdef0123456789abcdef01234567 1563\r\n$100\r\nab",
+            6380,
+        )
+        .unwrap();
+        assert_eq!(link.applied_position(), offset(42));
+
+        runtime.init_streaming_target(&mut link).unwrap();
+
+        assert_eq!(
+            runtime.ctx.replication().backlog.reported_offset(),
+            offset(1563)
+        );
+        assert_eq!(link.applied_position(), offset(42));
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use std::fmt::Debug;
 
 use crate::foundation::io::store::structure::hash::{HashHt, HashLp};
@@ -234,6 +234,33 @@ impl Robj {
 
     pub fn is_string(&self) -> bool {
         matches!(self, Robj::StrInt(_) | Robj::StrEmbstr(_) | Robj::StrRaw(_))
+    }
+
+    /// Overwrite a string range, reusing uniquely owned raw storage.
+    /// Returns None for non-strings or an overflowing range.
+    pub(crate) fn set_string_range(&mut self, offset: usize, patch: &[u8]) -> Option<usize> {
+        if !self.is_string() {
+            return None;
+        }
+        if patch.is_empty() {
+            return Some(self.as_bytes().len());
+        }
+        let end = offset.checked_add(patch.len())?;
+        let mut buffer = match self {
+            Robj::StrRaw(raw) => std::mem::take(&mut raw.0)
+                .try_into_mut()
+                .unwrap_or_else(|shared| BytesMut::from(shared.as_ref())),
+            Robj::StrInt(value) => BytesMut::from(value.as_bytes()),
+            Robj::StrEmbstr(value) => BytesMut::from(value.as_bytes()),
+            _ => return None,
+        };
+        if buffer.len() < end {
+            buffer.resize(end, 0);
+        }
+        buffer[offset..end].copy_from_slice(patch);
+        let len = buffer.len();
+        *self = Self::string_raw(buffer.freeze());
+        Some(len)
     }
 
     /// Produce a semantically identical value whose string payload is newly

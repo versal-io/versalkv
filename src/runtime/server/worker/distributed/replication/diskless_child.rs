@@ -5,6 +5,7 @@ use crate::framework::distributed::replication::{ConnectionId, ReplicaId, Replic
 use crate::runtime::server::worker::reactor::sources::{RuntimeSourceHandle, TransferId};
 use crate::runtime::server::worker::reactor::transport::PendingRemovalOwner;
 use std::collections::HashSet;
+use std::io::Write;
 use std::os::unix::io::AsRawFd;
 
 /// In-flight diskless fork relay: bytes stream from the child's pipe to every
@@ -14,8 +15,9 @@ use std::os::unix::io::AsRawFd;
 pub(crate) struct DisklessRelay {
     pub(crate) transfer_id: TransferId,
     pub(crate) source: Option<RuntimeSourceHandle>,
-    /// Parent-owned release end matching C's `rdb_child_exit_pipe`. Dropping it
-    /// after every EOF marker drains lets the child exit.
+    /// Parent-owned release end matching C's `rdb_child_exit_pipe`. Writing a
+    /// byte after every EOF marker drains explicitly releases the child; EOF
+    /// remains a fallback when the parent exits.
     pub(crate) child_release_write_end: Option<std::fs::File>,
     /// `ReplicaId` for every replica receiving this snapshot. The connection_token is
     /// NOT cached: a connection can close between ticks and its slab slot be
@@ -35,6 +37,16 @@ pub(crate) struct DisklessRelay {
     pub(crate) marker_sent_targets: HashSet<ReplicaId>,
     pub(crate) completion_announced: bool,
     pub(crate) completion_state: DisklessCompletionState,
+}
+
+impl DisklessRelay {
+    pub(crate) fn release_child(&mut self) {
+        if let Some(mut write_end) = self.child_release_write_end.take() {
+            // An explicit byte releases the child even if a concurrent test
+            // fork inherited another copy of this write descriptor.
+            let _ = write_end.write_all(&[1]);
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -851,15 +863,6 @@ impl ServerWorkerState {
             self.abort_orphaned_direct_dual_rdb_child();
             return DirectDualRdbDropOutcome::Failed;
         }
-        let observed_completed_body = self
-            .full_sync
-            .direct_dual_rdb_child
-            .as_ref()
-            .is_some_and(|child| {
-                child.phases.contains(
-                    &crate::framework::commands::server::save::DirectDualRdbChildPhase::SerializeDone,
-                )
-            });
         let marker_sent = self
             .full_sync
             .direct_dual_rdb_child
@@ -872,6 +875,15 @@ impl ServerWorkerState {
                 Self::record_direct_dual_phases(child, observed_phases);
                 child.phases.contains(
                     &crate::framework::commands::server::save::DirectDualRdbChildPhase::MarkerSent,
+                )
+            });
+        let observed_completed_body = self
+            .full_sync
+            .direct_dual_rdb_child
+            .as_ref()
+            .is_some_and(|child| {
+                child.phases.contains(
+                    &crate::framework::commands::server::save::DirectDualRdbChildPhase::SerializeDone,
                 )
             });
         if matches!(role, ReplicationConnection::RdbChannelCandidate) && marker_sent {
@@ -1236,7 +1248,7 @@ impl ServerWorkerState {
             relay.targets.len()
         );
         relay.completion_announced = true;
-        relay.child_release_write_end.take();
+        relay.release_child();
         let _ = self.reap_diskless_relay_child_if_done();
     }
 

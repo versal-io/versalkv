@@ -425,7 +425,12 @@ mod tests {
             ]
         );
         assert!(EVENT_RAN_IN_RUNTIME_SCOPE.load(Ordering::SeqCst));
-        assert_eq!(ctx.latency().history("module-event-loop").len(), 2);
+        let latest = ctx.latency().latest();
+        let event = latest
+            .iter()
+            .find(|event| event.0 == "module-event-loop")
+            .expect("both callbacks must record module latency");
+        assert_eq!((event.2, event.3, event.4, event.5), (7, 7, 14, 2));
         assert!(!record_module_latency("outside-event-scope", 9));
     }
 }

@@ -515,6 +515,10 @@ impl ClusterState {
         self.myself.flags |= CLUSTER_NODE_REPLICA;
         self.myself.replicaof = master_id_str.clone();
         self.myself.shard_id = master_shard_id;
+        // C clusterSetPrimary zeroes failover_auth_time whenever the node
+        // follows a primary: a quorum collected for the old lineage must not
+        // promote this node after the reparent commits.
+        self.automatic_failover.reset();
         self.mark_primary_migration_target(&master_id_str);
         if !previous_primary.is_empty() && previous_primary != master_id_str {
             self.clear_primary_migration_target_if_orphaned(&previous_primary);

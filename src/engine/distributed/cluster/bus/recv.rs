@@ -128,6 +128,10 @@ impl ClusterBusManager {
                     }
 
                     self.handle_message(state, &cluster_msg, token_value, now);
+                    self.propagate_gossip_failure_quorum(state, &cluster_msg, now);
+                    if let Some(sender) = state.nodes.get_mut(&cluster_msg.sender_id) {
+                        sender.data_received = now;
+                    }
                 }
                 Err(error) if error.is_incomplete() => break,
                 Err(e) => {
@@ -145,6 +149,50 @@ impl ClusterBusManager {
             }
         }
         should_close
+    }
+
+    fn propagate_gossip_failure_quorum(
+        &mut self,
+        state: &mut ClusterState,
+        message: &ClusterMsg,
+        now_ms: i64,
+    ) {
+        use crate::engine::distributed::cluster::node::{CLUSTER_NODE_FAIL, CLUSTER_NODE_PFAIL};
+
+        if !state.nodes.contains_key(&message.sender_id) {
+            return;
+        }
+        for entry in message.gossip() {
+            let locally_suspect = state.nodes.get(&entry.node_id).is_some_and(|node| {
+                node.has_flag(CLUSTER_NODE_PFAIL) && !node.has_flag(CLUSTER_NODE_FAIL)
+            });
+            if !locally_suspect || entry.flags & (CLUSTER_NODE_PFAIL | CLUSTER_NODE_FAIL) == 0 {
+                continue;
+            }
+            let (votes, quorum) = state.count_fail_reports(
+                &entry.node_id,
+                now_ms,
+                state.failure_report_node_timeout_ms(),
+            );
+            if votes < quorum || !state.mark_fail(&entry.node_id) {
+                continue;
+            }
+            // C checks failure quorum inside clusterProcessGossipSection.
+            // Publish the decision now so replicas can confirm their failed
+            // primary before a due election, without waiting for another cron.
+            let failing = &state.nodes[&entry.node_id];
+            let fail = self.build_fail(state, failing);
+            for connection in self.connections.values_mut() {
+                if connection.is_outgoing
+                    && connection.connected
+                    && connection.handshake_sent
+                    && !connection.node_name.is_empty()
+                {
+                    connection.write_buf.extend_from_slice(&fail);
+                    state.record_bus_message_sent(ClusterMsgType::Fail);
+                }
+            }
+        }
     }
 
     fn accept_noaddr_sender(
@@ -251,6 +299,7 @@ impl ClusterBusManager {
         token_value: usize,
         now: i64,
     ) {
+        Self::observe_known_sender_header(state, msg, now);
         match msg.msg_type {
             ClusterMsgType::Meet => {
                 self.handle_meet_received(state, msg, token_value, now);
@@ -297,36 +346,29 @@ impl ClusterBusManager {
                 Self::handle_paused_primary_message(state, msg);
             }
             ClusterMsgType::Fail => {
-                // Mark the reported node FAIL.
-                if !msg.sender_id.is_empty() {
-                    use crate::engine::distributed::cluster::node::CLUSTER_NODE_PFAIL;
-                    let ClusterBusBody::Fail { node_id } = &msg.body else {
-                        return;
-                    };
-                    let victim = node_id.to_string();
-                    // Require local suspicion before accepting a FAIL broadcast;
-                    // stale queued FAIL frames must not re-fail a recovered node.
-                    let locally_suspect = state
-                        .nodes
-                        .get(&victim)
-                        .map(|n| {
-                            const ALIVE_WINDOW_MS: i64 = 2_000;
-                            // pong_received==0 is bootstrap, not downtime.
-                            n.pong_received != 0
-                                && (n.has_flag(CLUSTER_NODE_PFAIL)
-                                    || now.saturating_sub(n.pong_received) >= ALIVE_WINDOW_MS)
-                        })
-                        // Unknown victims converge later through gossip.
-                        .unwrap_or(false);
-                    if locally_suspect {
-                        crate::server_log!(
-                            notice,
-                            "Cluster FAIL received about {} from {}",
-                            victim,
-                            msg.sender_id
-                        );
-                        state.mark_fail(&victim);
-                    }
+                use crate::engine::distributed::cluster::node::{
+                    CLUSTER_NODE_FAIL, CLUSTER_NODE_MYSELF,
+                };
+                if !state.nodes.contains_key(&msg.sender_id) {
+                    return;
+                }
+                let ClusterBusBody::Fail { node_id } = &msg.body else {
+                    return;
+                };
+                let victim = node_id.to_string();
+                // Match C: the sender has already confirmed failure, so a
+                // recent local PONG must not delay a replica's election.
+                let should_mark_fail = state.nodes.get(&victim).is_some_and(|node| {
+                    node.flags & (CLUSTER_NODE_FAIL | CLUSTER_NODE_MYSELF) == 0
+                });
+                if should_mark_fail {
+                    crate::server_log!(
+                        notice,
+                        "Cluster FAIL received about {} from {}",
+                        victim,
+                        msg.sender_id
+                    );
+                    state.mark_fail(&victim);
                 }
             }
             ClusterMsgType::Update => {
@@ -700,9 +742,15 @@ impl ClusterBusManager {
             // Gossip may identify the real node before an earlier outbound
             // handshake has been resolved. A direct MEET from that known node
             // proves both records describe the same peer, so retain the real
-            // ID and discard the random handshake identity. Close every link
-            // still projected through the random ID first: otherwise cron can
-            // no longer find that socket after the state record disappears.
+            // ID and discard the random handshake identity. Keep the current
+            // inbound link for its PONG before retiring other placeholder
+            // links, matching C's known-sender MEET response.
+            if let Some(connection) = self.connections.get_mut(&token_value) {
+                if !connection.is_outgoing && connection.handshake_node_name == handshake_id {
+                    connection.node_name = msg.sender_id.clone();
+                    connection.handshake_node_name.clear();
+                }
+            }
             let close = (
                 handshake_id.to_string(),
                 crate::engine::distributed::cluster::ClusterLinkDirection::All,
@@ -938,6 +986,13 @@ impl ClusterBusManager {
         if let Some(handshake_id) = handshake_id.as_deref() {
             // The stored handshake endpoint can differ from the peer's final
             // advertised endpoint when CLUSTER MEET uses a custom bus port.
+            // C deletes every link owned by the placeholder with the node.
+            // Capture its identity before removal; the confirmed current link
+            // is rebound below before the runtime retires the remaining owners.
+            state.queue_link_close_once((
+                handshake_id.to_string(),
+                crate::engine::distributed::cluster::ClusterLinkDirection::All,
+            ));
             state.remove_handshake_node(handshake_id);
         }
         self.close_endpoint_handshake_links(state, msg);

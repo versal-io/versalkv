@@ -77,12 +77,7 @@ pub struct ReplicaEligibility {
 
 impl ReplicaEligibility {
     pub fn is_eligible(&self) -> bool {
-        if self.no_failover
-            || !self.cluster_link_connected
-            || self.cluster_view_stale
-            || self.loading
-            || self.priority == 0
-        {
+        if self.no_failover || self.cluster_view_stale || self.loading || self.priority == 0 {
             return false;
         }
         if self.replica_validity_factor == 0 {

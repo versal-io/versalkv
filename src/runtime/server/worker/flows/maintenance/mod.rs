@@ -408,10 +408,6 @@ impl ServerWorkerState {
             .replication_runtime
             .replica_link()
             .is_some_and(|link| link.is_streaming());
-        let replica_full_sync_pending = self
-            .replication_runtime
-            .replica_link()
-            .is_some_and(|link| link.is_receiving_rdb() || link.has_pending_rdb_receive());
         // Match C `replicationSetPrimary`: merely polling before the new
         // upstream has connected or failed must leave `repl_down_since` at
         // zero. Actual teardown records the first disconnect baseline.
@@ -474,14 +470,16 @@ impl ServerWorkerState {
             let zero = crate::engine::distributed::replication::ReplicationOffset::try_from(0)
                 .expect("zero is a valid replication offset");
             let local_replication_offset = if self.ctx.replication().is_replica() {
-                // C's replicationGetReplicaOffset() cannot see a primary
-                // client during a full-sync load, so cluster bus packets
-                // advertise zero until the new dataset is committed. A plain
-                // disconnect still retains the cached primary offset.
-                if self.ctx.is_loading()
-                    || self.ctx.replication().async_loading
-                    || replica_full_sync_pending
-                {
+                // C's replicationAttachToNewPrimary() discards the cached
+                // primary client in the same event-loop turn that calls
+                // startLoading() (both disk and socket RDB loads), so the
+                // offset observable through cluster bus packets becomes zero
+                // exactly when `loading` flips on. Keep advertising the
+                // cached offset while the RDB is still being received or the
+                // primary link is plain disconnected, otherwise peers hide a
+                // non-empty replica from CLUSTER SLOTS and rank it as empty
+                // before the dataset load actually starts.
+                if self.ctx.is_loading() || self.ctx.replication().async_loading {
                     zero
                 } else {
                     self.ctx.replication().slave_repl_offset
@@ -519,6 +517,15 @@ impl ServerWorkerState {
                 &local_failover_status,
             );
             self.execute_cluster_actions(state, hints.actions, now);
+            // C frees stale links synchronously in clusterCron. Retire this
+            // tick's closures before the receive pump can confirm a fresh
+            // PONG; a deferred node-ID closure would otherwise tear down the
+            // recovered link during the next cron.
+            let actions = crate::engine::distributed::cluster::reducer::reduce(
+                state,
+                crate::engine::distributed::cluster::event::ClusterEvent::DrainLinkCloses,
+            );
+            self.execute_cluster_link_actions(state, actions);
             let actions = crate::engine::distributed::cluster::reducer::reduce(
                 state,
                 crate::engine::distributed::cluster::event::ClusterEvent::BroadcastTopology,
@@ -1566,6 +1573,69 @@ mod tests {
         assert_eq!(backend.cluster_bus.ping_interval, 1_500);
     }
 
+    #[test]
+    fn cluster_cron_closes_stale_bus_link_in_the_same_tick() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut backend = ServerWorkerState::new(1).unwrap();
+        backend.ctx.config_mut().server.cluster_enabled = true;
+        backend.ctx.config_mut().server.cluster_node_timeout = 1_000;
+        let peer = backend.transport.connect_tcp(addr).unwrap();
+        let (_server, _) = listener.accept().unwrap();
+        backend
+            .route_runtime_source(
+                peer.token,
+                crate::runtime::server::worker::reactor::sources::SourceOwner::ClusterBus,
+            )
+            .unwrap();
+        let now_ms = crate::foundation::io::sys::time::mstime();
+        let node_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let mut state = ClusterState::new("127.0.0.1", 6379, 16_379);
+        let mut node = ClusterNode::new(
+            node_id.to_string(),
+            addr.ip().to_string(),
+            addr.port(),
+            addr.port(),
+            true,
+        );
+        node.flags &= !CLUSTER_NODE_MYSELF;
+        node.ping_sent = now_ms - 750;
+        node.data_received = now_ms - 750;
+        node.pong_received = now_ms - 750;
+        state.nodes.insert(node_id.to_string(), node);
+        *backend.ctx.cluster_state_mut() = Some(Box::new(state));
+        backend.cluster_bus.register_outgoing_for_node(
+            peer.token,
+            addr,
+            false,
+            node_id.to_string(),
+        );
+        let connection = backend
+            .cluster_bus
+            .connections
+            .get_mut(&peer.token.0)
+            .unwrap();
+        connection.created_at = now_ms - 2_000;
+        connection.handshake_sent = true;
+
+        backend.run_cluster_cron();
+
+        assert!(
+            !backend.cluster_bus.connections.contains_key(&peer.token.0),
+            "cron must retire its stale link before a receive pump can observe a recovered peer"
+        );
+        assert!(
+            backend
+                .ctx
+                .cluster_state()
+                .as_ref()
+                .unwrap()
+                .pending_link_closes
+                .is_empty(),
+            "a stale-link decision must not survive into the next cron"
+        );
+    }
+
     fn cluster_replica_runtime() -> ServerWorkerState {
         let mut backend = ServerWorkerState::new(1).unwrap();
         backend.ctx.config_mut().server.cluster_enabled = true;
@@ -1651,7 +1721,7 @@ mod tests {
     }
 
     #[test]
-    fn cluster_cron_advertises_zero_offset_after_fullresync_before_rdb_payload() {
+    fn cluster_cron_retains_cached_replica_offset_after_fullresync_before_rdb_load() {
         let mut backend = cluster_replica_runtime();
         let mut link = ReplicaLink::new(
             ConnectionId(42),
@@ -1671,6 +1741,10 @@ mod tests {
 
         backend.run_cluster_cron();
 
+        // C discards the cached primary in replicationAttachToNewPrimary(),
+        // which runs in the same event-loop turn as startLoading(). While the
+        // RDB payload is still being received the cached offset stays visible,
+        // so peers must not hide the replica before `loading` flips on.
         assert_eq!(
             backend
                 .ctx
@@ -1679,7 +1753,7 @@ mod tests {
                 .unwrap()
                 .myself
                 .repl_offset,
-            0
+            42
         );
     }
 

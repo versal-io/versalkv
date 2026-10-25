@@ -329,9 +329,18 @@ impl ServerWorkerState {
             [crate::framework::capabilities::io::Token(connection_token)]
         .selected_db;
         if !was_paused {
-            self.ctx
-                .blocking_registry_mut()
-                .unregister_client(db_id, &blocked.keys, &session);
+            if matches!(
+                blocked.cmd,
+                BlockedCmd::Wait { .. } | BlockedCmd::WaitAof { .. } | BlockedCmd::SetSlot { .. }
+            ) {
+                self.ctx
+                    .blocking_registry_mut()
+                    .unregister_keyless_client(&session);
+            } else {
+                self.ctx
+                    .blocking_registry_mut()
+                    .unregister_client(db_id, &blocked.keys, &session);
+            }
         }
         if let Some(ci) = self.ctx.client_info_mut(token.0) {
             ci.flags.retain(|c| c != 'b');

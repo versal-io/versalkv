@@ -181,6 +181,11 @@ impl RuntimeMachine for ServerWorkerMachine {
                 );
                 self.runtime
                     .collect_after_poll_events(Some((batch.cycle_start, batch.events)));
+                if self.runtime.ctx.cluster_state().is_some() {
+                    // C accumulates failover work through file and time events,
+                    // then resolves it in the next beforeSleep callback.
+                    self.runtime.begin_cluster_bus_receive_batch();
+                }
                 if self.runtime.dispatch_ready_phase(DispatchContext::Normal)? == LoopControl::Stop
                 {
                     self.runtime.finish_turn_pending_outputs();
@@ -302,6 +307,44 @@ mod tests {
             RuntimeProgress::Progress
         );
         assert_eq!(machine.phase, WorkerPhase::AwaitingReady);
+    }
+
+    #[test]
+    fn cluster_bus_receive_batch_spans_ready_and_time_until_before_poll() {
+        let mut machine = ServerWorkerMachine {
+            runtime: ServerWorkerState::new(1).unwrap(),
+            phase: WorkerPhase::Ready,
+            ready_batch: Some(WorkerReadyBatch {
+                cycle_start: std::time::Instant::now(),
+                events: Vec::new(),
+            }),
+            clock: RuntimeClock::new(1_000, 1_000),
+        };
+        *machine.runtime.ctx.cluster_state_mut() = Some(Box::new(
+            crate::engine::distributed::cluster::ClusterState::new("127.0.0.1", 6379, 16_379),
+        ));
+
+        assert_eq!(
+            machine.advance(RuntimeClock::new(1_000, 1_000)).unwrap(),
+            RuntimeProgress::Progress
+        );
+        assert_eq!(
+            machine.runtime.cluster_bus_receive_batch_depth, 1,
+            "Ready-phase election results must wait for same-turn maintenance reads"
+        );
+
+        assert_eq!(
+            machine.advance(RuntimeClock::new(1_001, 1_001)).unwrap(),
+            RuntimeProgress::Progress
+        );
+        assert_eq!(machine.phase, WorkerPhase::BeforePoll);
+        assert_eq!(machine.runtime.cluster_bus_receive_batch_depth, 1);
+
+        assert_eq!(
+            machine.advance(RuntimeClock::new(1_002, 1_002)).unwrap(),
+            RuntimeProgress::Progress
+        );
+        assert_eq!(machine.runtime.cluster_bus_receive_batch_depth, 0);
     }
 
     #[test]

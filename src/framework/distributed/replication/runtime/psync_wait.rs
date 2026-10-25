@@ -193,11 +193,12 @@ impl ReplicationRuntime {
         rdb_connections: &[ConnectionId],
         backlog: &mut ReplicationBacklog,
     ) {
-        let pin = if backlog.history_len() == 0 {
-            backlog.next_stream_cursor()
-        } else {
-            backlog.tail_block_start_cursor()
-        };
+        // An empty backlog has a wait owner but no block to reference.
+        // The first propagated frame backfills the pin before byte eviction.
+        if backlog.history_len() == 0 {
+            return;
+        }
+        let pin = backlog.tail_block_start_cursor();
         for &rdb in rdb_connections {
             if let Some(wait) = self.rdb_psync_waits.get_mut(&rdb) {
                 if wait.pin_cursor.is_none() {

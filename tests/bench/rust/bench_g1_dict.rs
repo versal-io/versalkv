@@ -3,7 +3,7 @@ mod common;
 
 use common::{measure_destructive, measure_readonly, snapshot_mem, write_csv, CaseRow};
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use std::hint::black_box;
 use versal::foundation::io::store::structure::dict::Dict;
 
@@ -69,7 +69,7 @@ fn main() {
         let samples = measure_readonly(
             move || (d, keys_ro),
             |(d, ks), _i| {
-                let idx = rng.gen_range(0..ks.len());
+                let idx = rng.random_range(0..ks.len());
                 black_box(d.get(ks[idx].as_str()));
             },
         );
@@ -90,7 +90,7 @@ fn main() {
         let samples = measure_readonly(
             move || (d, miss_keys),
             |(d, mk), _i| {
-                let idx = rng.gen_range(0..mk.len());
+                let idx = rng.random_range(0..mk.len());
                 black_box(d.get(mk[idx].as_str()));
             },
         );
@@ -110,7 +110,7 @@ fn main() {
         let samples = measure_destructive(
             |_| {
                 let d = build_full(&keys_local);
-                let victim = keys_local[rng.gen_range(0..N)].clone();
+                let victim = keys_local[rng.random_range(0..N)].clone();
                 (d, victim)
             },
             |d, victim| {
@@ -165,7 +165,7 @@ fn main() {
         let samples = measure_readonly(
             move || (d, long_keys_ro),
             |(d, ks), _i| {
-                let idx = rng.gen_range(0..ks.len());
+                let idx = rng.random_range(0..ks.len());
                 black_box(d.get(ks[idx].as_str()));
             },
         );

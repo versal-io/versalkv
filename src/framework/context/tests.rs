@@ -116,6 +116,173 @@ fn server_context_synchronizes_lfu_policy_into_databases() {
 }
 
 #[test]
+fn latency_history_is_bounded_under_repeated_samples() {
+    let mut lat = LatencyState::new();
+    lat.set_threshold(1);
+
+    for _ in 0..65_536 {
+        lat.add_sample_at("command", 1, 1_000);
+    }
+
+    let history = lat.history("command");
+    assert!(
+        history.len() <= 160,
+        "latency history must retain at most 160 slots, got {}",
+        history.len()
+    );
+    let latest = lat.latest();
+    assert_eq!(latest.len(), 1);
+    assert_eq!(latest[0].5, 65_536);
+}
+
+#[test]
+fn latency_samples_in_the_same_second_keep_maximum_and_lifetime_totals() {
+    let mut lat = LatencyState::new();
+    lat.set_threshold(1);
+
+    lat.add_sample_at("command", 12, 1_000);
+    lat.add_sample_at("command", 20, 1_000);
+    lat.add_sample_at("command", 15, 1_000);
+
+    assert_eq!(lat.history("command"), vec![(1_000, 20)]);
+    assert_eq!(
+        lat.latest(),
+        vec![("command".to_string(), 1_000, 20, 20, 47, 3)]
+    );
+    assert!(lat
+        .graph("command")
+        .contains("command - high 20 ms, low 20 ms (all time high 20 ms)"));
+}
+
+#[test]
+fn latency_history_overwrites_oldest_slot_without_losing_lifetime_maximum() {
+    let mut lat = LatencyState::new();
+    lat.set_threshold(1);
+    lat.add_sample_at("command", 200, 1_000);
+    for latency_ms in 1..=160 {
+        lat.add_sample_at("command", latency_ms, 1_000 + latency_ms);
+    }
+
+    let expected: Vec<_> = (1..=160)
+        .map(|latency_ms| (1_000 + latency_ms, latency_ms))
+        .collect();
+    assert_eq!(lat.history("command"), expected);
+    assert_eq!(
+        lat.latest(),
+        vec![("command".to_string(), 1_160, 160, 200, 13_080, 161)]
+    );
+    assert!(lat
+        .graph("command")
+        .contains("command - high 160 ms, low 1 ms (all time high 200 ms)"));
+}
+
+#[test]
+fn latency_same_second_merge_at_full_capacity_does_not_evict_a_slot() {
+    let mut lat = LatencyState::new();
+    lat.set_threshold(1);
+    for timestamp_sec in 1_000..1_160 {
+        lat.add_sample_at("command", 1, timestamp_sec);
+    }
+    lat.add_sample_at("command", 12, 1_159);
+
+    let history = lat.history("command");
+    assert_eq!(history.len(), 160);
+    assert_eq!(history.first(), Some(&(1_000, 1)));
+    assert_eq!(history.last(), Some(&(1_159, 12)));
+    assert_eq!(
+        lat.latest(),
+        vec![("command".to_string(), 1_159, 12, 12, 172, 161)]
+    );
+
+    lat.add_sample_at("command", 2, 1_160);
+    let history = lat.history("command");
+    assert_eq!(history.len(), 160);
+    assert_eq!(history.first(), Some(&(1_001, 1)));
+    assert_eq!(history.last(), Some(&(1_160, 2)));
+    assert_eq!(
+        lat.latest(),
+        vec![("command".to_string(), 1_160, 2, 12, 174, 162)]
+    );
+}
+
+#[test]
+fn latency_history_preserves_insertion_order_when_time_moves_backwards() {
+    let mut lat = LatencyState::new();
+    lat.set_threshold(1);
+    lat.add_sample_at("command", 12, 1_002);
+    lat.add_sample_at("command", 20, 1_000);
+    lat.add_sample_at("command", 15, 1_002);
+
+    assert_eq!(
+        lat.history("command"),
+        vec![(1_002, 12), (1_000, 20), (1_002, 15)]
+    );
+    assert_eq!(
+        lat.latest(),
+        vec![("command".to_string(), 1_002, 15, 20, 47, 3)]
+    );
+}
+
+#[test]
+fn latency_threshold_filters_samples_without_discarding_existing_history() {
+    let mut lat = LatencyState::new();
+    lat.add_sample_at("command", 12, 1_000);
+    assert!(lat.latest().is_empty());
+
+    lat.set_threshold(10);
+    lat.add_sample_at("command", 9, 1_000);
+    assert!(lat.latest().is_empty());
+    lat.add_sample_at("command", 10, 1_000);
+    lat.set_threshold(0);
+    lat.add_sample_at("command", 30, 1_001);
+    lat.set_threshold(-1);
+    lat.add_sample_at("command", 40, 1_001);
+    assert_eq!(lat.history("command"), vec![(1_000, 10)]);
+
+    lat.set_threshold(10);
+    lat.add_sample_at("command", 20, 1_001);
+    assert_eq!(lat.history("command"), vec![(1_000, 10), (1_001, 20)]);
+    assert_eq!(
+        lat.latest(),
+        vec![("command".to_string(), 1_001, 20, 20, 30, 2)]
+    );
+}
+
+#[test]
+fn latency_reset_discards_history_and_lifetime_totals_but_keeps_threshold() {
+    let mut lat = LatencyState::new();
+    lat.set_threshold(1);
+    lat.add_sample_at("command", 200, 1_000);
+    for timestamp_sec in 1_001..=1_160 {
+        lat.add_sample_at("command", 1, timestamp_sec);
+    }
+    lat.add_sample_at("other", 3, 1_160);
+
+    assert_eq!(lat.reset(Some("missing")), 0);
+    assert_eq!(lat.reset(Some("command")), 1);
+    assert_eq!(lat.reset(Some("command")), 0);
+    assert!(lat.history("command").is_empty());
+    assert_eq!(lat.graph("command"), "No latency data for this event");
+    assert_eq!(lat.history("other"), vec![(1_160, 3)]);
+    assert_eq!(lat.latest(), vec![("other".to_string(), 1_160, 3, 3, 3, 1)]);
+
+    lat.add_sample_at("command", 2, 2_000);
+    let latest = lat.latest();
+    let command = latest.iter().find(|sample| sample.0 == "command").unwrap();
+    assert_eq!(command, &("command".to_string(), 2_000, 2, 2, 2, 1));
+    assert_eq!(lat.reset(None), 2);
+    assert_eq!(lat.reset(None), 0);
+    assert!(lat.latest().is_empty());
+    assert!(lat.history("other").is_empty());
+
+    lat.add_sample_at("command", 1, 3_000);
+    assert_eq!(
+        lat.latest(),
+        vec![("command".to_string(), 3_000, 1, 1, 1, 1)]
+    );
+}
+
+#[test]
 fn latency_threshold_latest_history_graph_and_reset_work_together() {
     let _guard = LATENCY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut lat = LatencyState::new();
@@ -124,8 +291,8 @@ fn latency_threshold_latest_history_graph_and_reset_work_together() {
 
     lat.add_sample("fast", 5);
     assert!(lat.latest().is_empty());
-    lat.add_sample("slow", 12);
-    lat.add_sample("slow", 20);
+    lat.add_sample_at("slow", 12, 1_000);
+    lat.add_sample_at("slow", 20, 1_001);
 
     let latest = lat.latest();
     assert_eq!(latest.len(), 1);
@@ -134,7 +301,7 @@ fn latency_threshold_latest_history_graph_and_reset_work_together() {
     assert_eq!(latest[0].3, 20);
     assert_eq!(latest[0].4, 32);
     assert_eq!(latest[0].5, 2);
-    assert_eq!(lat.history("slow").len(), 2);
+    assert_eq!(lat.history("slow"), vec![(1_000, 12), (1_001, 20)]);
     assert!(lat.history("missing").is_empty());
     let graph = lat.graph("slow");
     assert!(graph.contains("slow - high 20 ms, low 12 ms"));

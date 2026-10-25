@@ -2218,6 +2218,9 @@ def selftest_runtest_sentinel(ctx: RepoContext) -> None:
         root = Path(directory)
         shutil.copy2(str(ctx.root / "runtest-sentinel"), str(root / "runtest-sentinel"))
         (root / "runtest-sentinel").chmod(0o755)
+        runner = read_text(root / "runtest-sentinel")
+        _assert('temporary="$destination.tmp.$$"' in runner, "Sentinel binary staging must use a process-unique temporary path")
+        _assert('mv -f "$temporary" "$destination"' in runner, "Sentinel binary staging must replace the destination inode atomically")
         populate_fake_binaries(root)
         valkey = root / "thirdparty/valkey"
         (valkey / "src").mkdir(parents=True)

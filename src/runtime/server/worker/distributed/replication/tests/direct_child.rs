@@ -277,9 +277,7 @@ fn target_drop_before_publication_aborts_direct_child_cohort() {
     let _ = child.wait();
 }
 
-#[test]
-fn completed_rdb_socket_close_after_serialize_done_keeps_direct_child() {
-    use crate::framework::commands::server::save::DirectDualRdbChildPhase;
+fn waiting_direct_child() -> (ServerWorkerState, ConnectionId, ConnectionId, ReplicaId) {
     use crate::framework::distributed::replication::PrimaryDualChannelState;
 
     let mut backend = ServerWorkerState::new(1).unwrap();
@@ -306,6 +304,14 @@ fn completed_rdb_socket_close_after_serialize_done_keeps_direct_child() {
     link.transition_dual_state(PrimaryDualChannelState::WaitingForReplicaAck)
         .unwrap();
     install_fake_child(&mut backend, 123_456, vec![rdb], vec![replica_id]);
+    (backend, main, rdb, replica_id)
+}
+
+#[test]
+fn completed_rdb_socket_close_after_serialize_done_keeps_direct_child() {
+    use crate::framework::commands::server::save::DirectDualRdbChildPhase;
+
+    let (mut backend, _, rdb, _) = waiting_direct_child();
     backend
         .full_sync
         .direct_dual_rdb_child
@@ -319,4 +325,58 @@ fn completed_rdb_socket_close_after_serialize_done_keeps_direct_child() {
     assert_eq!(outcome, DirectDualRdbDropOutcome::CompletedPaired);
     assert!(backend.full_sync.direct_dual_rdb_child.is_some());
     assert!(backend.ctx.persistence().has_active_child());
+}
+
+#[test]
+fn completed_rdb_close_observes_serialize_done_pending_in_phase_pipe() {
+    use crate::foundation::io::sys::fd::{pipe, PipeFlags};
+    use crate::framework::commands::server::save::DirectDualRdbChildPhase;
+    use std::io::Write;
+
+    let (mut backend, _, rdb, _) = waiting_direct_child();
+    let (read_end, mut write_end) = pipe(PipeFlags::CLOEXEC_NONBLOCK).unwrap().into_parts();
+    write_end
+        .write_all(&[DirectDualRdbChildPhase::SerializeDone.as_byte()])
+        .unwrap();
+    backend
+        .full_sync
+        .direct_dual_rdb_child
+        .as_mut()
+        .unwrap()
+        .phase_read_end = read_end;
+
+    assert_eq!(
+        backend.drop_direct_dual_rdb_child_connection(rdb),
+        DirectDualRdbDropOutcome::CompletedPaired
+    );
+    assert!(backend.ctx.persistence().has_active_child());
+}
+
+#[test]
+fn completed_rdb_teardown_retains_main_target_until_child_reap() {
+    use crate::framework::commands::server::save::DirectDualRdbChildPhase;
+    use crate::runtime::server::worker::distributed::replication::ReplicationConnection;
+
+    let (mut backend, main, rdb, replica_id) = waiting_direct_child();
+    backend
+        .full_sync
+        .direct_dual_rdb_child
+        .as_mut()
+        .unwrap()
+        .phases
+        .push(DirectDualRdbChildPhase::SerializeDone);
+
+    backend.remove_connection(rdb.0);
+
+    let child = backend.full_sync.direct_dual_rdb_child.as_ref().unwrap();
+    assert_eq!(child.targets, vec![replica_id]);
+    assert!(child.rdb_connections.is_empty());
+    assert!(backend.ctx.persistence().has_active_child());
+    assert!(backend
+        .connection_registry
+        .contains(crate::framework::capabilities::io::Token(main.0)));
+    assert_eq!(
+        backend.replication_runtime.role(main),
+        Some(ReplicationConnection::Primary(replica_id))
+    );
 }

@@ -182,15 +182,15 @@ fn lex_inf() {
 // Task-required tests: 1000 random scores and 10000 interleaved add/remove.
 #[test]
 fn random_1000_matches_sorted_vec() {
-    use rand::{rngs::StdRng, Rng, SeedableRng};
+    use rand::{rngs::StdRng, RngExt, SeedableRng};
     let mut rng = StdRng::seed_from_u64(42);
     let mut z = SkipList::new();
     let mut sorted: std::collections::BTreeMap<(i64, Vec<u8>), (f64, Bytes)> =
         std::collections::BTreeMap::new();
     for _ in 0..1000 {
-        let s: f64 = rng.gen_range(-1000.0..1000.0);
-        let len = rng.gen_range(2usize..8);
-        let member: Vec<u8> = (0..len).map(|_| rng.gen_range(b'a'..=b'z')).collect();
+        let s: f64 = rng.random_range(-1000.0..1000.0);
+        let len = rng.random_range(2usize..8);
+        let member: Vec<u8> = (0..len).map(|_| rng.random_range(b'a'..=b'z')).collect();
         let key = ((s * 1e12) as i64, member.clone());
         if sorted.contains_key(&key) {
             continue;
@@ -209,16 +209,16 @@ fn random_1000_matches_sorted_vec() {
 
 #[test]
 fn interleaved_10000_iter_matches_sorted() {
-    use rand::{rngs::StdRng, Rng, SeedableRng};
+    use rand::{rngs::StdRng, RngExt, SeedableRng};
     let mut rng = StdRng::seed_from_u64(7);
     let mut z = SkipList::new();
     let mut canon: std::collections::BTreeMap<(u64, Vec<u8>), f64> =
         std::collections::BTreeMap::new();
     for _ in 0..10000 {
-        let op: u8 = rng.gen_range(0..3);
-        let s_raw: f64 = rng.gen_range(0.0..1000.0);
-        let len = rng.gen_range(1usize..6);
-        let member: Vec<u8> = (0..len).map(|_| rng.gen_range(b'a'..=b'z')).collect();
+        let op: u8 = rng.random_range(0..3);
+        let s_raw: f64 = rng.random_range(0.0..1000.0);
+        let len = rng.random_range(1usize..6);
+        let member: Vec<u8> = (0..len).map(|_| rng.random_range(b'a'..=b'z')).collect();
         let score_key: u64 = f64::to_bits(s_raw);
         match op {
             0 | 1 => {

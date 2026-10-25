@@ -7,7 +7,7 @@ use std::hash::Hash;
 use super::super::dict::{Dict, ResizeBudget, ResizePolicy};
 
 pub struct KVStore<K, V> {
-    slots: Vec<Option<Dict<K, V>>>,
+    slots: Vec<Option<Box<Dict<K, V>>>>,
     slot_bits: u32,
     total_len: usize,
     importing_slots: HashSet<usize>,
@@ -50,7 +50,7 @@ impl<K: Eq + Hash, V> KVStore<K, V> {
         if self.slots[slot].is_none() {
             let mut dict = Dict::with_resize_budget(self.resize_budget.clone());
             dict.set_resize_policy(self.resize_policy);
-            self.slots[slot] = Some(dict);
+            self.slots[slot] = Some(Box::new(dict));
             self.allocated_slots.insert(slot);
         }
         self.slots[slot].as_mut().unwrap()
@@ -489,6 +489,20 @@ mod tests {
 
     fn standalone() -> KVStore<Vec<u8>, u64> {
         KVStore::new(0)
+    }
+
+    #[test]
+    fn empty_cluster_slot_directory_uses_at_most_one_pointer_per_slot() {
+        let kv: KVStore<Vec<u8>, u64> = KVStore::new(14);
+        let directory_bytes = std::mem::size_of_val(kv.slots.as_slice());
+        let pointer_directory_bytes = kv.slot_count() * std::mem::size_of::<usize>();
+
+        assert!(
+            directory_bytes <= pointer_directory_bytes,
+            "empty slot directory uses {directory_bytes} bytes, expected at most {pointer_directory_bytes}"
+        );
+        assert!(kv.allocated_slots.is_empty());
+        assert_eq!(kv.bucket_count(), 0);
     }
 
     #[test]

@@ -94,6 +94,10 @@ pub struct PrimaryLink {
     pub(crate) rdb_channel_wait_deadline_ms: Option<i64>,
     pub(crate) dual_channel_already_failed: bool,
     output_buffer_soft_limit_reached_at: Option<OutputBufferSoftLimitReachedAt>,
+    /// Position in C's `server.replicas` list, assigned once when PSYNC is
+    /// accepted (replication.c:961 / replication.c:1230). Registration order
+    /// at REPLCONF time can differ across concurrently connecting replicas.
+    accept_seq: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -137,6 +141,7 @@ impl PrimaryLink {
             rdb_channel_wait_deadline_ms: None,
             dual_channel_already_failed: false,
             output_buffer_soft_limit_reached_at: None,
+            accept_seq: None,
         }
     }
 
@@ -476,6 +481,18 @@ impl PrimaryLink {
 
     pub fn connection_id(&self) -> ConnectionId {
         self.connection_id
+    }
+
+    pub(crate) fn accept_seq(&self) -> Option<u64> {
+        self.accept_seq
+    }
+
+    pub(crate) fn assign_accept_seq(&mut self, seq: u64) {
+        // The ordering position is stamped once when PSYNC is accepted; a
+        // re-processed PSYNC frame must not reorder an admitted replica.
+        if self.accept_seq.is_none() {
+            self.accept_seq = Some(seq);
+        }
     }
 
     pub fn replica(&self) -> &ReplicaConnectionInfo {

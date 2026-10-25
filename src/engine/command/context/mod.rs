@@ -15,7 +15,7 @@ pub enum ConnectionState {
     CloseAfterReply,
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BlockedCmd {
     Blpop,
     Brpop,
@@ -46,6 +46,15 @@ pub enum BlockedCmd {
     WaitAof {
         numlocal: i64,
         numreplicas: i64,
+        target_offset: crate::engine::distributed::replication::ReplicationOffset,
+    },
+    /// `CLUSTER SETSLOT` waiting for enough online replicas (C
+    /// `BLOCKED_WAIT` installed by `blockClientForReplicaAck` from
+    /// `clusterCommandSetSlot`). The command body runs once when the ACK
+    /// threshold is reached; the timeout path replies `NOREPLICAS` without
+    /// re-running the body.
+    SetSlot {
+        required: i64,
         target_offset: crate::engine::distributed::replication::ReplicationOffset,
     },
     Paused,

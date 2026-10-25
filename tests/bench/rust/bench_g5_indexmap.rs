@@ -5,7 +5,7 @@ use bytes::Bytes;
 use common::{measure_destructive, measure_readonly, snapshot_mem, write_csv, CaseRow};
 use indexmap::IndexMap;
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -70,7 +70,7 @@ fn main() {
         let samples = measure_readonly(
             move || h,
             |h, _i| {
-                let idx = rng.gen_range(0..N);
+                let idx = rng.random_range(0..N);
                 let k = mk_bytes("f:", idx);
                 black_box(h.get(&k));
             },
@@ -86,7 +86,7 @@ fn main() {
         let samples = measure_readonly(
             move || h,
             |h, _i| {
-                let idx = rng.gen_range(0..N);
+                let idx = rng.random_range(0..N);
                 let raw = format!("miss:{idx:010}");
                 let k = Bytes::from(raw.into_bytes());
                 black_box(h.get(&k));
@@ -108,7 +108,7 @@ fn main() {
         let samples = measure_destructive(
             |_| {
                 let h = build_full();
-                let victim = mk_bytes("f:", rng.gen_range(0..N));
+                let victim = mk_bytes("f:", rng.random_range(0..N));
                 (h, victim)
             },
             |h, victim| {

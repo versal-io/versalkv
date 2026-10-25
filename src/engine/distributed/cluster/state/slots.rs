@@ -385,10 +385,71 @@ impl ClusterState {
         Ok(changed)
     }
 
+    #[cfg(test)]
     pub(crate) fn assign_slot_to_myself(&mut self, slot: usize) -> Result<bool, String> {
         let changed = self.slot_ownership.owners[slot] != SlotOwner::Myself;
         self.replace_slot_owner(slot, SlotOwner::Myself)?;
         Ok(changed)
+    }
+
+    pub(crate) fn claim_slots_after_failover(
+        &mut self,
+        old_primary_id: &str,
+        inherited: &[bool],
+    ) -> Result<(), String> {
+        self.validate_failover_slot_claim(old_primary_id, inherited)?;
+        let has_inherited_slots = inherited.iter().any(|owned| *owned);
+        for (slot, &owned) in inherited.iter().enumerate() {
+            if !owned {
+                continue;
+            }
+            let previous = self.slot_ownership.owners[slot].clone();
+            self.clear_owner_bitmap(slot, &previous);
+            if !matches!(&previous, SlotOwner::Remote(node_id) if node_id.as_str() == old_primary_id)
+            {
+                let old_primary = self
+                    .nodes
+                    .get_mut(old_primary_id)
+                    .expect("old primary was validated before the batch");
+                if old_primary.slots[slot] {
+                    old_primary.slots[slot] = false;
+                    old_primary.numslots = old_primary.numslots.saturating_sub(1);
+                }
+            }
+            self.set_owner_bitmap(slot, &SlotOwner::Myself)?;
+            self.slot_ownership.owners[slot] = SlotOwner::Myself;
+            self.slots[slot] = self.owner_contributes_coverage(&SlotOwner::Myself);
+            self.slot_ownership.withdrawn_by[slot] = None;
+        }
+        if has_inherited_slots {
+            self.mark_slot_owned();
+            self.mark_topology_changed();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_failover_slot_claim(
+        &self,
+        old_primary_id: &str,
+        inherited: &[bool],
+    ) -> Result<(), String> {
+        if inherited.len() != CLUSTER_SLOTS {
+            return Err("Invalid failover slot bitmap length".to_string());
+        }
+        if !self.nodes.contains_key(old_primary_id) {
+            return Err(format!("Unknown node {old_primary_id}"));
+        }
+        for (slot, &owned) in inherited.iter().enumerate() {
+            if !owned {
+                continue;
+            }
+            if let SlotOwner::Remote(node_id) = &self.slot_ownership.owners[slot] {
+                if !self.nodes.contains_key(node_id.as_str()) {
+                    return Err(format!("Unknown node {}", node_id.as_str()));
+                }
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn unassign_slot_if_owned_by(&mut self, slot: usize, node_id: &str) -> bool {
@@ -584,33 +645,18 @@ impl ClusterState {
             })
     }
 
-    /// Add a slot to myself.
+    /// Add a slot to myself. Equivalent to a one-slot `add_slots_batch`.
+    /// Production callers use the batch primitive directly; this one-slot
+    /// convenience exists for test fixtures.
+    #[cfg(test)]
     pub fn add_slot(&mut self, slot: usize) -> Result<(), String> {
-        if slot >= CLUSTER_SLOTS {
-            return Err("Slot out of range".to_string());
-        }
-        if self.slot_ownership.owners[slot] != SlotOwner::Unassigned
-            && self.slot_ownership.owners[slot] != SlotOwner::Myself
-        {
-            return Err("Slot is already assigned".to_string());
-        }
-        if self.slot_ownership.owners[slot] == SlotOwner::Unassigned {
-            let is_first_slot = self.myself.numslots == 0;
-            self.replace_slot_owner(slot, SlotOwner::Myself)?;
-            if is_first_slot && self.primaries_have_replicas() {
-                self.myself.flags |= CLUSTER_NODE_MIGRATE_TO;
-            }
-            self.mark_slot_owned();
-            self.mark_topology_changed();
-        }
-        debug_assert!(self.myself.slots[slot] && self.slots[slot]);
-        debug_assert_eq!(self.myself.numslots, self.myself.count_slots());
-        Ok(())
+        self.add_slots_batch(std::slice::from_ref(&slot))
     }
 
     /// Apply a validated ADDSLOTS batch as one topology transition, matching
-    /// C `clusterUpdateSlots`: individual bindings update local ownership,
-    /// while persistence/state work is scheduled once after the command.
+    /// C `clusterUpdateSlots` driving `clusterAddSlot`: each binding is a
+    /// constant-time bitmap flip, while epoch/state/persistence work runs
+    /// once after the whole command rather than per slot.
     pub fn add_slots_batch(&mut self, slots: &[usize]) -> Result<(), String> {
         for &slot in slots {
             if slot >= CLUSTER_SLOTS {
@@ -622,21 +668,81 @@ impl ClusterState {
                 return Err("Slot is already assigned".to_string());
             }
         }
-        let mut changed = false;
+        let owned_before = self.myself.numslots;
+        let mut added = 0usize;
         for &slot in slots {
             if self.slot_ownership.owners[slot] == SlotOwner::Myself {
                 continue;
             }
-            let is_first_slot = self.myself.numslots == 0;
-            self.replace_slot_owner(slot, SlotOwner::Myself)?;
-            if is_first_slot && self.primaries_have_replicas() {
+            if !self.myself.slots[slot] {
+                self.myself.slots[slot] = true;
+                added += 1;
+            }
+            self.slot_ownership.owners[slot] = SlotOwner::Myself;
+            self.slots[slot] = self.owner_contributes_coverage(&SlotOwner::Myself);
+            self.slot_ownership.withdrawn_by[slot] = None;
+            self.topology_state_dirty = true;
+        }
+        if added > 0 {
+            self.myself.numslots += added;
+            if owned_before == 0 && self.primaries_have_replicas() {
                 self.myself.flags |= CLUSTER_NODE_MIGRATE_TO;
             }
             self.mark_slot_owned();
-            changed = true;
-        }
-        if changed {
             self.mark_topology_changed();
+            #[cfg(debug_assertions)]
+            {
+                debug_assert_eq!(self.myself.numslots, self.myself.count_slots());
+                for &slot in slots {
+                    debug_assert!(self.myself.slots[slot] && self.slots[slot]);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply a validated DELSLOTS batch as one topology transition, matching
+    /// C `clusterUpdateSlots` driving `clusterDelSlot`: every binding clears
+    /// with constant-time bitmap updates, while the epoch advance, broadcast,
+    /// persistence, and shard-channel cleanup run once for the whole command.
+    pub fn del_slots_batch(&mut self, slots: &[usize]) -> Result<(), String> {
+        for &slot in slots {
+            if slot >= CLUSTER_SLOTS {
+                return Err("Slot out of range".to_string());
+            }
+            if self.slot_ownership.owners[slot] == SlotOwner::Unassigned {
+                return Err("Slot is already unassigned".to_string());
+            }
+        }
+        let mut cleanup_slots: Vec<usize> = Vec::new();
+        for &slot in slots {
+            let served_before = self.serves_shard_slot(slot);
+            let previous = self.slot_ownership.owners[slot].clone();
+            self.clear_owner_bitmap(slot, &previous);
+            self.slot_ownership.owners[slot] = SlotOwner::Unassigned;
+            self.slots[slot] = false;
+            self.slot_ownership.withdrawn_by[slot] = None;
+            self.topology_state_dirty = true;
+            if served_before && !self.serves_shard_slot(slot) {
+                cleanup_slots.push(slot);
+            }
+        }
+        // `del_slot` advances the config epoch and records the deletion epoch
+        // per slot. A batch is one atomic topology transition, so a single
+        // epoch advance covers every slot removed by the command.
+        self.bump_epoch();
+        let deletion_epoch = self.myself.config_epoch;
+        for &slot in slots {
+            self.slot_ownership.delete_epochs[slot] = deletion_epoch;
+        }
+        self.request_topology_broadcast();
+        for slot in cleanup_slots {
+            self.request_shard_slot_cleanup(slot);
+        }
+        #[cfg(debug_assertions)]
+        {
+            debug_assert_eq!(self.myself.numslots, self.myself.count_slots());
+            debug_assert!(!slots.iter().any(|&slot| self.myself.slots[slot]));
         }
         Ok(())
     }
@@ -962,6 +1068,96 @@ mod tests {
 
     const SOURCE: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const TARGET: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    #[test]
+    fn failover_slot_claim_batch_replaces_previous_owner() {
+        let mut state = ClusterState::new("127.0.0.1", 6379, 16_379);
+        let mut source = ClusterNode::new(
+            SOURCE.to_string(),
+            "127.0.0.1".to_string(),
+            6380,
+            16_380,
+            true,
+        );
+        source.flags &= !CLUSTER_NODE_MYSELF;
+        for slot in [0, 2, CLUSTER_SLOTS - 1] {
+            source.slots[slot] = true;
+        }
+        source.numslots = 3;
+        state.nodes.insert(SOURCE.to_string(), source);
+        state.rebuild_slot_owners_from_bitmaps().unwrap();
+        let mut inherited = vec![false; CLUSTER_SLOTS];
+        for slot in [0, 2, CLUSTER_SLOTS - 1] {
+            inherited[slot] = true;
+        }
+
+        state
+            .claim_slots_after_failover(SOURCE, &inherited)
+            .unwrap();
+
+        assert_eq!(state.myself.numslots, 3);
+        assert_eq!(state.nodes[SOURCE].numslots, 0);
+        for slot in [0, 2, CLUSTER_SLOTS - 1] {
+            assert_eq!(
+                state.canonical_slot_owner_id(slot),
+                Some(state.myself.name.as_str())
+            );
+            assert!(state.myself.slots[slot]);
+            assert!(!state.nodes[SOURCE].slots[slot]);
+            assert!(state.slots[slot]);
+        }
+    }
+
+    #[test]
+    fn failover_slot_claim_batch_clears_a_newer_canonical_owner() {
+        let mut state = ClusterState::new("127.0.0.1", 6379, 16_379);
+        for node_id in [SOURCE, TARGET] {
+            let mut node = ClusterNode::new(
+                node_id.to_string(),
+                "127.0.0.1".to_string(),
+                6380,
+                16_380,
+                true,
+            );
+            node.flags &= !CLUSTER_NODE_MYSELF;
+            state.nodes.insert(node_id.to_string(), node);
+        }
+        state.assign_slot_to_remote(7, TARGET).unwrap();
+        let mut inherited = vec![false; CLUSTER_SLOTS];
+        inherited[7] = true;
+
+        state
+            .claim_slots_after_failover(SOURCE, &inherited)
+            .unwrap();
+
+        assert_eq!(
+            state.canonical_slot_owner_id(7),
+            Some(state.myself.name.as_str())
+        );
+        assert_eq!(state.nodes[TARGET].numslots, 0);
+        assert!(!state.nodes[TARGET].slots[7]);
+        state.validate_invariants().unwrap();
+    }
+
+    #[test]
+    fn empty_failover_slot_claim_does_not_mark_slot_ownership() {
+        let mut state = ClusterState::new("127.0.0.1", 6379, 16_379);
+        let mut source = ClusterNode::new(
+            SOURCE.to_string(),
+            "127.0.0.1".to_string(),
+            6380,
+            16_380,
+            true,
+        );
+        source.flags &= !CLUSTER_NODE_MYSELF;
+        state.nodes.insert(SOURCE.to_string(), source);
+
+        state
+            .claim_slots_after_failover(SOURCE, &vec![false; CLUSTER_SLOTS])
+            .unwrap();
+
+        assert!(!state.has_ever_owned_slots());
+    }
 
     #[test]
     fn open_slot_aux_round_trip_replaces_existing_state() {

@@ -88,6 +88,7 @@ impl ServerWorkerState {
         if let Some(action) = self.reject_unauthenticated_command(&input, fx) {
             return action;
         }
+        self.apply_client_test_tcp_buffer_policy(input.token, &input.name, &input.args);
 
         self.ctx.begin_cmd();
         self.connection_registry[input.token].begin_admitted_command(&input.name);
@@ -127,6 +128,37 @@ impl ServerWorkerState {
             LoopAction::Break
         } else {
             LoopAction::Continue
+        }
+    }
+
+    fn apply_client_test_tcp_buffer_policy(
+        &mut self,
+        token: Token,
+        name: &str,
+        args: &CommandArgs,
+    ) {
+        // Replicas negotiate on an unclassified accepted socket. Keep their
+        // kernel defaults, and apply harness backpressure only once a command
+        // identifies an ordinary client. Migration has its own explicit policy.
+        if self.connection_registry[token].is_test_tcp_buffer_policy_applied
+            || self
+                .replication_runtime
+                .role(crate::framework::distributed::replication::ConnectionId(
+                    token.0,
+                ))
+                .is_some()
+            || (name == "ping" && args.args.is_empty())
+            || matches!(name, "auth" | "hello" | "replconf" | "psync" | "sync")
+        {
+            return;
+        }
+        match self.transport.apply_test_tcp_buffer_limits(token) {
+            Ok(()) => self.connection_registry[token].is_test_tcp_buffer_policy_applied = true,
+            Err(error) => crate::server_log!(
+                warning,
+                "Could not apply client test TCP buffer policy: {}",
+                error
+            ),
         }
     }
 

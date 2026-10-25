@@ -14,10 +14,6 @@ use crate::runtime::server::worker::distributed::propagation::{
 };
 use bytes::Bytes;
 
-pub(super) fn cluster_setslot_wait_deadline(now_ms: i64, timeout_ms: u64) -> Option<i64> {
-    (timeout_ms > 0).then(|| now_ms.saturating_add(timeout_ms.min(i64::MAX as u64) as i64))
-}
-
 pub(super) fn client_last_command_name(name_lower: &str, args: &CommandArgs) -> String {
     args.args
         .first()
@@ -85,13 +81,6 @@ struct ConnectionPropagationState {
     skip_propagation: bool,
 }
 
-struct SetSlotReplicationWait {
-    target_offset: crate::engine::distributed::replication::ReplicationOffset,
-    required: usize,
-    deadline: Option<i64>,
-    was_protected: bool,
-}
-
 impl ConnectionPropagationState {
     fn should_propagate(&self, plan: &CommandPropagationPlan<'_>) -> bool {
         self.has_script_ops
@@ -101,61 +90,56 @@ impl ConnectionPropagationState {
 }
 
 impl ServerWorkerState {
-    pub(super) fn wait_for_cluster_setslot_replication(
+    /// Install the C `BLOCKED_WAIT` continuation for `CLUSTER SETSLOT`.
+    /// Mirrors `clusterCommandSetSlot` (cluster_legacy.c): force-propagate the
+    /// command frame to replicas once, then suspend the client without running
+    /// the command body or sending a reply. When enough replicas ACK the
+    /// target offset the blocked continuation re-invokes the handler, and the
+    /// retained command cycle suppresses a second propagation. Returns None
+    /// when the command must run immediately (not a SETSLOT candidate or no
+    /// eligible replica), or Some(reply) with the blocking sentinel / the
+    /// validation error.
+    pub(super) fn prepare_cluster_setslot_block(
         &mut self,
         token: crate::framework::capabilities::io::Token,
         args: &CommandArgs,
     ) -> Option<Value> {
-        let wait = match self.prepare_setslot_replication_wait(token, args) {
-            Ok(Some(wait)) => wait,
-            Ok(None) => return None,
-            Err(reply) => return Some(reply),
-        };
-        let timed_out =
-            self.wait_for_setslot_acks(token, wait.target_offset, wait.required, wait.deadline);
-        let Some(connection) = self.connection_registry.get_mut(token) else {
-            return Some(Value::Null);
-        };
-        connection.protected = wait.was_protected;
-        timed_out?.then(|| Value::error("NOREPLICAS Not enough good replicas to write."))
-    }
-
-    fn prepare_setslot_replication_wait(
-        &mut self,
-        token: crate::framework::capabilities::io::Token,
-        args: &CommandArgs,
-    ) -> Result<Option<SetSlotReplicationWait>, Value> {
         if !is_setslot_wait_candidate(self.connection_registry.get(token), args) {
-            return Ok(None);
+            return None;
         }
-        let prepared = crate::framework::commands::cluster::slots::prepare_cluster_setslot(
+        let prepared = match crate::framework::commands::cluster::slots::prepare_cluster_setslot(
             &args.args[1..],
             false,
             &self.ctx,
-        )
-        .inspect_err(|_| {
-            self.connection_registry[token].set_skip_propagation(true);
-        })?;
+        ) {
+            Ok(prepared) => prepared,
+            Err(reply) => {
+                self.connection_registry[token].set_skip_propagation(true);
+                return Some(reply);
+            }
+        };
         let required = self.eligible_setslot_replica_count();
         if required == 0 {
-            return Ok(None);
+            return None;
         }
+        // The frame is appended before the target offset is read, matching C's
+        // `server.primary_repl_offset + 1` target captured at block time.
         self.propagate_to_replicas_with_ack(&encode_command_args(args), true);
         let target_offset = self.ctx.replication().primary_repl_offset();
-        let connection = self.connection_registry.get_mut(token).ok_or(Value::Null)?;
-        connection.set_skip_propagation(true);
-        // C cluster_legacy.c protects the SETSLOT client across state changes
-        // that can recursively process events and retire connections.
-        let was_protected = std::mem::replace(&mut connection.protected, true);
-        Ok(Some(SetSlotReplicationWait {
-            target_offset,
-            required,
-            deadline: cluster_setslot_wait_deadline(
-                crate::foundation::io::sys::time::mstime(),
-                prepared.timeout_ms,
-            ),
-            was_protected,
-        }))
+        let connection = self
+            .connection_registry
+            .get_mut(token)
+            .expect("SETSLOT candidate connection exists");
+        Some(connection.enter_blocking(
+            BlockedCmd::SetSlot {
+                required: required as i64,
+                target_offset,
+            },
+            Vec::new(),
+            prepared.timeout_ms,
+            args,
+            connection.request_bytes_current_command(),
+        ))
     }
 
     fn eligible_setslot_replica_count(&self) -> usize {
@@ -168,40 +152,6 @@ impl ServerWorkerState {
                     && link.replica_version() > 0x0702ff
             })
             .count()
-    }
-
-    fn wait_for_setslot_acks(
-        &mut self,
-        token: crate::framework::capabilities::io::Token,
-        target_offset: crate::engine::distributed::replication::ReplicationOffset,
-        required: usize,
-        deadline: Option<i64>,
-    ) -> Option<bool> {
-        while self.replication_runtime.count_acked_replicas(
-            target_offset,
-            0,
-            crate::foundation::io::sys::time::mstime(),
-        ) < required
-            && deadline.is_none_or(|deadline| crate::foundation::io::sys::time::mstime() < deadline)
-        {
-            // C blocks the SETSLOT client until the replica ACK is readable.
-            // Polling the transport with a bounded wait preserves that wake-up
-            // behavior without a zero-time poll plus unconditional sleep.
-            self.process_events_while_command_blocked_with_timeout(
-                token,
-                Some(std::time::Duration::from_millis(1)),
-            );
-            if !self.connection_registry.contains(token) {
-                return None;
-            }
-        }
-        Some(
-            self.replication_runtime.count_acked_replicas(
-                target_offset,
-                0,
-                crate::foundation::io::sys::time::mstime(),
-            ) < required,
-        )
     }
 
     pub(super) fn execute_registered_handler(
@@ -277,7 +227,7 @@ impl ServerWorkerState {
             }
             reply
         } else {
-            if let Some(reply) = self.wait_for_cluster_setslot_replication(
+            if let Some(reply) = self.prepare_cluster_setslot_block(
                 crate::framework::capabilities::io::Token(connection_token),
                 args,
             ) {

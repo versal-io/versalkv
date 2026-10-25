@@ -7,7 +7,7 @@ mod common;
 
 use common::{measure_destructive, measure_readonly, snapshot_mem, write_csv, CaseRow};
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use std::hint::black_box;
 use versal::foundation::io::store::structure::zset::ZSetSl;
 use versal::foundation::memory::value::ZSetOps;
@@ -32,7 +32,7 @@ fn build_rand(members: &[Vec<u8>], seed: u64) -> ZSetSl {
     let mut rng = StdRng::seed_from_u64(seed);
     let mut z = ZSetSl::new();
     for k in members {
-        let _ = z.add(k, rng.gen_range(-1.0e9..1.0e9));
+        let _ = z.add(k, rng.random_range(-1.0e9..1.0e9));
     }
     z
 }
@@ -86,7 +86,7 @@ fn main() {
         let samples = measure_destructive(
             |_| {
                 let k = format!("m:{i}").into_bytes();
-                let s: f64 = rng.gen_range(-1.0e9..1.0e9);
+                let s: f64 = rng.random_range(-1.0e9..1.0e9);
                 i += 1;
                 ((ZSetSl::new(), k), s)
             },
@@ -141,7 +141,7 @@ fn main() {
         let samples = measure_readonly(
             move || (z.clone(), members_rank.clone()),
             |(z, ms), _i| {
-                let idx = rng.gen_range(0..ms.len());
+                let idx = rng.random_range(0..ms.len());
                 black_box(z.rank(&ms[idx]));
             },
         );
@@ -158,7 +158,7 @@ fn main() {
         let samples = measure_destructive(
             |_| {
                 let z = build_seq(&members_ref);
-                let victim = members_ref[rng.gen_range(0..N)].clone();
+                let victim = members_ref[rng.random_range(0..N)].clone();
                 (z, victim)
             },
             |z, victim| {

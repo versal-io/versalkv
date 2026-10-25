@@ -38,17 +38,16 @@ pub fn role(_conn: &mut dyn CommandConn, _args: &CommandArgs, ctx: &mut ServerCo
 }
 
 fn primary_role(ctx: &ServerContext) -> Value {
-    let mut replica_ids: Vec<usize> = ctx
-        .replication()
-        .view
-        .replica_info
+    // C's roleCommand walks `server.replicas` in PSYNC acceptance order
+    // (replication.c:4727), which `replica_order` mirrors. Connection-id
+    // sorting would renumber entries when concurrent connects register in a
+    // different order than their PSYNC is accepted.
+    let view = &ctx.replication().view;
+    let replicas = view
+        .replica_order
         .iter()
-        .filter_map(|(id, info)| (info.state == "online").then_some(*id))
-        .collect();
-    replica_ids.sort_unstable();
-    let replicas = replica_ids
-        .into_iter()
-        .filter_map(|id| ctx.replication().view.replica_info.get(&id))
+        .filter_map(|id| view.replica_info.get(id))
+        .filter(|info| info.state == "online")
         .map(|info| {
             Value::Array(vec![
                 Value::bulk(Bytes::copy_from_slice(info.ip.as_bytes())),
@@ -80,7 +79,9 @@ mod tests {
     #[test]
     fn primary_role_lists_connected_replicas() {
         let mut context = ServerContext::new(1);
-        context.replication_mut().view.replica_info.insert(
+        let state = context.replication_mut();
+        state.view.replica_order = vec![7];
+        state.view.replica_info.insert(
             7,
             ReplicaStatus {
                 ip: "127.0.0.1".to_string(),
@@ -103,5 +104,56 @@ mod tests {
                 ])]),
             ])
         );
+    }
+
+    #[test]
+    fn primary_role_follows_psync_acceptance_order_not_connection_id() {
+        // C's roleCommand walks server.replicas (PSYNC acceptance order,
+        // replication.c:4727), not connection-id order. A replica accepted
+        // later can own a smaller connection id, so connection-id sorting
+        // would renumber the ROLE array relative to C.
+        let mut context = ServerContext::new(1);
+        let view = context.replication_mut();
+        view.view.replica_order = vec![9, 7];
+        view.view.replica_info.insert(
+            7,
+            ReplicaStatus {
+                ip: "127.0.0.1".to_string(),
+                port: 6380,
+                offset: Some(offset(42)),
+                state: "online".to_string(),
+                lag_ms: 0,
+            },
+        );
+        view.view.replica_info.insert(
+            9,
+            ReplicaStatus {
+                ip: "127.0.0.1".to_string(),
+                port: 6381,
+                offset: Some(offset(43)),
+                state: "online".to_string(),
+                lag_ms: 0,
+            },
+        );
+
+        let Value::Array(sections) = primary_role(&context) else {
+            panic!("primary ROLE must be an array");
+        };
+        let Value::Array(replicas) = &sections[2] else {
+            panic!("ROLE replicas must be an array");
+        };
+        let ports: Vec<i64> = replicas
+            .iter()
+            .map(|replica| {
+                let Value::Array(fields) = replica else {
+                    panic!("replica entry must be an array");
+                };
+                match &fields[1] {
+                    Value::Integer(port) => *port,
+                    other => panic!("port must be an integer, got {other:?}"),
+                }
+            })
+            .collect();
+        assert_eq!(ports, vec![6381, 6380]);
     }
 }

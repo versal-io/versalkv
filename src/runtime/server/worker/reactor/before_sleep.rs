@@ -52,6 +52,10 @@ impl ServerWorkerState {
     }
 
     pub(super) fn recompute_cluster_state_before_sleep(&mut self) {
+        // Cluster packet handlers defer election decisions across the prior
+        // ready and time phases. Settle them at the same beforeSleep boundary
+        // C uses for CLUSTER_TODO_HANDLE_FAILOVER.
+        self.finish_cluster_bus_receive_batch();
         if let Some(state) = self.ctx.cluster_state_mut().as_deref_mut() {
             state.recompute_state_if_dirty();
         }

@@ -109,8 +109,64 @@ impl MonitorEvent {
     }
 }
 
+const LATENCY_HISTORY_LEN: usize = 160;
+
+struct LatencyTimeSeries {
+    samples: [(i64, i64); LATENCY_HISTORY_LEN],
+    next_index: usize,
+    len: usize,
+    max_ms: i64,
+    sum_ms: i64,
+    sample_count: i64,
+}
+
+impl Default for LatencyTimeSeries {
+    fn default() -> Self {
+        Self {
+            samples: [(0, 0); LATENCY_HISTORY_LEN],
+            next_index: 0,
+            len: 0,
+            max_ms: 0,
+            sum_ms: 0,
+            sample_count: 0,
+        }
+    }
+}
+
+impl LatencyTimeSeries {
+    fn record_sample(&mut self, timestamp_sec: i64, latency_ms: i64) {
+        self.max_ms = self.max_ms.max(latency_ms);
+        self.sum_ms += latency_ms;
+        self.sample_count += 1;
+
+        let last_index = (self.next_index + LATENCY_HISTORY_LEN - 1) % LATENCY_HISTORY_LEN;
+        // Coalesce the latest second without dropping lifetime totals.
+        if self.len > 0 && self.samples[last_index].0 == timestamp_sec {
+            self.samples[last_index].1 = self.samples[last_index].1.max(latency_ms);
+            return;
+        }
+
+        self.samples[self.next_index] = (timestamp_sec, latency_ms);
+        self.next_index = (self.next_index + 1) % LATENCY_HISTORY_LEN;
+        self.len = (self.len + 1).min(LATENCY_HISTORY_LEN);
+    }
+
+    fn latest(&self) -> Option<(i64, i64)> {
+        if self.len == 0 {
+            None
+        } else {
+            Some(self.samples[(self.next_index + LATENCY_HISTORY_LEN - 1) % LATENCY_HISTORY_LEN])
+        }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &(i64, i64)> {
+        let start_index = (self.next_index + LATENCY_HISTORY_LEN - self.len) % LATENCY_HISTORY_LEN;
+        (0..self.len).map(move |offset| &self.samples[(start_index + offset) % LATENCY_HISTORY_LEN])
+    }
+}
+
 pub struct LatencyState {
-    events: HashMap<String, Vec<(i64, i64)>>,
+    events: HashMap<String, LatencyTimeSeries>,
     threshold_ms: i64,
 }
 
@@ -130,10 +186,17 @@ impl LatencyState {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
+        self.add_sample_at(event, latency_ms, now);
+    }
+
+    pub(super) fn add_sample_at(&mut self, event: &str, latency_ms: i64, timestamp_sec: i64) {
+        if self.threshold_ms <= 0 || latency_ms < self.threshold_ms {
+            return;
+        }
         self.events
             .entry(event.to_string())
             .or_default()
-            .push((now, latency_ms));
+            .record_sample(timestamp_sec, latency_ms);
     }
 
     pub fn reset(&mut self, event: Option<&str>) -> usize {
@@ -159,46 +222,46 @@ impl LatencyState {
 
     pub fn latest(&self) -> Vec<(String, i64, i64, i64, i64, i64)> {
         let mut result = Vec::new();
-        for (name, samples) in &self.events {
-            if samples.is_empty() {
-                continue;
+        for (name, series) in &self.events {
+            if let Some(last) = series.latest() {
+                result.push((
+                    name.clone(),
+                    last.0,
+                    last.1,
+                    series.max_ms,
+                    series.sum_ms,
+                    series.sample_count,
+                ));
             }
-            let last = samples[samples.len() - 1];
-            let max = samples.iter().map(|s| s.1).max().unwrap_or(0);
-            let sum: i64 = samples.iter().map(|s| s.1).sum();
-            let cnt = samples.len() as i64;
-            result.push((name.clone(), last.0, last.1, max, sum, cnt));
         }
         result
     }
 
     pub fn history(&self, event: &str) -> Vec<(i64, i64)> {
         match self.events.get(event) {
-            Some(samples) => samples.clone(),
+            Some(series) => series.iter().copied().collect(),
             None => Vec::new(),
         }
     }
 
     pub fn graph(&self, event: &str) -> String {
         match self.events.get(event) {
-            Some(samples) if !samples.is_empty() => {
-                let max = samples.iter().map(|s| s.1).max().unwrap_or(0);
-                let min = samples.iter().map(|s| s.1).min().unwrap_or(0);
+            Some(series) if series.len > 0 => {
+                let max = series.iter().map(|s| s.1).max().unwrap_or(0);
+                let min = series.iter().map(|s| s.1).min().unwrap_or(0);
                 let width = 40i64;
                 let mut graph = String::new();
                 graph.push_str(&format!(
                     "{} - high {} ms, low {} ms (all time high {} ms)\n",
-                    event, max, min, max
+                    event, max, min, series.max_ms
                 ));
                 for _ in 0..width {
                     graph.push('-');
                 }
                 graph.push('\n');
                 let range = if max > min { max - min } else { 1 };
-                let n = samples.len().min(width as usize);
-                for i in 0..n {
-                    let idx = samples.len() - n + i;
-                    let v = samples[idx].1;
+                let n = series.len.min(width as usize);
+                for &(_, v) in series.iter().skip(series.len - n) {
                     let col = ((v - min) * (width - 1) / range).max(0).min(width - 1);
                     for j in 0..width {
                         if j == col {
@@ -217,6 +280,49 @@ impl LatencyState {
 
     pub fn doctor(&self) -> String {
         "I'm sorry, Dave, I'm afraid I can't do that.\n\nNo latency data available.".to_string()
+    }
+}
+
+#[cfg(test)]
+mod latency_tests {
+    use super::LatencyState;
+
+    #[test]
+    fn latency_storage_capacity_stays_fixed_after_warmup() {
+        let mut lat = LatencyState::new();
+        lat.set_threshold(1);
+        for timestamp_sec in 1..=160 {
+            lat.add_sample_at("command", 1, timestamp_sec);
+        }
+
+        let series = lat.events.get("command").unwrap();
+        let storage_capacity = series.samples.len();
+        let storage_bytes = std::mem::size_of_val(&series.samples);
+        let storage_ptr = series.samples.as_ptr();
+        let event_capacity = lat.events.capacity();
+        for timestamp_sec in 161..=160 + 65_536 {
+            lat.add_sample_at("command", 1, timestamp_sec);
+        }
+
+        let series = lat.events.get("command").unwrap();
+        assert_eq!(series.samples.len(), storage_capacity);
+        assert_eq!(std::mem::size_of_val(&series.samples), storage_bytes);
+        assert_eq!(series.samples.as_ptr(), storage_ptr);
+        assert_eq!(lat.events.capacity(), event_capacity);
+        assert_eq!(storage_capacity, 160);
+        assert_eq!(storage_bytes, 160 * std::mem::size_of::<(i64, i64)>());
+        assert_eq!(lat.history("command").len(), 160);
+        assert_eq!(
+            lat.latest(),
+            vec![(
+                "command".to_string(),
+                160 + 65_536,
+                1,
+                1,
+                160 + 65_536,
+                160 + 65_536
+            )]
+        );
     }
 }
 

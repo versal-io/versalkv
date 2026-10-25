@@ -672,6 +672,14 @@ impl ServerWorkerState {
         self.client_hup_drains.remove(&Token(token_value));
         self.connection_registry[crate::framework::capabilities::io::Token(connection_token)]
             .mark_closing();
+        // EOF needs no second write turn once all admitted replies are gone.
+        // A prior flush may already have claimed this turn's writable service.
+        if !self.connection_registry[Token(connection_token)].has_pending_output()
+            && !self.io_threads.is_write_inflight(Token(token_value))
+        {
+            self.remove_connection(token_value);
+            return;
+        }
         let token = self.connection_registry
             [crate::framework::capabilities::io::Token(connection_token)]
         .token();
@@ -856,6 +864,38 @@ mod tests {
             .read_exact(&mut response)
             .expect("read reply for command admitted before EOF");
         assert_eq!(&response, b"+PONG\r\n");
+    }
+
+    #[test]
+    fn peer_close_after_reply_flush_releases_client_in_the_same_write_turn() {
+        let mut runtime = ServerWorkerState::new(1).expect("create runtime");
+        crate::framework::commands::register_all(&mut runtime.registry);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind peer listener");
+        let address = listener.local_addr().expect("read peer address");
+        let peer = runtime.transport.connect_tcp(address).unwrap();
+        let (mut target, _) = listener.accept().unwrap();
+        runtime.add_connection(RuntimeConnectedPeer {
+            token: peer.token,
+            peer_addr: address,
+        });
+        runtime.ctx.set_host_task_loading(true);
+        runtime.writes.ordinary.begin_turn();
+        runtime.connection_registry[peer.token].queue_reply(b"+OK\r\n".to_vec());
+        runtime.handle_writable(peer.token);
+        let mut response = [0_u8; 5];
+        target.read_exact(&mut response).unwrap();
+        assert_eq!(&response, b"+OK\r\n");
+        assert!(runtime.writes.ordinary.was_serviced(peer.token));
+
+        runtime.process_client_read_outcome(
+            peer.token,
+            ClientReadMode::Fair,
+            Vec::new(),
+            ReadOutcome::PeerClosed,
+        );
+
+        assert!(!runtime.connection_registry.contains(peer.token));
+        assert!(!runtime.transport.is_registered(peer.token));
     }
 
     #[test]

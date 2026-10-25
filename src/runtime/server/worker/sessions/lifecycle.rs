@@ -530,7 +530,12 @@ impl ServerWorkerState {
             crate::server_log!(notice, "Connection with replica {} lost.", name);
         }
         if let Some(id) = plan.relayed_replica {
-            if plan.direct_child_main_target || plan.direct_child_rdb_target {
+            // A completed RDB close retains the surviving main target until
+            // child reaping publishes completion, even if MarkerSent is pending.
+            if (plan.direct_child_main_target || plan.direct_child_rdb_target)
+                && direct_child_drop
+                    != crate::runtime::server::worker::distributed::replication::diskless_child::DirectDualRdbDropOutcome::CompletedPaired
+            {
                 self.drop_direct_dual_rdb_child_target(id);
             }
             let _ = self.on_diskless_target_closed(id);

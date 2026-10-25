@@ -410,6 +410,31 @@ impl Db {
         }
     }
 
+    /// Mutate a string without replacing its DB entry or expiration metadata.
+    pub fn set_string_range(
+        &mut self,
+        key: &[u8],
+        offset: usize,
+        patch: &[u8],
+    ) -> Result<usize, ()> {
+        if let Some(value) = self.get_mut(key) {
+            let old_size = value.estimated_size();
+            let len = value.set_string_range(offset, patch).ok_or(())?;
+            let new_size = value.estimated_size();
+            if new_size > old_size {
+                memory_stats::track_add(MemoryCategory::Dataset, new_size - old_size);
+            }
+            return Ok(len);
+        }
+
+        let mut value = Robj::string_raw(Bytes::new());
+        let len = value.set_string_range(offset, patch).ok_or(())?;
+        if !patch.is_empty() {
+            self.set(key.to_vec(), value);
+        }
+        Ok(len)
+    }
+
     pub fn get_string_allow_expired(&self, key: &[u8]) -> Result<Option<&[u8]>, ()> {
         let slot = self.key_slot(key);
         match self.data.get_in_slot(slot, key).map(|entry| &entry.value) {
