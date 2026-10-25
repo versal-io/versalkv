@@ -1,7 +1,7 @@
 use log::LevelFilter;
 use std::cell::RefCell;
 use std::fs::File;
-use std::io::Write;
+use std::io::{self, Write};
 use std::panic::PanicHookInfo;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
 use std::sync::Once;
@@ -16,6 +16,7 @@ static USE_EXIT_ON_PANIC: AtomicBool = AtomicBool::new(false);
 static CRASH_LOG_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 static SYSLOG_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static SYSLOG_IDENT: OnceLock<std::ffi::CString> = OnceLock::new();
+static LOGGER: VersalLogger = VersalLogger::new();
 
 thread_local! {
     static ACTIVE_COMMAND: RefCell<Option<CommandDiagnostic>> = const { RefCell::new(None) };
@@ -381,6 +382,88 @@ fn format_legacy_prefix(level: log::Level) -> String {
     )
 }
 
+fn format_record_line(level: log::Level, message: &str) -> String {
+    match LOG_FORMAT.load(Ordering::Relaxed) {
+        value if value == LogFormat::Logfmt as u8 => format_logfmt_record(level, message),
+        value if value == LogFormat::Json as u8 => format_json_record(level, message),
+        _ => format!("{} {}", format_legacy_prefix(level), message),
+    }
+}
+
+enum LoggerOutput {
+    Stdout,
+    File(File),
+}
+
+struct VersalLogger {
+    output: Mutex<LoggerOutput>,
+}
+
+impl VersalLogger {
+    const fn new() -> Self {
+        Self {
+            output: Mutex::new(LoggerOutput::Stdout),
+        }
+    }
+
+    fn set_output(&self, logfile: Option<File>) {
+        let Ok(mut output) = self.output.lock() else {
+            return;
+        };
+        *output = match logfile {
+            Some(file) => LoggerOutput::File(file),
+            None => LoggerOutput::Stdout,
+        };
+    }
+
+    fn write_line(&self, line: &str) {
+        let Ok(mut output) = self.output.lock() else {
+            return;
+        };
+        match &mut *output {
+            LoggerOutput::Stdout => {
+                let _ = writeln!(io::stdout().lock(), "{line}");
+            }
+            LoggerOutput::File(file) => {
+                let _ = writeln!(file, "{line}");
+            }
+        }
+    }
+
+    fn flush_output(&self) {
+        let Ok(mut output) = self.output.lock() else {
+            return;
+        };
+        match &mut *output {
+            LoggerOutput::Stdout => {
+                let _ = io::stdout().lock().flush();
+            }
+            LoggerOutput::File(file) => {
+                let _ = file.flush();
+            }
+        }
+    }
+}
+
+impl log::Log for VersalLogger {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        metadata.level() <= log::max_level()
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+        let message = record.args().to_string();
+        emit_syslog(record.level(), &message);
+        self.write_line(&format_record_line(record.level(), &message));
+    }
+
+    fn flush(&self) {
+        self.flush_output();
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogLevel {
     Debug,
@@ -436,28 +519,9 @@ pub fn init_logger_with_format(
             LogLevel::Notice => LevelFilter::Info,
             LogLevel::Warning => LevelFilter::Warn,
         };
-        let mut builder = env_logger::Builder::new();
-        let target = match logfile {
-            Some(file) => env_logger::fmt::Target::Pipe(Box::new(file)),
-            None => env_logger::fmt::Target::Stdout,
-        };
-        builder
-            .target(target)
-            .filter_level(filter)
-            .format(move |buf, record| {
-                emit_syslog(record.level(), &record.args().to_string());
-                let message = record.args().to_string();
-                match LOG_FORMAT.load(Ordering::Relaxed) {
-                    value if value == LogFormat::Logfmt as u8 => {
-                        writeln!(buf, "{}", format_logfmt_record(record.level(), &message))
-                    }
-                    value if value == LogFormat::Json as u8 => {
-                        writeln!(buf, "{}", format_json_record(record.level(), &message))
-                    }
-                    _ => writeln!(buf, "{} {}", format_legacy_prefix(record.level()), message),
-                }
-            })
-            .init();
+        LOGGER.set_output(logfile);
+        log::set_logger(&LOGGER).expect("failed to initialize logger");
+        log::set_max_level(filter);
     });
 }
 
@@ -491,7 +555,7 @@ macro_rules! server_log {
 mod tests {
     use super::{
         enter_active_command, escape_json_string, format_json_record, format_logfmt_record,
-        CommandDiagnostic, ACTIVE_COMMAND,
+        format_record_line, set_log_format, CommandDiagnostic, LogFormat, ACTIVE_COMMAND,
     };
 
     #[test]
@@ -541,5 +605,24 @@ mod tests {
         assert!(record.starts_with(&format!("pid={} role=", std::process::id())));
         assert!(record.contains(" level=warning "));
         assert!(record.ends_with("message=\"bad 'value' next line\""));
+    }
+
+    #[test]
+    fn record_line_uses_selected_log_format() {
+        set_log_format(LogFormat::Legacy);
+        let legacy = format_record_line(log::Level::Info, "ready");
+        assert!(legacy.ends_with(" * ready"));
+
+        set_log_format(LogFormat::Logfmt);
+        let logfmt = format_record_line(log::Level::Info, "ready");
+        assert!(logfmt.contains(" level=notice "));
+        assert!(logfmt.ends_with("message=\"ready\""));
+
+        set_log_format(LogFormat::Json);
+        let json = format_record_line(log::Level::Info, "ready");
+        assert!(json.contains("\"level\":\"notice\""));
+        assert!(json.contains("\"message\":\"ready\""));
+
+        set_log_format(LogFormat::Legacy);
     }
 }

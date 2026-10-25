@@ -42,6 +42,315 @@ fn meet_packet() -> (String, Vec<u8>) {
 }
 
 #[test]
+fn fail_broadcast_confirms_primary_failure_before_local_timeout() {
+    use crate::engine::distributed::cluster::node::{
+        CLUSTER_NODE_MY_PRIMARY_FAIL, CLUSTER_NODE_REPLICA,
+    };
+    use crate::engine::distributed::cluster::NodeId;
+
+    let sender_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let primary_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    for is_sender_primary in [true, false] {
+        for pong_received in [0, 999] {
+            let mut manager = ClusterBusManager::new();
+            let mut state = ClusterState::new("127.0.0.1", 6380, 16_380);
+            state.myself.flags &= !CLUSTER_NODE_PRIMARY;
+            state.myself.flags |= CLUSTER_NODE_REPLICA;
+            state.myself.replicaof = primary_id.to_string();
+            let mut primary = ClusterNode::new(
+                primary_id.to_string(),
+                "127.0.0.1".to_string(),
+                6381,
+                16_381,
+                true,
+            );
+            primary.flags &= !CLUSTER_NODE_MYSELF;
+            primary.pong_received = pong_received;
+            state.nodes.insert(primary_id.to_string(), primary);
+            let mut sender = ClusterNode::new(
+                sender_id.to_string(),
+                "127.0.0.1".to_string(),
+                6382,
+                16_382,
+                is_sender_primary,
+            );
+            sender.flags &= !CLUSTER_NODE_MYSELF;
+            state.nodes.insert(sender_id.to_string(), sender.clone());
+            manager.register_incoming(Token(29), "127.0.0.1:16382".parse().unwrap());
+            let packet = msg::ClusterBusMessage::from_node(
+                ClusterMsgType::Fail,
+                &sender,
+                0,
+                msg::ClusterBusBody::Fail {
+                    node_id: NodeId::parse(primary_id.as_bytes()).unwrap(),
+                },
+            )
+            .encode()
+            .unwrap();
+            let mut reader = PacketReader {
+                packet: Some(packet.clone()),
+            };
+            let generation = state.topology_generation();
+
+            assert!(!state.nodes[primary_id].has_flag(CLUSTER_NODE_PFAIL));
+            assert!(!manager.readable(&mut state, &mut reader, 29, 1_000));
+
+            assert!(
+                state.nodes[primary_id].has_flag(CLUSTER_NODE_FAIL),
+                "a known sender's FAIL must not wait for a local timeout"
+            );
+            assert!(state.myself.has_flag(CLUSTER_NODE_MY_PRIMARY_FAIL));
+            assert!(state.topology_generation() > generation);
+            assert!(state.take_config_save_request());
+
+            let generation = state.topology_generation();
+            let flags = state.nodes[primary_id].flags;
+            let mut reader = PacketReader {
+                packet: Some(packet),
+            };
+            assert!(!manager.readable(&mut state, &mut reader, 29, 1_001));
+            assert_eq!(state.nodes[primary_id].flags, flags);
+            assert_eq!(state.topology_generation(), generation);
+            assert!(!state.take_config_save_request());
+        }
+    }
+}
+
+#[test]
+fn fail_broadcast_ignores_unknown_sender_unknown_target_and_self() {
+    use crate::engine::distributed::cluster::NodeId;
+
+    let sender_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let primary_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    for (is_sender_known, is_target_known, is_target_self) in [
+        (false, true, false),
+        (true, false, false),
+        (true, true, true),
+    ] {
+        let mut manager = ClusterBusManager::new();
+        let mut state = ClusterState::new("127.0.0.1", 6379, 16_379);
+        let mut sender = ClusterNode::new(
+            sender_id.to_string(),
+            "127.0.0.1".to_string(),
+            6380,
+            16_380,
+            true,
+        );
+        sender.flags &= !CLUSTER_NODE_MYSELF;
+        if is_sender_known {
+            state.nodes.insert(sender_id.to_string(), sender.clone());
+        }
+        let mut target = if is_target_self {
+            state.myself.clone()
+        } else {
+            ClusterNode::new(
+                primary_id.to_string(),
+                "127.0.0.1".to_string(),
+                6381,
+                16_381,
+                true,
+            )
+        };
+        if !is_target_self {
+            target.flags &= !CLUSTER_NODE_MYSELF;
+        }
+        target.flags |= CLUSTER_NODE_PFAIL;
+        target.pong_received = 1;
+        let target_id = target.name.clone();
+        if is_target_known {
+            state.nodes.insert(target_id.clone(), target);
+        }
+        let generation = state.topology_generation();
+        manager.register_incoming(Token(30), "127.0.0.1:16380".parse().unwrap());
+        let mut reader = PacketReader {
+            packet: Some(
+                msg::ClusterBusMessage::from_node(
+                    ClusterMsgType::Fail,
+                    &sender,
+                    0,
+                    msg::ClusterBusBody::Fail {
+                        node_id: NodeId::parse(target_id.as_bytes()).unwrap(),
+                    },
+                )
+                .encode()
+                .unwrap(),
+            ),
+        };
+
+        assert!(!manager.readable(&mut state, &mut reader, 30, 5_000));
+
+        assert!(!state.myself.has_flag(CLUSTER_NODE_FAIL));
+        assert!(!state
+            .nodes
+            .get(&target_id)
+            .is_some_and(|node| node.has_flag(CLUSTER_NODE_FAIL)));
+        assert_eq!(state.nodes.contains_key(sender_id), is_sender_known);
+        assert_eq!(state.nodes.contains_key(&target_id), is_target_known);
+        assert_eq!(state.topology_generation(), generation);
+    }
+}
+
+#[test]
+fn non_heartbeat_headers_refresh_replica_failure_confirmation_and_offset() {
+    use crate::engine::distributed::cluster::node::{
+        CLUSTER_NODE_MY_PRIMARY_FAIL, CLUSTER_NODE_REPLICA,
+    };
+    use crate::engine::distributed::cluster::NodeId;
+
+    let sender_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let primary_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let bodies = [
+        (ClusterMsgType::FailoverAuthAck, msg::ClusterBusBody::Empty),
+        (
+            ClusterMsgType::Fail,
+            msg::ClusterBusBody::Fail {
+                node_id: NodeId::parse(primary_id.as_bytes()).unwrap(),
+            },
+        ),
+        (
+            ClusterMsgType::Publish,
+            msg::ClusterBusBody::Publish(msg::ClusterPublish::new(
+                bytes::Bytes::from_static(b"channel"),
+                bytes::Bytes::from_static(b"payload"),
+                false,
+            )),
+        ),
+    ];
+    for (message_type, body) in bodies {
+        let mut manager = ClusterBusManager::new();
+        let mut state = ClusterState::new("127.0.0.1", 6379, 16_379);
+        let mut sender = ClusterNode::new(
+            sender_id.to_string(),
+            "127.0.0.1".to_string(),
+            6380,
+            16_380,
+            false,
+        );
+        sender.flags &= !(CLUSTER_NODE_MYSELF | CLUSTER_NODE_PRIMARY);
+        sender.flags |= CLUSTER_NODE_REPLICA;
+        sender.replicaof = primary_id.to_string();
+        sender.repl_offset = 10;
+        state.nodes.insert(sender_id.to_string(), sender.clone());
+        manager.register_incoming(Token(25), "127.0.0.1:16380".parse().unwrap());
+
+        for (confirmed, offset) in [(true, 100), (false, 200)] {
+            if confirmed {
+                sender.flags |= CLUSTER_NODE_MY_PRIMARY_FAIL;
+            } else {
+                sender.flags &= !CLUSTER_NODE_MY_PRIMARY_FAIL;
+            }
+            sender.repl_offset = offset;
+            let packet = msg::ClusterBusMessage::from_node(message_type, &sender, 9, body.clone())
+                .encode()
+                .unwrap();
+            let mut reader = PacketReader {
+                packet: Some(packet),
+            };
+
+            assert!(!manager.readable(&mut state, &mut reader, 25, 1_000));
+
+            let observed = &state.nodes[sender_id];
+            assert_eq!(
+                observed.has_flag(CLUSTER_NODE_MY_PRIMARY_FAIL),
+                confirmed,
+                "{message_type:?} must carry the latest primary-failure confirmation"
+            );
+            assert_eq!(observed.repl_offset, offset);
+            assert_eq!(observed.replicaof, primary_id);
+            assert_eq!(state.current_epoch, 9);
+        }
+    }
+}
+
+#[test]
+fn gossip_failure_quorum_marks_primary_failed_before_the_next_cron() {
+    use crate::engine::distributed::cluster::node::{
+        CLUSTER_NODE_MY_PRIMARY_FAIL, CLUSTER_NODE_REPLICA,
+    };
+
+    let mut manager = ClusterBusManager::new();
+    let mut state = ClusterState::new("127.0.0.1", 6380, 16_380);
+    let primary_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    state.myself.flags &= !CLUSTER_NODE_PRIMARY;
+    state.myself.flags |= CLUSTER_NODE_REPLICA;
+    state.myself.replicaof = primary_id.to_string();
+    state.set_failure_report_node_timeout_ms(5_000);
+    for (index, node_id) in [
+        primary_id,
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "cccccccccccccccccccccccccccccccccccccccc",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let mut node = ClusterNode::new(
+            node_id.to_string(),
+            "127.0.0.1".to_string(),
+            6381 + index as u16,
+            16_381 + index as u16,
+            true,
+        );
+        node.flags &= !CLUSTER_NODE_MYSELF;
+        node.slots[index] = true;
+        node.numslots = 1;
+        if *node_id == primary_id {
+            node.flags |= CLUSTER_NODE_PFAIL;
+        }
+        state.nodes.insert(node_id.to_string(), node);
+    }
+    manager.register_outgoing_for_node(
+        Token(28),
+        "127.0.0.1:16382".parse().unwrap(),
+        false,
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+    );
+    manager.connections.get_mut(&28).unwrap().handshake_sent = true;
+    for (index, reporter_id) in [
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "cccccccccccccccccccccccccccccccccccccccc",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let token = Token(26 + index);
+        manager.register_incoming(token, "127.0.0.1:16382".parse().unwrap());
+        let message = msg::ClusterBusMessage::from_node(
+            ClusterMsgType::Pong,
+            &state.nodes[*reporter_id],
+            1,
+            msg::ClusterBusBody::Gossip(vec![GossipEntry {
+                node_id: primary_id.to_string(),
+                flags: CLUSTER_NODE_PRIMARY | CLUSTER_NODE_PFAIL,
+                ping_sent: 0,
+                pong_received: 0,
+                ip: "127.0.0.1".to_string(),
+                port: 6381,
+                tls_port: 0,
+                bus_port: 16_381,
+                config_epoch: 0,
+            }]),
+        );
+        let mut reader = PacketReader {
+            packet: Some(message.encode().unwrap()),
+        };
+        assert!(!manager.readable(&mut state, &mut reader, token.0, 1_000));
+        if index == 0 {
+            assert!(!state.nodes[primary_id].has_flag(CLUSTER_NODE_FAIL));
+            assert!(manager.connections[&28].write_buf.is_empty());
+        }
+    }
+
+    assert!(
+        state.nodes[primary_id].has_flag(CLUSTER_NODE_FAIL),
+        "receiving the last required gossip report must commit FAIL in the same batch"
+    );
+    assert!(state.myself.has_flag(CLUSTER_NODE_MY_PRIMARY_FAIL));
+    let (broadcast, _) = msg::ClusterBusMessage::decode(&manager.connections[&28].write_buf)
+        .expect("the quorum decision must broadcast FAIL without waiting for cron");
+    assert_eq!(broadcast.msg_type, ClusterMsgType::Fail);
+}
+
+#[test]
 fn sender_observation_normalizes_fallback_ip_and_replica_role() {
     use crate::engine::distributed::cluster::node::{CLUSTER_NODE_PRIMARY, CLUSTER_NODE_REPLICA};
 
@@ -77,6 +386,16 @@ fn filtered_packet_is_not_applied_to_cluster_topology() {
     manager.register_incoming(token, "127.0.0.1:16380".parse().unwrap());
     state.set_debug_packet_filter(2);
     let (sender_id, packet) = meet_packet();
+    let mut sender = ClusterNode::new(
+        sender_id.clone(),
+        "127.0.0.1".to_string(),
+        6380,
+        16380,
+        true,
+    );
+    sender.flags &= !CLUSTER_NODE_MYSELF;
+    state.nodes.insert(sender_id.clone(), sender);
+    let before_node_count = state.nodes.len();
     let mut reader = PacketReader {
         packet: Some(packet),
     };
@@ -84,7 +403,8 @@ fn filtered_packet_is_not_applied_to_cluster_topology() {
     let should_close = manager.readable(&mut state, &mut reader, token.0, 100);
 
     assert!(!should_close);
-    assert!(!state.nodes.contains_key(&sender_id));
+    assert_eq!(state.nodes.len(), before_node_count);
+    assert_eq!(state.nodes[&sender_id].data_received, 0);
 }
 
 #[test]
@@ -148,6 +468,7 @@ fn pong_extensions_update_sender_metadata_after_full_decode() {
     assert!(!manager.readable(&mut state, &mut reader, token.0, 100));
     let endpoints = &state.nodes[&sender_id].endpoints;
     assert_eq!(endpoints.hostname(), Some("cache.example.com"));
+    assert_eq!(state.nodes[&sender_id].data_received, 100);
     assert_eq!(endpoints.human_name(), Some("cache-east-1"));
     assert_eq!(endpoints.client_ipv4(), Some("192.0.2.8"));
     assert_eq!(endpoints.client_ipv6(), Some("2001:db8::8"));

@@ -1,5 +1,4 @@
 use super::*;
-use crate::engine::distributed::cluster::node::{ClusterNode, CLUSTER_NODE_MYSELF};
 
 #[test]
 fn hosted_exec_connection_removal_stops_without_reindexing_the_registry() {
@@ -37,13 +36,12 @@ fn hosted_exec_connection_removal_stops_without_reindexing_the_registry() {
 }
 
 #[test]
-fn setslot_ack_wait_defers_client_kill_until_the_wait_finishes() {
-    const TARGET: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+fn setslot_blocked_client_is_removed_when_killed_by_another_connection() {
     let mut backend = ServerWorkerState::new(1).expect("create runtime");
     crate::framework::commands::register_all(&mut backend.registry);
     backend.ctx.set_command_registry_snapshot(&backend.registry);
-    let (_initiator_peer, _, initiator) = add_socket_connection(&mut backend);
-    let (mut controller, _, _) = add_socket_connection(&mut backend);
+    let (initiator_peer, _, initiator) = add_socket_connection(&mut backend);
+    let (controller, _, controller_token) = add_socket_connection(&mut backend);
     let initiator_id = backend.connection_registry[initiator]
         .client_id()
         .to_string();
@@ -52,56 +50,40 @@ fn setslot_ack_wait_defers_client_kill_until_the_wait_finishes() {
         initiator_id.len(),
         initiator_id
     );
-    controller
-        .write_all(kill.as_bytes())
-        .expect("queue controller CLIENT KILL");
 
-    let mut cluster =
-        crate::engine::distributed::cluster::ClusterState::new("127.0.0.1", 6379, 16_379);
-    cluster.add_slot(0).expect("assign source slot");
-    let mut target = ClusterNode::new(
-        TARGET.to_string(),
-        "127.0.0.1".to_string(),
-        6380,
-        16_380,
-        true,
+    install_setslot_cluster(&mut backend);
+    add_streaming_setslot_replica(&mut backend);
+
+    dispatch_client_frame(
+        &mut backend,
+        &initiator_peer,
+        initiator,
+        &setslot_command_frame(Some(50)),
     );
-    target.flags &= !CLUSTER_NODE_MYSELF;
-    cluster.nodes.insert(TARGET.to_string(), target);
-    *backend.ctx.cluster_state_mut() = Some(Box::new(cluster));
-    let replica_id = backend.replication_runtime.register_primary(
-        crate::framework::distributed::replication::ConnectionId(99),
-        crate::framework::distributed::replication::ReplicaConnectionInfo {
-            ip: "127.0.0.1".to_string(),
-            port: 6381,
-            capability: Vec::new(),
-            rdb_filter_mode: crate::framework::distributed::replication::RdbFilterMode::All,
-        },
+    assert!(matches!(
+        backend.connection_registry[initiator]
+            .blocked
+            .as_ref()
+            .expect("SETSLOT client must block")
+            .cmd,
+        BlockedCmd::SetSlot { required: 1, .. }
+    ));
+    assert_eq!(backend.ctx.blocking_registry().count(), 1);
+
+    dispatch_client_frame(&mut backend, &controller, controller_token, kill.as_bytes());
+
+    assert!(
+        !backend.connection_registry.contains(initiator),
+        "CLIENT KILL must remove a SETSLOT-blocked connection without deferred protection"
     );
-    let replica = backend
-        .replication_runtime
-        .primary_link_mut(replica_id)
-        .expect("registered replica link");
-    replica.set_state(crate::framework::distributed::replication::PrimaryLinkState::Streaming);
-    replica.set_replica_version(0x080000);
-    let args = make_args(&[
-        b"CLUSTER",
-        b"SETSLOT",
-        b"0",
-        b"MIGRATING",
-        TARGET.as_bytes(),
-        b"TIMEOUT",
-        b"50",
-    ]);
-
-    let reply = backend.wait_for_cluster_setslot_replication(initiator, &args);
-
-    assert!(matches!(reply, Some(Value::Error(_))));
-    assert!(backend.connection_registry.contains(initiator));
-    assert!(!backend.connection_registry[initiator].protected);
     assert_eq!(
-        backend.connection_registry[initiator].state,
-        ConnectionState::Closing
+        backend.ctx.blocking_registry().count(),
+        0,
+        "the keyless blocked registration must be discarded with the connection"
+    );
+    assert_eq!(
+        queued_frame_occurrences(&backend, Token(SETSLOT_REPLICA_TOKEN_VALUE), b"SETSLOT"),
+        1
     );
 }
 

@@ -112,6 +112,11 @@ pub(crate) struct ServerWorkerState {
     pub(in crate::runtime::server) sentinel_links: SentinelLinkManager,
     pub(in crate::runtime::server) cluster_bus:
         crate::engine::distributed::cluster::bus::ClusterBusManager,
+    /// Nesting depth of event-loop batches draining Cluster Bus readable
+    /// sockets. While positive, receive-path election results stay queued
+    /// until the batch boundary, reproducing C's beforeSleep failover handling
+    /// across every readable connection.
+    pub(in crate::runtime::server) cluster_bus_receive_batch_depth: u8,
     pub(in crate::runtime::server) replication_runtime:
         crate::framework::distributed::replication::ReplicationRuntime,
     pub(in crate::runtime::server) slot_migration_runtime:
@@ -235,6 +240,7 @@ impl ServerWorkerState {
             ctx,
             sentinel_links: SentinelLinkManager::new(),
             cluster_bus: crate::engine::distributed::cluster::bus::ClusterBusManager::new(),
+            cluster_bus_receive_batch_depth: 0,
             replication_runtime:
                 crate::framework::distributed::replication::ReplicationRuntime::new(),
             slot_migration_runtime:
@@ -807,6 +813,9 @@ impl Drop for ServerWorkerState {
     fn drop(&mut self) {
         if let Some(write) = self.child_signal_write.take() {
             crate::foundation::io::sys::signal::clear_child_signal_wake(write.as_raw_fd());
+        }
+        if let Some(relay) = self.full_sync.diskless_relay.as_mut() {
+            relay.release_child();
         }
         self.cancel_disk_sync_batch();
     }

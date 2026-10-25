@@ -124,6 +124,94 @@ fn take_connection_command_effects(
 }
 
 #[test]
+fn test_tcp_buffer_policy_is_applied_when_an_ordinary_command_identifies_the_client() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut backend = ServerWorkerState::new(1).unwrap();
+    crate::framework::commands::register_all(&mut backend.registry);
+    let peer = backend
+        .transport
+        .connect_tcp(listener.local_addr().unwrap())
+        .unwrap();
+    let (_remote, _) = listener.accept().unwrap();
+    backend
+        .connection_registry
+        .insert(Connection::new(peer.token, peer.peer_addr, false));
+    let fd = backend.transport.raw_fd(peer.token).unwrap();
+    let defaults = backend.transport.inner_mut().tcp_buffer_sizes_for_test(fd);
+    backend
+        .transport
+        .inner_mut()
+        .set_test_tcp_buffer_limits_for_test(4096, 4096);
+    let mut batch = ReadBatchEffects::default();
+
+    for parts in [&[b"PING".as_slice()][..], &[b"HELLO".as_slice(), b"2"][..]] {
+        let args = make_args(parts);
+        let name = String::from_utf8(args.name.to_ascii_lowercase()).unwrap();
+        backend.process_parsed_command(peer.token, args, name, false, &mut batch);
+        assert_eq!(
+            backend.transport.inner_mut().tcp_buffer_sizes_for_test(fd),
+            defaults
+        );
+    }
+    backend.process_parsed_command(
+        peer.token,
+        make_args(&[b"PING", b"payload"]),
+        "ping".to_string(),
+        false,
+        &mut batch,
+    );
+    let actual = backend.transport.inner_mut().tcp_buffer_sizes_for_test(fd);
+    assert!(actual.0 < defaults.0 && actual.1 < defaults.1);
+    backend.process_parsed_command(
+        peer.token,
+        make_args(&[b"GET", b"missing"]),
+        "get".to_string(),
+        false,
+        &mut batch,
+    );
+    assert_eq!(
+        backend.transport.inner_mut().tcp_buffer_sizes_for_test(fd),
+        actual
+    );
+}
+
+#[test]
+fn test_tcp_buffer_policy_does_not_classify_replica_negotiation_as_an_ordinary_client() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut backend = ServerWorkerState::new(1).unwrap();
+    crate::framework::commands::register_all(&mut backend.registry);
+    let peer = backend
+        .transport
+        .connect_tcp(listener.local_addr().unwrap())
+        .unwrap();
+    let (_remote, _) = listener.accept().unwrap();
+    backend
+        .connection_registry
+        .insert(Connection::new(peer.token, peer.peer_addr, false));
+    let fd = backend.transport.raw_fd(peer.token).unwrap();
+    let defaults = backend.transport.inner_mut().tcp_buffer_sizes_for_test(fd);
+    backend
+        .transport
+        .inner_mut()
+        .set_test_tcp_buffer_limits_for_test(4096, 4096);
+    let mut batch = ReadBatchEffects::default();
+    for parts in [
+        &[b"PING".as_slice()][..],
+        &[b"REPLCONF".as_slice(), b"listening-port", b"6380"][..],
+        &[b"REPLCONF".as_slice(), b"capa", b"eof"][..],
+        &[b"INFO".as_slice()][..],
+    ] {
+        let args = make_args(parts);
+        let name = String::from_utf8(args.name.to_ascii_lowercase()).unwrap();
+        backend.process_parsed_command(peer.token, args, name, false, &mut batch);
+        assert_eq!(
+            backend.transport.inner_mut().tcp_buffer_sizes_for_test(fd),
+            defaults
+        );
+    }
+}
+
+#[test]
 fn bulk_parse_limits_apply_configured_limit_after_authentication() {
     assert_eq!(
         crate::runtime::server::worker::sessions::read::command_bulk_limits(false, 1024 * 1024),
@@ -693,78 +781,6 @@ fn postponed_transaction_command_breaks_the_pipeline() {
     assert!(backend.connection_registry[Token(connection_token)]
         .blocked
         .is_some());
-}
-
-#[test]
-fn cluster_setslot_waits_for_eligible_replica_before_mutating_primary() {
-    use crate::engine::distributed::cluster::node::{ClusterNode, CLUSTER_NODE_MYSELF};
-
-    const TARGET: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-    let mut backend = ServerWorkerState::new(1).unwrap();
-    let connection_token = add_fake_connection(&mut backend);
-    let mut cluster =
-        crate::engine::distributed::cluster::ClusterState::new("127.0.0.1", 6379, 16_379);
-    cluster.add_slot(0).unwrap();
-    let mut target = ClusterNode::new(
-        TARGET.to_string(),
-        "127.0.0.1".to_string(),
-        6380,
-        16_380,
-        true,
-    );
-    target.flags &= !CLUSTER_NODE_MYSELF;
-    cluster.nodes.insert(TARGET.to_string(), target);
-    *backend.ctx.cluster_state_mut() = Some(Box::new(cluster));
-    let id = backend.replication_runtime.register_primary(
-        ConnectionId(99),
-        ReplicaConnectionInfo {
-            ip: "127.0.0.1".to_string(),
-            port: 6381,
-            capability: Vec::new(),
-            rdb_filter_mode: crate::framework::distributed::replication::RdbFilterMode::All,
-        },
-    );
-    let replica = backend.replication_runtime.primary_link_mut(id).unwrap();
-    replica.set_state(PrimaryLinkState::Streaming);
-    replica.set_replica_version(0x080000);
-    let args = make_args(&[
-        b"CLUSTER",
-        b"SETSLOT",
-        b"0",
-        b"MIGRATING",
-        TARGET.as_bytes(),
-        b"TIMEOUT",
-        b"1",
-    ]);
-
-    let reply = backend.wait_for_cluster_setslot_replication(Token(connection_token), &args);
-
-    assert_eq!(
-        reply,
-        Some(Value::error(
-            "NOREPLICAS Not enough good replicas to write."
-        ))
-    );
-    assert!(backend
-        .ctx
-        .cluster_state()
-        .as_deref()
-        .unwrap()
-        .migrating_slot_target(0)
-        .is_none());
-    assert!(backend.connection_registry[Token(connection_token)].skip_propagation());
-}
-
-#[test]
-fn cluster_setslot_zero_timeout_has_no_deadline() {
-    assert_eq!(
-        super::command_exec::cluster_setslot_wait_deadline(10_000, 0),
-        None
-    );
-    assert_eq!(
-        super::command_exec::cluster_setslot_wait_deadline(10_000, 250),
-        Some(10_250)
-    );
 }
 
 #[test]
@@ -2175,6 +2191,292 @@ fn script_has_no_writes_flag_detects_shebang() {
     assert!(script_has_no_writes_flag(
         "#!lua flags=no-writes,allow-oom\nreturn 1"
     ));
+}
+
+const SETSLOT_REMOTE_NODE_ID: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const SETSLOT_REPLICA_TOKEN_VALUE: usize = 9_101;
+
+fn setslot_cluster_state() -> crate::engine::distributed::cluster::ClusterState {
+    use crate::engine::distributed::cluster::node::{ClusterNode, CLUSTER_NODE_MYSELF};
+    use crate::engine::distributed::cluster::ClusterState;
+    let mut state = ClusterState::new("127.0.0.1", 6379, 16_379);
+    let mut remote = ClusterNode::new(
+        SETSLOT_REMOTE_NODE_ID.to_string(),
+        "127.0.0.1".to_string(),
+        6380,
+        16_380,
+        true,
+    );
+    remote.flags &= !CLUSTER_NODE_MYSELF;
+    state.nodes.insert(remote.name.clone(), remote);
+    state
+}
+
+fn install_setslot_cluster(backend: &mut ServerWorkerState) {
+    *backend.ctx.cluster_state_mut() = Some(Box::new(setslot_cluster_state()));
+}
+
+/// Register a fake primary-side replica connection, promote its link to
+/// Streaming with a new enough version for SETSLOT acknowledgement gating, and
+/// activate the replication backlog so command frames are appended.
+fn add_streaming_setslot_replica(
+    backend: &mut ServerWorkerState,
+) -> crate::framework::distributed::replication::ReplicaId {
+    let mut replica = Connection::new_fake();
+    replica.set_token_for_test(Token(SETSLOT_REPLICA_TOKEN_VALUE));
+    backend.connection_registry.insert(replica);
+    let replica_id = backend.replication_runtime.register_primary(
+        ConnectionId(SETSLOT_REPLICA_TOKEN_VALUE),
+        ReplicaConnectionInfo {
+            ip: "127.0.0.1".to_string(),
+            port: 6381,
+            capability: vec!["eof".to_string(), "psync2".to_string()],
+            rdb_filter_mode: crate::framework::distributed::replication::RdbFilterMode::All,
+        },
+    );
+    let now = crate::foundation::io::sys::time::mstime();
+    let link = backend
+        .replication_runtime
+        .primary_link_mut(replica_id)
+        .expect("registered primary link");
+    link.set_state(PrimaryLinkState::PreparingFullResync);
+    link.finish_full_resync();
+    link.acknowledge(offset(0), now);
+    assert!(link.promote_full_resync_on_ack());
+    link.set_replica_version(0x0007_0300);
+    backend.ctx.replication_mut().backlog.activate_new_history();
+    replica_id
+}
+
+fn setslot_command_frame(timeout_ms: Option<i64>) -> Vec<u8> {
+    let mut parts: Vec<&[u8]> = vec![
+        b"CLUSTER",
+        b"SETSLOT",
+        b"1",
+        b"IMPORTING",
+        SETSLOT_REMOTE_NODE_ID.as_bytes(),
+    ];
+    let timeout_text;
+    if let Some(ms) = timeout_ms {
+        timeout_text = ms.to_string();
+        parts.push(b"TIMEOUT");
+        parts.push(timeout_text.as_bytes());
+    }
+    crate::engine::distributed::replication::protocol::encode_command(&parts)
+}
+
+fn dispatch_client_frame(
+    backend: &mut ServerWorkerState,
+    client: &TcpStream,
+    token: Token,
+    frame: &[u8],
+) {
+    let mut client = client;
+    client.write_all(frame).expect("client sends command frame");
+    backend.transport.wait_readable_for_test(token);
+    backend.handle_readable(token.0, ClientReadMode::Fair);
+}
+
+fn queued_frame_occurrences(backend: &ServerWorkerState, token: Token, needle: &[u8]) -> usize {
+    backend.connection_registry[token]
+        .output
+        .queue
+        .iter()
+        .map(|frame| {
+            frame
+                .windows(needle.len())
+                .filter(|window| *window == needle)
+                .count()
+        })
+        .sum()
+}
+
+fn queued_flat_bytes(backend: &ServerWorkerState, token: Token) -> Vec<u8> {
+    backend.connection_registry[token]
+        .output
+        .queue
+        .iter()
+        .flat_map(|frame| frame.iter().copied())
+        .collect()
+}
+
+#[test]
+fn setslot_blocks_before_running_body_and_propagates_frame_once_before_acks() {
+    let mut backend = ServerWorkerState::new(1).unwrap();
+    crate::framework::commands::register_all(&mut backend.registry);
+    install_setslot_cluster(&mut backend);
+    let replica_id = add_streaming_setslot_replica(&mut backend);
+    let (client, _connection_token, token) = add_socket_connection(&mut backend);
+    let offset_before = backend.ctx.replication().primary_repl_offset();
+
+    dispatch_client_frame(&mut backend, &client, token, &setslot_command_frame(None));
+
+    let blocked = backend.connection_registry[token]
+        .blocked
+        .as_ref()
+        .expect("SETSLOT client must block for replica ACKs");
+    assert!(
+        matches!(blocked.cmd, BlockedCmd::SetSlot { required: 1, .. }),
+        "unexpected blocked command: {:?}",
+        blocked.cmd
+    );
+    assert!(
+        backend.connection_registry[token].output.queue.is_empty(),
+        "no reply is allowed before the ACK threshold is met"
+    );
+    assert!(
+        backend
+            .ctx
+            .cluster_state()
+            .as_ref()
+            .unwrap()
+            .importing_slot_source(1)
+            .is_none(),
+        "the SETSLOT body must not run while blocked"
+    );
+    let offset_blocked = backend.ctx.replication().primary_repl_offset();
+    assert!(
+        offset_blocked.get() > offset_before.get(),
+        "the preflight must append exactly one SETSLOT frame to the backlog"
+    );
+    assert_eq!(
+        queued_frame_occurrences(&backend, Token(SETSLOT_REPLICA_TOKEN_VALUE), b"SETSLOT"),
+        1
+    );
+    let _ = replica_id;
+}
+
+#[test]
+fn setslot_wakeup_reruns_body_once_and_replies_ok_without_a_second_frame() {
+    let mut backend = ServerWorkerState::new(1).unwrap();
+    crate::framework::commands::register_all(&mut backend.registry);
+    install_setslot_cluster(&mut backend);
+    let replica_id = add_streaming_setslot_replica(&mut backend);
+    let (client, _connection_token, token) = add_socket_connection(&mut backend);
+
+    dispatch_client_frame(&mut backend, &client, token, &setslot_command_frame(None));
+
+    let target_offset = match &backend.connection_registry[token]
+        .blocked
+        .as_ref()
+        .expect("SETSLOT client must block")
+        .cmd
+    {
+        BlockedCmd::SetSlot { target_offset, .. } => *target_offset,
+        other => panic!("unexpected blocked command: {other:?}"),
+    };
+    let offset_blocked = backend.ctx.replication().primary_repl_offset();
+    backend
+        .replication_runtime
+        .primary_link_mut(replica_id)
+        .expect("primary link")
+        .acknowledge(target_offset, crate::foundation::io::sys::time::mstime());
+
+    backend.check_wait_replica_wakeups();
+
+    assert_eq!(
+        backend
+            .ctx
+            .cluster_state()
+            .as_ref()
+            .unwrap()
+            .importing_slot_source(1),
+        Some(SETSLOT_REMOTE_NODE_ID)
+    );
+    assert!(backend.connection_registry[token].blocked.is_none());
+    let reply = queued_flat_bytes(&backend, token);
+    assert!(
+        reply.windows(5).any(|window| window == b"+OK\r\n"),
+        "wake-up reply must be +OK, got: {}",
+        String::from_utf8_lossy(&reply)
+    );
+    assert_eq!(
+        backend.ctx.replication().primary_repl_offset(),
+        offset_blocked,
+        "re-running SETSLOT must not propagate the command frame a second time"
+    );
+    assert_eq!(
+        queued_frame_occurrences(&backend, Token(SETSLOT_REPLICA_TOKEN_VALUE), b"SETSLOT"),
+        1
+    );
+}
+
+#[test]
+fn setslot_timeout_replies_noreplicas_without_rerunning_body() {
+    let mut backend = ServerWorkerState::new(1).unwrap();
+    crate::framework::commands::register_all(&mut backend.registry);
+    install_setslot_cluster(&mut backend);
+    let _replica_id = add_streaming_setslot_replica(&mut backend);
+    let (client, _connection_token, token) = add_socket_connection(&mut backend);
+
+    dispatch_client_frame(
+        &mut backend,
+        &client,
+        token,
+        &setslot_command_frame(Some(1)),
+    );
+
+    assert!(matches!(
+        backend.connection_registry[token]
+            .blocked
+            .as_ref()
+            .expect("SETSLOT client must block")
+            .cmd,
+        BlockedCmd::SetSlot { required: 1, .. }
+    ));
+    backend.connection_registry[token]
+        .blocked
+        .as_mut()
+        .expect("blocked state")
+        .start_time_ms -= 10;
+
+    backend.check_blocked_timeouts();
+
+    assert!(backend.connection_registry[token].blocked.is_none());
+    assert!(
+        backend
+            .ctx
+            .cluster_state()
+            .as_ref()
+            .unwrap()
+            .importing_slot_source(1)
+            .is_none(),
+        "the SETSLOT body must not run on timeout"
+    );
+    assert_eq!(
+        backend.connection_registry[token].output.queue.front(),
+        Some(&b"-NOREPLICAS Not enough good replicas to write.\r\n".to_vec())
+    );
+    assert!(!backend.event_batch.contains_runnable(
+        crate::runtime::server::worker::reactor::RunnableKey::ClientRead(token)
+    ));
+}
+
+#[test]
+fn setslot_runs_immediately_when_no_eligible_replica() {
+    let mut backend = ServerWorkerState::new(1).unwrap();
+    crate::framework::commands::register_all(&mut backend.registry);
+    install_setslot_cluster(&mut backend);
+    let (client, _connection_token, token) = add_socket_connection(&mut backend);
+
+    dispatch_client_frame(&mut backend, &client, token, &setslot_command_frame(None));
+
+    assert!(backend.connection_registry[token].blocked.is_none());
+    assert_eq!(
+        backend
+            .ctx
+            .cluster_state()
+            .as_ref()
+            .unwrap()
+            .importing_slot_source(1),
+        Some(SETSLOT_REMOTE_NODE_ID)
+    );
+    let reply = queued_flat_bytes(&backend, token);
+    assert!(
+        reply.windows(5).any(|window| window == b"+OK\r\n"),
+        "direct SETSLOT must reply +OK, got: {}",
+        String::from_utf8_lossy(&reply)
+    );
 }
 
 mod completion;

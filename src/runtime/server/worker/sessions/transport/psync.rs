@@ -472,6 +472,15 @@ impl ServerWorkerState {
         let Some(selection) = self.select_sync_plan(request, dual_resume_state, replies) else {
             return false;
         };
+        // C appends the replica to `server.replicas` exactly when PSYNC is
+        // accepted: partial CONTINUE (including the dual-channel main PSYNC)
+        // at replication.c:961, full-resync start at replication.c:1230, in
+        // both cases before the backlog is activated below. The initial
+        // dual-channel negotiation (+DUALCHANNELSYNC) returned earlier and is
+        // not admitted yet. Stamping here makes INFO replication follow
+        // acceptance order rather than REPLCONF registration order.
+        self.replication_runtime
+            .stamp_primary_acceptance(request.connection_id);
         self.activate_psync_history(&selection.plan);
         self.complete_psync_waits(request, &selection);
         if self.apply_sync_plan(request, selection, replies) {

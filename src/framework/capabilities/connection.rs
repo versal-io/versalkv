@@ -124,6 +124,7 @@ pub struct Connection {
     pub slot_migration_role:
         Option<crate::engine::distributed::cluster::migration::SlotMigrationConnectionRole>,
     pub(crate) slot_migration_tcp_buffers_applied: bool,
+    pub(crate) is_test_tcp_buffer_policy_applied: bool,
     tracking: TrackingState,
     pub monitoring: bool,
     pub readonly: bool,
@@ -212,6 +213,7 @@ impl Connection {
             import_source: false,
             slot_migration_role: None,
             slot_migration_tcp_buffers_applied: false,
+            is_test_tcp_buffer_policy_applied: false,
             tracking: TrackingState::default(),
             monitoring: false,
             readonly: false,
@@ -603,11 +605,14 @@ impl Connection {
             // During an incomplete bulk request the declared payload length is
             // already committed client memory in C. Partial argv payloads are
             // separate objects while the consumed query buffer is retained.
+            // C reserves big arguments non-greedily, so Rust Vec growth slack
+            // must not affect the client eviction decision.
             self.query_buffer_total()
                 .max(parser_memory.query_buffer)
                 .saturating_add(parser_memory.partial_argv)
         } else {
-            0
+            // C counts sdsAllocSize(querybuf) even after the request is consumed.
+            self.parser.buffer_allocation_bytes()
         };
         let total = std::mem::size_of::<Self>()
             // Match C getClientMemoryUsage(): the fixed 16 KiB reply buffer is
@@ -902,6 +907,7 @@ impl Connection {
             import_source: false,
             slot_migration_role: None,
             slot_migration_tcp_buffers_applied: false,
+            is_test_tcp_buffer_policy_applied: false,
             tracking: TrackingState::default(),
             monitoring: false,
             readonly: false,

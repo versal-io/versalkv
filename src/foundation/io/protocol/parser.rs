@@ -115,6 +115,17 @@ impl Parser {
         self.buf.capacity()
     }
 
+    pub fn buffer_allocation_bytes(&self) -> usize {
+        #[cfg(not(feature = "wasm"))]
+        {
+            crate::foundation::memory::util_alloc::vec_allocation_bytes(&self.buf)
+        }
+        #[cfg(feature = "wasm")]
+        {
+            self.buf.capacity()
+        }
+    }
+
     pub fn shrink_idle_buffer(&mut self) {
         if self.has_inflight_request() {
             self.buf.shrink_to(QUERY_BUFFER_RETAIN_CAPACITY);

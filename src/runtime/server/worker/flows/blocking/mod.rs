@@ -116,6 +116,7 @@ impl ServerWorkerState {
                     BlockedCmd::Paused
                         | BlockedCmd::Wait { .. }
                         | BlockedCmd::WaitAof { .. }
+                        | BlockedCmd::SetSlot { .. }
                         | BlockedCmd::SlotMigration(_)
                         | BlockedCmd::Shutdown
                         | BlockedCmd::Script
@@ -171,6 +172,7 @@ impl ServerWorkerState {
                     BlockedCmd::Paused
                         | BlockedCmd::Wait { .. }
                         | BlockedCmd::WaitAof { .. }
+                        | BlockedCmd::SetSlot { .. }
                         | BlockedCmd::SlotMigration(_)
                         | BlockedCmd::Shutdown
                         | BlockedCmd::Script
@@ -281,7 +283,7 @@ impl ServerWorkerState {
     ) {
         if matches!(
             blocked.cmd,
-            BlockedCmd::Wait { .. } | BlockedCmd::WaitAof { .. }
+            BlockedCmd::Wait { .. } | BlockedCmd::WaitAof { .. } | BlockedCmd::SetSlot { .. }
         ) {
             self.ctx
                 .blocking_registry_mut()
@@ -545,14 +547,32 @@ impl ServerWorkerState {
             }
         }
         for token in to_timeout {
+            // C `unblockClientOnTimeout` maps a BLOCKED_WAIT `CLUSTER SETSLOT`
+            // to `NOREPLICAS`; unlike C, the Rust continuation does not
+            // requeue the client, so the command body never runs twice.
+            if self.blocked_cmd_is_setslot(token) {
+                let reply =
+                    Value::error("NOREPLICAS Not enough good replicas to write.".to_string());
+                self.complete_blocked_command_reply(token, reply, false);
+                continue;
+            }
             let wait_reply = self.wait_blocked_reply(token);
             let reply = wait_reply.unwrap_or(Value::NullArray);
             self.complete_blocked_command_reply(token, reply, true);
         }
     }
 
+    fn blocked_cmd_is_setslot(&self, token: Token) -> bool {
+        self.connection_registry
+            .get(crate::framework::capabilities::io::Token(token.0))
+            .and_then(|connection| connection.blocked.as_ref())
+            .is_some_and(|blocked| matches!(blocked.cmd, BlockedCmd::SetSlot { .. }))
+    }
+
     pub(crate) fn check_wait_replica_wakeups(&mut self) {
+        use crate::foundation::io::sys::time::mstime;
         let mut to_wake = Vec::new();
+        let mut to_rerun: Vec<Token> = Vec::new();
         for (_connection_token, conn) in self.connection_registry.iter() {
             let Some(blocked) = &conn.blocked else {
                 continue;
@@ -584,11 +604,28 @@ impl ServerWorkerState {
                         to_wake.push((conn.token(), self.waitaof_reply(local, replicas)));
                     }
                 }
+                // SETSLOT mirrors C `processClientsWaitingReplicas`: once enough
+                // replicas ACK the target offset the client is unblocked and the
+                // original command is re-processed so its body runs once.
+                BlockedCmd::SetSlot {
+                    required,
+                    target_offset,
+                } => {
+                    let acked =
+                        self.replication_runtime
+                            .count_acked_replicas(target_offset, 0, mstime());
+                    if acked >= required as usize {
+                        to_rerun.push(conn.token());
+                    }
+                }
                 _ => {}
             }
         }
         for (token, reply) in to_wake {
             self.reply_to_unblocked_wait(token, reply);
+        }
+        for token in to_rerun {
+            self.wakeup_blocked_client(token, None, None);
         }
     }
 

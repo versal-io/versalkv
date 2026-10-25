@@ -240,13 +240,12 @@ fn apply_slots(slot_args: &[Bytes], ctx: &mut ServerContext, del: bool) -> Value
             return e;
         }
     }
-    if del {
-        for &slot in &slots {
-            if let Err(error) = state.del_slot(slot) {
-                return Value::error(format!("ERR {error}"));
-            }
-        }
-    } else if let Err(error) = state.add_slots_batch(&slots) {
+    let mutation = if del {
+        state.del_slots_batch(&slots)
+    } else {
+        state.add_slots_batch(&slots)
+    };
+    if let Err(error) = mutation {
         return Value::error(format!("ERR {error}"));
     }
     state.finalize_slot_changes();
@@ -311,23 +310,24 @@ fn apply_slots_range(
             return e;
         }
     }
+    // C walks the validated scratch bitmap once and applies every binding
+    // through `clusterUpdateSlots`; expand the ranges in slot order so the
+    // batch primitive performs one topology transition for the command.
+    let mut slots = Vec::new();
     for &(start, end) in &ranges {
-        for slot in start..=end {
-            let res = if del {
-                state.del_slot(slot)
-            } else {
-                state.add_slot(slot)
-            };
-            if let Err(e) = res {
-                return Value::error(format!("ERR {}", e));
-            }
-        }
+        slots.extend(start..=end);
+    }
+    let mutation = if del {
+        state.del_slots_batch(&slots)
+    } else {
+        state.add_slots_batch(&slots)
+    };
+    if let Err(error) = mutation {
+        return Value::error(format!("ERR {error}"));
     }
     state.finalize_slot_changes();
-    for (start, end) in ranges {
-        for slot in start..=end {
-            ctx.slot_metrics_mut().reset_slot(slot);
-        }
+    for &slot in &slots {
+        ctx.slot_metrics_mut().reset_slot(slot);
     }
     Value::ok()
 }
@@ -661,6 +661,75 @@ mod tests {
         let state = context.cluster_state().as_deref().unwrap();
         assert_eq!(state.topology_generation(), generation + 1);
         assert_eq!(state.myself.numslots, 2);
+    }
+
+    #[test]
+    fn addslotsrange_records_one_topology_change_for_the_whole_command() {
+        let mut context = ServerContext::new(1);
+        let state = ClusterState::new("127.0.0.1", 6379, 16_379);
+        let generation = state.topology_generation();
+        *context.cluster_state_mut() = Some(Box::new(state));
+
+        assert_eq!(
+            cluster_addslotsrange(
+                &[Bytes::from_static(b"0"), Bytes::from_static(b"16383")],
+                &mut context,
+            ),
+            Value::ok()
+        );
+
+        let state = context.cluster_state().as_deref().unwrap();
+        assert_eq!(state.topology_generation(), generation + 1);
+        assert_eq!(state.myself.numslots, 16_384);
+    }
+
+    #[test]
+    fn delslotsrange_records_one_topology_change_for_the_whole_command() {
+        let mut context = ServerContext::new(1);
+        let mut state = ClusterState::new("127.0.0.1", 6379, 16_379);
+        state.add_slots_batch(&(0..16_384).collect::<Vec<_>>()).unwrap();
+        state.finalize_slot_changes();
+        let generation = state.topology_generation();
+        *context.cluster_state_mut() = Some(Box::new(state));
+
+        assert_eq!(
+            cluster_delslotsrange(
+                &[Bytes::from_static(b"0"), Bytes::from_static(b"16383")],
+                &mut context,
+            ),
+            Value::ok()
+        );
+
+        let state = context.cluster_state().as_deref().unwrap();
+        assert_eq!(state.topology_generation(), generation + 1);
+        assert_eq!(state.myself.numslots, 0);
+    }
+
+    #[test]
+    fn addslotsrange_full_range_is_linear_in_debug_builds() {
+        // A per-slot ownership transition must not rescan the whole 16k bitmap
+        // (e.g. via `count_slots()` debug assertions) or the cluster-create
+        // setup stalls the event loop for seconds on unoptimized CI builds.
+        let mut context = ServerContext::new(1);
+        *context.cluster_state_mut() = Some(Box::new(ClusterState::new(
+            "127.0.0.1",
+            6379,
+            16_379,
+        )));
+
+        let started = std::time::Instant::now();
+        let reply = cluster_addslotsrange(
+            &[Bytes::from_static(b"0"), Bytes::from_static(b"16383")],
+            &mut context,
+        );
+        let elapsed = started.elapsed();
+
+        assert_eq!(reply, Value::ok());
+        assert_eq!(context.cluster_state().as_deref().unwrap().myself.numslots, 16_384);
+        assert!(
+            elapsed < std::time::Duration::from_millis(250),
+            "full-range ADDSLOTSRANGE took {elapsed:?}, expected linear cost"
+        );
     }
 
     #[test]

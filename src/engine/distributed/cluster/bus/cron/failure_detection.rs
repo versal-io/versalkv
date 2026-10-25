@@ -47,12 +47,10 @@ impl ClusterBusManager {
         let mut failed = Vec::new();
         let mut reachability_changed = false;
         for node_name in &node_names {
-            let data_received = self
-                .connections
-                .values()
-                .filter(|connection| connection.node_name == *node_name)
-                .map(|connection| connection.last_recv)
-                .max()
+            let data_received = state
+                .nodes
+                .get(node_name)
+                .map(|node| node.data_received)
                 .unwrap_or(0);
             self.queue_stale_outgoing_link_close(state, node_name, now, timeout_ms, data_received);
             let Some((newly_pfailed, pfail_and_not_fail, changed)) =
@@ -125,6 +123,18 @@ mod tests {
         let connection = bus.connections.get_mut(&41).unwrap();
         connection.node_name = node_id.clone();
         connection.last_recv = 1_500;
+        state.nodes.get_mut(&node_id).unwrap().data_received = 1_500;
+
+        bus.detect_failures(&mut state, 2_000, 1_000);
+
+        assert!(!state.nodes[&node_id].has_flag(CLUSTER_NODE_PFAIL));
+    }
+
+    #[test]
+    fn recent_bus_data_survives_link_teardown() {
+        let bus = ClusterBusManager::new();
+        let (mut state, node_id) = state_with_peer(500, 1);
+        state.nodes.get_mut(&node_id).unwrap().data_received = 1_500;
 
         bus.detect_failures(&mut state, 2_000, 1_000);
 
@@ -167,11 +177,12 @@ mod tests {
                 Token(43),
                 "127.0.0.1:16380".parse().unwrap(),
                 false,
-                node_id,
+                node_id.clone(),
             );
             let connection = bus.connections.get_mut(&43).unwrap();
             connection.created_at = created_at;
             connection.last_recv = last_recv;
+            state.nodes.get_mut(&node_id).unwrap().data_received = last_recv;
 
             bus.detect_failures(&mut state, 1_501, 1_000);
 

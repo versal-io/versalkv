@@ -307,14 +307,20 @@ impl ServerWorkerState {
     ) -> std::io::Result<LoopControl> {
         #[cfg(test)]
         self.trace_turn_for_test(TurnTracePoint::ReadyDispatch);
+        // Bracket the whole readiness phase like C's beforeSleep: bus packets
+        // on every readable connection mutate topology immediately, while
+        // election results they carry settle once after the full batch.
+        self.begin_cluster_bus_receive_batch();
         while let Some(event) = self.event_batch.pop_ready() {
             self.dispatch_event(event, &context);
             if self.exit_if_shutdown_requested() {
                 self.event_batch.finish_phase(EventPhase::Ready);
+                self.finish_cluster_bus_receive_batch();
                 return Ok(LoopControl::Stop);
             }
         }
         self.event_batch.finish_phase(EventPhase::Ready);
+        self.finish_cluster_bus_receive_batch();
         Ok(LoopControl::Continue)
     }
 

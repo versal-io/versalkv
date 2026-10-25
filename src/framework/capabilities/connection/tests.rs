@@ -414,6 +414,7 @@ fn admitted_transaction_command_accumulates_input_once() {
 #[test]
 fn incomplete_query_accounting_ignores_vec_growth_slack() {
     let mut conn = Connection::new(Token(1), addr(), false);
+    let baseline = conn.client_memory_usage().total;
     const PAYLOAD_LEN: usize = 300_000;
     let header = format!("*1\r\n${PAYLOAD_LEN}\r\n");
 
@@ -427,6 +428,10 @@ fn incomplete_query_accounting_ignores_vec_growth_slack() {
 
     assert_eq!(conn.query_buffer_used(), PAYLOAD_LEN);
     assert_eq!(conn.query_buffer_total(), PAYLOAD_LEN);
+    assert!(
+        conn.client_memory_usage().total <= baseline + PAYLOAD_LEN + 1024,
+        "client eviction must follow C's non-greedy bulk reservation"
+    );
 }
 
 #[test]
@@ -450,6 +455,22 @@ fn idle_incomplete_bulk_shrinks_qbuf_without_dropping_memory_commitment() {
         PAYLOAD_LEN
     );
     assert_eq!(conn.query_buffer_total(), 16 * 1024);
+}
+
+#[test]
+fn completed_pipeline_retains_query_allocation_in_client_memory() {
+    let mut conn = Connection::new(Token(1), addr(), false);
+    let baseline = conn.client_memory_usage().total;
+    let request = b"*1\r\n$4\r\nPING\r\n".repeat(4096);
+    conn.parser.feed(&request);
+    while conn.parser.try_parse().unwrap().is_some() {}
+    assert!(!conn.parser.has_inflight_request());
+    assert!(conn.parser.buffer_capacity() >= 16 * 1024);
+
+    assert!(
+        conn.client_memory_usage().total >= baseline + 12 * 1024,
+        "an empty query buffer still owns its retained allocation"
+    );
 }
 
 #[test]

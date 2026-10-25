@@ -764,7 +764,7 @@ impl TransportRuntime for PollingTransportRuntime {
             }
             AcceptedStream::Unix(stream) => Stream::Unix(stream),
         };
-        apply_accepted_stream_options(&stream, self.tcp_buffer_limits)?;
+        apply_accepted_stream_options(&stream)?;
         let key = self.registered.vacant_key();
         let id = TransportId::new(key + 1).expect("slab index plus one is nonzero");
         match &stream {
@@ -831,6 +831,12 @@ impl TransportRuntime for PollingTransportRuntime {
         let Some(limits) = self.tcp_buffer_limits else {
             return Ok(());
         };
+        if matches!(
+            self.registered.get(id.get() - 1),
+            Some(Registered::Stream(Stream::Unix(_)))
+        ) {
+            return Ok(());
+        }
         let stream = tcp_stream_ref(self.registered.get(id.get() - 1))?;
         let socket = SockRef::from(stream);
         socket.set_send_buffer_size(limits.send_bytes)?;
@@ -1174,10 +1180,6 @@ impl PollingTransportRuntime {
         socket.set_reuse_address(true)?;
         socket.set_nodelay(true)?;
         socket.set_nonblocking(true)?;
-        if let Some(limits) = self.tcp_buffer_limits {
-            socket.set_send_buffer_size(limits.send_bytes)?;
-            socket.set_recv_buffer_size(limits.receive_bytes)?;
-        }
         if let Some(source_ip) = source_ip {
             if source_ip.is_ipv4() != addr.is_ipv4() {
                 return Err(io::Error::new(
@@ -1193,6 +1195,33 @@ impl PollingTransportRuntime {
             Err(error) => return Err(error),
         }
         Ok(TcpStream::from(socket))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_tcp_buffer_limits_for_test(
+        &mut self,
+        send_bytes: usize,
+        receive_bytes: usize,
+    ) {
+        self.tcp_buffer_limits = Some(TcpBufferLimits {
+            send_bytes,
+            receive_bytes,
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tcp_buffer_sizes_for_test(&self, fd: std::os::fd::RawFd) -> (usize, usize) {
+        let stream = self
+            .registered
+            .iter()
+            .filter_map(|(_, entry)| tcp_stream_ref(Some(entry)).ok())
+            .find(|stream| stream.as_raw_fd() == fd)
+            .expect("registered test TCP stream");
+        let socket = SockRef::from(stream);
+        (
+            socket.send_buffer_size().expect("read test SO_SNDBUF"),
+            socket.recv_buffer_size().expect("read test SO_RCVBUF"),
+        )
     }
 
     #[cfg(test)]
@@ -1251,10 +1280,7 @@ fn validate_mode(poller: &Poller, mode: TransportPollMode) -> io::Result<()> {
     }
 }
 
-fn apply_accepted_stream_options(
-    stream: &Stream,
-    limits: Option<TcpBufferLimits>,
-) -> io::Result<()> {
+fn apply_accepted_stream_options(stream: &Stream) -> io::Result<()> {
     match stream {
         Stream::Tcp(stream) => stream.set_nonblocking(true)?,
         #[cfg(feature = "tls")]
@@ -1264,20 +1290,10 @@ fn apply_accepted_stream_options(
     match stream {
         Stream::Tcp(stream) => {
             stream.set_nodelay(true)?;
-            if let Some(limits) = limits {
-                let socket = SockRef::from(stream);
-                socket.set_send_buffer_size(limits.send_bytes)?;
-                socket.set_recv_buffer_size(limits.receive_bytes)?;
-            }
         }
         #[cfg(feature = "tls")]
         Stream::Tls(stream) => {
             stream.get_ref().set_nodelay(true)?;
-            if let Some(limits) = limits {
-                let socket = SockRef::from(stream.get_ref());
-                socket.set_send_buffer_size(limits.send_bytes)?;
-                socket.set_recv_buffer_size(limits.receive_bytes)?;
-            }
         }
         Stream::Unix(_) => {}
     }
@@ -1360,6 +1376,129 @@ mod tests {
         (listener, address)
     }
 
+    fn tcp_buffers(runtime: &PollingTransportRuntime, id: super::TransportId) -> (usize, usize) {
+        let stream = super::tcp_stream_ref(runtime.registered.get(id.get() - 1))
+            .expect("registered TCP stream");
+        let socket = socket2::SockRef::from(stream);
+        (
+            socket.send_buffer_size().expect("read SO_SNDBUF"),
+            socket.recv_buffer_size().expect("read SO_RCVBUF"),
+        )
+    }
+
+    fn runtime_with_limits(limits: Option<super::TcpBufferLimits>) -> PollingTransportRuntime {
+        PollingTransportRuntime::with_mode_and_tcp_buffer_limits(TransportPollMode::Level, limits)
+            .expect("create polling runtime with explicit limits")
+    }
+
+    fn accept_test_peer(
+        runtime: &mut PollingTransportRuntime,
+        listener: super::TransportId,
+    ) -> super::ConnectedPeer {
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            if let Some(peer) = runtime.accept(listener).expect("accept test peer") {
+                return peer;
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            assert!(!remaining.is_zero(), "test peer must become ready");
+            runtime
+                .poll(&mut Vec::new(), Some(remaining))
+                .expect("poll test listener");
+        }
+    }
+
+    #[test]
+    fn test_tcp_buffer_policy_leaves_outbound_streams_at_system_defaults() {
+        let mut baseline = runtime_with_limits(None);
+        let (listener, address) = bind_tcp_loopback(&mut baseline);
+        let baseline_peer = baseline.connect_tcp(address).expect("connect baseline");
+        accept_test_peer(&mut baseline, listener.id);
+        let defaults = tcp_buffers(&baseline, baseline_peer.id);
+        let mut limited = runtime_with_limits(Some(super::TcpBufferLimits {
+            send_bytes: 4096,
+            receive_bytes: 4096,
+        }));
+        let peer = limited
+            .connect_tcp(address)
+            .expect("connect generic stream");
+        accept_test_peer(&mut baseline, listener.id);
+
+        assert_eq!(
+            tcp_buffers(&limited, peer.id),
+            defaults,
+            "generic outbound links must not inherit ordinary-client test limits"
+        );
+        limited
+            .apply_test_tcp_buffer_limits(peer.id)
+            .expect("explicitly apply migration limits");
+        let actual = tcp_buffers(&limited, peer.id);
+        assert!(actual.0 < defaults.0 && actual.1 < defaults.1);
+    }
+
+    #[test]
+    fn test_tcp_buffer_policy_leaves_accepted_streams_at_system_defaults() {
+        let mut baseline = runtime_with_limits(None);
+        let (listener, address) = bind_tcp_loopback(&mut baseline);
+        let _client = TcpStream::connect(address).expect("connect baseline client");
+        let baseline_peer = accept_test_peer(&mut baseline, listener.id);
+        let defaults = tcp_buffers(&baseline, baseline_peer.id);
+        let mut limited = runtime_with_limits(Some(super::TcpBufferLimits {
+            send_bytes: 4096,
+            receive_bytes: 4096,
+        }));
+        let (listener, address) = bind_tcp_loopback(&mut limited);
+        let _client = TcpStream::connect(address).expect("connect unclassified client");
+        let peer = accept_test_peer(&mut limited, listener.id);
+
+        assert_eq!(
+            tcp_buffers(&limited, peer.id),
+            defaults,
+            "accepted links must retain defaults until their purpose is known"
+        );
+    }
+
+    #[test]
+    fn test_tcp_buffer_policy_explicit_limits_keep_client_buffers_small() {
+        let mut runtime = runtime_with_limits(None);
+        let (listener, address) = bind_tcp_loopback(&mut runtime);
+        let _client = TcpStream::connect(address).expect("connect ordinary client");
+        let peer = accept_test_peer(&mut runtime, listener.id);
+        let defaults = tcp_buffers(&runtime, peer.id);
+        runtime.set_test_tcp_buffer_limits_for_test(4096, 4096);
+        runtime
+            .apply_test_tcp_buffer_limits(peer.id)
+            .expect("apply ordinary-client test limits");
+        let actual = tcp_buffers(&runtime, peer.id);
+        let reference = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        )
+        .expect("create explicit-limit reference");
+        reference
+            .set_send_buffer_size(4096)
+            .expect("set reference send buffer");
+        reference
+            .set_recv_buffer_size(4096)
+            .expect("set reference receive buffer");
+        assert_eq!(
+            actual,
+            (
+                reference
+                    .send_buffer_size()
+                    .expect("read reference SO_SNDBUF"),
+                reference
+                    .recv_buffer_size()
+                    .expect("read reference SO_RCVBUF"),
+            )
+        );
+        assert!(
+            actual.0 < defaults.0 && actual.1 < defaults.1,
+            "explicit ordinary-client limits must preserve small-buffer backpressure"
+        );
+    }
+
     #[test]
     fn separate_read_and_write_filters_are_coalesced_in_first_seen_order() {
         let first = super::TransportId::new(1).expect("nonzero transport id");
@@ -1382,26 +1521,44 @@ mod tests {
             .expect("create polling runtime");
         let (listener, listener_address) = bind_tcp_loopback(&mut runtime);
         let mut first = TcpStream::connect(listener_address).expect("connect first client");
-        let _second = TcpStream::connect(listener_address).expect("connect second client");
         first.write_all(b"ready").expect("write first client");
 
         let mut events = Vec::new();
-        runtime
-            .poll(&mut events, Some(Duration::from_secs(1)))
-            .expect("poll first readiness");
-        assert!(events
-            .iter()
-            .any(|event| event.id == listener.id && event.readable));
+        // Keep the observed connection queued for both polls. A second
+        // connect can return before its server-side queue entry is visible.
+        for _ in 0..2 {
+            let deadline = std::time::Instant::now() + Duration::from_secs(1);
+            loop {
+                events.clear();
+                runtime
+                    .poll(&mut events, Some(Duration::from_millis(10)))
+                    .expect("poll queued listener readiness");
+                if events
+                    .iter()
+                    .any(|event| event.id == listener.id && event.readable)
+                {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "queued listener readiness must repeat without rearming"
+                );
+            }
+        }
         runtime
             .accept(listener.id)
             .expect("accept first result")
             .expect("first client");
+        assert!(runtime
+            .accept(listener.id)
+            .expect("check drained accept queue")
+            .is_none());
 
         events.clear();
         runtime
             .poll(&mut events, Some(Duration::ZERO))
-            .expect("poll repeated readiness");
-        assert!(events
+            .expect("poll drained listener");
+        assert!(!events
             .iter()
             .any(|event| event.id == listener.id && event.readable));
     }

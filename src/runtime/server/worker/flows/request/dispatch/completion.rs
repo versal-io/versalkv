@@ -244,12 +244,18 @@ impl ServerWorkerState {
         };
         if matches!(
             blocked.cmd,
-            BlockedCmd::Wait { .. } | BlockedCmd::WaitAof { .. }
+            BlockedCmd::Wait { .. } | BlockedCmd::WaitAof { .. } | BlockedCmd::SetSlot { .. }
         ) {
             self.ctx
                 .blocking_registry_mut()
                 .register_keyless_client(connection.session_id());
-            return true;
+            // SETSLOT already force-propagated its frame together with the
+            // GETACK request, so it must not trigger the empty-command GETACK
+            // that WAIT/WAITAOF rely on.
+            return matches!(
+                blocked.cmd,
+                BlockedCmd::Wait { .. } | BlockedCmd::WaitAof { .. }
+            );
         }
         if !matches!(blocked.cmd, BlockedCmd::Paused | BlockedCmd::Shutdown) {
             self.ctx.blocking_registry_mut().register_client(

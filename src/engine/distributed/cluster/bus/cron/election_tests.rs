@@ -506,7 +506,7 @@ fn requested_topology_broadcast_is_returned_when_random_ping_is_disabled() {
 }
 
 #[test]
-fn runtime_replica_health_blocks_ineligible_automatic_election() {
+fn runtime_replica_loading_and_stale_data_block_automatic_election() {
     let mut bus = ClusterBusManager::new();
     let mut state = ClusterState::new("127.0.0.1", 6380, 16380);
     let primary_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -519,7 +519,8 @@ fn runtime_replica_health_blocks_ineligible_automatic_election() {
     bus.cron_with_replica_status(&mut state, 1_000, 1_000, &offsets, &health);
     assert_eq!(
         state.automatic_failover.phase(),
-        AutomaticFailoverPhase::Idle
+        AutomaticFailoverPhase::RequestingVotes,
+        "a transient lack of voting-primary links must not cancel C-compatible election state"
     );
 
     let voter_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";

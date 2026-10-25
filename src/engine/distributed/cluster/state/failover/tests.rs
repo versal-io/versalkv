@@ -141,7 +141,7 @@ fn replica_eligibility_rejects_each_disqualifying_fact() {
         Case {
             name: "disconnected cluster link",
             mutate: |candidate| candidate.cluster_link_connected = false,
-            expected: false,
+            expected: true,
         },
         Case {
             name: "stale cluster view",
@@ -467,6 +467,26 @@ mod automatic {
     }
 
     #[test]
+    fn lower_ranked_replica_keeps_c_propagation_delay() {
+        let mut failover = AutomaticFailover::default();
+        let mut current = facts(1_000);
+        current.siblings.push(eligible_replica(b'a', 43));
+
+        assert!(failover.on_tick(&current).is_empty());
+        assert_eq!(failover.rank(), 1);
+        // C adds fixed and random propagation delays before the rank penalty.
+        assert!((1_498..1_664).contains(&failover.deadline_ms()));
+        let first_deadline = failover.deadline_ms();
+        current.now_ms += 1;
+        assert!(failover.on_tick(&current).is_empty());
+        assert_eq!(failover.deadline_ms(), first_deadline);
+
+        current.siblings.push(eligible_replica(b'b', 44));
+        assert!(failover.on_tick(&current).is_empty());
+        assert_eq!(failover.deadline_ms(), first_deadline + 332);
+    }
+
+    #[test]
     fn election_moves_through_phases_and_emits_complete_promotion() {
         let mut failover = AutomaticFailover::default();
         assert!(failover.on_tick(&facts(1_000)).is_empty());
@@ -567,6 +587,36 @@ mod automatic {
     }
 
     #[test]
+    fn promotion_with_missing_primary_leaves_replica_unchanged() {
+        use crate::engine::distributed::cluster::node::{
+            CLUSTER_NODE_PRIMARY, CLUSTER_NODE_REPLICA,
+        };
+        use crate::engine::distributed::cluster::state::ClusterState;
+
+        let old_primary = node_id(b'p');
+        let shard_id = node_id(b's');
+        let mut state = ClusterState::new("127.0.0.1", 6380, 16380);
+        state.myself.flags &= !CLUSTER_NODE_PRIMARY;
+        state.myself.flags |= CLUSTER_NODE_REPLICA;
+        state.myself.replicaof = old_primary.to_string();
+        let mut slots = vec![false; 16_384];
+        slots[7] = true;
+
+        assert!(!state.apply_promotion(
+            &Promotion {
+                old_primary: old_primary.clone(),
+                shard_id,
+                slots,
+                config_epoch: 10,
+            },
+            1_000,
+        ));
+        assert!(state.myself.is_replica());
+        assert_eq!(state.myself.replicaof, old_primary.as_str());
+        assert_eq!(state.myself.numslots, 0);
+    }
+
+    #[test]
     fn primary_recovery_and_ineligible_replica_cancel_election() {
         let mut failover = AutomaticFailover::default();
         failover.on_tick(&facts(1_000));
@@ -617,7 +667,7 @@ mod automatic {
     }
 
     #[test]
-    fn disconnected_from_voters_cancels_a_queued_promotion() {
+    fn disconnected_from_voters_preserves_a_queued_promotion() {
         let mut failover = AutomaticFailover::default();
         failover.on_tick(&facts(1_000));
         failover.on_tick(&facts(1_000));
@@ -627,7 +677,7 @@ mod automatic {
         let mut disconnected = facts(1_001);
         disconnected.local.as_mut().unwrap().cluster_link_connected = false;
         assert!(failover.on_tick(&disconnected).is_empty());
-        assert_eq!(failover.phase(), AutomaticFailoverPhase::Idle);
+        assert_eq!(failover.phase(), AutomaticFailoverPhase::Promoting);
     }
 
     #[test]
@@ -689,7 +739,7 @@ mod automatic {
 
         assert!(failover.on_tick(&current).is_empty());
         let first_deadline = failover.deadline_ms();
-        assert_eq!(first_deadline, 1_832);
+        assert!((1_998..2_164).contains(&first_deadline));
 
         current.now_ms = first_deadline;
         assert!(matches!(
@@ -701,10 +751,10 @@ mod automatic {
         current.now_ms = request_started_at + 10_001;
         assert!(failover.on_tick(&current).is_empty());
         assert_eq!(failover.phase(), AutomaticFailoverPhase::WaitingRankDelay);
-        assert_eq!(
-            failover.deadline_ms(),
-            request_started_at + 20_000 + 832,
-            "C reapplies the rank and zero-offset delays after the retry window"
+        let retry_delay = failover.deadline_ms() - request_started_at - 20_000;
+        assert!(
+            (998..1_164).contains(&retry_delay),
+            "C reapplies propagation, rank and zero-offset delays after the retry window"
         );
     }
 
@@ -834,7 +884,7 @@ mod automatic {
         second.on_tick(&second_facts);
 
         assert_eq!(first.deadline_ms(), 1_000);
-        assert_eq!(second.deadline_ms(), 1_332);
+        assert!((1_498..1_664).contains(&second.deadline_ms()));
     }
 
     #[test]

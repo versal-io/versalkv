@@ -11,6 +11,7 @@ fn cmd_may_timeout(cmd: &BlockedCmd) -> bool {
             | BlockedCmd::SlotMigration(_)
             | BlockedCmd::Shutdown
             | BlockedCmd::Script
+            | BlockedCmd::SetSlot { .. }
     )
 }
 

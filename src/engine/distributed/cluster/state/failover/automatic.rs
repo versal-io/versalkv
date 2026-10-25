@@ -83,6 +83,7 @@ pub struct AutomaticFailover {
     started_at_ms: i64,
     quorum: usize,
     failed_primary_rank: usize,
+    propagation_jitter_ms: u64,
     all_replicas_primary_failed: bool,
     voters: HashSet<NodeId>,
     last_vote_epoch: u64,
@@ -99,22 +100,26 @@ impl AutomaticFailover {
         replication_offset: i64,
         manual: bool,
         all_replicas_primary_failed: bool,
+        propagation_jitter_ms: u64,
     ) -> u64 {
         if manual {
             return 0;
         }
         let base_delay = (node_timeout_ms / 30).min(500);
-        let mut delay =
-            failover_election_delay_ms(node_timeout_ms, rank, replication_offset, false)
-                .saturating_add(base_delay.saturating_mul(failed_primary_rank as u64));
+        let delay = failover_election_delay_ms(node_timeout_ms, rank, replication_offset, false)
+            .saturating_add(base_delay.saturating_mul(failed_primary_rank as u64));
         let may_start_immediately = rank == 0
             && failed_primary_rank == 0
             && replication_offset != 0
             && all_replicas_primary_failed;
-        if !may_start_immediately && delay == 0 {
-            delay = base_delay;
+        if may_start_immediately {
+            return 0;
         }
+        // C always adds propagation time before rank and zero-offset penalties.
+        // Keep one random sample per attempt so rank changes do not reroll it.
         delay
+            .saturating_add(base_delay)
+            .saturating_add(propagation_jitter_ms)
     }
 
     pub fn phase(&self) -> AutomaticFailoverPhase {
@@ -155,14 +160,6 @@ impl AutomaticFailover {
             self.reset();
             return Vec::new();
         }
-        let Some(local) = facts
-            .local
-            .as_ref()
-            .filter(|local| facts.manual || local.is_eligible())
-        else {
-            self.reset();
-            return Vec::new();
-        };
         let Some(primary) = facts
             .primary
             .as_ref()
@@ -183,6 +180,14 @@ impl AutomaticFailover {
         if self.phase == AutomaticFailoverPhase::Promoting {
             return Vec::new();
         }
+        let Some(local) = facts
+            .local
+            .as_ref()
+            .filter(|local| facts.manual || local.is_eligible())
+        else {
+            self.reset();
+            return Vec::new();
+        };
 
         match self.phase {
             AutomaticFailoverPhase::Idle => {
@@ -195,6 +200,9 @@ impl AutomaticFailover {
                         .position(|node_id| node_id == &local.node_id)
                         .unwrap_or(ranked.len())
                 };
+                self.propagation_jitter_ms = crate::foundation::io::sys::rand::random_usize(
+                    (facts.node_timeout_ms / 30).min(500) as usize,
+                ) as u64;
                 let delay = Self::election_delay_ms(
                     facts.node_timeout_ms,
                     self.rank,
@@ -202,6 +210,7 @@ impl AutomaticFailover {
                     local.replication_offset,
                     facts.manual,
                     facts.all_replicas_primary_failed,
+                    self.propagation_jitter_ms,
                 );
                 self.deadline_ms = facts
                     .now_ms
@@ -235,6 +244,7 @@ impl AutomaticFailover {
                             local.replication_offset,
                             false,
                             self.all_replicas_primary_failed,
+                            self.propagation_jitter_ms,
                         );
                         let new_delay = Self::election_delay_ms(
                             facts.node_timeout_ms,
@@ -243,6 +253,7 @@ impl AutomaticFailover {
                             local.replication_offset,
                             false,
                             facts.all_replicas_primary_failed,
+                            self.propagation_jitter_ms,
                         );
                         self.deadline_ms = self
                             .deadline_ms
@@ -290,6 +301,9 @@ impl AutomaticFailover {
                         .unwrap_or(ranked.len());
                     self.failed_primary_rank = facts.failed_primary_rank;
                     self.all_replicas_primary_failed = facts.all_replicas_primary_failed;
+                    self.propagation_jitter_ms = crate::foundation::io::sys::rand::random_usize(
+                        (facts.node_timeout_ms / 30).min(500) as usize,
+                    ) as u64;
                     let retry_delay = Self::election_delay_ms(
                         facts.node_timeout_ms,
                         self.rank,
@@ -297,6 +311,7 @@ impl AutomaticFailover {
                         local.replication_offset,
                         facts.manual,
                         self.all_replicas_primary_failed,
+                        self.propagation_jitter_ms,
                     );
                     self.election_epoch = 0;
                     self.voters.clear();

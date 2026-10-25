@@ -72,6 +72,77 @@ fn dual_rdb_handshake_reply_precedes_endoff() {
 }
 
 #[test]
+fn fullresync_keeps_empty_applied_position_until_rdb_commit() {
+    let mut link = link();
+    link.connected(None, None);
+    link.on_bytes(
+        b"+PONG\r\n+OK\r\n+OK\r\n+FULLRESYNC 0123456789abcdef0123456789abcdef01234567 1563\r\n",
+        6380,
+    )
+    .unwrap();
+
+    assert!(link.is_receiving_rdb());
+    assert_eq!(link.applied_position(), offset(0));
+    assert_eq!(link.acknowledged_position(), offset(0));
+    assert_eq!(link.received_position(), offset(1563));
+    let snapshot_position = link.prevalidate_rdb_apply_position().unwrap();
+    assert_eq!(snapshot_position, offset(1563));
+    link.finish_rdb_apply(snapshot_position);
+    assert_eq!(link.applied_position(), offset(1563));
+}
+
+#[test]
+fn fullresync_keeps_cached_applied_position_until_rdb_commit() {
+    let mut link = link();
+    link.set_resume_position("cached-replid".to_string(), offset(42), 0);
+    link.connected(None, None);
+    link.on_bytes(
+        b"+PONG\r\n+OK\r\n+OK\r\n+FULLRESYNC 0123456789abcdef0123456789abcdef01234567 1563\r\n$100\r\n",
+        6380,
+    )
+    .unwrap();
+
+    assert!(link.is_receiving_rdb());
+    assert!(link.has_pending_rdb_receive());
+    assert_eq!(link.applied_position(), offset(42));
+    assert_eq!(link.acknowledged_position(), offset(42));
+    let snapshot_position = link.prevalidate_rdb_apply_position().unwrap();
+    assert_eq!(snapshot_position, offset(1563));
+    link.finish_rdb_apply(snapshot_position);
+    assert_eq!(link.applied_position(), offset(1563));
+}
+
+#[test]
+fn dual_endoff_keeps_applied_position_until_rdb_commit() {
+    for cached_offset in [0, 42] {
+        let mut link = link();
+        if cached_offset != 0 {
+            link.set_resume_position("cached-replid".to_string(), offset(cached_offset), 0);
+        }
+        link.transition_rdb_channel_state(ReplicaRdbChannelState::Connecting)
+            .unwrap();
+        link.transition_rdb_channel_state(ReplicaRdbChannelState::Handshake)
+            .unwrap();
+        link.on_rdb_bytes(b"+OK\r\n").unwrap();
+        let endoff = protocol::encode_end_offset(
+            offset(1563),
+            "0123456789abcdef0123456789abcdef01234567",
+            0,
+            91,
+        );
+
+        link.on_rdb_bytes(&endoff).unwrap();
+
+        assert_eq!(link.applied_position(), offset(cached_offset));
+        assert_eq!(link.acknowledged_position(), offset(cached_offset));
+        let snapshot_position = link.prevalidate_rdb_apply_position().unwrap();
+        assert_eq!(snapshot_position, offset(1563));
+        link.finish_rdb_apply(snapshot_position);
+        assert_eq!(link.applied_position(), offset(1563));
+    }
+}
+
+#[test]
 fn classic_replica_link_keeps_rdb_channel_disabled() {
     let mut link = link();
     link.connected(None, None);

@@ -222,12 +222,18 @@ impl ReplicationRuntime {
                 },
             );
         }
-        // C emits `server.replicas` in registration order. Keep the same
-        // ordering here: endpoint sorting can move a classic online replica
-        // behind a transient dual-channel pair, renumbering slaveN entries
-        // while callers wait for both replicas to become online.
+        // C appends to `server.replicas` only when PSYNC is accepted
+        // (replication.c:961 for partial CONTINUE and the dual-channel main
+        // PSYNC, replication.c:1230 for full-resync start), not when REPLCONF
+        // registers the connection. Order admitted links by the acceptance
+        // sequence so concurrently connecting replicas keep stable slaveN
+        // numbering; links not yet past PSYNC acceptance remain behind, in
+        // registration order.
         let mut ordered_links: Vec<_> = self.primary_links.iter().collect();
-        ordered_links.sort_by_key(|(replica_id, _)| replica_id.0);
+        ordered_links.sort_by_key(|(replica_id, link)| match link.accept_seq() {
+            Some(seq) => (0, seq),
+            None => (1, replica_id.0),
+        });
         view.replica_order = ordered_links
             .iter()
             .filter(|(_, link)| !is_pre_psync_main_link(link))
@@ -540,8 +546,9 @@ mod tests {
         let view = runtime.cluster_view(LOCAL_REPLICA, false);
         assert_eq!(view.health, ClusterReplicaHealth::Loading);
         assert_eq!(view.received_offset, offset(42));
-        assert_eq!(view.applied_offset, offset(42));
-        assert_eq!(view.acknowledged_offset, offset(42));
+        // A fresh full-sync snapshot is received before it is applied or ACKed.
+        assert_eq!(view.applied_offset, offset(0));
+        assert_eq!(view.acknowledged_offset, offset(0));
     }
 
     #[test]

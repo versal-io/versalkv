@@ -486,6 +486,39 @@ impl ClusterBusManager {
         }
     }
 
+    pub(super) fn observe_known_sender_header(
+        state: &mut ClusterState,
+        msg: &ClusterMsg,
+        now_ms: i64,
+    ) {
+        use crate::engine::distributed::cluster::node::CLUSTER_NODE_MY_PRIMARY_FAIL;
+
+        let Some(sender) = state.nodes.get_mut(&msg.sender_id) else {
+            return;
+        };
+        // C updates these fields before dispatching every full-header packet,
+        // including FAIL, auth ACK, and publish messages. They describe live
+        // observations, not a topology or role transition.
+        sender.flags = (sender.flags & !CLUSTER_NODE_MY_PRIMARY_FAIL)
+            | (msg.flags & CLUSTER_NODE_MY_PRIMARY_FAIL);
+        sender.data_received = now_ms;
+        if sender.has_flag(CLUSTER_NODE_HANDSHAKE) {
+            return;
+        }
+        sender.repl_offset = msg.repl_offset;
+        let claimed_epoch = if msg.replicaof.is_empty() && msg.config_epoch > sender.config_epoch {
+            sender.config_epoch = msg.config_epoch;
+            Some(msg.config_epoch)
+        } else {
+            None
+        };
+        state.advance_current_epoch(msg.current_epoch);
+        if claimed_epoch.is_some() {
+            state.request_config_fsync();
+            Self::handle_competing_primary_claim(state, msg, claimed_epoch);
+        }
+    }
+
     fn update_sender_lineage(state: &mut ClusterState, plan: &NodeUpdatePlan<'_>) {
         let msg = plan.observation.message;
         if !msg.replicaof.is_empty() {

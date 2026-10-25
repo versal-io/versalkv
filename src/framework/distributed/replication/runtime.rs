@@ -101,6 +101,9 @@ pub struct ReplicationRuntime {
     /// protected by C's delayed-free grace period.
     grace_psync_pin_by_main: HashMap<ConnectionId, GracePsyncWait>,
     next_replica_id: u64,
+    /// Monotonic sequence assigned to a primary link when PSYNC is accepted,
+    /// mirroring C's tail insertion into `server.replicas` for INFO ordering.
+    next_accept_seq: u64,
     next_master_connect_ms: i64,
     dual_channel_failed_replicas: HashSet<(String, u16)>,
 }
@@ -131,6 +134,7 @@ impl ReplicationRuntime {
             repl_buffer_tail_exists: false,
             grace_psync_pin_by_main: HashMap::new(),
             next_replica_id: 1,
+            next_accept_seq: 0,
             next_master_connect_ms: 0,
             dual_channel_failed_replicas: HashSet::new(),
         }
@@ -792,6 +796,49 @@ mod tests {
     }
 
     #[test]
+    fn empty_dual_backlog_attaches_only_on_first_replication_frame() {
+        let mut runtime = ReplicationRuntime::new();
+        let main = ConnectionId(170);
+        let rdb = ConnectionId(180);
+        register_waiting_dual_main(&mut runtime, main);
+        runtime.register_rdb_candidate(rdb).unwrap();
+        let mut backlog = ReplicationBacklog::new("current".to_string(), 32);
+        assert_eq!(
+            runtime
+                .take_endoff_for_rdb_cohort(&[rdb], |rdb| Some(rdb.0 as u64), &mut backlog, 0)
+                .len(),
+            1
+        );
+
+        runtime.activate_waiting_psync_pins_for_rdb_connections(&[rdb], &mut backlog);
+        assert!(runtime.has_psync_wait_owners());
+        assert_eq!(runtime.psync_wait_owner_count(), 1);
+        assert_eq!(runtime.rdb_psync_waits[&rdb].pin_cursor, None);
+        assert_eq!(runtime.min_protected_backlog_cursor(), None);
+        assert!(!runtime.repl_buffer_tail_exists);
+
+        let first_frame_cursor = backlog.next_stream_cursor();
+        assert_eq!(
+            runtime.backfill_waiting_psync_pins(first_frame_cursor),
+            vec![rdb]
+        );
+        backlog.set_min_protected_cursor(runtime.min_protected_backlog_cursor());
+        backlog.append(b"tail").unwrap();
+        assert_eq!(
+            backlog.read_from(first_frame_cursor),
+            Some(b"tail".to_vec())
+        );
+        assert!(runtime.repl_buffer_tail_exists);
+        assert!(runtime
+            .backfill_waiting_psync_pins(first_frame_cursor)
+            .is_empty());
+
+        runtime.remove_connection(rdb);
+        assert!(!runtime.has_psync_wait_owners());
+        assert_eq!(runtime.min_protected_backlog_cursor(), None);
+    }
+
+    #[test]
     fn direct_cohort_pins_unassociated_rdb_candidates_before_first_tail_frame() {
         let mut runtime = ReplicationRuntime::new();
         let mains = [ConnectionId(70), ConnectionId(71), ConnectionId(72)];
@@ -819,6 +866,10 @@ mod tests {
         assert_eq!(runtime.min_protected_backlog_cursor(), None);
 
         runtime.activate_waiting_psync_pins_for_rdb_connections(&rdbs, &mut backlog);
+        assert!(runtime.has_psync_wait_owners());
+        assert_eq!(runtime.min_protected_backlog_cursor(), None);
+        assert_eq!(runtime.backfill_waiting_psync_pins(cursor(42)), rdbs);
+        backlog.set_min_protected_cursor(runtime.min_protected_backlog_cursor());
         backlog.append(b"tail").unwrap();
 
         assert_eq!(runtime.min_protected_backlog_cursor(), Some(cursor(42)));
@@ -1394,6 +1445,49 @@ mod tests {
 
         assert_eq!(view.replica_order, vec![classic.0, dual_main.0]);
         assert_eq!(view.info_order, vec![classic.0, dual_rdb.0, dual_main.0]);
+    }
+
+    #[test]
+    fn rebuild_view_orders_replicas_by_psync_acceptance_not_registration() {
+        let mut runtime = ReplicationRuntime::new();
+        // REPLCONF listening-port registers a primary link before PSYNC is
+        // accepted, and across concurrent replicas that order can differ from
+        // PSYNC acceptance order. C appends to `server.replicas` only at PSYNC
+        // acceptance (replication.c:961 and replication.c:1230), so the view
+        // must follow the acceptance sequence even when a registered classic
+        // link is accepted after a concurrently connecting dual-channel pair.
+        let slow_classic = ConnectionId(70);
+        let fast_dual_main = ConnectionId(71);
+        let fast_dual_rdb = ConnectionId(72);
+
+        let classic_id = runtime.register_primary(slow_classic, replica_info(6382));
+        let dual_id = runtime.register_primary(fast_dual_main, replica_info(6383));
+        runtime
+            .register_rdb_channel(fast_dual_rdb, fast_dual_main)
+            .expect("dual channel pair");
+
+        let dual_link = runtime
+            .primary_link_mut(dual_id)
+            .expect("dual main link must exist");
+        dual_link.set_state(PrimaryLinkState::Streaming);
+        dual_link
+            .transition_to_waiting_for_rdb_channel()
+            .expect("dual main must wait for its RDB channel");
+        runtime.stamp_primary_acceptance(fast_dual_main);
+
+        runtime
+            .primary_link_mut(classic_id)
+            .expect("classic link must exist")
+            .set_state(PrimaryLinkState::Streaming);
+        runtime.stamp_primary_acceptance(slow_classic);
+
+        let view = runtime.rebuild_view();
+
+        assert_eq!(view.replica_order, vec![fast_dual_main.0, slow_classic.0]);
+        assert_eq!(
+            view.info_order,
+            vec![fast_dual_rdb.0, fast_dual_main.0, slow_classic.0]
+        );
     }
 
     #[test]

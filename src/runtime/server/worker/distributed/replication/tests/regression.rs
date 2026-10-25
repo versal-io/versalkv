@@ -636,7 +636,7 @@ fn classic_diskless_marker_publishes_online_before_terminal_ack() {
 }
 
 #[test]
-fn diskless_pipe_eof_releases_child_without_publishing_reap() {
+fn diskless_pipe_eof_explicitly_releases_child_with_inherited_writer() {
     use crate::runtime::server::worker::distributed::replication::diskless_child::DisklessRelay;
     use std::thread::sleep;
     use std::time::{Duration, Instant};
@@ -647,6 +647,7 @@ fn diskless_pipe_eof_releases_child_without_publishing_reap() {
     let (read_end, marker, release) = backend
         .try_begin_diskless_fork(&[])
         .expect("fork diskless child");
+    let inherited_release_write_end = release.try_clone().unwrap();
     let pid = backend
         .ctx
         .persistence()
@@ -717,6 +718,48 @@ fn diskless_pipe_eof_releases_child_without_publishing_reap() {
     }
     assert_eq!(backend.ctx.persistence().diskless_child_pid(), None);
     assert!(backend.full_sync.diskless_relay.is_none());
+    drop(inherited_release_write_end);
+}
+
+#[test]
+fn dropping_diskless_relay_explicitly_releases_child_when_writer_is_inherited() {
+    use crate::foundation::io::sys::fd::{pipe, PipeFlags};
+    use crate::runtime::server::worker::distributed::replication::diskless_child::DisklessRelay;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let (read_end, write_end) = pipe(PipeFlags::CLOEXEC).unwrap().into_parts();
+    let inherited_write_end = write_end.try_clone().unwrap();
+    let (released_tx, released_rx) = mpsc::channel();
+    let child = std::thread::spawn(move || {
+        crate::framework::capabilities::process::wait_for_pipe_eof(read_end);
+        released_tx.send(()).unwrap();
+    });
+    let mut backend = ServerWorkerState::new(1).unwrap();
+    backend.full_sync.diskless_relay = Some(DisklessRelay {
+        transfer_id: crate::runtime::server::worker::reactor::sources::TransferId(1),
+        source: None,
+        child_release_write_end: Some(write_end),
+        targets: Vec::new(),
+        marker: Vec::new(),
+        complete_full_resync: true,
+        not_before_ms: 0,
+        eof_reached: false,
+        marker_queued_targets: std::collections::HashSet::new(),
+        marker_sent_targets: std::collections::HashSet::new(),
+        completion_announced: false,
+        completion_state: crate::runtime::server::worker::distributed::replication::diskless_child::DisklessCompletionState::default(),
+    });
+
+    drop(backend);
+    let release_result = released_rx.recv_timeout(Duration::from_secs(2));
+    drop(inherited_write_end);
+    child.join().unwrap();
+
+    assert!(
+        release_result.is_ok(),
+        "dropping the relay must explicitly release the child even when another process inherited the write end"
+    );
 }
 
 #[test]

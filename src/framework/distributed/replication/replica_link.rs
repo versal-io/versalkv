@@ -403,8 +403,9 @@ impl ReplicaLink {
                         self.requested_offset = Some(fullresync.offset);
                         self.received_offset = fullresync.offset;
                         self.decoded_offset = fullresync.offset;
-                        self.applied_offset = fullresync.offset;
-                        self.acked_offset = fullresync.offset;
+                        // C records primary_initial_offset separately from
+                        // the live or cached primary's processed position.
+                        // Publish this snapshot only after the RDB commits.
                         // A full resync begins a fresh stream that re-emits SELECT
                         // and reloads from the RDB, so any cached resume DB is
                         // discarded and we restart on DB 0 (§5.6).
@@ -695,13 +696,12 @@ impl ReplicaLink {
                         db_id: endoff.db_id,
                         rdb_client_id: endoff.client_id,
                     });
-                    // Seed the main-stream cursor from  before +CONTINUE.
+                    // Seed the main-stream cursor before +CONTINUE while
+                    // retaining the processed history until the RDB commits.
                     self.master_replid = Some(endoff.replid.clone());
                     self.requested_offset = Some(endoff.offset);
                     self.received_offset = endoff.offset;
                     self.decoded_offset = endoff.offset;
-                    self.applied_offset = endoff.offset;
-                    self.acked_offset = endoff.offset;
                     self.selected_db = endoff.db_id;
                     self.state = ReplicaLinkState::WaitDualRdbClientIdReply;
                     self.rdb_framing_state = Some(RdbFramingState::Header);

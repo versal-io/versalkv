@@ -546,6 +546,9 @@ impl super::ServerWorkerState {
         }
         let poll_result = self.poll_ready()?;
         self.collect_after_poll_events(poll_result);
+        if self.ctx.cluster_state().is_some() {
+            self.begin_cluster_bus_receive_batch();
+        }
         if self.dispatch_ready_phase(DispatchContext::Normal)? == LoopControl::Stop {
             self.finish_turn_pending_outputs();
             return Ok(self.turn_trace.clone());

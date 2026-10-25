@@ -3,7 +3,7 @@ mod common;
 
 use common::{measure_destructive, measure_readonly, snapshot_mem, write_csv, CaseRow};
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use std::collections::VecDeque;
 use std::hint::black_box;
 
@@ -112,7 +112,7 @@ fn main() {
         let samples = measure_readonly(
             move || l,
             |l, _i| {
-                let idx = rng.gen_range(0..l.len());
+                let idx = rng.random_range(0..l.len());
                 black_box(&l[idx]);
             },
         );

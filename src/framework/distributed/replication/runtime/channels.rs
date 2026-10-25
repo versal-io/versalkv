@@ -45,6 +45,24 @@ impl ReplicationRuntime {
         );
         id
     }
+    /// Stamp the position C assigns with `listAddNodeTail(server.replicas, c)`
+    /// when PSYNC is accepted (partial CONTINUE or full-resync start,
+    /// including the dual-channel main PSYNC). REPLCONF-time registration order
+    /// may differ from this acceptance order when several replicas connect
+    /// concurrently. Idempotent for an already admitted link.
+    pub(crate) fn stamp_primary_acceptance(&mut self, connection_id: ConnectionId) {
+        let needs_stamp = self
+            .primary_for_connection_mut(connection_id)
+            .is_some_and(|link| link.accept_seq().is_none());
+        if !needs_stamp {
+            return;
+        }
+        let seq = self.next_accept_seq;
+        self.next_accept_seq = self.next_accept_seq.saturating_add(1);
+        if let Some(link) = self.primary_for_connection_mut(connection_id) {
+            link.assign_accept_seq(seq);
+        }
+    }
     /// Register an RDB connection before its main channel is known. The
     /// connection id is the value later supplied by
     /// `REPLCONF set-rdb-client-id`.

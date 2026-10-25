@@ -160,20 +160,21 @@ fn assign_primary_slots(
         let Some((start, end)) = node_layout.slot_range else {
             continue;
         };
-        let start = start.to_string();
-        let end = end.to_string();
-        send_ok(
-            &endpoint.host,
-            endpoint.port,
-            &[
-                b"CLUSTER",
-                b"ADDSLOTSRANGE",
-                start.as_bytes(),
-                end.as_bytes(),
-            ],
-        )?;
+        let command = build_addslots_command(start, end);
+        let command_refs = command.iter().map(Vec::as_slice).collect::<Vec<&[u8]>>();
+        send_ok(&endpoint.host, endpoint.port, &command_refs)?;
     }
     Ok(())
+}
+
+fn build_addslots_command(start: u16, end: u16) -> Vec<Vec<u8>> {
+    let mut command = Vec::with_capacity(usize::from(end - start) + 3);
+    command.push(b"CLUSTER".to_vec());
+    command.push(b"ADDSLOTS".to_vec());
+    for slot in start..=end {
+        command.push(slot.to_string().into_bytes());
+    }
+    command
 }
 
 fn assign_config_epochs(endpoints: &[ClusterEndpoint]) -> Result<(), String> {
@@ -330,6 +331,22 @@ mod tests {
                     primary_index: 0,
                     slot_range: None,
                 },
+            ]
+        );
+    }
+
+    #[test]
+    fn builds_addslots_command_with_expanded_slots() {
+        let command = build_addslots_command(2, 4);
+
+        assert_eq!(
+            command,
+            vec![
+                b"CLUSTER".to_vec(),
+                b"ADDSLOTS".to_vec(),
+                b"2".to_vec(),
+                b"3".to_vec(),
+                b"4".to_vec(),
             ]
         );
     }

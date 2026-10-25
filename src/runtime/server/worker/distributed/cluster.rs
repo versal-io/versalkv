@@ -115,9 +115,81 @@ impl ServerWorkerState {
             .copied()
             .map(Token)
             .collect();
+        if tokens.is_empty() {
+            return;
+        }
+        // All readable bus sockets belong to one beforeSleep-equivalent batch:
+        // election results collected across connections settle only after every
+        // packet-induced reparent has committed.
+        self.begin_cluster_bus_receive_batch();
         for token in tokens {
             self.handle_cluster_bus_readable(token);
         }
+        self.finish_cluster_bus_receive_batch();
+    }
+
+    /// Open an event-loop batch that drains several Cluster Bus readable
+    /// sockets. C packet handlers only schedule
+    /// `CLUSTER_TODO_HANDLE_FAILOVER`; the promotion decision is taken once,
+    /// in beforeSleep. While a batch is active, receive-path election results
+    /// remain queued until `finish_cluster_bus_receive_batch`.
+    pub(crate) fn begin_cluster_bus_receive_batch(&mut self) {
+        self.cluster_bus_receive_batch_depth =
+            self.cluster_bus_receive_batch_depth.saturating_add(1);
+    }
+
+    pub(crate) fn finish_cluster_bus_receive_batch(&mut self) {
+        if self.cluster_bus_receive_batch_depth == 0 {
+            return;
+        }
+        self.cluster_bus_receive_batch_depth -= 1;
+        if self.cluster_bus_receive_batch_depth == 0 {
+            self.settle_cluster_bus_receive_batch();
+        }
+    }
+
+    fn cluster_bus_receive_batch_active(&self) -> bool {
+        self.cluster_bus_receive_batch_depth > 0
+    }
+
+    /// Settle receive-path failover work once for the whole event-loop batch.
+    /// Ordering mirrors C: `clusterProcessPacket` performs a sub-replica
+    /// reparent synchronously (and voids the old election via
+    /// `clusterSetPrimary`), whereas beforeSleep evaluates queued election
+    /// results only after every readable socket has been drained.
+    fn settle_cluster_bus_receive_batch(&mut self) {
+        let mut state_opt = self.ctx.cluster_state_mut().take();
+        if let Some(state) = state_opt.as_deref_mut() {
+            self.cluster_apply_pending_replication_switch(state);
+            let now = mstime();
+            let failover_actions = self.cluster_bus.drain_receive_failover_actions(state, now);
+            self.execute_cluster_actions(state, failover_actions.actions, now);
+
+            let node_timeout = self.ctx.config().server.cluster_node_timeout.max(1_000);
+            let (local_failover_status, local_replication_offset) =
+                self.local_replica_failover_inputs(now);
+            state.observe_local_replication(
+                local_replication_offset,
+                local_failover_status.priority,
+            );
+            let failover_actions = self
+                .cluster_bus
+                .reevaluate_automatic_failover_after_receive(
+                    state,
+                    now,
+                    node_timeout,
+                    &local_failover_status,
+                );
+            self.execute_cluster_actions(state, failover_actions.actions, now);
+            let actions = reduce(state, ClusterEvent::BroadcastTopology);
+            self.execute_cluster_bus_actions(state, actions);
+            self.refresh_cluster_link_views_for_state(state);
+        }
+        *self.ctx.cluster_state_mut() = state_opt;
+        self.drain_cluster_bus_publishes();
+        // Reevaluation may queue an auth request without a topology broadcast.
+        // C installs a write handler whenever its Cluster send queue grows.
+        self.flush_cluster_bus_writes();
     }
 
     pub(crate) fn flush_cluster_bus_writes(&mut self) {
@@ -508,12 +580,8 @@ impl ServerWorkerState {
                     .cluster_replica_validity_factor
                     .max(0) as u64,
             };
-        let full_sync_pending = self
-            .replication_runtime
-            .replica_link()
-            .is_some_and(|link| link.is_receiving_rdb() || link.has_pending_rdb_receive());
         let replication_offset = if self.ctx.replication().is_replica() {
-            if status.loading || full_sync_pending {
+            if status.loading {
                 0
             } else {
                 self.ctx.replication().slave_repl_offset.get()
@@ -546,27 +614,40 @@ impl ServerWorkerState {
                 return;
             };
             should_close = self.cluster_bus.readable(state, &mut stream, tv, now);
+            // A reciprocal MEET retires its obsolete outgoing link inside
+            // C packet processing. Complete receive-generated closures before
+            // another socket can confirm or replace that peer's link.
+            let actions = reduce(state, ClusterEvent::DrainLinkCloses);
+            self.execute_cluster_link_actions(state, actions);
             self.cluster_process_pending_dirty_slots(state);
             let was_primary = state.myself.is_primary();
-            let failover_actions = self.cluster_bus.drain_receive_failover_actions(state, now);
-            self.execute_cluster_actions(state, failover_actions.actions, now);
+            // C performs a sub-replica reparent synchronously inside packet
+            // processing (clusterSetPrimary), so commit the switch before any
+            // election result queued by the packets just received.
             self.cluster_apply_pending_replication_switch(state);
-            let reevaluation_now = mstime();
-            let (local_failover_status, local_replication_offset) =
-                self.local_replica_failover_inputs(reevaluation_now);
-            state.observe_local_replication(
-                local_replication_offset,
-                local_failover_status.priority,
-            );
-            let failover_actions = self
-                .cluster_bus
-                .reevaluate_automatic_failover_after_receive(
-                    state,
-                    reevaluation_now,
-                    node_timeout,
-                    &local_failover_status,
+            if !self.cluster_bus_receive_batch_active() {
+                // Without an event-loop batch this readable turn is its own
+                // beforeSleep boundary; direct lower-level callers (and their
+                // unit tests) keep the immediate settlement semantics.
+                let failover_actions = self.cluster_bus.drain_receive_failover_actions(state, now);
+                self.execute_cluster_actions(state, failover_actions.actions, now);
+                let reevaluation_now = mstime();
+                let (local_failover_status, local_replication_offset) =
+                    self.local_replica_failover_inputs(reevaluation_now);
+                state.observe_local_replication(
+                    local_replication_offset,
+                    local_failover_status.priority,
                 );
-            self.execute_cluster_actions(state, failover_actions.actions, reevaluation_now);
+                let failover_actions = self
+                    .cluster_bus
+                    .reevaluate_automatic_failover_after_receive(
+                        state,
+                        reevaluation_now,
+                        node_timeout,
+                        &local_failover_status,
+                    );
+                self.execute_cluster_actions(state, failover_actions.actions, reevaluation_now);
+            }
             became_replica = was_primary && state.myself.is_replica();
             let actions = reduce(state, ClusterEvent::BroadcastTopology);
             self.execute_cluster_bus_actions(state, actions);
@@ -716,6 +797,36 @@ mod tests {
 
     fn offset(value: i64) -> ReplicationOffset {
         ReplicationOffset::try_from(value).expect("valid test offset")
+    }
+
+    #[test]
+    fn receive_failover_inputs_retain_cached_offset_before_rdb_load() {
+        use crate::framework::distributed::replication::{ConnectionId, MasterInfo, ReplicaLink};
+
+        let mut backend = ServerWorkerState::new(1).unwrap();
+        backend.ctx.replication_mut().switch_to_replica();
+        backend.ctx.replication_mut().slave_repl_offset = offset(42);
+        let mut link = ReplicaLink::new(
+            ConnectionId(41),
+            MasterInfo {
+                host: "127.0.0.1".to_string(),
+                port: 6379,
+            },
+        );
+        link.set_resume_position("cached-replid".to_string(), offset(42), 0);
+        link.connected(None, None);
+        link.on_bytes(
+            b"+PONG\r\n+OK\r\n+OK\r\n+FULLRESYNC 0123456789abcdef0123456789abcdef01234567 1563\r\n",
+            6380,
+        )
+        .unwrap();
+        backend.replication_runtime.set_replica_link(link);
+
+        let (status, replication_offset) =
+            backend.local_replica_failover_inputs(crate::foundation::io::sys::time::mstime());
+
+        assert!(!status.loading);
+        assert_eq!(replication_offset, 42);
     }
 
     #[test]
@@ -997,6 +1108,258 @@ mod tests {
     }
 
     #[test]
+    fn reciprocal_meet_retires_the_old_outgoing_link_in_the_receive_turn() {
+        use crate::engine::distributed::cluster::msg::{
+            ClusterBusBody, ClusterBusMessage, ClusterMsgType,
+        };
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut backend = ServerWorkerState::new(1).unwrap();
+        let outgoing = backend.transport.connect_tcp(addr).unwrap();
+        let (_outgoing_peer, _) = listener.accept().unwrap();
+        let incoming = backend.transport.connect_tcp(addr).unwrap();
+        let (mut incoming_peer, _) = listener.accept().unwrap();
+        for token in [outgoing.token, incoming.token] {
+            backend
+                .route_runtime_source(
+                    token,
+                    crate::runtime::server::worker::reactor::sources::SourceOwner::ClusterBus,
+                )
+                .unwrap();
+        }
+        let node_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let mut node = ClusterNode::new(
+            node_id.to_string(),
+            addr.ip().to_string(),
+            addr.port(),
+            addr.port(),
+            true,
+        );
+        node.flags &= !CLUSTER_NODE_MYSELF;
+        node.created_at = crate::foundation::io::sys::time::mstime() - 5_000;
+        node.asymmetric_meet_started_at = node.created_at;
+        let packet = ClusterBusMessage::from_node(
+            ClusterMsgType::Meet,
+            &node,
+            1,
+            ClusterBusBody::Gossip(Vec::new()),
+        )
+        .encode()
+        .unwrap();
+        let mut state = ClusterState::new("127.0.0.1", 6379, 16_379);
+        state.set_failure_report_node_timeout_ms(1_000);
+        state.nodes.insert(node_id.to_string(), node);
+        *backend.ctx.cluster_state_mut() = Some(Box::new(state));
+        backend.cluster_bus.register_outgoing_for_node(
+            outgoing.token,
+            addr,
+            false,
+            node_id.to_string(),
+        );
+        backend.cluster_bus.register_incoming(incoming.token, addr);
+        incoming_peer.write_all(&packet).unwrap();
+        backend.transport.wait_readable_for_test(incoming.token);
+
+        backend.handle_cluster_bus_readable(incoming.token);
+
+        assert!(
+            !backend
+                .cluster_bus
+                .connections
+                .contains_key(&outgoing.token.0),
+            "reciprocal MEET must not leave its obsolete outbound link active until cron"
+        );
+        assert!(backend
+            .cluster_bus
+            .connections
+            .contains_key(&incoming.token.0));
+        assert!(backend
+            .ctx
+            .cluster_state()
+            .as_ref()
+            .unwrap()
+            .pending_link_closes
+            .is_empty());
+    }
+
+    #[test]
+    fn repeated_meet_after_gossip_identification_keeps_the_inbound_reply_link() {
+        use crate::engine::distributed::cluster::msg::{
+            ClusterBusBody, ClusterBusMessage, ClusterMsgType,
+        };
+        use std::io::Read;
+
+        fn read_reply(peer: &mut std::net::TcpStream) -> ClusterBusMessage {
+            let mut bytes = Vec::new();
+            let mut chunk = [0; 4096];
+            loop {
+                let count = peer.read(&mut chunk).unwrap();
+                assert!(count > 0, "the MEET reply link must remain open");
+                bytes.extend_from_slice(&chunk[..count]);
+                if let Ok((message, _)) = ClusterBusMessage::decode(&bytes) {
+                    return message;
+                }
+            }
+        }
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut backend = ServerWorkerState::new(1).unwrap();
+        let incoming = backend.transport.connect_tcp(addr).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
+        backend
+            .route_runtime_source(
+                incoming.token,
+                crate::runtime::server::worker::reactor::sources::SourceOwner::ClusterBus,
+            )
+            .unwrap();
+        backend.cluster_bus.register_incoming(incoming.token, addr);
+        let node_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let mut node = ClusterNode::new(
+            node_id.to_string(),
+            addr.ip().to_string(),
+            addr.port(),
+            addr.port(),
+            true,
+        );
+        node.flags &= !CLUSTER_NODE_MYSELF;
+        let packet = ClusterBusMessage::from_node(
+            ClusterMsgType::Meet,
+            &node,
+            1,
+            ClusterBusBody::Gossip(Vec::new()),
+        )
+        .encode()
+        .unwrap();
+        *backend.ctx.cluster_state_mut() =
+            Some(Box::new(ClusterState::new("127.0.0.1", 6379, 16_379)));
+        peer.write_all(&packet).unwrap();
+        backend.transport.wait_readable_for_test(incoming.token);
+        backend.handle_cluster_bus_readable(incoming.token);
+        assert_eq!(read_reply(&mut peer).msg_type, ClusterMsgType::Pong);
+        let placeholder_id = backend.cluster_bus.connections[&incoming.token.0]
+            .handshake_node_name
+            .clone();
+        assert!(!placeholder_id.is_empty());
+
+        // Another peer's trusted gossip identifies the sender while this
+        // original inbound link is still projected through its placeholder.
+        backend
+            .ctx
+            .cluster_state_mut()
+            .as_deref_mut()
+            .unwrap()
+            .nodes
+            .insert(node_id.to_string(), node);
+        peer.write_all(&packet).unwrap();
+        backend.transport.wait_readable_for_test(incoming.token);
+
+        backend.handle_cluster_bus_readable(incoming.token);
+
+        assert!(
+            backend
+                .cluster_bus
+                .connections
+                .contains_key(&incoming.token.0),
+            "resolving the placeholder must retain the current inbound reply link"
+        );
+        let connection = &backend.cluster_bus.connections[&incoming.token.0];
+        assert_eq!(connection.node_name, node_id);
+        assert!(connection.handshake_node_name.is_empty());
+        assert!(!backend
+            .ctx
+            .cluster_state()
+            .as_deref()
+            .unwrap()
+            .nodes
+            .contains_key(&placeholder_id));
+        assert_eq!(read_reply(&mut peer).msg_type, ClusterMsgType::Pong);
+    }
+
+    #[test]
+    fn outbound_pong_retires_other_handshake_owned_links() {
+        use crate::engine::distributed::cluster::msg::{
+            ClusterBusBody, ClusterBusMessage, ClusterMsgType,
+        };
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut backend = ServerWorkerState::new(1).unwrap();
+        let outgoing = backend.transport.connect_tcp(addr).unwrap();
+        let (mut outgoing_peer, _) = listener.accept().unwrap();
+        let incoming = backend.transport.connect_tcp(addr).unwrap();
+        let (_incoming_peer, _) = listener.accept().unwrap();
+        for token in [outgoing.token, incoming.token] {
+            backend
+                .route_runtime_source(
+                    token,
+                    crate::runtime::server::worker::reactor::sources::SourceOwner::ClusterBus,
+                )
+                .unwrap();
+        }
+        let node_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let mut node = ClusterNode::new(
+            node_id.to_string(),
+            addr.ip().to_string(),
+            addr.port(),
+            addr.port(),
+            true,
+        );
+        node.flags &= !CLUSTER_NODE_MYSELF;
+        let packet = ClusterBusMessage::from_node(
+            ClusterMsgType::Pong,
+            &node,
+            1,
+            ClusterBusBody::Gossip(Vec::new()),
+        )
+        .encode()
+        .unwrap();
+        let mut state = ClusterState::new("127.0.0.1", 6379, 16_379);
+        let handshake_id = state.ensure_handshake_node(
+            &addr.ip().to_string(),
+            addr.port(),
+            addr.port(),
+            crate::foundation::io::sys::time::mstime(),
+        );
+        state.nodes.insert(node_id.to_string(), node);
+        *backend.ctx.cluster_state_mut() = Some(Box::new(state));
+        backend.cluster_bus.register_outgoing_for_handshake(
+            outgoing.token,
+            addr,
+            handshake_id.clone(),
+        );
+        backend.cluster_bus.register_incoming(incoming.token, addr);
+        backend
+            .cluster_bus
+            .connections
+            .get_mut(&incoming.token.0)
+            .unwrap()
+            .handshake_node_name = handshake_id.clone();
+        backend.refresh_cluster_link_views();
+        outgoing_peer.write_all(&packet).unwrap();
+        backend.transport.wait_readable_for_test(outgoing.token);
+
+        backend.handle_cluster_bus_readable(outgoing.token);
+
+        assert!(
+            !backend
+                .cluster_bus
+                .connections
+                .contains_key(&incoming.token.0),
+            "removing a handshake identity must retire its other socket owners"
+        );
+        let confirmed = &backend.cluster_bus.connections[&outgoing.token.0];
+        assert_eq!(confirmed.node_name, node_id);
+        assert!(confirmed.handshake_node_name.is_empty());
+        let state = backend.ctx.cluster_state().as_deref().unwrap();
+        assert!(!state.nodes.contains_key(&handshake_id));
+        assert!(state.pending_link_closes.is_empty());
+    }
+
+    #[test]
     fn send_buffer_limit_closes_link_once_and_removes_its_projection() {
         let mut backend = ServerWorkerState::new(1).unwrap();
         let node_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -1088,6 +1451,72 @@ mod tests {
             .as_deref_mut()
             .unwrap()
             .take_topology_broadcast_request());
+    }
+
+    #[test]
+    fn receive_batch_settlement_flushes_election_requests_without_topology_changes() {
+        use crate::engine::distributed::cluster::msg::{
+            ClusterBusBody, ClusterBusMessage, ClusterMsgType,
+        };
+        use std::io::Read;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut backend = ServerWorkerState::new(1).unwrap();
+        let node_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let mut state = ClusterState::new("127.0.0.1", 6379, 16_379);
+        let mut voter = ClusterNode::new(
+            node_id.to_string(),
+            "127.0.0.1".to_string(),
+            6380,
+            16_380,
+            true,
+        );
+        voter.flags &= !CLUSTER_NODE_MYSELF;
+        state.nodes.insert(node_id.to_string(), voter);
+        let request = ClusterBusMessage::from_node(
+            ClusterMsgType::FailoverAuthRequest,
+            &state.myself,
+            10,
+            ClusterBusBody::Empty,
+        )
+        .encode()
+        .unwrap();
+        *backend.ctx.cluster_state_mut() = Some(Box::new(state));
+        let peer = backend.transport.connect_tcp(addr).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        server
+            .set_read_timeout(Some(std::time::Duration::from_millis(100)))
+            .unwrap();
+        backend.cluster_bus.register_outgoing_for_node(
+            peer.token,
+            addr,
+            false,
+            node_id.to_string(),
+        );
+        let connection = backend
+            .cluster_bus
+            .connections
+            .get_mut(&peer.token.0)
+            .unwrap();
+        connection.handshake_sent = true;
+        connection.events = LinkEvents::READABLE;
+
+        backend.begin_cluster_bus_receive_batch();
+        // Receive-path reevaluation can enqueue requests after the last ready
+        // event, without producing a topology mutation or writable readiness.
+        backend
+            .cluster_bus
+            .connections
+            .get_mut(&peer.token.0)
+            .unwrap()
+            .write_buf
+            .extend_from_slice(&request);
+        backend.finish_cluster_bus_receive_batch();
+
+        let mut received = vec![0; request.len()];
+        server.read_exact(&mut received).unwrap();
+        assert_eq!(received, request);
     }
 
     #[test]
@@ -1660,6 +2089,196 @@ mod tests {
             assert_ne!(message.msg_type, ClusterMsgType::FailoverAuthRequest);
             queued = &queued[consumed..];
         }
+    }
+
+    #[test]
+    fn cross_connection_ack_before_demotion_pong_settles_at_batch_boundary() {
+        use crate::engine::distributed::cluster::msg::{
+            ClusterBusBody, ClusterBusMessage, ClusterMsgType,
+        };
+        use crate::engine::distributed::cluster::node::{
+            CLUSTER_NODE_FAIL, CLUSTER_NODE_MY_PRIMARY_FAIL, CLUSTER_NODE_PRIMARY,
+            CLUSTER_NODE_REPLICA,
+        };
+        use crate::engine::distributed::cluster::state::failover::{
+            AutomaticFailoverFacts, AutomaticFailoverPhase, FailedPrimaryFacts, ReplicaEligibility,
+        };
+        use crate::engine::distributed::cluster::NodeId;
+
+        // Two bus sockets: the deciding FAILOVER_AUTH_ACK arrives from a voting
+        // primary while the PONG announcing the demotion of the local replica's
+        // old primary arrives on a different connection. C processes all
+        // readable sockets first and settles the election once in beforeSleep,
+        // so the committed reparent must void the stale promotion.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener_addr = listener.local_addr().unwrap();
+        let mut backend = ServerWorkerState::new(1).unwrap();
+        let voter_peer = backend.transport.connect_tcp(listener_addr).unwrap();
+        let (mut voter_writer, _) = listener.accept().unwrap();
+        let demotion_peer = backend.transport.connect_tcp(listener_addr).unwrap();
+        let (mut demotion_writer, _) = listener.accept().unwrap();
+
+        let old_primary_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let new_primary_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let old_shard_id = "dddddddddddddddddddddddddddddddddddddddd";
+        let new_shard_id = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        let mut state = ClusterState::new("127.0.0.1", 6380, 16_380);
+        state.current_epoch = 9;
+        state.myself.config_epoch = 9;
+        state.myself.flags &= !CLUSTER_NODE_PRIMARY;
+        state.myself.flags |= CLUSTER_NODE_REPLICA | CLUSTER_NODE_MY_PRIMARY_FAIL;
+        state.myself.replicaof = old_primary_id.to_string();
+        state.myself.shard_id = old_shard_id.to_string();
+        state.myself.repl_offset = 42;
+
+        let mut old_primary = ClusterNode::new(
+            old_primary_id.to_string(),
+            "127.0.0.1".to_string(),
+            6379,
+            16_379,
+            true,
+        );
+        old_primary.flags &= !CLUSTER_NODE_MYSELF;
+        old_primary.flags |= CLUSTER_NODE_FAIL;
+        old_primary.shard_id = old_shard_id.to_string();
+        old_primary.config_epoch = 4;
+        old_primary.slots[7] = true;
+        old_primary.numslots = 1;
+        let inherited_slots = old_primary.slots.clone();
+        state.insert_node(old_primary);
+
+        let mut new_primary = ClusterNode::new(
+            new_primary_id.to_string(),
+            "127.0.0.1".to_string(),
+            6381,
+            16_381,
+            true,
+        );
+        new_primary.flags &= !CLUSTER_NODE_MYSELF;
+        new_primary.shard_id = new_shard_id.to_string();
+        new_primary.slots[8] = true;
+        new_primary.numslots = 1;
+        new_primary.config_epoch = 8;
+        state.insert_node(new_primary.clone());
+
+        let local = ReplicaEligibility {
+            node_id: NodeId::parse(state.myself.name.as_bytes()).unwrap(),
+            no_failover: false,
+            cluster_link_connected: true,
+            cluster_view_stale: false,
+            loading: false,
+            priority: 100,
+            replication_offset: 42,
+            data_age_ms: 0,
+            node_timeout_ms: 1_000,
+            repl_ping_period_ms: 0,
+            replica_validity_factor: 0,
+        };
+        let facts = AutomaticFailoverFacts {
+            now_ms: 1_000,
+            node_timeout_ms: 1_000,
+            current_epoch: 9,
+            voting_primaries: 1,
+            failed_primary_rank: 0,
+            all_replicas_primary_failed: true,
+            local: Some(local.clone()),
+            primary: Some(FailedPrimaryFacts {
+                node_id: NodeId::parse(old_primary_id.as_bytes()).unwrap(),
+                shard_id: NodeId::parse(old_shard_id.as_bytes()).unwrap(),
+                slots: inherited_slots,
+                is_failed: true,
+            }),
+            siblings: vec![local],
+            manual: false,
+        };
+        assert!(state.automatic_failover_on_tick(&facts).is_empty());
+        assert!(matches!(
+            state.automatic_failover_on_tick(&facts).as_slice(),
+            [crate::engine::distributed::cluster::action::ClusterAction::BroadcastFailoverAuthRequest {
+                election_epoch: 10,
+                ..
+            }]
+        ));
+
+        let ack_packet = ClusterBusMessage::from_node(
+            ClusterMsgType::FailoverAuthAck,
+            &new_primary,
+            10,
+            ClusterBusBody::Empty,
+        )
+        .encode()
+        .unwrap();
+
+        let mut demoted_old_primary = state.nodes[old_primary_id].clone();
+        demoted_old_primary.flags &= !(CLUSTER_NODE_PRIMARY | CLUSTER_NODE_FAIL);
+        demoted_old_primary.flags |= CLUSTER_NODE_REPLICA;
+        demoted_old_primary.replicaof = new_primary_id.to_string();
+        demoted_old_primary.shard_id = new_shard_id.to_string();
+        demoted_old_primary.slots.fill(false);
+        demoted_old_primary.numslots = 0;
+        demoted_old_primary.config_epoch = 10;
+        let demotion_packet = ClusterBusMessage::from_node(
+            ClusterMsgType::Pong,
+            &demoted_old_primary,
+            10,
+            ClusterBusBody::Gossip(Vec::new()),
+        )
+        .encode()
+        .unwrap();
+
+        *backend.ctx.cluster_state_mut() = Some(Box::new(state));
+        backend.ctx.replication_mut().switch_to_replica();
+        backend.ctx.replication_mut().slave_repl_offset = offset(42);
+        backend
+            .ctx
+            .config_mut()
+            .server
+            .cluster_replica_validity_factor = 0;
+        backend.cluster_bus.register_outgoing_for_node(
+            voter_peer.token,
+            listener_addr,
+            false,
+            new_primary_id.to_string(),
+        );
+        backend.cluster_bus.register_outgoing_for_node(
+            demotion_peer.token,
+            listener_addr,
+            false,
+            old_primary_id.to_string(),
+        );
+        voter_writer.write_all(&ack_packet).unwrap();
+        demotion_writer.write_all(&demotion_packet).unwrap();
+        backend.transport.wait_readable_for_test(voter_peer.token);
+        backend
+            .transport
+            .wait_readable_for_test(demotion_peer.token);
+
+        // Drive the voter ACK connection first and the demotion PONG
+        // connection second within the same event-loop receive batch.
+        backend.begin_cluster_bus_receive_batch();
+        backend.handle_cluster_bus_readable(voter_peer.token);
+        backend.handle_cluster_bus_readable(demotion_peer.token);
+        backend.finish_cluster_bus_receive_batch();
+
+        let state = backend.ctx.cluster_state().as_ref().unwrap();
+        assert!(
+            state.myself.is_replica(),
+            "the sub-replica must not promote itself on an election voided by the old primary's demotion"
+        );
+        assert_eq!(state.myself.replicaof, new_primary_id);
+        assert!(!state.myself.slots[7]);
+        assert_eq!(state.myself.numslots, 0);
+        assert_eq!(
+            state.myself.config_epoch, 9,
+            "the stale election must not burn a promotion config epoch"
+        );
+        assert_eq!(
+            state.automatic_failover.phase(),
+            AutomaticFailoverPhase::Idle
+        );
+        assert!(state.pending_replication_switch.is_none());
+        assert!(state.nodes[old_primary_id].is_replica());
+        assert_eq!(state.nodes[old_primary_id].replicaof, new_primary_id);
     }
 
     #[test]

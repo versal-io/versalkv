@@ -219,6 +219,9 @@ impl ClusterState {
         if !self.myself.is_replica()
             || self.myself.replicaof != promotion.old_primary.as_str()
             || promotion.slots.len() != CLUSTER_SLOTS
+            || self
+                .validate_failover_slot_claim(promotion.old_primary.as_str(), &promotion.slots)
+                .is_err()
         {
             return false;
         }
@@ -244,20 +247,8 @@ impl ClusterState {
         self.myself.shard_id = promotion.shard_id.to_string();
         self.myself.slots.fill(false);
         self.myself.numslots = 0;
-        if let Some(old_primary) = self.nodes.get_mut(promotion.old_primary.as_str()) {
-            for (owned, inherited) in old_primary.slots.iter_mut().zip(&promotion.slots) {
-                if *inherited && *owned {
-                    *owned = false;
-                    old_primary.numslots = old_primary.numslots.saturating_sub(1);
-                }
-            }
-        }
-        for (slot, inherited) in promotion.slots.iter().copied().enumerate() {
-            if inherited {
-                self.assign_slot_to_myself(slot)
-                    .expect("promotion slot is within the canonical table");
-            }
-        }
+        self.claim_slots_after_failover(promotion.old_primary.as_str(), &promotion.slots)
+            .expect("validated promotion references the failed primary");
         self.advance_current_epoch(promotion.config_epoch);
         self.myself.config_epoch = promotion.config_epoch;
 

@@ -3,7 +3,7 @@ mod common;
 
 use common::{measure_destructive, measure_readonly, snapshot_mem, write_csv, CaseRow};
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use std::collections::HashSet;
 use std::hint::black_box;
 
@@ -21,7 +21,7 @@ fn build_rand(seed: u64) -> IntSet {
     let mut rng = StdRng::seed_from_u64(seed);
     let mut s = IntSet::with_capacity(N);
     while s.len() < N {
-        s.insert(rng.gen_range(i64::MIN..i64::MAX));
+        s.insert(rng.random_range(i64::MIN..i64::MAX));
     }
     s
 }
@@ -65,7 +65,7 @@ fn main() {
         let mut rng = StdRng::seed_from_u64(SEED ^ 0xE);
         let samples = measure_destructive(
             |_| {
-                let v: i64 = rng.gen_range(i64::MIN..i64::MAX);
+                let v: i64 = rng.random_range(i64::MIN..i64::MAX);
                 (IntSet::new(), v)
             },
             |s, v| {
@@ -84,7 +84,7 @@ fn main() {
         let samples = measure_readonly(
             move || (s, hits),
             |(s, hits), _i| {
-                let v = hits[rng.gen_range(0..hits.len())];
+                let v = hits[rng.random_range(0..hits.len())];
                 black_box(s.contains(&v));
             },
         );
@@ -103,7 +103,7 @@ fn main() {
         let samples = measure_readonly(
             move || s,
             |s, _i| {
-                let v: i64 = -rng.gen_range(1..1_000_000_000_i64);
+                let v: i64 = -rng.random_range(1..1_000_000_000_i64);
                 black_box(s.contains(&v));
             },
         );
@@ -122,7 +122,7 @@ fn main() {
         let samples = measure_destructive(
             |_| {
                 let s = build_seq();
-                let victim: i64 = rng.gen_range(0..N as i64);
+                let victim: i64 = rng.random_range(0..N as i64);
                 (s, victim)
             },
             |s, victim| {
