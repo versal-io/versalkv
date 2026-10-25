@@ -22,13 +22,24 @@ fn readiness(event: EventLoopEvent) -> ReadinessEvent {
 }
 
 fn timer_event(id: TimeEventId, payload: TimerEvent) -> EventLoopEvent {
-    EventLoopEvent {
-        sequence: 0,
-        phase: EventPhase::Time,
-        lane: EventLane::Normal,
-        owner: EventOwner::Timer(id),
-        payload: EventPayload::Timer(payload),
-    }
+    EventLoopEvent::timer(id, payload)
+}
+
+#[test]
+fn timer_constructor_assigns_canonical_metadata() {
+    let mut registry = TimeEventRegistry::default();
+    let id = registry.create_time_event(0_i64, Duration::ZERO, None, RuntimeTimeEvent::Test(1));
+
+    let event = EventLoopEvent::timer(id, TimerEvent::ServerCron);
+
+    assert_eq!(event.sequence, 0);
+    assert_eq!(event.phase, EventPhase::Time);
+    assert_eq!(event.lane, EventLane::Normal);
+    assert_eq!(event.owner, EventOwner::Timer(id));
+    assert!(matches!(
+        event.payload,
+        EventPayload::Timer(TimerEvent::ServerCron)
+    ));
 }
 
 #[test]
@@ -191,6 +202,7 @@ fn converged_eviction_time_dispatch_cancels_the_registered_timer() {
 #[test]
 fn pending_runtime_work_is_deduplicated_by_runnable_key_and_slot() {
     let mut runtime = ServerWorkerState::new(1).unwrap();
+    let collected_before = runtime.ctx.stats().eventloop_events_collected;
     let scheduled = [
         RunnableKey::ClientRead(Token(11)),
         RunnableKey::ClientRead(Token(11)),
@@ -202,6 +214,10 @@ fn pending_runtime_work_is_deduplicated_by_runnable_key_and_slot() {
     for key in scheduled {
         runtime.schedule_runtime_runnable(key);
     }
+    assert_eq!(
+        runtime.ctx.stats().eventloop_events_collected,
+        collected_before
+    );
 
     let events = runtime.event_batch.drain_before_poll_for_test();
     let keys: Vec<_> = events

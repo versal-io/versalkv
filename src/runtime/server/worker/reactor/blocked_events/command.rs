@@ -207,7 +207,7 @@ impl ServerWorkerState {
                 .replication_runtime
                 .replica_link()
                 .is_some_and(|link| link.connection_id().0 == token.0 && link.is_streaming());
-        let outcome = self.dispatch_readiness_in_context(
+        let outcome = self.dispatch_readiness_now(
             DispatchContext::CommandBlocked {
                 protected_client: protected_token,
             },

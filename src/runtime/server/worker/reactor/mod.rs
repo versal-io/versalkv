@@ -391,6 +391,16 @@ impl EventLoopEvent {
         }
     }
 
+    pub(crate) fn timer(id: TimeEventId, payload: TimerEvent) -> Self {
+        Self {
+            sequence: 0,
+            phase: EventPhase::Time,
+            lane: EventLane::Normal,
+            owner: EventOwner::Timer(id),
+            payload: EventPayload::Timer(payload),
+        }
+    }
+
     pub(crate) fn readiness(phase: EventPhase, lane: EventLane, readiness: ReadinessEvent) -> Self {
         Self {
             sequence: 0,
