@@ -1736,6 +1736,7 @@ fn ready_phase_counts_io_worker_failure_as_handled_not_owner_closed() {
     let mut backend = ServerWorkerState::new(1).expect("create runtime");
     let wake_token = backend.io_threads.wake_token();
     let before = (
+        backend.ctx.stats().eventloop_events_collected,
         backend.ctx.stats().eventloop_events_handled,
         backend.ctx.stats().eventloop_events_owner_closed,
     );
@@ -1760,14 +1761,19 @@ fn ready_phase_counts_io_worker_failure_as_handled_not_owner_closed() {
     );
 
     assert_eq!(
-        backend.ctx.stats().eventloop_events_handled,
+        backend.ctx.stats().eventloop_events_collected,
         before.0 + 1,
-        "nonterminal IO worker wake failures must stay handled"
+        "polled terminal IO worker wakes must be collected as readiness"
+    );
+    assert_eq!(
+        backend.ctx.stats().eventloop_events_handled,
+        before.1 + 2,
+        "terminal IO worker wakes must be handled through readiness and control ingress"
     );
     assert_eq!(
         backend.ctx.stats().eventloop_events_owner_closed,
-        before.1,
-        "nonterminal IO worker wake failures must not count as owner-closed"
+        before.2,
+        "terminal IO worker wakes must not count as owner-closed"
     );
 }
 

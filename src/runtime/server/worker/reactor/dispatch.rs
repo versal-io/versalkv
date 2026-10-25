@@ -15,6 +15,12 @@ use crate::runtime::server::worker::reactor::sources::{SourceOwner, SourceRoute}
 use crate::runtime::server::worker::reactor::transport::{PendingRemovalOwner, RuntimeSentinelIo};
 use crate::runtime::server::worker::sessions::ClientReadMode;
 
+#[derive(Clone, Copy)]
+enum RunnableTurn {
+    Current,
+    Next,
+}
+
 impl ServerWorkerState {
     pub(crate) fn dispatch_before_poll_slot(
         &mut self,
@@ -223,7 +229,9 @@ impl ServerWorkerState {
             }
             SourceOwner::Listener => self.remove_listener(token),
             SourceOwner::Connection => self.handle_connection_transport_failure(token),
-            SourceOwner::IoWorkerWake => self.drain_io_completions(),
+            SourceOwner::IoWorkerWake => {
+                self.dispatch_control_now(super::ControlEvent::IoWorkerWake);
+            }
             SourceOwner::InternalPipe(_) => self.retire_failed_internal_source(token, "readiness"),
             // Later tasks install these source classes together with their
             // concrete teardown state machines.
@@ -273,6 +281,122 @@ impl ServerWorkerState {
             .may_request_shutdown
     }
 
+    fn runnable_slot(&self, key: RunnableKey) -> BeforePollSlot {
+        match key {
+            RunnableKey::ClientRead(_)
+            | RunnableKey::DeferredReadiness(_)
+            | RunnableKey::ReplicationAction(_) => BeforePollSlot::PreAof,
+            RunnableKey::ClientWrite(token) => {
+                let connection_id =
+                    crate::framework::distributed::replication::ConnectionId(token.0);
+                if self.replication_runtime.role(connection_id).is_some() {
+                    BeforePollSlot::DistributedWrites
+                } else {
+                    BeforePollSlot::OrdinaryWrites
+                }
+            }
+            RunnableKey::SlotExportWrite(_) => BeforePollSlot::DistributedWrites,
+            RunnableKey::ClusterBeforeSleep => BeforePollSlot::Maintenance,
+            #[cfg(test)]
+            RunnableKey::Test(_) => BeforePollSlot::Maintenance,
+        }
+    }
+
+    /// Places one keyed continuation into its canonical before-poll slot.
+    /// EventBatch owns deduplication, while RunnableTurn preserves whether the
+    /// continuation may execute in this turn or must wait for the next one.
+    fn enqueue_runtime_runnable(&mut self, key: RunnableKey, turn: RunnableTurn) {
+        let slot = self.runnable_slot(key);
+        let event = EventLoopEvent::runnable(key);
+        match turn {
+            RunnableTurn::Current => self.event_batch.push_before_poll(slot, event),
+            RunnableTurn::Next => self.event_batch.push_before_poll_next_turn(slot, event),
+        }
+    }
+
+    pub(crate) fn schedule_runtime_runnable(&mut self, key: RunnableKey) {
+        self.enqueue_runtime_runnable(key, RunnableTurn::Current);
+    }
+
+    pub(crate) fn schedule_runtime_runnable_next_turn(&mut self, key: RunnableKey) {
+        self.enqueue_runtime_runnable(key, RunnableTurn::Next);
+    }
+
+    pub(crate) fn cancel_runtime_runnable(&mut self, key: RunnableKey) -> bool {
+        self.event_batch.remove_runnable(key)
+    }
+
+    /// Dispatches a completion drained from the shared worker channel. The wake
+    /// readiness is only the notification mechanism; each queued completion is a
+    /// distinct collected event and must pass through the common dispatcher.
+    pub(super) fn dispatch_worker_completion_now(
+        &mut self,
+        completion: super::io_workers::WorkerCompletionEvent,
+    ) {
+        self.ctx.record_eventloop_event_collected(1);
+        self.dispatch_event(
+            EventLoopEvent::worker_completion(completion),
+            &DispatchContext::Normal,
+        );
+    }
+
+    /// Converts a control-source readiness into its typed control action without
+    /// delaying it behind ordinary ready events. The readiness event already owns
+    /// collection accounting, so this derived event records dispatch only.
+    fn dispatch_control_now(&mut self, control: super::ControlEvent) -> DispatchOutcome {
+        self.dispatch_event(EventLoopEvent::control(control), &DispatchContext::Normal)
+    }
+
+    /// Queues a timer that the time registry has already declared due. The caller
+    /// retains the registry entry until dispatch, while EventBatch orders equal
+    /// deadlines by owner id.
+    pub(super) fn enqueue_due_timer(
+        &mut self,
+        due_at: crate::foundation::io::sys::time::MonotonicInstant,
+        id: super::timers::TimeEventId,
+        payload: super::TimerEvent,
+    ) {
+        self.ctx.record_eventloop_event_collected(1);
+        self.event_batch
+            .push_time(due_at, EventLoopEvent::timer(id, payload));
+    }
+
+    /// Queues one child result after ChildRegistry has made the exit idempotent.
+    /// Child completions use the control lane so cleanup cannot be starved behind
+    /// ordinary connection readiness.
+    pub(super) fn enqueue_child_completion(
+        &mut self,
+        completion: super::sources::ChildCompletionEvent,
+    ) {
+        self.ctx.record_eventloop_event_collected(1);
+        self.event_batch
+            .push(EventLoopEvent::child_completion(completion));
+    }
+
+    /// Converts one readiness record returned by the poll backend into the
+    /// canonical ready-phase event. Poll collection is the observation boundary,
+    /// so this method records exactly one collected event before queueing it.
+    fn enqueue_polled_readiness(
+        &mut self,
+        event: crate::runtime::server::worker::reactor::transport::RuntimeEvent,
+    ) {
+        self.ctx.record_eventloop_event_collected(1);
+        let readiness = ReadinessEvent {
+            token: event.token,
+            origin: ReadinessOrigin::Polled,
+            readable: event.readable,
+            writable: event.writable,
+            read_closed: event.read_hup,
+            error: event.error,
+        };
+        let lane = self.ready_lane_for(readiness.token);
+        self.event_batch.push(EventLoopEvent::readiness(
+            EventPhase::Ready,
+            lane,
+            readiness,
+        ));
+    }
+
     pub(crate) fn collect_after_poll_events(
         &mut self,
         poll_result: Option<(
@@ -283,21 +407,8 @@ impl ServerWorkerState {
         let Some((_cycle_start, events)) = poll_result else {
             return;
         };
-        self.ctx.record_eventloop_event_collected(events.len());
         for event in events {
-            let lane = self.ready_lane_for(event.token);
-            self.event_batch.push(EventLoopEvent::readiness(
-                EventPhase::Ready,
-                lane,
-                ReadinessEvent {
-                    token: event.token,
-                    origin: ReadinessOrigin::Polled,
-                    readable: event.readable,
-                    writable: event.writable,
-                    read_closed: event.read_hup,
-                    error: event.error,
-                },
-            ));
+            self.enqueue_polled_readiness(event);
         }
     }
 
@@ -420,32 +531,29 @@ impl ServerWorkerState {
             EventPayload::ChildCompletion(_) => EventPayloadKind::ChildCompletion,
         };
         let dependencies = self.event_dependencies(&event);
-        let outcome = if let Some(outcome) = self.dispatch_protected_readiness(context, &event) {
+        // Protected readiness is a split read/write case and must be resolved before
+        // the context-only policy can reduce the event to one dependency.
+        let outcome = if let Some(outcome) = self.try_dispatch_protected_readiness(context, &event)
+        {
             outcome
         } else {
             match decide_dispatch(context, &dependencies, payload_kind) {
-                DispatchDecision::Dispatch => match event.payload {
-                    EventPayload::Readiness(readiness) => self.dispatch_queued_readiness(readiness),
-                    EventPayload::Timer(_) => self.dispatch_timer_event(event),
-                    EventPayload::Runnable(runnable) => self.dispatch_runnable(runnable),
-                    EventPayload::WorkerCompletion(completion) => {
-                        self.apply_worker_completion(completion);
-                        DispatchOutcome::Handled
-                    }
-                    EventPayload::Control(control) => self.dispatch_control_event(control),
-                    EventPayload::ChildCompletion(completion) => {
-                        self.dispatch_child_completion(completion, context)
-                    }
-                },
+                DispatchDecision::Dispatch => self.dispatch_event_payload(event, context),
                 DispatchDecision::Defer => self.defer_event(event, dependencies),
-                // Blocked loops never collect Time events. This fallback preserves
-                // the due event for the normal loop without running its callback.
+                // Suppressed readiness is not a normal decide_dispatch result. Keep
+                // this defensive fallback stale rather than inventing deferred work.
                 DispatchDecision::Suppress if payload_kind == EventPayloadKind::Readiness => {
                     DispatchOutcome::Stale
                 }
+                // Blocked loops never collect time-phase events, so this is a defensive
+                // outcome for a timer presented by a nonstandard caller. Report it as
+                // requeued without running the callback; this branch does not mutate EventBatch.
                 DispatchDecision::Suppress => DispatchOutcome::Requeued,
             }
         };
+        // Readiness handlers may initiate shutdown while closing a failed source.
+        // Surface that state to blocked-loop callers even when the local handler
+        // returned a less terminal outcome.
         let outcome = if payload_kind == EventPayloadKind::Readiness
             && (self.ctx.is_shutdown_requested() || self.ctx.shutdown_state().asap)
         {
@@ -460,7 +568,31 @@ impl ServerWorkerState {
         outcome
     }
 
-    fn dispatch_protected_readiness(
+    fn dispatch_event_payload(
+        &mut self,
+        event: EventLoopEvent,
+        context: &DispatchContext,
+    ) -> DispatchOutcome {
+        match event.payload {
+            EventPayload::Readiness(readiness) => self.dispatch_queued_readiness(readiness),
+            EventPayload::Timer(_) => self.dispatch_timer_event(event),
+            EventPayload::Runnable(runnable) => self.dispatch_runnable(runnable),
+            EventPayload::WorkerCompletion(completion) => {
+                self.apply_worker_completion(completion);
+                DispatchOutcome::Handled
+            }
+            EventPayload::Control(control) => self.dispatch_control_event(control),
+            EventPayload::ChildCompletion(completion) => {
+                self.dispatch_child_completion(completion, context)
+            }
+        }
+    }
+
+    /// Handles readiness for a read resource owned by the active blocked scope.
+    /// This check precedes generic dispatch because one readiness record may carry
+    /// readable and writable state together: reads must wait for the outer scope,
+    /// while writes must remain serviceable to avoid output deadlock.
+    fn try_dispatch_protected_readiness(
         &mut self,
         context: &DispatchContext,
         event: &EventLoopEvent,
@@ -468,10 +600,30 @@ impl ServerWorkerState {
         let EventPayload::Readiness(readiness) = event.payload else {
             return None;
         };
-        self.protected_readiness_dispatch(context, readiness)
+        if !self.is_read_protected_in_context(context, readiness.token) {
+            return None;
+        }
+
+        // Terminal errors must release transport ownership immediately. Deferring
+        // them as ordinary reads would retain a dead source until the outer scope
+        // happens to replay deferred readiness.
+        if readiness.error {
+            return Some(self.dispatch_queued_readiness(readiness));
+        }
+
+        // A readable HUP belongs to the same deferred read observation. A HUP-only
+        // event remains immediately dispatchable unless a prior read is already
+        // deferred, preserving EOF ordering without hiding terminal state.
+        if readiness.readable
+            || (readiness.read_closed && self.blocked_events.has_deferred_read(readiness.token))
+        {
+            return Some(self.defer_protected_readiness(readiness));
+        }
+
+        Some(self.dispatch_queued_readiness(readiness))
     }
 
-    fn protected_readiness_context(&self, context: &DispatchContext, token: Token) -> bool {
+    fn is_read_protected_in_context(&self, context: &DispatchContext, token: Token) -> bool {
         match context {
             DispatchContext::Normal => false,
             DispatchContext::CommandBlocked { protected_client } => {
@@ -496,25 +648,6 @@ impl ServerWorkerState {
             self.dispatch_blocked_writable(readiness.token);
         }
         DispatchOutcome::Deferred
-    }
-
-    fn protected_readiness_dispatch(
-        &mut self,
-        context: &DispatchContext,
-        readiness: ReadinessEvent,
-    ) -> Option<DispatchOutcome> {
-        if !self.protected_readiness_context(context, readiness.token) {
-            return None;
-        }
-        if readiness.error {
-            return Some(self.dispatch_queued_readiness(readiness));
-        }
-        if readiness.readable
-            || (readiness.read_closed && self.blocked_events.has_deferred_read(readiness.token))
-        {
-            return Some(self.defer_protected_readiness(readiness));
-        }
-        Some(self.dispatch_queued_readiness(readiness))
     }
 
     fn event_dependencies(&self, event: &EventLoopEvent) -> EventDependencies {
@@ -730,7 +863,11 @@ impl ServerWorkerState {
         .outcome
     }
 
-    pub(super) fn dispatch_readiness_in_context(
+    /// Dispatches readiness that is already owned by the main thread without
+    /// crossing an EventBatch boundary. Pending-data and replay paths must retain
+    /// their position inside the current before-poll or blocked-service sequence,
+    /// so queueing here would change command, AOF, and write ordering.
+    pub(super) fn dispatch_readiness_now(
         &mut self,
         context: DispatchContext,
         readiness: ReadinessEvent,
@@ -780,10 +917,7 @@ impl ServerWorkerState {
     ) -> TransportEventDispatchOutcome {
         match route.owner {
             SourceOwner::IoWorkerWake => {
-                self.dispatch_event(
-                    EventLoopEvent::control(super::ControlEvent::IoWorkerWake),
-                    &DispatchContext::Normal,
-                );
+                self.dispatch_control_now(super::ControlEvent::IoWorkerWake);
                 TransportEventDispatchOutcome::handled()
             }
             SourceOwner::Listener => self.dispatch_listener_readiness(ready),

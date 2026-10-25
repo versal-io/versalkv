@@ -7,7 +7,8 @@ use crate::runtime::server::worker::reactor::io_workers::{
     WorkerCompletionEvent, WriteCompletion,
 };
 use crate::runtime::server::worker::reactor::transport::{RuntimeEvent, RuntimePollCompletion};
-use crate::runtime::server::worker::reactor::{EventLoopEvent, EventPayload};
+#[cfg(test)]
+use crate::runtime::server::worker::reactor::EventLoopEvent;
 use crate::runtime::server::worker::PendingRemovalOwner;
 use crate::runtime::server::worker::ServerWorkerState;
 #[cfg(test)]
@@ -345,6 +346,7 @@ impl ServerWorkerState {
         ));
     }
 
+    #[cfg(test)]
     pub(crate) fn collect_worker_completion_events(&mut self) -> Vec<EventLoopEvent> {
         self.worker_completions
             .drain()
@@ -354,11 +356,9 @@ impl ServerWorkerState {
     }
 
     pub(crate) fn dispatch_worker_completion_events(&mut self) {
-        for event in self.collect_worker_completion_events() {
-            let EventPayload::WorkerCompletion(completion) = event.payload else {
-                continue;
-            };
-            self.apply_worker_completion(completion);
+        let completions = self.worker_completions.drain();
+        for completion in completions {
+            self.dispatch_worker_completion_now(completion);
         }
     }
 

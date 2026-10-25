@@ -47,7 +47,7 @@ impl ServerWorkerState {
     fn dispatch_pending_data(&mut self) -> bool {
         let events = self.collect_before_sleep_pending_events();
         for event in events {
-            let outcome = self.dispatch_readiness_in_context(
+            let outcome = self.dispatch_readiness_now(
                 DispatchContext::Normal,
                 ReadinessEvent {
                     token: event.token,
@@ -89,7 +89,7 @@ impl ServerWorkerState {
         if !self.transport.is_registered(event.token) {
             return;
         }
-        self.dispatch_readiness_in_context(
+        self.dispatch_readiness_now(
             DispatchContext::Normal,
             ReadinessEvent {
                 token: event.token,

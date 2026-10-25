@@ -92,7 +92,7 @@ impl ServerWorkerState {
     }
 
     fn dispatch_hosted_readiness(&mut self, readiness: ReadinessEvent) -> DispatchOutcome {
-        self.dispatch_readiness_in_context(
+        self.dispatch_readiness_now(
             DispatchContext::HostedBlocked {
                 protected_resources: self.blocked_events.protected_resources(),
             },

@@ -194,7 +194,12 @@ fn child_completion_event_finalizes_only_in_normal_context() {
         .child_registry
         .record_exit_for_test(child, ChildExitOutcome::Exited(0));
 
+    let collected_before = runtime.ctx.stats().eventloop_events_collected;
     runtime.collect_child_completion_events();
+    assert_eq!(
+        runtime.ctx.stats().eventloop_events_collected,
+        collected_before + 1
+    );
     let events = runtime.event_batch.drain_ready_for_test();
     assert_eq!(events.len(), 1);
     assert!(matches!(

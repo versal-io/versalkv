@@ -8,13 +8,15 @@ use crate::foundation::io::transport::{
 };
 use crate::framework::capabilities::io::mt_driver::IoDriverMtConfig;
 use crate::framework::capabilities::io::Token;
-use crate::runtime::server::worker::reactor::transport::{RuntimePollJob, RuntimeTransport};
-use crate::runtime::server::worker::reactor::EventLane;
+use crate::runtime::server::worker::reactor::transport::{
+    RuntimeEvent, RuntimePollJob, RuntimeTransport,
+};
+use crate::runtime::server::worker::reactor::{DispatchContext, EventLane, LoopControl};
 use std::collections::VecDeque;
 use std::io::{Cursor, Read, Write};
 use std::net::Shutdown;
 use std::os::fd::AsRawFd;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 fn recv_runtime_read_completion(
     runtime: &mut crate::runtime::server::worker::ServerWorkerState,
@@ -297,6 +299,62 @@ fn main_thread_poll_returned_metric_does_not_wake_control_source() {
             .is_empty(),
         "main-thread PollReturned accounting must not leave a stale worker wake"
     );
+}
+
+#[test]
+fn worker_completion_uses_unified_ingress_metrics() {
+    let mut runtime = test_runtime_with_workers();
+    runtime.enqueue_poll_returned_metric_for_test();
+    let collected_before = runtime.ctx.stats().eventloop_events_collected;
+    let handled_before = runtime.ctx.stats().eventloop_events_handled;
+
+    runtime.dispatch_worker_completion_events();
+
+    assert_eq!(
+        runtime.ctx.stats().eventloop_events_collected,
+        collected_before + 1,
+    );
+    assert_eq!(
+        runtime.ctx.stats().eventloop_events_handled,
+        handled_before + 1,
+    );
+}
+
+#[test]
+fn terminal_io_worker_wake_uses_control_ingress() {
+    for (read_closed, error) in [(false, true), (true, false)] {
+        let mut runtime = test_runtime_with_workers();
+        runtime.enqueue_poll_returned_metric_for_test();
+        let wake_token = runtime.io_threads.wake_token();
+        let collected_before = runtime.ctx.stats().eventloop_events_collected;
+        let handled_before = runtime.ctx.stats().eventloop_events_handled;
+
+        runtime.collect_after_poll_events(Some((
+            Instant::now(),
+            vec![RuntimeEvent {
+                token: wake_token,
+                readable: false,
+                writable: false,
+                read_hup: read_closed,
+                error,
+            }],
+        )));
+
+        assert_eq!(
+            runtime
+                .dispatch_ready_phase(DispatchContext::Normal)
+                .expect("dispatch ready phase"),
+            LoopControl::Continue
+        );
+        assert_eq!(
+            runtime.ctx.stats().eventloop_events_collected,
+            collected_before + 2,
+        );
+        assert_eq!(
+            runtime.ctx.stats().eventloop_events_handled,
+            handled_before + 3,
+        );
+    }
 }
 
 fn detached_poll(

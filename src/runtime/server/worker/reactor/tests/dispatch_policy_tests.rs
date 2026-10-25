@@ -120,7 +120,7 @@ fn protected_command_readable_writable_defers_read_and_services_write_once() {
         runtime.ctx.stats().eventloop_events_stale,
     );
 
-    let outcome = runtime.dispatch_readiness_in_context(
+    let outcome = runtime.dispatch_readiness_now(
         command_context(token),
         ReadinessEvent {
             token,
@@ -153,7 +153,7 @@ fn protected_command_error_dispatches_terminal_handling() {
     let mut runtime = ServerWorkerState::new(1).expect("create runtime");
     let (_client, token) = connected_client(&mut runtime);
 
-    let outcome = runtime.dispatch_readiness_in_context(
+    let outcome = runtime.dispatch_readiness_now(
         command_context(token),
         ReadinessEvent {
             token,
@@ -174,7 +174,7 @@ fn protected_command_hup_only_dispatches_terminal_handling() {
     let mut runtime = ServerWorkerState::new(1).expect("create runtime");
     let (_client, token) = connected_client(&mut runtime);
 
-    let outcome = runtime.dispatch_readiness_in_context(
+    let outcome = runtime.dispatch_readiness_now(
         command_context(token),
         ReadinessEvent {
             token,
@@ -195,7 +195,7 @@ fn protected_command_readable_hup_defers_the_terminal_bit_with_the_read() {
     let mut runtime = ServerWorkerState::new(1).expect("create runtime");
     let (_client, token) = connected_client(&mut runtime);
 
-    let outcome = runtime.dispatch_readiness_in_context(
+    let outcome = runtime.dispatch_readiness_now(
         command_context(token),
         ReadinessEvent {
             token,
@@ -234,6 +234,7 @@ fn normal_pending_data_uses_the_unified_dispatch_metric_path() {
         .any(|event| event.token == token && event.readable));
     runtime.transport.queue_test_pending_data_event(token);
     runtime.writes.ordinary.begin_turn();
+    let collected_before = runtime.ctx.stats().eventloop_events_collected;
     let handled_before = runtime.ctx.stats().eventloop_events_handled;
 
     assert!(!runtime.drain_pending_input());
@@ -245,6 +246,10 @@ fn normal_pending_data_uses_the_unified_dispatch_metric_path() {
     assert_eq!(
         runtime.ctx.stats().eventloop_events_handled,
         handled_before + 2
+    );
+    assert_eq!(
+        runtime.ctx.stats().eventloop_events_collected,
+        collected_before
     );
 }
 
@@ -267,6 +272,7 @@ fn normal_deferred_replay_uses_the_unified_dispatch_metric_path() {
         .blocked_events
         .defer(DeferredReadyEvent::new(token, true, false, false, false));
     runtime.writes.ordinary.begin_turn();
+    let collected_before = runtime.ctx.stats().eventloop_events_collected;
     let handled_before = runtime.ctx.stats().eventloop_events_handled;
 
     runtime.replay_one_deferred_readiness();
@@ -280,6 +286,10 @@ fn normal_deferred_replay_uses_the_unified_dispatch_metric_path() {
     assert_eq!(
         runtime.ctx.stats().eventloop_events_handled,
         handled_before + 2
+    );
+    assert_eq!(
+        runtime.ctx.stats().eventloop_events_collected,
+        collected_before
     );
 }
 

@@ -7,8 +7,8 @@ use super::super::ServerWorkerState;
 #[cfg(test)]
 use super::TurnTracePoint;
 use super::{
-    server_cron_interval, BeforePollSlot, DispatchContext, EventLane, EventLoopEvent, EventOwner,
-    EventPayload, EventPhase, LoopControl, RunnableKey,
+    server_cron_interval, BeforePollSlot, DispatchContext, EventLoopEvent, EventOwner, EventPhase,
+    LoopControl, RunnableKey,
 };
 
 impl ServerWorkerState {
@@ -61,61 +61,15 @@ impl ServerWorkerState {
         }
     }
 
-    fn runnable_slot(&self, key: RunnableKey) -> BeforePollSlot {
-        match key {
-            RunnableKey::ClientRead(_)
-            | RunnableKey::DeferredReadiness(_)
-            | RunnableKey::ReplicationAction(_) => BeforePollSlot::PreAof,
-            RunnableKey::ClientWrite(token) => {
-                let connection_id =
-                    crate::framework::distributed::replication::ConnectionId(token.0);
-                if self.replication_runtime.role(connection_id).is_some() {
-                    BeforePollSlot::DistributedWrites
-                } else {
-                    BeforePollSlot::OrdinaryWrites
-                }
-            }
-            RunnableKey::SlotExportWrite(_) => BeforePollSlot::DistributedWrites,
-            RunnableKey::ClusterBeforeSleep => BeforePollSlot::Maintenance,
-            #[cfg(test)]
-            RunnableKey::Test(_) => BeforePollSlot::Maintenance,
-        }
-    }
-
-    pub(crate) fn schedule_runtime_runnable(&mut self, key: RunnableKey) {
-        let slot = self.runnable_slot(key);
-        self.event_batch
-            .push_before_poll(slot, EventLoopEvent::runnable(key));
-    }
-
-    pub(crate) fn schedule_runtime_runnable_next_turn(&mut self, key: RunnableKey) {
-        let slot = self.runnable_slot(key);
-        self.event_batch
-            .push_before_poll_next_turn(slot, EventLoopEvent::runnable(key));
-    }
-
-    pub(crate) fn cancel_runtime_runnable(&mut self, key: RunnableKey) -> bool {
-        self.event_batch.remove_runnable(key)
-    }
-
     pub(crate) fn collect_due_time_events(&mut self) {
         let now = MonotonicInstant::now();
         let due_events = self.time_events.take_due(now);
-        self.ctx.record_eventloop_event_collected(due_events.len());
         for (offset, event) in due_events.into_iter().enumerate() {
             let event_id = event.id;
             let payload = event.kind;
             self.pending_due_time_events.insert(event_id, event);
-            self.event_batch.push_time(
-                now.saturating_add(Duration::from_nanos(offset as u64)),
-                EventLoopEvent {
-                    sequence: 0,
-                    phase: EventPhase::Time,
-                    lane: EventLane::Normal,
-                    owner: EventOwner::Timer(event_id),
-                    payload: EventPayload::Timer(payload),
-                },
-            );
+            let deadline = now.saturating_add(Duration::from_nanos(offset as u64));
+            self.enqueue_due_timer(deadline, event_id, payload);
         }
     }
 
@@ -202,11 +156,9 @@ impl ServerWorkerState {
     pub(crate) fn collect_child_completion_events(&mut self) -> usize {
         self.child_registry.collect_exited_children();
         let completions = self.child_registry.drain_completions();
-        self.ctx.record_eventloop_event_collected(completions.len());
         let count = completions.len();
         for completion in completions {
-            self.event_batch
-                .push(EventLoopEvent::child_completion(completion));
+            self.enqueue_child_completion(completion);
         }
         count
     }
