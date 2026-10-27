@@ -24,6 +24,29 @@ fn args(values: &[&str]) -> CommandArgs {
 }
 
 #[test]
+fn debug_pause_before_psync_accepts_toggle_and_rejects_invalid_arguments() {
+    use crate::engine::extension::config::server::ProtectedAction;
+
+    let mut ctx = ServerContext::new(1);
+    ctx.config_mut().server.enable_debug_command = ProtectedAction::Yes;
+    let mut conn = Connection::new_fake();
+    for value in ["1", "0"] {
+        assert_eq!(
+            super::debug_cmd(&mut conn, &args(&["pause-before-psync", value]), &mut ctx),
+            Value::ok()
+        );
+    }
+    assert_eq!(
+        super::debug_cmd(&mut conn, &args(&["pause-before-psync"]), &mut ctx),
+        Value::error("ERR syntax error")
+    );
+    assert_eq!(
+        super::debug_cmd(&mut conn, &args(&["pause-before-psync", "invalid"]), &mut ctx),
+        Value::error("ERR value is not an integer or out of range")
+    );
+}
+
+#[test]
 fn debug_gate_honors_no_yes_and_local_modes() {
     use crate::engine::extension::config::server::ProtectedAction;
 

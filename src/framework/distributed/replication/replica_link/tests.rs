@@ -225,6 +225,7 @@ fn transient_psync_replies_are_retryable_not_protocol_errors() {
     for reply in [
         b"-NOMASTERLINK Can't SYNC while not connected with my master\r\n".as_slice(),
         b"-LOADING primary is loading the dataset in memory\r\n".as_slice(),
+        b"-BUSY Valkey is busy running a script\r\n".as_slice(),
     ] {
         let mut link = link();
         advance_to_waitpsyncreply(&mut link, 6380);

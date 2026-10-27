@@ -41,6 +41,8 @@ mod thread_safe_context_api;
 mod time_api;
 mod timer;
 
+#[cfg(test)]
+pub(crate) use active_registry::with_active_registry;
 pub(crate) use active_registry::{ActiveModuleContextScope, ActiveModuleRegistryScope};
 pub(crate) use get_api::module_get_api_impl;
 use libc::{c_char, c_int, size_t};
