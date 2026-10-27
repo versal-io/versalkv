@@ -423,7 +423,7 @@ mod tests {
             std::env::temp_dir().join(format!("versal-name-lifecycle-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let library = dir.join("name_lifecycle.so");
-        let mut compiler = Command::new("cc");
+        let mut compiler = Command::new(std::env::var_os("CC").unwrap_or_else(|| "cc".into()));
         if cfg!(target_os = "macos") {
             compiler.args(["-dynamiclib", "-undefined", "dynamic_lookup"]);
         } else {

@@ -2703,10 +2703,17 @@ def command_check_ci_support(_args: argparse.Namespace, ctx: RepoContext) -> int
         failures.append("CI must install Node.js before running wasm-check")
     rust_unit = pipeline.find("run: cargo test --lib")
     install_build_essential = pipeline.find("build-essential")
+    install_clang = pipeline.find("clang")
     if install_build_essential < 0:
         failures.append("Rust Check must install build-essential for runtime module tests")
     elif rust_unit < 0 or install_build_essential > rust_unit:
         failures.append("CI must install build-essential before Rust unit tests")
+    if install_clang < 0:
+        failures.append("Rust Check must install clang for runtime module tests")
+    elif rust_unit < 0 or install_clang > rust_unit:
+        failures.append("CI must install clang before Rust unit tests")
+    if "CC: clang" not in pipeline:
+        failures.append("Rust Check must force module fixture compilation through clang")
     if docs_pipeline and '"scripts/versal-util.py"' not in docs_pipeline:
         failures.append("documentation pipeline does not watch versal-util.py")
     if "python3 \"$ROOT_DIR/scripts/versal-util.py\" tcl binaries" not in moduleapi:

@@ -453,7 +453,7 @@ fn compile_header_module(out_dir: &Path, name: &str) -> PathBuf {
         .join("valkey")
         .join("src");
     let output = out_dir.join(format!("{name}.so"));
-    let mut compiler = Command::new("cc");
+    let mut compiler = Command::new(std::env::var_os("CC").unwrap_or_else(|| "cc".into()));
     compiler
         .args(["-shared", "-fPIC", "-Wall", "-Wextra", "-Werror"])
         .arg("-I")
@@ -477,7 +477,7 @@ fn compile_module_fixture(out_dir: &Path, name: &str) -> PathBuf {
         .join("module_ffi")
         .join(format!("{name}.c"));
     let output = out_dir.join(format!("{name}.so"));
-    let status = Command::new("cc")
+    let status = Command::new(std::env::var_os("CC").unwrap_or_else(|| "cc".into()))
         .arg("-shared")
         .arg("-fPIC")
         .arg("-Wall")
