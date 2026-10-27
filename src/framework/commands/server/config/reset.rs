@@ -3,6 +3,7 @@ use crate::foundation::io::protocol::Value;
 
 pub fn config_resetstat(ctx: &mut ServerContext) -> Value {
     ctx.stats_mut().reset();
+    crate::engine::extension::acl::reset_acl_stats();
     ctx.reset_lazyfree_stats();
     ctx.reset_io_thread_counters();
     ctx.slot_metrics_mut().reset_counters();

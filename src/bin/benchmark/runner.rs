@@ -105,13 +105,15 @@ fn run_idle(config: &BenchConfig) -> Result<Vec<BenchStats>, String> {
     }
     let mut streams = Vec::with_capacity(config.clients);
     for _ in 0..config.clients {
-        let mut stream = RespConnection::connect(&options)?;
-        stream.write_all(&protocol::serialize_resp(&[b"PING".to_vec()]))?;
-        streams.push(stream);
+        streams.push(RespConnection::connect(&options)?);
     }
-    std::thread::sleep(Duration::from_millis(100));
-    drop(streams);
-    Ok(Vec::new())
+    println!(
+        "Creating {} idle connections and waiting forever (Ctrl+C when done)",
+        streams.len()
+    );
+    loop {
+        std::thread::park();
+    }
 }
 
 fn fetch_maxclients(config: &BenchConfig) -> Result<Option<usize>, String> {

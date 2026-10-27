@@ -150,6 +150,7 @@ impl ServerWorkerState {
             .is_some_and(|connection| connection.protected)
         {
             self.connection_registry[token].mark_closing();
+            self.connection_registry[token].is_async_close_pending = true;
             return;
         }
         // Already isolated from every business index; only its L1 registration

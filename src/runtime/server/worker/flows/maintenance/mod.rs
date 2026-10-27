@@ -264,6 +264,11 @@ impl ServerWorkerState {
                 continue;
             }
             let memory = conn.accounted_normal_memory();
+            if conn.is_async_close_pending {
+                // Deferred closes still contribute to cached memory until retirement.
+                total = total.saturating_sub(memory);
+                continue;
+            }
             if !conn.no_evict && !conn.import_source {
                 candidates.push((connection_token.0, conn.token().0, memory));
             }

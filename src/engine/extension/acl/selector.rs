@@ -175,3 +175,15 @@ pub(crate) fn add_acl_log_entry(
 pub(crate) fn reset_acl_log() {
     acl_log().lock().unwrap().clear();
 }
+
+pub(crate) fn reset_acl_stats() {
+    for counter in [
+        &ACL_STATS_AUTH,
+        &ACL_STATS_CMD,
+        &ACL_STATS_KEY,
+        &ACL_STATS_CHANNEL,
+        &ACL_STATS_DB,
+    ] {
+        counter.store(0, Ordering::Relaxed);
+    }
+}
