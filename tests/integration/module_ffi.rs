@@ -461,6 +461,8 @@ fn compile_header_module(out_dir: &Path, name: &str) -> PathBuf {
         .arg("-o")
         .arg(&output)
         .arg(&source);
+    #[cfg(target_os = "linux")]
+    compiler.arg("-fuse-ld=lld");
     #[cfg(target_os = "macos")]
     compiler.arg("-Wl,-undefined,dynamic_lookup");
     let status = compiler
@@ -477,15 +479,15 @@ fn compile_module_fixture(out_dir: &Path, name: &str) -> PathBuf {
         .join("module_ffi")
         .join(format!("{name}.c"));
     let output = out_dir.join(format!("{name}.so"));
-    let status = Command::new(std::env::var_os("CC").unwrap_or_else(|| "clang".into()))
-        .arg("-shared")
-        .arg("-fPIC")
-        .arg("-Wall")
-        .arg("-Wextra")
-        .arg("-Werror")
+    let mut compiler = Command::new(std::env::var_os("CC").unwrap_or_else(|| "clang".into()));
+    compiler
+        .args(["-shared", "-fPIC", "-Wall", "-Wextra", "-Werror"])
         .arg("-o")
         .arg(&output)
-        .arg(&source)
+        .arg(&source);
+    #[cfg(target_os = "linux")]
+    compiler.arg("-fuse-ld=lld");
+    let status = compiler
         .status()
         .expect("failed to invoke cc for module FFI fixture");
     assert!(status.success(), "failed to compile {source:?}");

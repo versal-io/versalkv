@@ -286,6 +286,8 @@ mod lifecycle_tests {
             .arg("-o")
             .arg(&path)
             .arg(root.join("tests/fixtures/module_ffi/auto_memory_lifecycle.c"));
+        #[cfg(target_os = "linux")]
+        compiler.arg("-fuse-ld=lld");
         #[cfg(target_os = "macos")]
         compiler.arg("-Wl,-undefined,dynamic_lookup");
         let result = compiler.output().unwrap();

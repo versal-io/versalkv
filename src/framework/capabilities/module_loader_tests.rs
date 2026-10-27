@@ -44,6 +44,9 @@ impl Fixture {
         let path = self.0.join(format!("{flavor}.so"));
         let mut cc = Command::new(std::env::var_os("CC").unwrap_or_else(|| "clang".into()));
         cc.args(["-shared", "-fPIC", "-Wall", "-Wextra", "-Werror"]);
+        if cfg!(target_os = "linux") {
+            cc.arg("-fuse-ld=lld");
+        }
         if cfg!(target_os = "macos") {
             cc.arg("-Wl,-undefined,dynamic_lookup");
         }

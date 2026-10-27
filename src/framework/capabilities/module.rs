@@ -429,6 +429,9 @@ mod tests {
         } else {
             compiler.args(["-shared", "-fPIC"]);
         }
+        if cfg!(target_os = "linux") {
+            compiler.arg("-fuse-ld=lld");
+        }
         let output = compiler
             .arg("-I")
             .arg(root.join("thirdparty/valkey/src"))
