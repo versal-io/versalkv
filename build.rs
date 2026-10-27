@@ -717,6 +717,16 @@ fn main() {
         println!("cargo:rustc-link-arg-bin=versal-server=-rdynamic");
     }
 
+    // Direct module ABI calls need link roots even without Rust callers.
+    let symbol_prefix = if env::var("CARGO_CFG_TARGET_VENDOR").as_deref() == Ok("apple") {
+        "_"
+    } else {
+        ""
+    };
+    for symbol in ["VM_CallArgv", "VM_ReplyRaw"] {
+        println!("cargo:rustc-link-arg-bin=versal-server=-Wl,-u,{symbol_prefix}{symbol}");
+    }
+
     let c_shim_dir = PathBuf::from(&manifest_dir)
         .join("src")
         .join("engine")

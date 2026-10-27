@@ -407,10 +407,10 @@ impl ServerWorkerState {
                 (
                     spec.executor,
                     CmdPreconditions {
-                        name: spec.name,
+                        name: spec.name.clone(),
                         arity: spec.arity,
                         flags: crate::runtime::server::worker::flows::request::dispatch::subcmd_flags::effective_command_flags_for_call(
-                            spec.name,
+                            spec.name.as_str(),
                             spec.flags,
                             args,
                             &self.ctx,
@@ -421,7 +421,7 @@ impl ServerWorkerState {
                         key_flags: spec.key_flags,
                         acl_categories:
                             crate::runtime::server::worker::flows::request::dispatch::subcmd_flags::effective_acl_categories(
-                                spec.name,
+                                spec.name.as_str(),
                                 spec.acl_categories,
                                 args.args.first().map(|arg| arg.as_ref()),
                             ),
@@ -475,7 +475,7 @@ impl ServerWorkerState {
                             .lookup(&cmd.name)
                             .is_some_and(|s| {
                                 (crate::runtime::server::worker::flows::request::dispatch::subcmd_flags::effective_command_flags_for_call(
-                                    s.name,
+                                    s.name.as_str(),
                                     s.flags,
                                     cmd,
                                     &self.ctx,
@@ -485,7 +485,7 @@ impl ServerWorkerState {
                 } else {
                     self.registry.lookup(&args.name).is_some_and(|s| {
                         (crate::runtime::server::worker::flows::request::dispatch::subcmd_flags::effective_command_flags_for_call(
-                            s.name,
+                            s.name.as_str(),
                             s.flags,
                             args,
                             &self.ctx,
@@ -884,7 +884,7 @@ impl ServerWorkerState {
     fn wakeup_command_flags(&self, args: &CommandArgs) -> u64 {
         self.registry.lookup(&args.name).map_or(0, |spec| {
             crate::runtime::server::worker::flows::request::dispatch::subcmd_flags::effective_command_flags_for_call(
-                spec.name, spec.flags, args, &self.ctx,
+                spec.name.as_str(), spec.flags, args, &self.ctx,
             )
         })
     }
@@ -1082,9 +1082,10 @@ mod tests {
         conn.username = "session-user".to_string();
         conn.authenticated = false;
         assert!(conn.transaction.begin(7, 0));
-        assert!(conn
-            .transaction
-            .queue(CommandArgs::from_parts(vec![Bytes::from_static(b"PING")])));
+        assert!(conn.transaction.queue(
+            backend.ctx.num_dbs(),
+            CommandArgs::from_parts(vec![Bytes::from_static(b"PING")])
+        ));
         assert_eq!(
             conn.transaction
                 .watch_many(vec![crate::engine::command::context::WatchedKey::new(
@@ -1235,11 +1236,14 @@ mod tests {
             [crate::framework::capabilities::io::Token(connection_token)]
         .transaction;
         transaction.take_queued_commands();
-        assert!(transaction.queue(CommandArgs::from_parts(vec![
-            Bytes::from_static(b"PUBLISH"),
-            channel.clone(),
-            Bytes::from_static(b"exec-message"),
-        ])));
+        assert!(transaction.queue(
+            backend.ctx.num_dbs(),
+            CommandArgs::from_parts(vec![
+                Bytes::from_static(b"PUBLISH"),
+                channel.clone(),
+                Bytes::from_static(b"exec-message"),
+            ])
+        ));
         backend.connection_registry[crate::framework::capabilities::io::Token(connection_token)]
             .retire_command_attempt_for_postpone();
         backend.connection_registry[crate::framework::capabilities::io::Token(connection_token)]

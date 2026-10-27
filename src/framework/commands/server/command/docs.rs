@@ -18,16 +18,16 @@ pub(crate) fn command_docs(reg: &CommandRegistry, ctx: &ServerContext, args: &[B
         let parent_name = name.split('|').next().unwrap_or(&name);
         let found = reg
             .iter()
-            .find(|spec| spec.name == name)
-            .or_else(|| reg.iter().find(|spec| spec.name == parent_name));
+            .find(|spec| spec.name.as_str().eq_ignore_ascii_case(&name))
+            .or_else(|| reg.iter().find(|spec| spec.name.as_str().eq_ignore_ascii_case(parent_name)));
         if let Some(spec) = found {
             if is_sentinel && (spec.flags & CMD_SENTINEL) == 0 {
                 continue;
             }
             let doc = if let Some(module_name) =
-                ctx.module_registry().command_module_name(spec.name)
+                ctx.module_registry().command_module_name(spec.name.as_str())
             {
-                module_doc(ctx, spec.name, module_name)
+                module_doc(ctx, spec.name.as_str(), module_name)
             } else {
                 Value::Map(vec![
                     (bulk("summary"), Value::bulk(Bytes::from_static(b""))),

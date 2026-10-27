@@ -109,12 +109,12 @@ fn command_denial(
         request.facts.selected_db as i64
     };
     let restrict = crate::engine::extension::acl::should_restrict_cmd(
-        meta.name,
+        meta.name.as_str(),
         meta.acl_categories,
         meta.first_key != 0 || meta.get_keys.is_some(),
     );
     let db = crate::engine::extension::acl::compute_db_requirement(
-        meta.name,
+        meta.name.as_str(),
         &request.args.args,
         (meta.flags & CMD_ALL_DBS) != 0,
         restrict,
@@ -122,7 +122,7 @@ fn command_denial(
         num_dbs,
     );
     user.check_command_perm(
-        AclCommand::new(meta.name, &request.args.args, meta.acl_categories),
+        AclCommand::new(meta.name.as_str(), &request.args.args, meta.acl_categories),
         &db,
         num_dbs,
         key_requirements,
@@ -166,7 +166,7 @@ fn acl_denial_outcome(
     let (reason, object, message) = match denial {
         AclDenial::Db { dbid, arg_index } => {
             let object = ServerWorkerState::acl_database_object_name(
-                request.meta.name,
+                request.meta.name.as_str(),
                 request.args,
                 arg_index,
             );
@@ -198,7 +198,8 @@ fn acl_denial_outcome(
 }
 
 fn command_denial_details(request: &AclRequest<'_>) -> (i32, String, String) {
-    let object = ServerWorkerState::acl_command_object_name(request.meta.name, request.args);
+    let object =
+        ServerWorkerState::acl_command_object_name(request.meta.name.as_str(), request.args);
     let message = format!(
         "NOPERM User {} has no permissions to run the '{}' command",
         request.facts.username, object
@@ -224,7 +225,7 @@ fn key_denial_details(
 }
 
 fn channel_denial_outcome(user: &AclUser, request: &AclRequest<'_>) -> Option<DispatchOutcome> {
-    let command = request.meta.name;
+    let command = request.meta.name.as_str();
     let is_channel_command = matches!(
         command.to_ascii_lowercase().as_str(),
         "publish" | "spublish" | "subscribe" | "ssubscribe" | "psubscribe"

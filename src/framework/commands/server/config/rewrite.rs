@@ -107,7 +107,10 @@ pub fn config_rewrite(ctx: &mut ServerContext) -> Value {
             "strict"
         }
     ));
-    lines.push(format!("rdb-key-save-delay {}", r.persistence.rdb_key_save_delay));
+    lines.push(format!(
+        "rdb-key-save-delay {}",
+        r.persistence.rdb_key_save_delay
+    ));
     lines.push(format!("key-load-delay {}", r.persistence.key_load_delay));
     lines.push(format!(
         "loading-process-events-interval-bytes {}",
@@ -269,6 +272,9 @@ pub fn config_rewrite(ctx: &mut ServerContext) -> Value {
         r.server.enable_module_command.as_str()
     ));
     for module in ctx.module_registry().list() {
+        if module.is_static {
+            continue;
+        }
         if let Some((path, args)) = &module.load_path {
             let mut line = format!("loadmodule {}", path);
             for arg in args {
@@ -416,6 +422,45 @@ mod tests {
     use crate::foundation::io::protocol::Value;
     use crate::framework::context::ServerContext;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn loader_rewrite_preserves_dynamic_order_and_omits_static_module_paths() {
+        use crate::engine::extension::module::ModuleRef;
+        let path = std::env::temp_dir().join(format!(
+            "versal-loader-rewrite-{}-{}.conf",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, "loadmodule stale.so\n").unwrap();
+        let mut ctx = ServerContext::new(1);
+        ctx.config_mut().server.config_file = Some(path.to_string_lossy().into_owned());
+        for (name, is_static) in [("infotest", false), ("datatype", false), ("lua", true)] {
+            ctx.module_registry_mut()
+                .register(ModuleRef::new(name, std::ptr::null_mut(), 1, is_static))
+                .unwrap();
+            assert!(ctx.module_registry_mut().set_load_path(
+                name,
+                format!("{name}.so"),
+                vec!["argument".to_string()]
+            ));
+        }
+        assert_eq!(config_rewrite(&mut ctx), Value::ok());
+        let rewritten = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            rewritten
+                .lines()
+                .filter(|line| line.starts_with("loadmodule "))
+                .collect::<Vec<_>>(),
+            [
+                "loadmodule infotest.so argument",
+                "loadmodule datatype.so argument"
+            ]
+        );
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn rewrite_preserves_hidden_cluster_gossip_percentage() {

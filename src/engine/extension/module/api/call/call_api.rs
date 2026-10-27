@@ -8,7 +8,8 @@ use std::ffi::{CStr, CString};
 use super::super::super::{ValkeyModuleCtx, ValkeyModuleString, VALKEYMODULE_ERR, VALKEYMODULE_OK};
 use super::call_conn::ModuleCallConn;
 use super::call_reply::{
-    CallReplyKind, CallReplyNode, ValkeyModuleCallReply, ValkeyModule_FreeCallReply,
+    finish_call_reply, CallReplyKind, CallReplyNode, ValkeyModuleCallReply,
+    ValkeyModule_FreeCallReply,
 };
 use crate::engine::command::context::CommandConn;
 use crate::engine::command::{CommandArgs, CMD_DENYOOM, CMD_NOSCRIPT, CMD_STALE, CMD_WRITE};
@@ -102,6 +103,22 @@ pub unsafe extern "C" fn VM_CallWithReply(
     argc: c_int,
     flags: c_int,
 ) -> *mut ValkeyModuleCallReply {
+    // SAFETY: the internal implementation only borrows the caller's argv.
+    let reply = unsafe { call_with_reply(ctx, argv, argc, flags) };
+    if reply.is_null() {
+        return reply;
+    }
+    // SAFETY: every non-null internal result is a fresh owned root.
+    unsafe { finish_call_reply(ctx, Box::from_raw(reply)) }
+}
+
+// SAFETY: ctx and argv follow VM_CallWithReply's synchronous borrowed-input contract.
+unsafe fn call_with_reply(
+    ctx: *mut ValkeyModuleCtx,
+    argv: *mut *mut ValkeyModuleString,
+    argc: c_int,
+    flags: c_int,
+) -> *mut ValkeyModuleCallReply {
     if ctx.is_null() || argv.is_null() || argc < 1 {
         log::warn!("VM_CallWithReply: invalid args");
         return std::ptr::null_mut();
@@ -114,143 +131,155 @@ pub unsafe extern "C" fn VM_CallWithReply(
         log::warn!("VM_CallWithReply: no internal context");
         return std::ptr::null_mut();
     }
-    // SAFETY: internal belongs to ctx and its runtime handle remains active for
-    // this synchronous module invocation.
-    let Some(runtime) = (unsafe { runtime_from_opaque((*internal).runtime_handle) }) else {
-        log::warn!("VM_CallWithReply: no module runtime");
-        return std::ptr::null_mut();
-    };
+    // SAFETY: internal belongs to the live context for this synchronous invocation.
+    let runtime_handle = unsafe { (*internal).runtime_handle };
+    let (cmd_name_lower, spec, cmd_args, mut conn, reply) = {
+        // SAFETY: the live handle is exclusively accessed until this scope ends.
+        let Some(runtime) = (unsafe { runtime_from_opaque(runtime_handle) }) else {
+            log::warn!("VM_CallWithReply: no module runtime");
+            return std::ptr::null_mut();
+        };
 
-    // SAFETY: argc is positive and argv points to that many live module strings.
-    let cmd_name_bytes = unsafe { (**argv).as_bytes().to_vec() };
-    let cmd_name_lower: Vec<u8> = cmd_name_bytes
-        .iter()
-        .map(|&b| b.to_ascii_lowercase())
-        .collect();
+        // SAFETY: argc is positive and argv points to that many live module strings.
+        let cmd_name_bytes = unsafe { (**argv).as_bytes().to_vec() };
+        let cmd_name_lower: Vec<u8> = cmd_name_bytes
+            .iter()
+            .map(|&b| b.to_ascii_lowercase())
+            .collect();
 
-    let cmd_name_raw = String::from_utf8_lossy(&cmd_name_bytes).to_string();
+        let cmd_name_raw = String::from_utf8_lossy(&cmd_name_bytes).to_string();
 
-    let spec = match runtime.lookup_command(&cmd_name_lower) {
-        Some(s) => s,
-        None => {
+        let spec = match runtime.lookup_command(&cmd_name_lower) {
+            Some(s) => s,
+            None => {
+                return Box::into_raw(ValkeyModuleCallReply::from_value(
+                    &Value::error(format!(
+                        "ERR unknown command '{}', with args beginning with: ",
+                        cmd_name_raw
+                    )),
+                    false,
+                ));
+            }
+        };
+
+        let cmd_name_lower_str = String::from_utf8_lossy(&cmd_name_lower);
+        // SAFETY: argv contains argc live module-string pointers for this call.
+        let parts: Vec<Bytes> = unsafe {
+            (0..argc as usize)
+                .map(|i| Bytes::copy_from_slice((**argv.add(i)).as_bytes()))
+                .collect()
+        };
+        let cmd_args = CommandArgs::from_parts(parts);
+        if !valid_arity(spec.arity, cmd_args.args.len() as i32 + 1) {
             return Box::into_raw(ValkeyModuleCallReply::from_value(
                 &Value::error(format!(
-                    "ERR unknown command '{}', with args beginning with: ",
-                    cmd_name_raw
+                    "ERR wrong number of arguments for '{}' command",
+                    spec.name
                 )),
                 false,
             ));
         }
-    };
 
-    let cmd_name_lower_str = String::from_utf8_lossy(&cmd_name_lower);
-    // SAFETY: argv contains argc live module-string pointers for this call.
-    let parts: Vec<Bytes> = unsafe {
-        (0..argc as usize)
-            .map(|i| Bytes::copy_from_slice((**argv.add(i)).as_bytes()))
-            .collect()
-    };
-    let cmd_args = CommandArgs::from_parts(parts);
-    if !valid_arity(spec.arity, cmd_args.args.len() as i32 + 1) {
-        return Box::into_raw(ValkeyModuleCallReply::from_value(
-            &Value::error(format!(
-                "ERR wrong number of arguments for '{}' command",
-                spec.name
-            )),
-            false,
-        ));
-    }
-
-    if format.script_mode() && spec.flags & CMD_NOSCRIPT != 0 {
-        return Box::into_raw(ValkeyModuleCallReply::from_value(
-            &Value::error(format!(
-                "ERR command '{}' is not allowed on script mode",
-                cmd_name_lower_str
-            )),
-            false,
-        ));
-    }
-    if format.no_writes() && spec.flags & CMD_WRITE != 0 {
-        return Box::into_raw(ValkeyModuleCallReply::from_value(
-            &Value::error(format!(
-                "ERR Write command '{}' was called while write is not allowed.",
-                cmd_name_lower_str
-            )),
-            false,
-        ));
-    }
-    if format.script_mode() && runtime.is_stale_replica() && spec.flags & CMD_STALE == 0 {
-        return Box::into_raw(ValkeyModuleCallReply::from_value(
+        if format.script_mode() && spec.flags & CMD_NOSCRIPT != 0 {
+            return Box::into_raw(ValkeyModuleCallReply::from_value(
+                &Value::error(format!(
+                    "ERR command '{}' is not allowed on script mode",
+                    cmd_name_lower_str
+                )),
+                false,
+            ));
+        }
+        if format.no_writes() && spec.flags & CMD_WRITE != 0 {
+            return Box::into_raw(ValkeyModuleCallReply::from_value(
+                &Value::error(format!(
+                    "ERR Write command '{}' was called while write is not allowed.",
+                    cmd_name_lower_str
+                )),
+                false,
+            ));
+        }
+        if format.script_mode() && runtime.is_stale_replica() && spec.flags & CMD_STALE == 0 {
+            return Box::into_raw(ValkeyModuleCallReply::from_value(
             &Value::error(
                 "MASTERDOWN Link with MASTER is down and replica-serve-stale-data is set to 'no'.",
             ),
             false,
         ));
-    }
-    if format.script_mode()
-        && spec.flags & CMD_WRITE != 0
-        && !runtime.has_enough_replicas_to_write()
-    {
-        return Box::into_raw(ValkeyModuleCallReply::from_value(
-            &Value::error("NOREPLICAS Not enough good replicas to write."),
-            false,
-        ));
-    }
-    if format.script_mode() && spec.flags & CMD_WRITE != 0 && runtime.has_persistence_write_error()
-    {
-        return Box::into_raw(ValkeyModuleCallReply::from_value(
+        }
+        if format.script_mode()
+            && spec.flags & CMD_WRITE != 0
+            && !runtime.has_enough_replicas_to_write()
+        {
+            return Box::into_raw(ValkeyModuleCallReply::from_value(
+                &Value::error("NOREPLICAS Not enough good replicas to write."),
+                false,
+            ));
+        }
+        if format.script_mode()
+            && spec.flags & CMD_WRITE != 0
+            && runtime.has_persistence_write_error()
+        {
+            return Box::into_raw(ValkeyModuleCallReply::from_value(
             &Value::error(
                 "MISCONF Errors writing to the RDB file, writes are disabled because stop-writes-on-bgsave-error is enabled.",
             ),
             false,
         ));
-    }
-    if format.script_mode() && spec.flags & CMD_WRITE != 0 && runtime.is_readonly_replica() {
-        return Box::into_raw(ValkeyModuleCallReply::from_value(
-            &Value::error("READONLY You can't write against a read only replica."),
-            false,
-        ));
-    }
-    if format.respect_deny_oom() && spec.flags & CMD_DENYOOM != 0 && runtime.is_oom() {
-        return Box::into_raw(ValkeyModuleCallReply::from_value(
-            &Value::error("OOM command not allowed when used memory > 'maxmemory'."),
-            false,
-        ));
-    }
-    if format.run_as_user() {
-        if let Some(error) = runtime.module_acl_error(spec, &cmd_args) {
+        }
+        if format.script_mode() && spec.flags & CMD_WRITE != 0 && runtime.is_readonly_replica() {
             return Box::into_raw(ValkeyModuleCallReply::from_value(
-                &Value::error(error),
+                &Value::error("READONLY You can't write against a read only replica."),
                 false,
             ));
         }
-    }
-    if format.dry_run() {
-        return std::ptr::null_mut();
-    }
-
-    // SAFETY: internal was obtained from the validated live context above.
-    let (db_idx, client_resp) = unsafe { ((*internal).db_idx, (*internal).resp_version) };
-
-    let tracking = runtime.module_client_tracking();
-    let mut conn = ModuleCallConn::with_tracking(db_idx as u32, tracking);
-    conn.set_allow_oom(!format.respect_deny_oom());
-    conn.set_deny_blocking(!format.allow_block());
-    let response_version = format.response().version(client_resp as u8);
-    conn.set_resp_version(response_version);
-
-    let reply = runtime.execute_command(&cmd_name_lower, &mut conn, &cmd_args);
-    let monitor_argv = std::iter::once(cmd_args.name.clone())
-        .chain(cmd_args.args.iter().enumerate().map(|(index, argument)| {
-            if conn.is_redacted_command_argument(index + 1) {
-                Bytes::from_static(b"(redacted)")
-            } else {
-                argument.clone()
+        if format.respect_deny_oom() && spec.flags & CMD_DENYOOM != 0 && runtime.is_oom() {
+            return Box::into_raw(ValkeyModuleCallReply::from_value(
+                &Value::error("OOM command not allowed when used memory > 'maxmemory'."),
+                false,
+            ));
+        }
+        if format.run_as_user() {
+            if let Some(error) = runtime.module_acl_error(spec.clone(), &cmd_args) {
+                return Box::into_raw(ValkeyModuleCallReply::from_value(
+                    &Value::error(error),
+                    false,
+                ));
             }
-        }))
-        .collect();
-    let monitor_source = if format.script_mode() { "lua" } else { "" };
-    runtime.record_internal_monitor(spec, conn.selected_db(), monitor_source, monitor_argv);
+        }
+        if format.dry_run() {
+            return std::ptr::null_mut();
+        }
+
+        // SAFETY: internal was obtained from the validated live context above.
+        let (db_idx, client_resp) = unsafe { ((*internal).db_idx, (*internal).resp_version) };
+
+        let tracking = runtime.module_client_tracking();
+        let mut conn = ModuleCallConn::with_tracking(db_idx as u32, tracking);
+        conn.set_allow_oom(!format.respect_deny_oom());
+        conn.set_deny_blocking(!format.allow_block());
+        let response_version = format.response().version(client_resp as u8);
+        conn.set_resp_version(response_version);
+
+        let reply = runtime.execute_command(&cmd_name_lower, &mut conn, &cmd_args);
+        let monitor_argv = std::iter::once(cmd_args.name.clone())
+            .chain(cmd_args.args.iter().enumerate().map(|(index, argument)| {
+                if conn.is_redacted_command_argument(index + 1) {
+                    Bytes::from_static(b"(redacted)")
+                } else {
+                    argument.clone()
+                }
+            }))
+            .collect();
+        let monitor_source = if format.script_mode() { "lua" } else { "" };
+        runtime.record_internal_monitor(
+            spec.clone(),
+            conn.selected_db(),
+            monitor_source,
+            monitor_argv,
+        );
+        (cmd_name_lower, spec, cmd_args, conn, reply)
+    };
+
     if !IN_MODULE_NOTIFICATION.with(Cell::get) {
         let event = module_keyspace_event(&cmd_name_lower, &cmd_args, &reply);
         if let Some((event_type, event_name, key)) = event {
@@ -258,51 +287,44 @@ pub unsafe extern "C" fn VM_CallWithReply(
                 let key = Box::into_raw(ValkeyModuleString::from_bytes(key));
                 IN_MODULE_NOTIFICATION.with(|active| {
                     active.set(true);
-                    // SAFETY: the module context, registry scope, and key remain
-                    // live for the synchronous callback.
-                    unsafe {
-                        crate::engine::extension::module::api::active_registry::with_active_registry(
-                            |registry| {
-                                registry.notify_keyspace_event(
-                                    crate::engine::extension::module::api::ctx::get_module_name(ctx)
-                                        .as_str(),
-                                    event_type,
-                                    &event_name,
-                                    key,
-                                    ctx,
-                                );
-                            },
-                        );
-                    }
+                    // SAFETY: context and host key remain live throughout dispatch.
+                    unsafe { dispatch_keyspace_callbacks(ctx, event_type, &event_name, key) };
                     active.set(false);
                 });
                 // SAFETY: key was allocated immediately above and is no longer
                 // referenced after all callbacks return.
                 unsafe {
-                    let mut key = Box::from_raw(key);
-                    key.free();
+                    ValkeyModuleString::release(key);
                 }
             }
         }
     }
-    for (channel, message) in conn.take_pending_notifications() {
-        runtime.publish_module_message(channel, message, false);
-    }
-    for (channel, message) in conn.take_pending_shard_notifications() {
-        runtime.publish_module_message(channel, message, true);
-    }
+    {
+        // SAFETY: the first runtime borrow ended before notification dispatch, and
+        // all synchronous callbacks have returned before this exclusive reborrow.
+        let Some(runtime) = (unsafe { runtime_from_opaque(runtime_handle) }) else {
+            log::warn!("VM_CallWithReply: no module runtime");
+            return std::ptr::null_mut();
+        };
+        for (channel, message) in conn.take_pending_notifications() {
+            runtime.publish_module_message(channel, message, false);
+        }
+        for (channel, message) in conn.take_pending_shard_notifications() {
+            runtime.publish_module_message(channel, message, true);
+        }
 
-    if spec.flags & CMD_WRITE == 0 && spec.flags & crate::engine::command::CMD_READONLY != 0 {
-        let should_track = conn.tracking()
-            && !conn.tracking_bcast()
-            && (!conn.tracking_optin() || conn.tracking_caching())
-            && (!conn.tracking_optout() || !conn.tracking_caching());
-        conn.set_tracking_caching(false);
-        if should_track {
-            if let Some(keys) = spec.extract_keys(&cmd_args) {
-                let client_id = conn.token().0;
-                for key in keys {
-                    runtime.remember_module_tracked_key(client_id, &key);
+        if spec.flags & CMD_WRITE == 0 && spec.flags & crate::engine::command::CMD_READONLY != 0 {
+            let should_track = conn.tracking()
+                && !conn.tracking_bcast()
+                && (!conn.tracking_optin() || conn.tracking_caching())
+                && (!conn.tracking_optout() || !conn.tracking_caching());
+            conn.set_tracking_caching(false);
+            if should_track {
+                if let Some(keys) = spec.extract_keys(&cmd_args) {
+                    let client_id = conn.token().0;
+                    for key in keys {
+                        runtime.remember_module_tracked_key(client_id, &key);
+                    }
                 }
             }
         }
@@ -321,6 +343,59 @@ pub unsafe extern "C" fn VM_CallWithReply(
         format.reply_exact(),
         reply_is_resp3,
     ))
+}
+
+// SAFETY: source and key are live for all synchronous callbacks.
+unsafe fn dispatch_keyspace_callbacks(
+    source: *mut ValkeyModuleCtx,
+    event_type: c_int,
+    event: &CString,
+    key: *mut ValkeyModuleString,
+) {
+    use crate::engine::extension::module::{
+        create_module_cmd_ctx, create_module_ctx, free_module_ctx,
+    };
+    // SAFETY: source is a live context; preserve the existing per-module dispatch boundary.
+    let module_name = unsafe { super::super::ctx::get_module_name(source) };
+    let callbacks = super::super::active_registry::with_active_registry(|registry| {
+        registry.keyspace_callbacks(&module_name, event_type)
+    })
+    .unwrap_or_default();
+    // SAFETY: copy inherited state before invoking any reentrant module callback.
+    let (runtime_handle, db_idx, resp_version, getapi, username, module_options) = unsafe {
+        let internal = (*source).internal;
+        let username = if (*internal).username.is_null() {
+            CString::new("default").expect("static username has no NUL")
+        } else {
+            CStr::from_ptr((*internal).username).to_owned()
+        };
+        (
+            (*internal).runtime_handle,
+            (*internal).db_idx,
+            (*internal).resp_version,
+            (*source).getapifuncptr,
+            username,
+            (*internal).module_options.clone(),
+        )
+    };
+    for (name, module_ref, callback) in callbacks {
+        let mut internal = create_module_cmd_ctx(&name, "", module_ref, runtime_handle);
+        internal.module_options = module_options.clone();
+        internal.db_idx = db_idx;
+        internal.resp_version = resp_version;
+        // SAFETY: the constructor's username allocation is uniquely owned.
+        unsafe { drop(CString::from_raw(internal.username)) };
+        internal.username = username.clone().into_raw();
+        let ctx = Box::into_raw(create_module_ctx(Box::into_raw(internal)));
+        // SAFETY: ctx is uniquely owned; its scope starts with auto memory disabled.
+        unsafe { (*ctx).getapifuncptr = getapi };
+        {
+            let _context_scope = super::super::ActiveModuleContextScope::enter(ctx);
+            callback(ctx, event_type, event.as_ptr(), key);
+        }
+        // SAFETY: callback returned; collect its independent scope before freeing ctx.
+        unsafe { free_module_ctx(ctx) };
+    }
 }
 
 fn valid_arity(arity: i32, argc: i32) -> bool {

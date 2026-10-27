@@ -40,6 +40,11 @@ impl ServerWorkerState {
             connection
                 .client_memory_usage_with_pending_replies(pending_replies)
                 .total
+                .saturating_add(
+                    self.ctx
+                        .pubsub()
+                        .client_name_memory_usage(connection.token().0),
+                )
         }
     }
 

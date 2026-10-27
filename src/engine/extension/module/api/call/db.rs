@@ -69,7 +69,7 @@ pub unsafe extern "C" fn ValkeyModule_RandomKey(
         let Some(key) = db.random_key().map(<[u8]>::to_vec) else {
             return std::ptr::null_mut();
         };
-        Box::into_raw(ValkeyModuleString::from_bytes(&key))
+        super::super::super::auto_memory::create_auto_string(ctx, &key)
     }
 }
 
@@ -162,7 +162,7 @@ mod tests {
 
         fn register_module_command(
             &mut self,
-            _name: &'static str,
+            _name: &str,
             _arity: i32,
             _flags: CmdFlags,
             _first_key: i32,

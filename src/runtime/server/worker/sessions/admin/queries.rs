@@ -36,6 +36,7 @@ fn format_client_list_line(
     client_infos: &mut std::collections::HashMap<usize, crate::engine::state::db::ClientInfo>,
     is_replica: bool,
     is_master_link: bool,
+    pubsub_name_memory: usize,
 ) -> String {
     let age_secs = now.duration_since(conn.create_time).as_secs();
     let idle_ms = now.duration_since(conn.last_interaction).as_millis() as u64;
@@ -90,7 +91,7 @@ fn format_client_list_line(
         rbs,
         conn.pending_output_list_len(),
         memory.output,
-        memory.total,
+        memory.total.saturating_add(pubsub_name_memory),
         cmd_str,
         conn.resp_version,
         conn.lib_name,
@@ -171,6 +172,7 @@ impl ServerWorkerState {
             let tok = conn.token().0;
             let is_replica = self.is_replica_connection(tok);
             let is_master_link = self.is_master_link(tok);
+            let pubsub_name_memory = self.ctx.pubsub().client_name_memory_usage(tok);
             let line = format_client_list_line(
                 conn,
                 now,
@@ -178,6 +180,7 @@ impl ServerWorkerState {
                 self.ctx.client_infos_mut(),
                 is_replica,
                 is_master_link,
+                pubsub_name_memory,
             );
             out.push_str(&line);
         }

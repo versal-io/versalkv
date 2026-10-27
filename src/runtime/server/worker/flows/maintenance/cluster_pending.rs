@@ -656,6 +656,64 @@ mod tests {
     }
 
     #[test]
+    fn expired_retry_marked_handshake_replaces_identity_and_sends_meet() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut backend = ServerWorkerState::new(1).unwrap();
+        backend.ctx.config_mut().server.cluster_enabled = true;
+        backend.ctx.config_mut().server.cluster_node_timeout = 1;
+        let mut state = ClusterState::new("127.0.0.1", 6379, 16379);
+        let now_ms = crate::foundation::io::sys::time::mstime();
+        let old_id = state.ensure_handshake_node(
+            &addr.ip().to_string(),
+            6381,
+            addr.port(),
+            now_ms.saturating_sub(1_001),
+        );
+        state.mark_handshake_retry(&old_id);
+        let handle = backend.transport.connect_tcp(addr).unwrap();
+        let (mut old_peer, _) = listener.accept().unwrap();
+        old_peer
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        backend
+            .cluster_bus
+            .register_outgoing_for_handshake(handle.token, addr, old_id.clone());
+        *backend.ctx.cluster_state_mut() = Some(Box::new(state));
+
+        backend.run_cluster_cron();
+
+        let state = backend.ctx.cluster_state().as_ref().unwrap();
+        assert!(!state.nodes.contains_key(&old_id));
+        assert_eq!(old_peer.read(&mut [0u8; 1]).unwrap(), 0);
+        assert!(state.pending_connects.is_empty());
+        assert_eq!(backend.cluster_bus.connections.len(), 1);
+        let connection = backend.cluster_bus.connections.values().next().unwrap();
+        let bytes = queued_or_sent_bus_bytes(&listener, &connection.write_buf);
+        let (message, _) =
+            crate::engine::distributed::cluster::msg::ClusterBusMessage::decode(&bytes).unwrap();
+        assert_eq!(
+            message.msg_type,
+            crate::engine::distributed::cluster::msg::ClusterMsgType::Meet
+        );
+        assert!(connection.node_name.is_empty());
+        assert!(!connection.handshake_node_name.is_empty());
+        assert_ne!(connection.handshake_node_name, old_id);
+        assert!(connection.send_meet);
+        assert!(connection.meet_sent_at >= now_ms);
+        assert_eq!(connection.addr, addr);
+        let replacement = &state.nodes[&connection.handshake_node_name];
+        assert!(
+            replacement.has_flag(crate::engine::distributed::cluster::node::CLUSTER_NODE_HANDSHAKE)
+        );
+        assert!(replacement.handshake_retry_on_timeout);
+        assert_eq!(replacement.ip(), addr.ip().to_string());
+        assert_eq!(replacement.port(), 6381);
+        assert_eq!(replacement.cport(), addr.port());
+        assert!(replacement.created_at >= now_ms);
+    }
+
+    #[test]
     fn explicit_meet_queues_its_first_bus_frame_without_waiting_for_writable_edge() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();

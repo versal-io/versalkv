@@ -73,9 +73,9 @@ pub(crate) struct DispatchOutcome {
     pub reject_reply: Option<Value>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct CmdPreconditions {
-    pub name: &'static str,
+    pub name: crate::engine::command::CommandName,
     pub arity: i32,
     pub flags: u64,
     pub first_key: i32,

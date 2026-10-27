@@ -23,6 +23,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -120,6 +121,35 @@ extern int VM_ReplyWithDoubleValue(ValkeyModuleCtx* ctx, double value);
 extern const char* VM_StringPtrLenForShim(
     const ValkeyModuleString* str,
     size_t* len);
+extern void VM_StringIncrRefForShim(ValkeyModuleString* str);
+extern void VM_StringReleaseForShim(ValkeyModuleString* str);
+
+static void release_argv(ValkeyModuleString** argv, int count) {
+    for (int index = 0; index < count; index++) {
+        VM_StringReleaseForShim(argv[index]);
+    }
+}
+
+static int reserve_argv(
+    ValkeyModuleString*** argv,
+    ValkeyModuleString** stack,
+    int* capacity,
+    int count,
+    size_t extra)
+{
+    if (extra > (size_t)(INT_MAX - count - 16)) return 0;
+    int needed = count + (int)extra;
+    if (needed <= *capacity) return 1;
+    int new_capacity = needed + 16;
+    if ((size_t)new_capacity > SIZE_MAX / sizeof(**argv)) return 0;
+    ValkeyModuleString** grown = realloc(
+        *argv == stack ? NULL : *argv, (size_t)new_capacity * sizeof(**argv));
+    if (grown == NULL) return 0;
+    if (*argv == stack) memcpy(grown, stack, (size_t)count * sizeof(**argv));
+    *argv = grown;
+    *capacity = new_capacity;
+    return 1;
+}
 
 // ============================================================================
 // VM_Call (variadic) — format-string based command invocation
@@ -138,20 +168,13 @@ ValkeyModuleCallReply* VM_Call(
     va_list ap;
     va_start(ap, fmt);
 
-    // First pass: count arguments and compute flags.
-    // We don't count 'v' (vector) since we don't know its length yet;
-    // the second pass will realloc argv as needed.
-    int argc = 1;  // argv[0] = command name
+    // Compute flags before building argv; capacity grows for every argument slot.
     int flags = 0;
     const char* p = fmt;
     while (*p) {
         switch (*p) {
             // Argument type specifiers (lowercase) — consume va_args
-            case 'c': argc++; break;
-            case 's': argc++; break;
-            case 'l': argc++; break;
-            case 'b': argc++; break;
-            case 'v': break;  // length unknown, handled dynamically in pass 2
+            case 'c': case 's': case 'l': case 'b': case 'v': break;
             // Flag characters (uppercase / !) — set flags, no va_args consumed
             case '!': flags |= FLAG_REPLICATE; break;
             case 'A': flags |= FLAG_NO_AOF; break;
@@ -179,32 +202,26 @@ ValkeyModuleCallReply* VM_Call(
     ValkeyModuleString** argv = argv_stack;
     int argv_cap = 128;
 
-    if (argc > 128) {
-        argv_cap = argc + 8;
-        argv = (ValkeyModuleString**)malloc(sizeof(ValkeyModuleString*) * (size_t)argv_cap);
-        if (argv == NULL) {
-            va_end(ap);
-            return NULL;
-        }
-    }
-
     int idx = 0;
-    argv[idx++] = VM_CreateString(ctx, cmdname, strlen(cmdname));
+    argv[idx++] = VM_CreateString(NULL, cmdname, strlen(cmdname));
     p = fmt;
     while (*p) {
+        if (!reserve_argv(&argv, argv_stack, &argv_cap, idx, 1)) goto call_build_failed;
         switch (*p) {
             case 'c': {
                 const char* s = va_arg(ap, const char*);
                 if (s != NULL) {
-                    argv[idx] = VM_CreateString(ctx, s, strlen(s));
+                    argv[idx] = VM_CreateString(NULL, s, strlen(s));
                 } else {
-                    argv[idx] = VM_CreateString(ctx, "", 0);
+                    argv[idx] = VM_CreateString(NULL, "", 0);
                 }
                 idx++;
                 break;
             }
             case 's': {
                 ValkeyModuleString* ms = va_arg(ap, ValkeyModuleString*);
+                if (ms == NULL) goto call_build_failed;
+                VM_StringIncrRefForShim(ms);
                 argv[idx++] = ms;
                 break;
             }
@@ -212,36 +229,23 @@ ValkeyModuleCallReply* VM_Call(
                 long long val = va_arg(ap, long long);
                 char buf[32];
                 int n = snprintf(buf, sizeof(buf), "%lld", val);
-                argv[idx++] = VM_CreateString(ctx, buf, (size_t)n);
+                argv[idx++] = VM_CreateString(NULL, buf, (size_t)n);
                 break;
             }
             case 'b': {
                 const char* data = va_arg(ap, const char*);
                 size_t len = va_arg(ap, size_t);
-                argv[idx++] = VM_CreateString(ctx, data, len);
+                argv[idx++] = VM_CreateString(NULL, data, len);
                 break;
             }
             case 'v': {
                 ValkeyModuleString** arr = va_arg(ap, ValkeyModuleString**);
                 size_t count = va_arg(ap, size_t);
-                // Grow argv if needed
-                if (idx + (int)count > argv_cap) {
-                    int new_cap = idx + (int)count + 16;
-                    ValkeyModuleString** new_argv = (ValkeyModuleString**)realloc(
-                        argv == argv_stack ? NULL : argv,
-                        sizeof(ValkeyModuleString*) * (size_t)new_cap);
-                    if (new_argv == NULL) {
-                        va_end(ap);
-                        if (argv != argv_stack) free(argv);
-                        return NULL;
-                    }
-                    if (argv == argv_stack) {
-                        memcpy(new_argv, argv_stack, sizeof(ValkeyModuleString*) * (size_t)idx);
-                    }
-                    argv = new_argv;
-                    argv_cap = new_cap;
-                }
+                if ((arr == NULL && count != 0) ||
+                    !reserve_argv(&argv, argv_stack, &argv_cap, idx, count)) goto call_build_failed;
                 for (size_t i = 0; i < count; i++) {
+                    if (arr[i] == NULL) goto call_build_failed;
+                    VM_StringIncrRefForShim(arr[i]);
                     argv[idx++] = arr[i];
                 }
                 break;
@@ -252,7 +256,7 @@ ValkeyModuleCallReply* VM_Call(
             case 'D': case 'K': case 'X':
                 break;
             default:
-                break;
+                goto call_build_failed;
         }
         p++;
     }
@@ -262,17 +266,19 @@ ValkeyModuleCallReply* VM_Call(
     // Call the Rust implementation
     ValkeyModuleCallReply* reply = VM_CallWithReply(ctx, argv, idx, flags);
 
-    // Free strings we allocated for argv (skip cmdname at [0], skip 's' type which
-    // is owned by the module). We only free strings created by 'c', 'l', 'b', 'v' copies.
-    // However 's' and 'v' elements are borrowed from the module, so we must not free them.
-    // For simplicity, we don't free individual strings here — the Rust side's
-    // AutoMemory will handle cleanup, or the module uses FreeString.
-    // We only need to free the heap-allocated argv array itself.
+    release_argv(argv, idx);
     if (argv != argv_stack) {
         free(argv);
     }
 
     return reply;
+
+call_build_failed:
+    va_end(ap);
+    release_argv(argv, idx);
+    if (argv != argv_stack) free(argv);
+    errno = EINVAL;
+    return NULL;
 }
 
 // ============================================================================
@@ -292,48 +298,27 @@ int VM_Replicate(
     va_list ap;
     va_start(ap, fmt);
 
-    int argc = 1;
     const char* p = fmt;
-    while (*p) {
-        switch (*p) {
-            case 'c': argc++; break;
-            case 's': argc++; break;
-            case 'l': argc++; break;
-            case 'b': argc++; break;
-            case 'v': break;
-            default: break;
-        }
-        p++;
-    }
-
-    va_end(ap);
-    va_start(ap, fmt);
 
     ValkeyModuleString* argv_stack[128];
     ValkeyModuleString** argv = argv_stack;
     int argv_cap = 128;
 
-    if (argc > 128) {
-        argv_cap = argc + 8;
-        argv = (ValkeyModuleString**)malloc(sizeof(ValkeyModuleString*) * (size_t)argv_cap);
-        if (argv == NULL) {
-            va_end(ap);
-            return 1;
-        }
-    }
-
     int idx = 0;
-    argv[idx++] = VM_CreateString(ctx, cmdname, strlen(cmdname));
+    argv[idx++] = VM_CreateString(NULL, cmdname, strlen(cmdname));
     p = fmt;
     while (*p) {
+        if (!reserve_argv(&argv, argv_stack, &argv_cap, idx, 1)) goto replicate_build_failed;
         switch (*p) {
             case 'c': {
                 const char* s = va_arg(ap, const char*);
-                argv[idx++] = VM_CreateString(ctx, s != NULL ? s : "", s != NULL ? strlen(s) : 0);
+                argv[idx++] = VM_CreateString(NULL, s != NULL ? s : "", s != NULL ? strlen(s) : 0);
                 break;
             }
             case 's': {
                 ValkeyModuleString* ms = va_arg(ap, ValkeyModuleString*);
+                if (ms == NULL) goto replicate_build_failed;
+                VM_StringIncrRefForShim(ms);
                 argv[idx++] = ms;
                 break;
             }
@@ -341,41 +326,33 @@ int VM_Replicate(
                 long long val = va_arg(ap, long long);
                 char buf[32];
                 int n = snprintf(buf, sizeof(buf), "%lld", val);
-                argv[idx++] = VM_CreateString(ctx, buf, (size_t)n);
+                argv[idx++] = VM_CreateString(NULL, buf, (size_t)n);
                 break;
             }
             case 'b': {
                 const char* data = va_arg(ap, const char*);
                 size_t len = va_arg(ap, size_t);
-                argv[idx++] = VM_CreateString(ctx, data, len);
+                argv[idx++] = VM_CreateString(NULL, data, len);
                 break;
             }
             case 'v': {
                 ValkeyModuleString** arr = va_arg(ap, ValkeyModuleString**);
                 size_t count = va_arg(ap, size_t);
-                if (idx + (int)count > argv_cap) {
-                    int new_cap = idx + (int)count + 16;
-                    ValkeyModuleString** new_argv = (ValkeyModuleString**)realloc(
-                        argv == argv_stack ? NULL : argv,
-                        sizeof(ValkeyModuleString*) * (size_t)new_cap);
-                    if (new_argv == NULL) {
-                        va_end(ap);
-                        if (argv != argv_stack) free(argv);
-                        return 1;
-                    }
-                    if (argv == argv_stack) {
-                        memcpy(new_argv, argv_stack, sizeof(ValkeyModuleString*) * (size_t)idx);
-                    }
-                    argv = new_argv;
-                    argv_cap = new_cap;
-                }
+                if ((arr == NULL && count != 0) ||
+                    !reserve_argv(&argv, argv_stack, &argv_cap, idx, count)) goto replicate_build_failed;
                 for (size_t i = 0; i < count; i++) {
+                    if (arr[i] == NULL) goto replicate_build_failed;
+                    VM_StringIncrRefForShim(arr[i]);
                     argv[idx++] = arr[i];
                 }
                 break;
             }
-            default:
+            case '!': case 'A': case 'R': case '3': case '0':
+            case 'C': case 'S': case 'W': case 'E': case 'M':
+            case 'D': case 'K': case 'X':
                 break;
+            default:
+                goto replicate_build_failed;
         }
         p++;
     }
@@ -383,10 +360,18 @@ int VM_Replicate(
     va_end(ap);
 
     int ret = VM_ReplicateCommand(ctx, argv, idx);
+    release_argv(argv, idx);
     if (argv != argv_stack) {
         free(argv);
     }
     return ret;
+
+replicate_build_failed:
+    va_end(ap);
+    release_argv(argv, idx);
+    if (argv != argv_stack) free(argv);
+    errno = EINVAL;
+    return 1;
 }
 
 // ============================================================================

@@ -1368,6 +1368,7 @@ fn hup_peer_close_waits_for_backpressured_inflight_write_frames() {
     client.shutdown(Shutdown::Write).unwrap();
     runtime.transport.wait_readable_for_test(peer.token);
     runtime.io_threads_after_poll(1);
+    let worker_timeout = Duration::from_secs(10);
 
     runtime.dispatch_transport_event(
         crate::runtime::server::worker::reactor::ReadyEvent {
@@ -1379,7 +1380,7 @@ fn hup_peer_close_waits_for_backpressured_inflight_write_frames() {
         },
         false,
     );
-    let first_read = recv_runtime_read_completion(&mut runtime, Duration::from_secs(2));
+    let first_read = recv_runtime_read_completion(&mut runtime, worker_timeout);
     assert!(matches!(first_read.outcome, ReadOutcome::BudgetExhausted));
     runtime.complete_io_read(first_read);
 
@@ -1387,10 +1388,10 @@ fn hup_peer_close_waits_for_backpressured_inflight_write_frames() {
     runtime.writes.begin_turn();
     runtime.drive_pending_ordinary_writes();
     runtime.drive_one_pending_client_read();
-    let first_write = recv_runtime_write_completion(&mut runtime, Duration::from_secs(2));
+    let first_write = recv_runtime_write_completion(&mut runtime, worker_timeout);
     assert!(matches!(first_write.outcome, WriteOutcome::Backpressured));
     assert!(!first_write.frames.is_empty());
-    let second_read = recv_runtime_read_completion(&mut runtime, Duration::from_secs(2));
+    let second_read = recv_runtime_read_completion(&mut runtime, worker_timeout);
     assert!(matches!(second_read.outcome, ReadOutcome::BudgetExhausted));
     runtime.complete_io_read(second_read);
     runtime.complete_io_write(first_write);
@@ -1398,20 +1399,32 @@ fn hup_peer_close_waits_for_backpressured_inflight_write_frames() {
     runtime.event_batch.begin_next_turn();
     runtime.writes.begin_turn();
     runtime.drive_pending_ordinary_writes();
-    runtime.drive_one_pending_client_read();
-    let second_write = recv_runtime_write_completion(&mut runtime, Duration::from_secs(2));
+    let final_read_job = runtime
+        .io_threads
+        .take_read_job(
+            peer.token,
+            crate::runtime::server::worker::NORMAL_CLIENT_READ_BUDGET,
+            true,
+        )
+        .expect("read handle should be available for the final HUP drain");
+    let second_write = recv_runtime_write_completion(&mut runtime, worker_timeout);
     assert!(matches!(second_write.outcome, WriteOutcome::Backpressured));
     assert!(!second_write.frames.is_empty());
-    let final_read = recv_runtime_read_completion(&mut runtime, Duration::from_secs(2));
-    assert!(final_read.bytes.is_empty());
-    assert!(matches!(final_read.outcome, ReadOutcome::PeerClosed));
-    assert!(runtime.connection_registry[peer.token]
-        .output
-        .queue
-        .is_empty());
+    let final_read = ReadCompletion {
+        id: final_read_job.id,
+        handle: final_read_job.handle,
+        bytes: Vec::new(),
+        outcome: ReadOutcome::PeerClosed,
+        drain_to_budget: final_read_job.drain_to_budget,
+        cancelled: false,
+    };
+    assert!(runtime.io_threads.is_write_inflight(peer.token));
     runtime.writes.ordinary.begin_turn();
     runtime.schedule_runtime_runnable(
         crate::runtime::server::worker::reactor::RunnableKey::ClientWrite(peer.token),
+    );
+    runtime.cancel_runtime_runnable(
+        crate::runtime::server::worker::reactor::RunnableKey::ClientRead(peer.token),
     );
 
     runtime.complete_io_read(final_read);

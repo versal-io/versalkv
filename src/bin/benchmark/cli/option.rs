@@ -289,9 +289,9 @@ const VALKEY_OPTIONS: &[OptionSpec] = &[
             parse_number(n, v)?
         ))))
     }),
-    OptionSpec::value("-r", false, |n, v| {
+    OptionSpec::value("-r", false, |_, v| {
         Ok(valkey!(ValkeyOption::Load(ValkeyLoadOption::Keyspace(
-            parse_number(n, v)?
+            parse_keyspace(v)?
         ))))
     }),
     OptionSpec::value("--dbnum", false, |n, v| {
@@ -651,6 +651,27 @@ where
     value
         .parse()
         .map_err(|_| format!("Invalid value for {option}: {value}"))
+}
+
+fn parse_keyspace(value: &str) -> Result<u64, String> {
+    let number = value.trim_start_matches([' ', '\t', '\n', '\r', '\x0b', '\x0c']);
+    let digits = number
+        .strip_prefix('+')
+        .or_else(|| number.strip_prefix('-'))
+        .unwrap_or(number);
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(format!(
+            "Invalid value for -r: '{value}' is not a valid number"
+        ));
+    }
+    number
+        .parse::<i64>()
+        .ok()
+        .filter(|number| (0..=999_999_999_999).contains(number))
+        .map(|number| number as u64)
+        .ok_or_else(|| {
+            "Invalid value for -r: keyspacelen must be between 0 and 999999999999".to_string()
+        })
 }
 
 fn parse_tests(input: &str) -> Vec<String> {

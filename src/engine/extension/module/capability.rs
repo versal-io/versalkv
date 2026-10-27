@@ -87,7 +87,7 @@ pub trait ModuleRuntime {
     ) -> Value;
     fn register_module_command(
         &mut self,
-        name: &'static str,
+        name: &str,
         arity: i32,
         flags: CmdFlags,
         first_key: i32,
@@ -306,7 +306,7 @@ mod tests {
 
         fn lookup_command(&self, _name: &[u8]) -> Option<CommandDescriptor> {
             Some(CommandDescriptor {
-                name: "ping",
+                name: crate::engine::command::CommandName::Static("ping"),
                 arity: 1,
                 flags: 0,
                 first_key: 0,
@@ -329,7 +329,7 @@ mod tests {
 
         fn register_module_command(
             &mut self,
-            _name: &'static str,
+            _name: &str,
             _arity: i32,
             _flags: CmdFlags,
             _first_key: i32,
@@ -394,7 +394,7 @@ mod tests {
                 crate::foundation::io::store::Robj::string("value"),
             );
             let descriptor = capability.lookup_command(b"PING").unwrap();
-            assert_eq!(descriptor.name, "ping");
+            assert_eq!(descriptor.name.as_str(), "ping");
             let mut conn =
                 crate::engine::extension::module::api::call::call_conn::ModuleCallConn::new(1);
             let args = CommandArgs::from_parts(vec![bytes::Bytes::from_static(b"PING")]);

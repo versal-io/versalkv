@@ -1330,9 +1330,8 @@ impl ClusterState {
     ) -> Vec<String> {
         use crate::engine::distributed::cluster::node::CLUSTER_NODE_HANDSHAKE;
 
-        // Keep handshake expiry aligned with the configured cluster timeout so
-        // failover stress tests can intentionally drive near-immediate retries.
-        let timeout_ms = node_timeout_ms.max(1).min(i64::MAX as u64) as i64;
+        // Match C getHandshakeTimeout without changing normal failure detection.
+        let timeout_ms = node_timeout_ms.max(1_000).min(i64::MAX as u64) as i64;
         self.handshake_cooldowns.retain(|_, until| *until > now_ms);
         let expired: Vec<String> = self
             .nodes
@@ -1349,12 +1348,17 @@ impl ClusterState {
                 let endpoint = (node.ip().to_string(), node.port(), node.cport());
                 self.handshake_cooldowns
                     .insert(endpoint, now_ms.saturating_add(timeout_ms));
-                // Both sides may need one reciprocal MEET after an
-                // inconsistent handshake expires. The cooldown prevents a
-                // stale packet from recreating the temporary handshake before
-                // this retry is processed.
-                let retry = (node.ip().to_string(), node.cport(), true);
-                self.queue_connect_once(retry);
+                // Only a retry-marked outbound MEET may restart anonymously.
+                // Inbound placeholders expire without creating reciprocal MEETs.
+                if node.handshake_retry_on_timeout {
+                    // Keep the full endpoint on a fresh temporary identity so
+                    // pending connects can register a MEET handshake.
+                    let handshake_id =
+                        self.ensure_handshake_node(node.ip(), node.port(), node.cport(), now_ms);
+                    self.mark_handshake_retry(&handshake_id);
+                    let retry = (node.ip().to_string(), node.cport(), true);
+                    self.queue_connect_once(retry);
+                }
             }
             self.observe_link_close(node_id, ClusterLinkDirection::All);
         }
@@ -1691,23 +1695,24 @@ mod tests {
     }
 
     #[test]
-    fn expired_handshake_nodes_follow_configured_timeout() {
-        use crate::engine::distributed::cluster::node::{
-            ClusterNode, CLUSTER_NODE_HANDSHAKE, CLUSTER_NODE_MYSELF,
-        };
+    fn expired_handshake_nodes_use_at_least_one_second() {
+        use crate::engine::distributed::cluster::link::{ClusterLinkView, LinkEvents};
+        use crate::engine::distributed::cluster::NodeId;
 
         let mut state = ClusterState::new("127.0.0.1", 6379, 16379);
-        let mut handshake = ClusterNode::new(
-            "handshake".to_string(),
-            "127.0.0.1".to_string(),
-            6380,
-            16380,
-            true,
-        );
-        handshake.flags &= !CLUSTER_NODE_MYSELF;
-        handshake.flags |= CLUSTER_NODE_HANDSHAKE;
-        handshake.created_at = 1_000;
-        state.nodes.insert(handshake.name.clone(), handshake);
+        let handshake_id = state.ensure_handshake_node("127.0.0.1", 6380, 16380, 1_000);
+        for direction in [ClusterLinkDirection::To, ClusterLinkDirection::From] {
+            state.observe_link_open(
+                ClusterLinkView::new(
+                    NodeId::parse(handshake_id.as_bytes()).unwrap(),
+                    direction,
+                    1_000,
+                    LinkEvents::READABLE,
+                )
+                .with_temporary_handshake(true),
+            );
+        }
+        assert_eq!(state.link_views().count(), 2);
 
         assert_eq!(
             state.expire_handshake_nodes(1_500, 500),
@@ -1715,17 +1720,24 @@ mod tests {
         );
         assert_eq!(
             state.expire_handshake_nodes(1_501, 500),
-            vec!["handshake".to_string()]
+            Vec::<String>::new()
         );
-        assert!(!state.nodes.contains_key("handshake"));
         assert_eq!(
-            state.pending_connects,
-            vec![("127.0.0.1".to_string(), 16380, true)]
+            state.expire_handshake_nodes(2_000, 500),
+            Vec::<String>::new()
         );
+        assert_eq!(state.link_views().count(), 2);
+        assert_eq!(
+            state.expire_handshake_nodes(2_001, 500),
+            vec![handshake_id.clone()]
+        );
+        assert!(!state.nodes.contains_key(&handshake_id));
+        assert!(state.pending_connects.is_empty());
+        assert_eq!(state.link_views().count(), 0);
     }
 
     #[test]
-    fn expired_gossip_handshake_schedules_reciprocal_meet() {
+    fn expired_retry_marked_handshake_schedules_reciprocal_meet() {
         use crate::engine::distributed::cluster::node::{
             ClusterNode, CLUSTER_NODE_HANDSHAKE, CLUSTER_NODE_MYSELF,
         };
@@ -1745,7 +1757,7 @@ mod tests {
         state.nodes.insert(handshake.name.clone(), handshake);
 
         assert_eq!(
-            state.expire_handshake_nodes(1_501, 500),
+            state.expire_handshake_nodes(2_001, 500),
             vec!["handshake".to_string()]
         );
         assert_eq!(
@@ -1755,7 +1767,7 @@ mod tests {
     }
 
     #[test]
-    fn gossip_discovered_handshake_uses_timeout_window_and_retry() {
+    fn retry_marked_handshake_uses_configured_timeout_above_one_second() {
         use crate::engine::distributed::cluster::node::{
             ClusterNode, CLUSTER_NODE_HANDSHAKE, CLUSTER_NODE_MYSELF,
         };
@@ -1775,11 +1787,11 @@ mod tests {
         state.nodes.insert(handshake.name.clone(), handshake);
 
         assert_eq!(
-            state.expire_handshake_nodes(2_500, 500),
+            state.expire_handshake_nodes(6_000, 4_000),
             Vec::<String>::new()
         );
         assert_eq!(
-            state.expire_handshake_nodes(2_501, 500),
+            state.expire_handshake_nodes(6_001, 4_000),
             vec!["gossip-handshake".to_string()]
         );
         assert_eq!(
@@ -1789,28 +1801,64 @@ mod tests {
     }
 
     #[test]
-    fn zero_timeout_expires_handshake_on_next_tick() {
-        use crate::engine::distributed::cluster::node::{
-            ClusterNode, CLUSTER_NODE_HANDSHAKE, CLUSTER_NODE_MYSELF,
-        };
+    fn zero_and_one_ms_timeouts_keep_handshake_for_one_second() {
+        for timeout_ms in [0, 1] {
+            let mut state = ClusterState::new("127.0.0.1", 6379, 16379);
+            let handshake_id = state.ensure_handshake_node("127.0.0.1", 6380, 16380, 1_000);
+
+            for now_ms in [1_001, 1_002, 1_999, 2_000] {
+                assert!(
+                    state.expire_handshake_nodes(now_ms, timeout_ms).is_empty(),
+                    "timeout={timeout_ms}, now={now_ms}"
+                );
+                assert!(state.nodes.contains_key(&handshake_id));
+            }
+            assert_eq!(
+                state.expire_handshake_nodes(2_001, timeout_ms),
+                vec![handshake_id]
+            );
+            assert!(state.pending_connects.is_empty());
+        }
+    }
+
+    #[test]
+    fn anonymous_handshake_expiry_does_not_queue_meet() {
+        let mut state = ClusterState::new("127.0.0.1", 6379, 16379);
+        let handshake_id = state.ensure_handshake_node("127.0.0.1", 6380, 16380, 1_000);
+        assert!(!state.nodes[&handshake_id].handshake_retry_on_timeout);
+
+        assert_eq!(
+            state.expire_handshake_nodes(2_001, 1_000),
+            vec![handshake_id]
+        );
+        assert!(state.pending_connects.is_empty());
+        assert!(state.expire_handshake_nodes(3_002, 1_000).is_empty());
+        assert!(state.pending_connects.is_empty());
+    }
+
+    #[test]
+    fn handshake_window_does_not_delay_normal_node_failure_detection() {
+        use crate::engine::distributed::cluster::node::CLUSTER_NODE_MYSELF;
 
         let mut state = ClusterState::new("127.0.0.1", 6379, 16379);
-        let mut handshake = ClusterNode::new(
-            "handshake".to_string(),
+        let mut peer = ClusterNode::new(
+            "peer".to_string(),
             "127.0.0.1".to_string(),
             6380,
             16380,
             true,
         );
-        handshake.flags &= !CLUSTER_NODE_MYSELF;
-        handshake.flags |= CLUSTER_NODE_HANDSHAKE;
-        handshake.created_at = 1_000;
-        state.nodes.insert(handshake.name.clone(), handshake);
+        peer.flags &= !CLUSTER_NODE_MYSELF;
+        peer.ping_sent = 1_000;
+        state.nodes.insert(peer.name.clone(), peer);
 
-        assert_eq!(state.expire_handshake_nodes(1_001, 0), Vec::<String>::new());
         assert_eq!(
-            state.expire_handshake_nodes(1_002, 0),
-            vec!["handshake".to_string()]
+            state.observe_node_failure_timeout("peer", 1_001, 1_000, 1),
+            Some((false, false, false))
+        );
+        assert_eq!(
+            state.observe_node_failure_timeout("peer", 1_002, 1_000, 1),
+            Some((true, true, true))
         );
     }
 }

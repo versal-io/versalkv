@@ -8,7 +8,7 @@ fn has_keys_via_subcommand(spec: &crate::framework::CommandSpec) -> bool {
     if spec.get_keys.is_some() {
         return true;
     }
-    let cmd_name = spec.name.to_ascii_lowercase();
+    let cmd_name = spec.name.as_str().to_ascii_lowercase();
     SUBCOMMAND_NAMES
         .iter()
         .any(|n| n.starts_with(&format!("{}|", cmd_name)))
@@ -16,7 +16,7 @@ fn has_keys_via_subcommand(spec: &crate::framework::CommandSpec) -> bool {
 
 fn has_module_keys(spec: &crate::framework::CommandSpec, ctx: &ServerContext) -> bool {
     ctx.module_registry()
-        .lookup_cmd_func(spec.name)
+        .lookup_cmd_func(spec.name.as_str())
         .and_then(|entry| entry.info.as_ref())
         .is_some_and(|info| {
             !info.key_specs.is_empty() || info.legacy_keys.is_some_and(|(first, _, _)| first > 0)
@@ -104,7 +104,7 @@ pub(crate) fn extract_command_keys<'a>(
     };
     if let Some(info) = ctx
         .module_registry()
-        .lookup_cmd_func(spec.name)
+        .lookup_cmd_func(spec.name.as_str())
         .and_then(|entry| entry.info.as_ref())
     {
         return extract_module_keys(info, key_args);

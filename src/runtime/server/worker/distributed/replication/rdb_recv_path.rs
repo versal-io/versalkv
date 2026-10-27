@@ -583,6 +583,12 @@ impl ServerWorkerState {
             self.reset_downstream_after_full_sync(link.connection_id());
         }
         self.ctx.config_mut().replication.master_link_status = "sync".to_string();
+        if disk_backed {
+            crate::server_log!(
+                notice,
+                "PRIMARY <-> REPLICA sync: receiving streamed RDB from primary for persistence to disk (buffering in memory; delayed installation after transfer completes)"
+            );
+        }
         crate::server_log!(notice, "PRIMARY <-> REPLICA sync: Loading DB in memory");
         if swapdb || disk_backed {
             let temp = self.ctx.dbs().empty_like();

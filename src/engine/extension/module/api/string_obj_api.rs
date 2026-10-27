@@ -2,72 +2,72 @@
 
 use libc::{c_char, c_double, c_int, c_longlong, c_ulonglong, size_t};
 
+use super::super::auto_memory::{create_auto_string, internal_owner, remove_string};
 use super::super::{ValkeyModuleCtx, ValkeyModuleString, VALKEYMODULE_ERR, VALKEYMODULE_OK};
 
 // SAFETY: Called by C module code; ctx is a valid ValkeyModuleCtx pointer, ptr is a valid buffer of len bytes (or null/empty, which is handled)
 #[export_name = "VM_CreateString"]
 pub unsafe extern "C" fn ValkeyModule_CreateString(
-    _ctx: *mut ValkeyModuleCtx,
+    ctx: *mut ValkeyModuleCtx,
     ptr: *const c_char,
     len: size_t,
 ) -> *mut ValkeyModuleString {
     unsafe {
         log::trace!("ValkeyModule_CreateString(len={}) called", len);
         if ptr.is_null() || len == 0 {
-            return Box::into_raw(ValkeyModuleString::from_bytes(b"" as &[u8]));
+            return create_auto_string(ctx, b"");
         }
         let slice = std::slice::from_raw_parts(ptr.cast::<u8>(), len);
-        Box::into_raw(ValkeyModuleString::from_bytes(slice))
+        create_auto_string(ctx, slice)
     }
 }
 
 // SAFETY: Called by C module code; ctx is a valid ValkeyModuleCtx pointer
 pub unsafe extern "C" fn ValkeyModule_CreateStringFromLongLong(
-    _ctx: *mut ValkeyModuleCtx,
+    ctx: *mut ValkeyModuleCtx,
     ll: c_longlong,
 ) -> *mut ValkeyModuleString {
     log::trace!("ValkeyModule_CreateStringFromLongLong({}) called", ll);
     let s = format!("{}", ll);
-    Box::into_raw(ValkeyModuleString::from_bytes(s.as_bytes()))
+    // SAFETY: ctx is null or live by the API contract.
+    unsafe { create_auto_string(ctx, s.as_bytes()) }
 }
 
 // SAFETY: Called by C module code; ctx is a valid ValkeyModuleCtx pointer.
 pub unsafe extern "C" fn ValkeyModule_CreateStringFromULongLong(
-    _ctx: *mut ValkeyModuleCtx,
+    ctx: *mut ValkeyModuleCtx,
     value: c_ulonglong,
 ) -> *mut ValkeyModuleString {
     let value = value.to_string();
-    Box::into_raw(ValkeyModuleString::from_bytes(value.as_bytes()))
+    // SAFETY: ctx is null or live by the API contract.
+    unsafe { create_auto_string(ctx, value.as_bytes()) }
 }
 
 // SAFETY: Called by C module code; ctx is a valid ValkeyModuleCtx pointer, s is a valid ValkeyModuleString pointer (or null, which is handled)
 pub unsafe extern "C" fn ValkeyModule_CreateStringFromString(
-    _ctx: *mut ValkeyModuleCtx,
+    ctx: *mut ValkeyModuleCtx,
     s: *mut ValkeyModuleString,
 ) -> *mut ValkeyModuleString {
     unsafe {
         log::trace!("ValkeyModule_CreateStringFromString() called");
         if s.is_null() {
-            return Box::into_raw(ValkeyModuleString::from_bytes(b"" as &[u8]));
+            return create_auto_string(ctx, b"");
         }
         let data = (*s).as_bytes();
-        Box::into_raw(ValkeyModuleString::from_bytes(data))
+        create_auto_string(ctx, data)
     }
 }
 
 // SAFETY: Called by C module code; ctx is a valid ValkeyModuleCtx pointer, s is a valid ValkeyModuleString pointer (or null, which is handled)
 pub unsafe extern "C" fn ValkeyModule_FreeString(
-    _ctx: *mut ValkeyModuleCtx,
+    ctx: *mut ValkeyModuleCtx,
     s: *mut ValkeyModuleString,
 ) {
     unsafe {
         log::trace!("ValkeyModule_FreeString() called");
         if !s.is_null() {
-            let _ = super::active_registry::with_active_registry(|registry| {
-                registry.release_string(s);
-            });
-            (*s).free();
-            let _ = Box::from_raw(s);
+            remove_string(internal_owner(ctx), s);
+            ValkeyModuleString::release(s);
         }
     }
 }
@@ -174,6 +174,26 @@ pub unsafe extern "C" fn ValkeyModule_StringToDouble(
 }
 
 // SAFETY: Called by C module code; ctx is a valid ValkeyModuleCtx pointer
-pub unsafe extern "C" fn ValkeyModule_AutoMemory(_ctx: *mut ValkeyModuleCtx) {
+pub unsafe extern "C" fn ValkeyModule_AutoMemory(ctx: *mut ValkeyModuleCtx) {
     log::trace!("ValkeyModule_AutoMemory() called");
+    // SAFETY: ctx is null or live; enabling does not register existing allocations.
+    unsafe {
+        if let Some(owner) = internal_owner(ctx) {
+            (*owner.as_ptr()).auto_memory.is_enabled = true;
+        }
+    }
+}
+
+// SAFETY: the shim passes a non-null live string for each borrowed argv slot.
+#[export_name = "VM_StringIncrRefForShim"]
+pub unsafe extern "C" fn string_incr_ref_for_shim(s: *mut ValkeyModuleString) {
+    // SAFETY: the caller owns a live reference.
+    unsafe { ValkeyModuleString::incr_ref(s) };
+}
+
+// SAFETY: the shim releases one reference for each constructed argv slot.
+#[export_name = "VM_StringReleaseForShim"]
+pub unsafe extern "C" fn string_release_for_shim(s: *mut ValkeyModuleString) {
+    // SAFETY: the slot owns one reference, or is null.
+    unsafe { ValkeyModuleString::release(s) };
 }

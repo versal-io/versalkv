@@ -74,13 +74,13 @@ pub(crate) fn check_acl_command(
     }
     let dbid = conn.selected_db() as i64;
     let num_dbs = runtime.num_dbs();
-    let acl_categories = runtime.command_acl_categories(spec, args);
+    let acl_categories = runtime.command_acl_categories(spec.clone(), args);
     let db_req = crate::engine::extension::acl::compute_db_requirement(
-        spec.name,
+        spec.name.as_str(),
         &args.args,
         (spec.flags & CMD_ALL_DBS) != 0,
         crate::engine::extension::acl::should_restrict_cmd(
-            spec.name,
+            spec.name.as_str(),
             acl_categories,
             spec.first_key != 0,
         ),
@@ -97,8 +97,11 @@ pub(crate) fn check_acl_command(
         .into_iter()
         .flatten()
         .map(|index| (args.args[index].as_ref(), required != 0));
-    let command =
-        crate::engine::extension::acl::AclCommand::new(spec.name, &args.args, acl_categories);
+    let command = crate::engine::extension::acl::AclCommand::new(
+        spec.name.as_str(),
+        &args.args,
+        acl_categories,
+    );
     Some(user.can_execute_command_with_args_and_keys_db(
         command,
         &db_req,
@@ -398,31 +401,37 @@ impl<'a> ScriptCommandInvocation<'a> {
             .lookup_command(args.name.as_ref())
             .ok_or_else(|| Value::error("ERR Unknown command called from script"))?;
         let spec = command.descriptor();
-        let has_subcommands = crate::engine::command::is_subcommand_container(spec.name);
-        validate_script_command(spec, args, runtime, has_subcommands)?;
+        let has_subcommands = crate::engine::command::is_subcommand_container(spec.name.as_str());
+        validate_script_command(&spec, args, runtime, has_subcommands)?;
+        let key_indices = spec.key_indices(args);
+        let is_write = spec.flags & CMD_WRITE != 0;
+        let may_write_or_replicate = spec.flags & (CMD_WRITE | CMD_MAY_REPLICATE) != 0;
         Ok(Self {
             args,
             command,
             spec,
-            key_indices: spec.key_indices(args),
+            key_indices,
             has_subcommands,
             protected: mode == ScriptCallMode::ProtectedCall,
-            is_write: spec.flags & CMD_WRITE != 0,
-            may_write_or_replicate: spec.flags & (CMD_WRITE | CMD_MAY_REPLICATE) != 0,
+            is_write,
+            may_write_or_replicate,
         })
     }
 
     fn resolve_stats_name(&self, runtime: &dyn ScriptRuntime) -> Cow<'static, str> {
         if self.has_subcommands {
-            Cow::Owned(runtime.command_stats_name(self.spec, self.args))
+            Cow::Owned(runtime.command_stats_name(self.spec.clone(), self.args))
         } else {
-            Cow::Borrowed(self.spec.name)
+            match &self.spec.name {
+                crate::engine::command::CommandName::Static(name) => Cow::Borrowed(name),
+                crate::engine::command::CommandName::Shared(name) => Cow::Owned(name.to_string()),
+            }
         }
     }
 }
 
 fn validate_script_command(
-    spec: CommandDescriptor,
+    spec: &CommandDescriptor,
     args: &CommandArgs,
     runtime: &dyn ScriptRuntime,
     has_subcommands: bool,
@@ -442,7 +451,7 @@ fn validate_script_command(
 }
 
 fn script_command_restrictions(
-    spec: CommandDescriptor,
+    spec: &CommandDescriptor,
     args: &CommandArgs,
     runtime: &dyn ScriptRuntime,
     has_subcommands: bool,
@@ -452,17 +461,17 @@ fn script_command_restrictions(
         .flatten()
         .map(|value| String::from_utf8_lossy(value).to_ascii_lowercase());
     let subcmd_noscript = subcommand.as_deref().is_some_and(|subcommand| {
-        let name = format!("{}-{}", spec.name, subcommand);
+        let name = format!("{}-{}", spec.name.as_str(), subcommand);
         runtime
             .lookup_command(name.as_bytes())
             .is_some_and(|command| command.descriptor().flags & CMD_NOSCRIPT != 0)
     });
     let forced = subcommand
         .as_deref()
-        .is_some_and(|subcommand| is_blocked_subcmd(spec.name, subcommand));
+        .is_some_and(|subcommand| is_blocked_subcmd(spec.name.as_str(), subcommand));
     let safe = subcommand
         .as_deref()
-        .is_some_and(|subcommand| is_noscript_subcmd(spec.name, subcommand));
+        .is_some_and(|subcommand| is_noscript_subcmd(spec.name.as_str(), subcommand));
     ScriptCommandRestrictions {
         parent_noscript: spec.flags & CMD_NOSCRIPT != 0,
         subcommand_noscript: subcmd_noscript,
@@ -490,7 +499,7 @@ fn decide_script_call(
         return reject(
             format!(
                 "ERR Write commands are not allowed from read-only scripts. script: {}",
-                invocation.spec.name
+                invocation.spec.name.as_str()
             ),
             Some("ERR Write commands are not allowed from read-only scripts."),
         );
@@ -565,7 +574,7 @@ fn apply_script_call_decision(
     else {
         return Ok(());
     };
-    runtime.end_command(invocation.spec.name, true);
+    runtime.end_command(invocation.spec.name.as_str(), true);
     let reply = if invocation.protected {
         let reply = protected_message.map(Cow::Borrowed).unwrap_or(message);
         super::defer_pcall_error(script_ctx, reply.as_ref());
@@ -613,7 +622,7 @@ fn run_script_command(
         .log_gate
         .logging_active()
         .then(std::time::Instant::now);
-    let result = runtime.execute_command(invocation.command, conn, invocation.args);
+    let result = runtime.execute_command(invocation.command.clone(), conn, invocation.args);
     let outcome = ScriptCommandOutcome {
         result,
         stats_name,
@@ -654,15 +663,15 @@ fn command_acl_denial(
     conn: &dyn CommandConn,
     runtime: &dyn ScriptRuntime,
 ) -> Option<ScriptAclDenial> {
-    let spec = invocation.spec;
-    let categories = runtime.command_acl_categories(spec, invocation.args);
+    let spec = &invocation.spec;
+    let categories = runtime.command_acl_categories(spec.clone(), invocation.args);
     let restrict = crate::engine::extension::acl::should_restrict_cmd(
-        spec.name,
+        spec.name.as_str(),
         categories,
         spec.first_key != 0,
     );
     let requirement = crate::engine::extension::acl::compute_db_requirement(
-        spec.name,
+        spec.name.as_str(),
         &invocation.args.args,
         spec.flags & CMD_ALL_DBS != 0,
         restrict,
@@ -680,7 +689,7 @@ fn command_acl_denial(
         .flatten()
         .map(|index| (invocation.args.args[index].as_ref(), permission));
     let command = crate::engine::extension::acl::AclCommand::new(
-        spec.name,
+        spec.name.as_str(),
         &invocation.args.args,
         categories,
     );
@@ -700,16 +709,16 @@ fn map_command_acl_denial(
             object: arg_index
                 .and_then(|index| invocation.args.args.get(index))
                 .map(|value| String::from_utf8_lossy(value).to_string())
-                .unwrap_or_else(|| invocation.spec.name.to_ascii_lowercase()),
+                .unwrap_or_else(|| invocation.spec.name.as_str().to_ascii_lowercase()),
         },
         AclDenial::Command => ScriptAclDenial {
             message: format!(
                 "User {} has no permissions to run the '{}' command",
                 username,
-                invocation.spec.name.to_ascii_lowercase()
+                invocation.spec.name.as_str().to_ascii_lowercase()
             ),
             reason: crate::engine::extension::acl::ACL_DENIED_CMD,
-            object: invocation.spec.name.to_ascii_lowercase(),
+            object: invocation.spec.name.as_str().to_ascii_lowercase(),
         },
         AclDenial::Key(index) => ScriptAclDenial {
             message: "No permissions to access a key".to_string(),
@@ -735,7 +744,7 @@ fn channel_acl_denial(
         "ssubscribe",
         "psubscribe",
     ];
-    let command = invocation.spec.name;
+    let command = invocation.spec.name.as_str();
     let checks_channels = CHANNEL_COMMANDS
         .iter()
         .any(|name| command.eq_ignore_ascii_case(name));
@@ -770,7 +779,7 @@ fn apply_acl_denial(
         conn.username().to_string(),
         format!("addr={} cmd=eval", conn.peer_addr()),
     );
-    runtime.end_command(invocation.spec.name, true);
+    runtime.end_command(invocation.spec.name.as_str(), true);
     let message = format!("ACL failure in script: {}", denial.message);
     if invocation.protected {
         super::defer_pcall_error(script_ctx, &message);
@@ -838,7 +847,8 @@ fn validate_script_cluster_state(
     let Some(indices) = invocation.key_indices else {
         return Ok(());
     };
-    let Some(error) = runtime.script_cluster_error(invocation.spec, conn, invocation.args, indices)
+    let Some(error) =
+        runtime.script_cluster_error(invocation.spec.clone(), conn, invocation.args, indices)
     else {
         return Ok(());
     };
@@ -965,7 +975,7 @@ fn record_nested_observability(
         );
     }
     if record_monitor {
-        runtime.record_internal_monitor(invocation.spec, conn.selected_db(), argv);
+        runtime.record_internal_monitor(invocation.spec.clone(), conn.selected_db(), argv);
     }
 }
 

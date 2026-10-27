@@ -86,8 +86,10 @@ unsafe fn init_module_attribs(
                 Ok(()) => {
                     log::info!("Module '{}' initialized (v{})", module_name, ver);
                     if !internal.is_null() {
-                        if let Some(m) = reg.lookup_mut(&module_name) {
-                            (*internal).module_ref = m as *mut ModuleRef as *mut c_void;
+                        if let Some(module) = reg.lookup(&module_name) {
+                            (*internal).module_ref =
+                                (module as *const ModuleRef).cast_mut().cast::<c_void>();
+                            (*internal).module_options = Some(module.options.clone());
                         }
                     }
                 }
@@ -112,6 +114,23 @@ pub unsafe extern "C" fn ValkeyModule_SetModuleAttribs(
     unsafe {
         if init_module_attribs(ctx, name, ver, apiver) != VALKEYMODULE_OK {
             log::error!("Failed to initialize module attributes");
+        }
+    }
+}
+
+// SAFETY: ctx is null or a live module context whose internal context remains
+// valid throughout this call.
+pub unsafe extern "C" fn ValkeyModule_SetModuleOptions(ctx: *mut ValkeyModuleCtx, options: c_int) {
+    // SAFETY: each pointer is checked before accessing its live owned target.
+    unsafe {
+        let Some(ctx) = ctx.as_ref() else {
+            return;
+        };
+        let Some(internal) = ctx.internal.as_ref() else {
+            return;
+        };
+        if let Some(state) = internal.module_options.as_ref() {
+            state.set(options);
         }
     }
 }
@@ -196,17 +215,10 @@ pub unsafe extern "C" fn ValkeyModule_CreateCommand(
                 return VALKEYMODULE_OK;
             };
 
-            let leaked_name: &'static str = Box::leak(cmd_name.clone().into_boxed_str());
             let flags = parse_module_flags(flags_str);
             let arity = if func.is_some() { -1 } else { -2 };
-            if !runtime.register_module_command(
-                leaked_name,
-                arity,
-                flags,
-                firstkey,
-                lastkey,
-                keystep,
-            ) {
+            if !runtime.register_module_command(&cmd_name, arity, flags, firstkey, lastkey, keystep)
+            {
                 return VALKEYMODULE_ERR;
             }
             let getkeys_api = flags_str
@@ -221,7 +233,7 @@ pub unsafe extern "C" fn ValkeyModule_CreateCommand(
 
             log::info!(
                 "Module command '{}' registered in CommandRegistry",
-                leaked_name
+                cmd_name
             );
             VALKEYMODULE_OK
         })
@@ -311,9 +323,8 @@ pub unsafe extern "C" fn ValkeyModule_CreateSubcommand(
             let Some(runtime) = runtime_from_opaque(parent.runtime_handle) else {
                 return VALKEYMODULE_ERR;
             };
-            let leaked_name: &'static str = Box::leak(full_name.into_boxed_str());
             let flags = parse_module_flags(flags_str);
-            if runtime.register_module_command(leaked_name, -2, flags, firstkey, lastkey, keystep) {
+            if runtime.register_module_command(&full_name, -2, flags, firstkey, lastkey, keystep) {
                 VALKEYMODULE_OK
             } else {
                 VALKEYMODULE_ERR

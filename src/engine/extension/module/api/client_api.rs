@@ -75,7 +75,7 @@ pub unsafe extern "C" fn ValkeyModule_GetClientNameById(
         let Some(name) = runtime.module_client_name(client_id) else {
             return std::ptr::null_mut();
         };
-        Box::into_raw(ValkeyModuleString::from_bytes(&name))
+        super::super::auto_memory::create_auto_string(ctx, &name)
     }
 }
 

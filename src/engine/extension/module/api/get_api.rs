@@ -84,6 +84,7 @@ module_api_entries! {
             super::cluster_slot_api::ValkeyModule_ClusterCanonicalKeyNameInSlot as *mut c_void
         },
         "ValkeyModule_CreateCommand" => ctx::ValkeyModule_CreateCommand as *mut c_void,
+        "ValkeyModule_SetModuleOptions" => ctx::ValkeyModule_SetModuleOptions as *mut c_void,
         "ValkeyModule_GetCommand" => ctx::ValkeyModule_GetCommand as *mut c_void,
         "ValkeyModule_CreateSubcommand" => ctx::ValkeyModule_CreateSubcommand as *mut c_void,
         "ValkeyModule_SetCommandACLCategories" => {
@@ -372,7 +373,6 @@ mod tests {
         create_module_cmd_ctx, create_module_ctx, free_module_ctx, ValkeyModuleCtx,
         ValkeyModuleString,
     };
-    use libc::c_void;
     use std::collections::HashSet;
     use std::ffi::CStr;
 
@@ -418,14 +418,23 @@ mod tests {
 
     #[test]
     fn detached_thread_safe_context_preserves_module_identity_and_frees_independently() {
+        use crate::engine::extension::module::api::ctx::ValkeyModule_SetModuleOptions;
+        use crate::engine::extension::module::{ModuleRef, ModuleRegistry};
+
         // SAFETY: These function types model module ABI entries that accept raw
         // contexts; callers must pass contexts allocated by this module runtime.
         type GetDetached = unsafe extern "C" fn(*mut ValkeyModuleCtx) -> *mut ValkeyModuleCtx;
         type FreeDetached = unsafe extern "C" fn(*mut ValkeyModuleCtx);
 
-        let module_ref = 0x1234usize as *mut c_void;
-        let internal =
+        let mut registry = ModuleRegistry::new();
+        registry
+            .register(ModuleRef::new("misc", std::ptr::null_mut(), 1, true))
+            .unwrap();
+        let module = registry.lookup("misc").unwrap();
+        let module_ref = (module as *const ModuleRef).cast_mut().cast();
+        let mut internal =
             create_module_cmd_ctx("misc", "test.log_tsctx", module_ref, std::ptr::null_mut());
+        internal.module_options = Some(module.options.clone());
         let original = Box::into_raw(create_module_ctx(Box::into_raw(internal)));
         let get_detached = resolve_module_api("ValkeyModule_GetDetachedThreadSafeContext")
             .expect("detached context API must resolve");
@@ -448,12 +457,177 @@ mod tests {
             assert_eq!(CStr::from_ptr(VM_ModuleName(detached)).to_bytes(), b"misc");
             assert!(resolve_module_api("ValkeyModule_ThreadSafeContextLock").is_none());
             assert!(resolve_module_api("ValkeyModule_ThreadSafeContextUnlock").is_none());
+            ValkeyModule_SetModuleOptions(detached, 3);
+            assert_eq!(registry.lookup("misc").unwrap().options.get(), 3);
+            ValkeyModule_SetModuleOptions(original, 4);
+            assert_eq!(
+                (*(*detached).internal)
+                    .module_options
+                    .as_ref()
+                    .unwrap()
+                    .get(),
+                4
+            );
 
             let free_detached: FreeDetached = std::mem::transmute(free_detached);
             free_detached(detached);
             assert_eq!((*(*original).internal).module_ref, module_ref);
             free_module_ctx(original);
         }
+        assert_eq!(registry.lookup("misc").unwrap().options.get(), 4);
+    }
+
+    #[test]
+    fn loader_options_default_overwrite_and_isolation_use_registered_module_refs() {
+        use crate::engine::extension::module::{
+            create_module_internal_ctx, ModuleRef, ModuleRegistry,
+        };
+        let mut registry = ModuleRegistry::new();
+        for name in ["options-first", "options-second"] {
+            registry
+                .register(ModuleRef::new(name, std::ptr::null_mut(), 1, true))
+                .unwrap();
+            assert_eq!(registry.lookup(name).unwrap().options.get(), 0);
+        }
+        let first = registry.lookup_mut("options-first").unwrap();
+        let first_options = first.options.clone();
+        let first_ref = (first as *mut ModuleRef).cast();
+        let second = registry.lookup_mut("options-second").unwrap();
+        let second_options = second.options.clone();
+        let second_ref = (second as *mut ModuleRef).cast();
+        let mut first_internal = create_module_internal_ctx("options-first", first_ref);
+        first_internal.module_options = Some(first_options);
+        let first_ctx = Box::into_raw(create_module_ctx(Box::into_raw(first_internal)));
+        let mut second_internal = create_module_internal_ctx("options-second", second_ref);
+        second_internal.module_options = Some(second_options);
+        let second_ctx = Box::into_raw(create_module_ctx(Box::into_raw(second_internal)));
+        // SAFETY: this signature is the exact void(ctx, int) header ABI.
+        type SetOptions = unsafe extern "C" fn(*mut ValkeyModuleCtx, libc::c_int);
+        let address = resolve_module_api("ValkeyModule_SetModuleOptions").unwrap();
+        // SAFETY: the API resolver returned this exact declared ABI entry.
+        let set_options: SetOptions = unsafe { std::mem::transmute(address) };
+        // SAFETY: both contexts and their distinct module references remain live.
+        unsafe {
+            set_options(first_ctx, 1);
+            set_options(first_ctx, 2);
+            set_options(second_ctx, 8);
+            assert_eq!(registry.lookup("options-first").unwrap().options.get(), 2);
+            assert_eq!(registry.lookup("options-second").unwrap().options.get(), 8);
+            set_options(first_ctx, 0);
+            assert_eq!(registry.lookup("options-first").unwrap().options.get(), 0);
+            assert_eq!(registry.lookup("options-second").unwrap().options.get(), 8);
+            for value in [-9, libc::c_int::MIN, libc::c_int::MAX, 0x6000] {
+                set_options(first_ctx, value);
+                assert_eq!(
+                    registry.lookup("options-first").unwrap().options.get(),
+                    value
+                );
+                assert_eq!(registry.lookup("options-second").unwrap().options.get(), 8);
+            }
+            free_module_ctx(first_ctx);
+            free_module_ctx(second_ctx);
+        }
+    }
+
+    #[test]
+    fn loader_options_outer_context_updates_after_inner_context_is_freed() {
+        use crate::engine::extension::module::api::ctx::ValkeyModule_SetModuleOptions;
+        use crate::engine::extension::module::{
+            create_module_internal_ctx, ModuleRef, ModuleRegistry,
+        };
+
+        let mut registry = ModuleRegistry::new();
+        registry
+            .register(ModuleRef::new(
+                "options-nested",
+                std::ptr::null_mut(),
+                1,
+                true,
+            ))
+            .unwrap();
+        let outer_module = registry.lookup_mut("options-nested").unwrap();
+        let outer_options = outer_module.options.clone();
+        let outer_ref = (outer_module as *mut ModuleRef).cast();
+        let mut outer_internal = create_module_internal_ctx("options-nested", outer_ref);
+        outer_internal.module_options = Some(outer_options);
+        let outer = Box::into_raw(create_module_ctx(Box::into_raw(outer_internal)));
+        // SAFETY: outer is a live allocated context for the registered module.
+        unsafe { ValkeyModule_SetModuleOptions(outer, 1) };
+
+        let inner_module = registry.lookup_mut("options-nested").unwrap();
+        let inner_options = inner_module.options.clone();
+        let inner_ref = (inner_module as *mut ModuleRef).cast();
+        let mut inner_internal = create_module_internal_ctx("options-nested", inner_ref);
+        inner_internal.module_options = Some(inner_options);
+        let inner = Box::into_raw(create_module_ctx(Box::into_raw(inner_internal)));
+        // SAFETY: both contexts are live and belong to the same registered module.
+        unsafe {
+            ValkeyModule_SetModuleOptions(inner, 3);
+            free_module_ctx(inner);
+            ValkeyModule_SetModuleOptions(outer, 4);
+        }
+        assert_eq!(registry.lookup("options-nested").unwrap().options.get(), 4);
+        // SAFETY: outer still uniquely owns its allocated context.
+        unsafe { free_module_ctx(outer) };
+    }
+
+    #[test]
+    fn loader_options_unbound_contexts_do_not_write_registered_module_state() {
+        use crate::engine::extension::module::api::ctx::ValkeyModule_SetModuleOptions;
+        use crate::engine::extension::module::{
+            create_module_internal_ctx, ModuleRef, ModuleRegistry,
+        };
+
+        let mut registry = ModuleRegistry::new();
+        registry
+            .register(ModuleRef::new(
+                "options-unbound",
+                std::ptr::null_mut(),
+                1,
+                true,
+            ))
+            .unwrap();
+        let module_ref = (registry.lookup("options-unbound").unwrap() as *const ModuleRef)
+            .cast_mut()
+            .cast();
+        for internal in [
+            create_module_internal_ctx("options-unbound", module_ref),
+            create_module_cmd_ctx("options-unbound", "", module_ref, std::ptr::null_mut()),
+        ] {
+            assert!(internal.module_options.is_none());
+            let ctx = Box::into_raw(create_module_ctx(Box::into_raw(internal)));
+            // SAFETY: ctx owns a live internal context; identity alone does not bind options.
+            unsafe {
+                ValkeyModule_SetModuleOptions(ctx, 4);
+                free_module_ctx(ctx);
+            }
+            assert_eq!(registry.lookup("options-unbound").unwrap().options.get(), 0);
+        }
+        let ctx = Box::into_raw(create_module_ctx(std::ptr::null_mut()));
+        // SAFETY: null ctx/internal are permitted no-op inputs; ctx is freed once.
+        unsafe {
+            ValkeyModule_SetModuleOptions(std::ptr::null_mut(), 4);
+            ValkeyModule_SetModuleOptions(ctx, 4);
+            free_module_ctx(ctx);
+        }
+        assert_eq!(registry.lookup("options-unbound").unwrap().options.get(), 0);
+    }
+
+    #[test]
+    fn loader_options_api_resolves_with_exact_void_signature() {
+        // SAFETY: this type matches valkeymodule.h's void(ctx, int) declaration.
+        type SetModuleOptions = unsafe extern "C" fn(*mut ValkeyModuleCtx, libc::c_int);
+        let name = std::ffi::CString::new("ValkeyModule_SetModuleOptions").unwrap();
+        let mut address = std::ptr::null_mut();
+        // SAFETY: name and the output slot are live, valid ABI arguments.
+        assert_eq!(
+            unsafe { super::module_get_api_impl(name.as_ptr(), &mut address) },
+            super::VALKEYMODULE_OK
+        );
+        assert!(!address.is_null());
+        // SAFETY: only a successfully resolved, non-null ABI entry is converted.
+        let _set_options: SetModuleOptions = unsafe { std::mem::transmute(address) };
+        assert!(resolve_module_api("ValkeyModule_UnknownLoaderApi").is_none());
     }
 
     #[test]
@@ -513,12 +687,13 @@ mod tests {
             key_bytes.extend_from_slice(b"x{");
             key_bytes.extend_from_slice(tag);
             key_bytes.extend_from_slice(b"}y");
-            let mut key = Box::new(ValkeyModuleString::from_bytes(&key_bytes));
+            let key = Box::into_raw(ValkeyModuleString::from_bytes(&key_bytes));
 
             // SAFETY: key and key_bytes remain live for both synchronous calls.
             unsafe {
-                assert_eq!(key_slot(&mut **key), slot);
+                assert_eq!(key_slot(key), slot);
                 assert_eq!(key_slot_c(key_bytes.as_ptr().cast(), key_bytes.len()), slot);
+                ValkeyModuleString::release(key);
             }
         }
 

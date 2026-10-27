@@ -69,7 +69,14 @@ fn db_id_args(cmd_name: &str, cmd_args: &[Bytes], num_dbs: usize) -> Option<Vec<
     };
     if cmd_name.eq_ignore_ascii_case("select") {
         // argv[1] == cmd_args[0]
-        Some(vec![(parse_db(0)?, 0)])
+        let dbid = std::str::from_utf8(cmd_args.first()?)
+            .ok()?
+            .parse::<u32>()
+            .ok()?;
+        if usize::try_from(dbid).ok()? >= num_dbs {
+            return None;
+        }
+        Some(vec![(i64::from(dbid), 0)])
     } else if cmd_name.eq_ignore_ascii_case("swapdb") {
         // argv[1], argv[2] == cmd_args[0], cmd_args[1]
         Some(vec![(parse_db(0)?, 0), (parse_db(1)?, 1)])
@@ -120,6 +127,14 @@ pub(crate) fn compute_db_requirement(
     num_dbs: usize,
 ) -> DbRequirement {
     if let Some(positions) = db_id_args(cmd_name, cmd_args, num_dbs) {
+        if cmd_name.eq_ignore_ascii_case("move") || cmd_name.eq_ignore_ascii_case("copy") {
+            let mut ids: Vec<_> = positions
+                .into_iter()
+                .map(|(db, idx)| (db, Some(idx)))
+                .collect();
+            ids.push((current_dbid, None));
+            return DbRequirement::Ids(ids);
+        }
         if positions.len() == 1 {
             let (dbid, arg_index) = positions[0];
             return DbRequirement::Single(dbid, Some(arg_index));
@@ -734,7 +749,44 @@ fn apply_requirepass(user: &mut AclUser, password: Option<&[u8]>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_requirepass, AclUser};
+    use super::{apply_requirepass, compute_db_requirement, db_id_args, AclUser, DbRequirement};
+    use bytes::Bytes;
+
+    #[test]
+    fn select_database_acl_matches_handler_index_validity() {
+        for (raw, expected_db) in [
+            (b"-0".as_slice(), None),
+            (b" 0", None),
+            (b"0 ", None),
+            (b"-1", None),
+            (b"16", None),
+            (b"4294967295", None),
+            (b"4294967296", None),
+            (b"9223372036854775807", None),
+            (b"", None),
+            (b"\xff", None),
+            (b"0", Some(0)),
+            (b"1", Some(1)),
+            (b"15", Some(15)),
+        ] {
+            let args = [Bytes::from_static(raw)];
+            assert_eq!(
+                db_id_args("select", &args, 16),
+                expected_db.map(|db_id| vec![(db_id, 0)]),
+                "SELECT {}",
+                String::from_utf8_lossy(raw)
+            );
+            let requirement = expected_db.map_or(DbRequirement::None, |db_id| {
+                DbRequirement::Single(db_id, Some(0))
+            });
+            assert_eq!(
+                compute_db_requirement("select", &args, false, false, 1, 16),
+                requirement
+            );
+        }
+        assert_eq!(db_id_args("select", &[], 16), None);
+        assert_eq!(db_id_args("select", &[Bytes::from_static(b"0")], 0), None);
+    }
 
     #[test]
     fn requirepass_replaces_default_user_password_and_restores_nopass() {

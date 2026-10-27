@@ -1,4 +1,4 @@
-use super::{CmdFlags, CommandArgs};
+use super::{CmdFlags, CommandArgs, CommandName};
 use bytes::Bytes;
 
 #[derive(Clone, Copy, Debug)]
@@ -22,9 +22,9 @@ impl Iterator for CommandKeyIndices {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandDescriptor {
-    pub name: &'static str,
+    pub name: CommandName,
     pub arity: i32,
     pub flags: CmdFlags,
     pub first_key: i32,
@@ -34,7 +34,7 @@ pub struct CommandDescriptor {
     pub acl_categories: &'static [&'static str],
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct ResolvedCommand {
     descriptor: CommandDescriptor,
     registry_id: u64,
@@ -57,17 +57,17 @@ impl ResolvedCommand {
         }
     }
 
-    pub fn descriptor(self) -> CommandDescriptor {
-        self.descriptor
+    pub fn descriptor(&self) -> CommandDescriptor {
+        self.descriptor.clone()
     }
 
-    pub(crate) fn execution_token(self) -> (u64, usize, u64) {
+    pub(crate) fn execution_token(&self) -> (u64, usize, u64) {
         (self.registry_id, self.execution_id, self.generation)
     }
 }
 
 impl CommandDescriptor {
-    pub fn key_indices(self, args: &CommandArgs) -> Option<CommandKeyIndices> {
+    pub fn key_indices(&self, args: &CommandArgs) -> Option<CommandKeyIndices> {
         if self.first_key <= 0 {
             return None;
         }
@@ -96,7 +96,7 @@ impl CommandDescriptor {
         })
     }
 
-    pub fn extract_keys(self, args: &CommandArgs) -> Option<Vec<Bytes>> {
+    pub fn extract_keys(&self, args: &CommandArgs) -> Option<Vec<Bytes>> {
         self.key_indices(args)
             .map(|indices| indices.map(|index| args.args[index].clone()).collect())
     }

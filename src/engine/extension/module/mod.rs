@@ -1,8 +1,11 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod api;
+mod auto_memory;
 pub mod capability;
 mod context;
+#[cfg(test)]
+pub(crate) mod lifecycle_test_support;
 pub mod loader;
 pub mod registry;
 mod types;

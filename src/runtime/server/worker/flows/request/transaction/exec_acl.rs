@@ -50,21 +50,25 @@ fn exec_acl_failure(
     num_dbs: usize,
 ) -> Option<ExecAclFailure> {
     let categories = super::super::dispatch::subcmd_flags::effective_acl_categories(
-        request.spec.name,
+        request.spec.name.as_str(),
         request.spec.acl_categories,
         request.args.args.first().map(|arg| arg.as_ref()),
     );
     let has_keys = request.spec.first_key != 0;
     let db_req = crate::engine::extension::acl::compute_db_requirement(
-        request.spec.name,
+        request.spec.name.as_str(),
         &request.args.args,
         (request.spec.flags & CMD_ALL_DBS) != 0,
-        crate::engine::extension::acl::should_restrict_cmd(request.spec.name, categories, has_keys),
+        crate::engine::extension::acl::should_restrict_cmd(
+            request.spec.name.as_str(),
+            categories,
+            has_keys,
+        ),
         dbid,
         num_dbs,
     );
     let keys = exec_acl_key_requirements(request.spec, request.args);
-    let command = AclCommand::new(request.spec.name, &request.args.args, categories);
+    let command = AclCommand::new(request.spec.name.as_str(), &request.args.args, categories);
     user.check_command_perm(command, &db_req, num_dbs, &keys)
         .map(|denial| acl_denial_failure(request, denial, &keys))
         .or_else(|| channel_acl_failure(request, user))
@@ -101,7 +105,7 @@ fn acl_denial_failure(
     match denial {
         AclDenial::Db { dbid, arg_index } => {
             let (object, _) =
-                tx_db_object_and_label(request.spec.name, request.args, arg_index, dbid);
+                tx_db_object_and_label(request.spec.name.as_str(), request.args, arg_index, dbid);
             ExecAclFailure {
                 reason: ACL_DENIED_DB,
                 object,
@@ -131,11 +135,11 @@ fn command_acl_object(spec: &CommandSpec, args: &CommandArgs) -> String {
         .first()
         .and_then(|arg| std::str::from_utf8(arg).ok())
     else {
-        return spec.name.to_ascii_lowercase();
+        return spec.name.as_str().to_ascii_lowercase();
     };
     let full_name = format!(
         "{}|{}",
-        spec.name.to_ascii_lowercase(),
+        spec.name.as_str().to_ascii_lowercase(),
         subcommand.to_ascii_lowercase()
     );
     if crate::framework::generated::commands::SUBCOMMAND_NAMES
@@ -144,12 +148,12 @@ fn command_acl_object(spec: &CommandSpec, args: &CommandArgs) -> String {
     {
         full_name
     } else {
-        spec.name.to_ascii_lowercase()
+        spec.name.as_str().to_ascii_lowercase()
     }
 }
 
 fn channel_acl_failure(request: &ExecAclRequest<'_>, user: &AclUser) -> Option<ExecAclFailure> {
-    let command = request.spec.name;
+    let command = request.spec.name.as_str();
     let is_channel_command = [
         "publish",
         "spublish",

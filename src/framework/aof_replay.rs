@@ -111,7 +111,7 @@ pub(crate) fn apply_replay_command(
         if tracking_only {
             return Ok(());
         }
-        conn.transaction.queue(args);
+        conn.transaction.queue(ctx.num_dbs(), args);
         return Ok(());
     }
     if tracking_only {

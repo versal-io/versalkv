@@ -48,7 +48,7 @@ impl ServerWorkerState {
             return Some(DispatchOutcome {
                 action: DispatchAction::Rejected,
                 call_flags: CmdCallFlags::default(),
-                reject_reply: Some(CommandError::wrong_arity(meta.name)),
+                reject_reply: Some(CommandError::wrong_arity(meta.name.as_str())),
             });
         }
         None
@@ -148,7 +148,7 @@ impl ServerWorkerState {
         _args: &CommandArgs,
         _call_flags: CmdCallFlags,
     ) -> Option<DispatchOutcome> {
-        let is_busy_control = matches!(meta.name, "script" | "function");
+        let is_busy_control = matches!(meta.name.as_str(), "script" | "function");
         if self.ctx.is_loading() {
             return None;
         }
@@ -185,7 +185,8 @@ impl ServerWorkerState {
         if internal_loading && !async_loading && (meta.flags & CMD_LOADING) == 0 {
             return reject();
         }
-        if self.ctx.is_host_task_loading() && matches!(meta.name, "replicaof" | "slaveof") {
+        if self.ctx.is_host_task_loading() && matches!(meta.name.as_str(), "replicaof" | "slaveof")
+        {
             return reject();
         }
         if async_loading && (meta.flags & CMD_NO_ASYNC_LOADING) != 0 {
@@ -211,7 +212,7 @@ impl ServerWorkerState {
             let Some(state) = self.ctx.cluster_state() else {
                 return None;
             };
-            let keys = Self::cluster_redirect_keys(*meta, args);
+            let keys = Self::cluster_redirect_keys(meta, args);
             let slot_open = !keys.is_empty()
                 && state.is_slot_open(crate::engine::distributed::cluster::node::key_hash_slot(
                     &keys[0],
@@ -220,7 +221,7 @@ impl ServerWorkerState {
         };
         // For open slots, compute per-key local existence (NOTOUCH/NOEXPIRE
         // semantics) so ASK vs TRYAGAIN can be decided correctly.
-        let route_sharded_pubsub = matches!(meta.name, "ssubscribe" | "spublish");
+        let route_sharded_pubsub = matches!(meta.name.as_str(), "ssubscribe" | "spublish");
         let existing: Option<Vec<bool>> =
             if slot_open && !route_sharded_pubsub && !facts.transaction {
                 let db_id = facts.selected_db;
@@ -274,7 +275,7 @@ impl ServerWorkerState {
                     redirect_keyless,
                     client_readonly,
                     client_asking: call_flags.client_asking,
-                    open_slot_policy: open_slot_policy(meta.name, args, facts.selected_db),
+                    open_slot_policy: open_slot_policy(meta.name.as_str(), args, facts.selected_db),
                 });
         if decision != crate::engine::distributed::cluster::ClusterRouteDecision::ExecuteLocal {
             return Some(DispatchOutcome {
@@ -359,10 +360,10 @@ impl ServerWorkerState {
     }
 
     pub(crate) fn cluster_redirect_keys(
-        meta: CmdPreconditions,
+        meta: &CmdPreconditions,
         args: &CommandArgs,
     ) -> Vec<Vec<u8>> {
-        match meta.name {
+        match meta.name.as_str() {
             "ssubscribe" => {
                 return crate::framework::commands::pubsub::ssubscribe::route_channels(args);
             }
@@ -414,7 +415,7 @@ impl ServerWorkerState {
             let pause = self.ctx.client_pause().is_paused(now);
             let has_write_flag = (meta.flags & (CMD_WRITE | CMD_MAY_REPLICATE)) != 0;
             let is_ro = if has_write_flag {
-                is_ro_script(meta.name, args, &self.ctx)
+                is_ro_script(meta.name.as_str(), args, &self.ctx)
             } else {
                 true
             };
@@ -444,7 +445,7 @@ impl ServerWorkerState {
         if !call_flags.is_write || facts.transaction {
             return None;
         }
-        let keys = Self::cluster_redirect_keys(*meta, args);
+        let keys = Self::cluster_redirect_keys(meta, args);
         let job_id = self.ctx.cluster_state().as_deref().and_then(|state| {
             keys.iter().find_map(|key| {
                 state.migrations.paused_export_for_slot(
@@ -470,13 +471,13 @@ impl ServerWorkerState {
         // Gated reap: only retires a lingering diskless child when no relay is in flight (ABA-safe).
         self.collect_idle_diskless_child_exit();
         let has_write_flag = (meta.flags & CMD_WRITE) != 0;
-        if (has_write_flag || meta.name.eq_ignore_ascii_case("ping"))
+        if (has_write_flag || meta.name.as_str().eq_ignore_ascii_case("ping"))
             && self.ctx.config().persistence.stop_writes_on_bgsave_error
             && !self.ctx.config().persistence.saveparams.is_empty()
             && self.ctx.persistence().rdb().last_bgsave_status
                 == crate::engine::persistence::OperationStatus::Err
-            && !is_ro_script(meta.name, args, &self.ctx)
-            && !meta.name.eq_ignore_ascii_case("eval")
+            && !is_ro_script(meta.name.as_str(), args, &self.ctx)
+            && !meta.name.as_str().eq_ignore_ascii_case("eval")
         {
             return Some(DispatchOutcome {
                 action: DispatchAction::Rejected,
@@ -501,8 +502,8 @@ impl ServerWorkerState {
         if has_write_flag
             && replication.min_replicas_max_lag > 0
             && replication.min_replicas_to_write > self.good_replicas_count()
-            && !is_ro_script(meta.name, args, &self.ctx)
-            && !is_eval_without_shebang(meta.name, args)
+            && !is_ro_script(meta.name.as_str(), args, &self.ctx)
+            && !is_eval_without_shebang(meta.name.as_str(), args)
         {
             return Some(DispatchOutcome {
                 action: DispatchAction::Rejected,
@@ -526,8 +527,8 @@ impl ServerWorkerState {
         if has_write_flag
             && self.ctx.replication().is_replica()
             && self.ctx.config().replication.replica_read_only
-            && !is_ro_script(meta.name, args, &self.ctx)
-            && !is_eval_without_shebang(meta.name, args)
+            && !is_ro_script(meta.name.as_str(), args, &self.ctx)
+            && !is_eval_without_shebang(meta.name.as_str(), args)
         {
             return Some(DispatchOutcome {
                 action: DispatchAction::Rejected,

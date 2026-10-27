@@ -30,7 +30,7 @@ pub(crate) fn command_info(
                 continue;
             }
         };
-        let found = reg.iter().find(|spec| spec.name == name);
+        let found = reg.iter().find(|spec| spec.name.as_str().eq_ignore_ascii_case(&name));
         match found {
             Some(spec) => results.push(make_entry(spec, reg, modules)),
             None => match crate::framework::generated::commands::acl_command_meta(&name) {
@@ -45,10 +45,37 @@ pub(crate) fn command_info(
 #[cfg(test)]
 mod tests {
     use super::command_info;
+    use crate::engine::command::CommandName;
     use crate::engine::extension::module::ModuleRegistry;
     use crate::foundation::io::protocol::Value;
     use crate::framework::CommandRegistry;
     use bytes::Bytes;
+    use std::sync::Arc;
+
+    #[test]
+    fn command_info_owns_dynamic_names_after_registry_removal() {
+        let mut registry = CommandRegistry::new();
+        let owner: Arc<str> = Arc::from("Module.Info");
+        let weak = Arc::downgrade(&owner);
+        let mut spec = crate::framework::commands::string::get::GET_SPEC;
+        spec.name = CommandName::Shared(owner);
+        registry.register(spec);
+        let reply = command_info(
+            &registry,
+            &ModuleRegistry::new(),
+            &[Bytes::from_static(b"MODULE.INFO")],
+        );
+        assert!(registry.unregister("module.info"));
+        drop(registry);
+        assert!(weak.upgrade().is_none());
+        let Value::Array(entries) = reply else {
+            panic!("expected COMMAND INFO array");
+        };
+        let Value::Array(fields) = &entries[0] else {
+            panic!("expected COMMAND INFO entry");
+        };
+        assert_eq!(fields[0], Value::bulk(Bytes::from_static(b"Module.Info")));
+    }
 
     fn category_names(entry: &Value) -> Vec<String> {
         let Value::Array(fields) = entry else {

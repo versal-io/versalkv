@@ -131,3 +131,46 @@ fn rejects_missing_rdb_option_values() {
         Err(RdbCliError::Usage)
     );
 }
+
+fn slot_import_rdb(count: u64, ranges: &[(u64, u64)]) -> Vec<u8> {
+    let mut data = b"VALKEY080".to_vec();
+    data.push(243);
+    versal::foundation::io::persistence::save_string(&mut data, &[b'a'; 40]);
+    for value in std::iter::once(count).chain(ranges.iter().flat_map(|&(start, end)| [start, end]))
+    {
+        data.push(0x81);
+        data.extend_from_slice(&value.to_be_bytes());
+    }
+    data.push(255);
+    let checksum = crc64(0, &data);
+    data.extend_from_slice(&checksum.to_le_bytes());
+    data
+}
+
+#[test]
+fn slot_import_accepts_counts_and_ranges_without_extra_range_validation() {
+    for ranges in [vec![], vec![(1, 2)], vec![(2, 1), (16384, u64::MAX - 1)]] {
+        let data = slot_import_rdb(ranges.len() as u64, &ranges);
+        let report = scan_rdb(&data).expect("SLOT IMPORT lengths should be valid");
+        assert_eq!(report.state.final_offset, data.len() as u64);
+        assert!(report
+            .notices
+            .iter()
+            .any(|notice| notice.message.contains("Checksum OK")));
+    }
+}
+
+#[test]
+fn slot_import_rejects_length_error_in_each_numeric_field() {
+    for (count, ranges, field_offset) in [
+        (u64::MAX, vec![], 51),
+        (1, vec![(u64::MAX, 2)], 60),
+        (1, vec![(2, u64::MAX)], 69),
+    ] {
+        let data = slot_import_rdb(count, &ranges);
+        let failure = scan_rdb(&data).expect_err("RDB_LENERR must fail even with a valid CRC");
+        assert_eq!(failure.phase, RdbCheckPhase::ReadLength);
+        assert_eq!(failure.offset, field_offset + 9);
+        assert_eq!(failure.message, "Unexpected EOF reading SLOT IMPORT");
+    }
+}

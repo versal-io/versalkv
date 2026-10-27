@@ -52,14 +52,17 @@ pub unsafe extern "C" fn ValkeyModule_OpenKey(
         if key_exists && uses_lfu {
             db.initialize_lfu_freq(&key_bytes, 5);
         }
-        let handle = ModuleKeyHandle::new(
+        let mut handle = ModuleKeyHandle::new(
             (db as *mut crate::foundation::io::store::kv_engine::Db).cast(),
             key_bytes,
             mode,
             list_max_listpack_size,
             uses_lfu,
         );
-        ValkeyModuleKey::from_handle(Box::into_raw(handle))
+        handle.owner = std::ptr::NonNull::new(internal);
+        let handle = Box::into_raw(handle);
+        super::super::auto_memory::register_key(handle);
+        ValkeyModuleKey::from_handle(handle)
     }
 }
 
@@ -67,9 +70,7 @@ pub unsafe extern "C" fn ValkeyModule_OpenKey(
 pub unsafe extern "C" fn ValkeyModule_CloseKey(key: *mut ValkeyModuleKey) {
     unsafe {
         log::trace!("ValkeyModule_CloseKey() called");
-        if !key.is_null() {
-            let _ = Box::from_raw(key as *mut ModuleKeyHandle);
-        }
+        super::super::auto_memory::release_key(key.cast());
     }
 }
 

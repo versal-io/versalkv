@@ -500,12 +500,14 @@ fn client_memory_usage_counts_argv_multi_watch_pubsub_tracking_and_output() {
 
     conn.set_request_bytes_for_test(4096);
     assert!(conn.transaction.begin(0, 0));
-    conn.transaction
-        .queue(crate::framework::CommandArgs::from_parts(vec![
+    conn.transaction.queue(
+        1,
+        crate::framework::CommandArgs::from_parts(vec![
             Bytes::from_static(b"SET"),
             Bytes::from_static(b"key"),
             Bytes::from(vec![b'x'; 8192]),
-        ]));
+        ]),
+    );
     conn.transaction.watch_many(vec![WatchedKey::new(
         0,
         Bytes::from_static(b"watched"),

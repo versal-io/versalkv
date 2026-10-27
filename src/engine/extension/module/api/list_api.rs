@@ -64,7 +64,7 @@ pub unsafe extern "C" fn ValkeyModule_ListGet(
             set_errno(libc::EDOM);
             return std::ptr::null_mut();
         };
-        Box::into_raw(ValkeyModuleString::from_bytes(&list[index]))
+        super::super::auto_memory::create_string_for_owner(handle.owner, &list[index])
     }
 }
 

@@ -134,8 +134,8 @@ fn transaction_command_keys(
         return crate::framework::commands::pubsub::ssubscribe::route_channels(command);
     }
     ServerWorkerState::cluster_redirect_keys(
-        CmdPreconditions {
-            name: spec.name,
+        &CmdPreconditions {
+            name: spec.name.clone(),
             arity: spec.arity,
             flags: spec.flags,
             first_key: spec.first_key,

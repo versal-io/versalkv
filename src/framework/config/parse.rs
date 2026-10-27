@@ -509,7 +509,7 @@ impl Config {
     }
 
     pub fn parse_config_string(&mut self, contents: &str) {
-        self.parse_config_string_filtered(contents, false);
+        self.parse_config_string_inner(contents, false, false);
     }
 
     /// Parse a config-file style string. When `skip_cli_set` is true, directives
@@ -517,12 +517,21 @@ impl Config {
     /// are ignored, so a config file cannot clobber a CLI-provided value —
     /// matching C valkey's "config file first, CLI appended last, last wins".
     pub fn parse_config_string_filtered(&mut self, contents: &str, skip_cli_set: bool) {
+        self.parse_config_string_inner(contents, skip_cli_set, true);
+    }
+
+    fn parse_config_string_inner(
+        &mut self,
+        contents: &str,
+        skip_cli_set: bool,
+        capture_registry: bool,
+    ) {
         for line in contents.lines() {
-            self.parse_config_line(line, skip_cli_set);
+            self.parse_config_line(line, skip_cli_set, capture_registry);
         }
     }
 
-    fn parse_config_line(&mut self, line: &str, skip_cli_set: bool) {
+    fn parse_config_line(&mut self, line: &str, skip_cli_set: bool, capture_registry: bool) {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             return;
@@ -547,7 +556,7 @@ impl Config {
         } else if let Some((_, setter)) = SIMPLE_CONFIGS.iter().find(|(name, _)| *name == key) {
             self.apply_simple(setter, &decoded);
         } else {
-            self.apply_special_config(&key, &decoded, raw_value.trim(), skip_cli_set);
+            self.apply_special_config(&key, &decoded, raw_value.trim(), capture_registry);
         }
     }
 
@@ -568,7 +577,7 @@ impl Config {
         key: &str,
         value: &str,
         raw_value: &str,
-        from_config_file: bool,
+        capture_registry: bool,
     ) {
         if self.apply_bounded_numeric_config(key, value) {
             return;
@@ -579,7 +588,8 @@ impl Config {
             "user" => self.apply_user_config(value),
             "rename-command" => self.apply_rename_command(value),
             "loadmodule" => self.apply_loadmodule(value),
-            _ => self.capture_registry_config(key, value, from_config_file),
+            _ if capture_registry => self.capture_registry_config(key, value),
+            _ => {}
         }
     }
 
@@ -683,13 +693,12 @@ impl Config {
         }
     }
 
-    fn capture_registry_config(&mut self, key: &str, value: &str, from_config_file: bool) {
+    fn capture_registry_config(&mut self, key: &str, value: &str) {
         // Registry-only directives are replayed by Server::apply_config. The
-        // CLI fallback already records them, so only retain config-file input.
-        if from_config_file
-            && crate::framework::commands::server::config::config_registry()
-                .lookup(key)
-                .is_some()
+        // CLI fallback already records unknown command-line flags directly.
+        if crate::framework::commands::server::config::config_registry()
+            .lookup(key)
+            .is_some()
         {
             self.extra_cli_configs
                 .push((key.to_string(), value.to_string()));

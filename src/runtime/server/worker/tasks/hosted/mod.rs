@@ -276,7 +276,7 @@ impl ServerWorkerState {
         // transaction rather than an instruction to clear the replay queue.
         if conn.transaction.is_active() && name != b"exec" {
             if !tracking_only {
-                conn.transaction.queue(args);
+                conn.transaction.queue(self.ctx.num_dbs(), args);
             }
             return Ok(());
         }
@@ -728,7 +728,7 @@ mod tests {
         let mut runtime = ServerWorkerState::new(1).expect("create runtime");
         crate::framework::commands::register_all(&mut runtime.registry);
         runtime.registry.register(CommandSpec {
-            name: "rejecthosted",
+            name: crate::engine::command::CommandName::Static("rejecthosted"),
             arity: 1,
             flags: 0,
             dispatch_group: DispatchGroup::Default,

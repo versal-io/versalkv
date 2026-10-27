@@ -103,11 +103,6 @@ fn apply_debug_param(ctx: &mut ServerContext, option: &str, value: i64) {
         "publish-period" => state.tunables.publish_period_ms = value,
         "default-down-after" => {
             state.tunables.default_down_after_ms = value;
-            for master_id in state.registry.master_ids() {
-                if let Some(master) = state.registry.master_by_id_mut(master_id) {
-                    master.down_after_ms = value;
-                }
-            }
         }
         "tilt-trigger" => state.tunables.tilt_trigger_ms = value,
         "tilt-period" => state.tunables.tilt_period_ms = value,
@@ -124,5 +119,35 @@ fn apply_debug_param(ctx: &mut ServerContext, option: &str, value: i64) {
             state.script_engine.debug_retry_delay_ms = value;
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_debug_param;
+    use crate::engine::distributed::sentinel::SentinelInstance;
+    use crate::framework::context::ServerContext;
+
+    #[test]
+    fn default_down_after_debug_setting_does_not_rewrite_loaded_masters() {
+        let mut ctx = ServerContext::new(1);
+        let mut master = SentinelInstance::new_master(1, "setmaster", "127.0.0.1:6379", 2);
+        master.down_after_ms = 20_000;
+        ctx.sentinel_state_mut()
+            .registry
+            .insert_master(master.name.clone(), master)
+            .unwrap();
+
+        apply_debug_param(&mut ctx, "default-down-after", 1_000);
+
+        assert_eq!(ctx.sentinel_state().tunables.default_down_after_ms, 1_000);
+        assert_eq!(
+            ctx.sentinel_state()
+                .registry
+                .master("setmaster")
+                .unwrap()
+                .down_after_ms,
+            20_000
+        );
     }
 }

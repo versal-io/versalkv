@@ -2,8 +2,12 @@
 
 use bytes::Bytes;
 use libc::{c_char, c_double, c_int, c_longlong, size_t};
+use std::ptr::NonNull;
 
-use super::super::super::{ValkeyModuleString, VALKEYMODULE_ERR, VALKEYMODULE_OK};
+use super::super::super::auto_memory;
+use super::super::super::{
+    ModuleInternalCtx, ValkeyModuleCtx, ValkeyModuleString, VALKEYMODULE_ERR, VALKEYMODULE_OK,
+};
 use crate::foundation::io::protocol::serializer::format_double;
 use crate::foundation::io::protocol::Value;
 
@@ -34,6 +38,8 @@ pub struct ValkeyModuleCallReply {
     pub reply_type: c_int,
     pub exact: bool,
     resp3: bool,
+    pub(crate) is_root: bool,
+    pub(crate) auto_owner: Option<NonNull<ModuleInternalCtx>>,
     pub str_data: *mut c_char,
     pub str_len: size_t,
     pub int_val: c_longlong,
@@ -52,6 +58,13 @@ pub struct ValkeyModuleCallReply {
     verbatim_storage: Option<Box<[u8]>>,
     verbatim_format_storage: Option<Box<[u8]>>,
     raw_proto: Option<Box<[u8]>>,
+}
+
+#[cfg(test)]
+impl Drop for ValkeyModuleCallReply {
+    fn drop(&mut self) {
+        crate::engine::extension::module::lifecycle_test_support::reply_dropped();
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -257,6 +270,8 @@ impl ValkeyModuleCallReply {
             reply_type,
             exact,
             resp3,
+            is_root: true,
+            auto_owner: None,
             str_data: std::ptr::null_mut(),
             str_len: 0,
             int_val: 0,
@@ -301,7 +316,9 @@ impl ValkeyModuleCallReply {
     ) -> (*mut *mut ValkeyModuleCallReply, size_t) {
         let mut elements: Vec<*mut ValkeyModuleCallReply> = Vec::new();
         for item in items {
-            elements.push(Box::into_raw(Self::from_wire_value(item, exact, resp3)));
+            let mut child = Self::from_wire_value(item, exact, resp3);
+            child.is_root = false;
+            elements.push(Box::into_raw(child));
         }
         if elements.is_empty() {
             (std::ptr::null_mut(), 0)
@@ -425,6 +442,7 @@ impl ValkeyModuleCallReply {
         let items = attrs.iter().flat_map(|(key, value)| [key, value]);
         let (elements, _) = Self::build_elements(items, exact, resp3);
         let mut attribute = Self::empty(VALKEYMODULE_REPLY_ATTRIBUTE, exact, resp3);
+        attribute.is_root = false;
         attribute.num_elements = attrs.len();
         attribute.elements = elements;
         reply.attribute = Box::into_raw(Box::new(attribute));
@@ -474,6 +492,55 @@ impl ValkeyModuleCallReply {
                 self.attribute = std::ptr::null_mut();
             }
         }
+    }
+}
+
+// SAFETY: ctx is null or live, and reply is a freshly allocated owned root.
+pub(crate) unsafe fn finish_call_reply(
+    ctx: *mut ValkeyModuleCtx,
+    reply: Box<ValkeyModuleCallReply>,
+) -> *mut ValkeyModuleCallReply {
+    let reply = Box::into_raw(reply);
+    // SAFETY: the explicit context owns an enabled scope if present.
+    unsafe {
+        let owner = auto_memory::internal_owner(ctx);
+        if auto_memory::is_enabled(owner) {
+            if let Some(owner) = owner {
+                set_reply_owner(reply, Some(owner));
+                auto_memory::register_reply(owner, reply);
+            }
+        }
+    }
+    reply
+}
+
+// SAFETY: reply owns a complete live tree, and owner is null or live.
+unsafe fn set_reply_owner(
+    reply: *mut ValkeyModuleCallReply,
+    owner: Option<NonNull<ModuleInternalCtx>>,
+) {
+    // SAFETY: each child and attribute is uniquely owned by this tree.
+    unsafe {
+        (*reply).auto_owner = owner;
+        let count = reply_child_count(
+            CallReplyKind::from_raw((*reply).reply_type),
+            (*reply).num_elements,
+        );
+        for index in 0..count {
+            set_reply_owner(*(*reply).elements.add(index), owner);
+        }
+        if !(*reply).attribute.is_null() {
+            set_reply_owner((*reply).attribute, owner);
+        }
+    }
+}
+
+// SAFETY: reply is a live owned root not registered in an automatic scope.
+pub(crate) unsafe fn release_call_reply(reply: *mut ValkeyModuleCallReply) {
+    // SAFETY: private recursive cleanup frees children regardless of is_root.
+    unsafe {
+        (*reply).free();
+        drop(Box::from_raw(reply));
     }
 }
 
@@ -630,11 +697,11 @@ pub unsafe extern "C" fn ValkeyModule_CallReplyProto(
 // Box::into_raw and has not been double-freed.
 pub unsafe extern "C" fn ValkeyModule_FreeCallReply(reply: *mut ValkeyModuleCallReply) {
     unsafe {
-        if reply.is_null() {
+        if reply.is_null() || !(*reply).is_root {
             return;
         }
-        (*reply).free();
-        let _ = Box::from_raw(reply);
+        auto_memory::remove_reply(reply);
+        release_call_reply(reply);
     }
 }
 
@@ -667,7 +734,7 @@ pub unsafe extern "C" fn ValkeyModule_CreateStringFromCallReply(
             }
             _ => return std::ptr::null_mut(),
         };
-        Box::into_raw(ValkeyModuleString::from_bytes(&data))
+        auto_memory::create_string_for_owner(r.auto_owner, &data)
     }
 }
 
@@ -922,8 +989,7 @@ mod tests {
             assert_eq!(std::slice::from_raw_parts(ptr.cast::<u8>(), len), b"a\0b");
             let string = ValkeyModule_CreateStringFromCallReply(&mut *bulk);
             assert_eq!((*string).as_bytes(), b"a\0b");
-            let mut string = Box::from_raw(string);
-            string.free();
+            ValkeyModuleString::release(string);
             free_reply(bulk);
 
             let mut error = ValkeyModuleCallReply::from_value(

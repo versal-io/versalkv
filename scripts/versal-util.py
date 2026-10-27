@@ -1835,6 +1835,12 @@ def command_check_generated_metadata(_args: argparse.Namespace, ctx: RepoContext
         fixture = Path(directory)
         project = fixture / "project"
         (project / "src/framework/commands").mkdir(parents=True)
+        for module in ("command_runtime", "introspection", "key_extractors", "pattern"):
+            write_fixture(
+                project,
+                "src/framework/commands/{}.rs".format(module),
+                "// Static module stub for the metadata-only fixture.\n",
+            )
         command_dir = project / "thirdparty/valkey/src/commands"
         command_dir.mkdir(parents=True)
         shutil.copy2(str(root / "build.rs"), str(project / "build.rs"))

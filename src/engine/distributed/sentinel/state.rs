@@ -232,10 +232,6 @@ impl SentinelRegistry {
         self.master_by_name.keys()
     }
 
-    pub fn master_ids(&self) -> Vec<SentinelInstanceId> {
-        self.master_by_name.values().copied().collect()
-    }
-
     pub fn master_count(&self) -> usize {
         self.master_by_name.len()
     }

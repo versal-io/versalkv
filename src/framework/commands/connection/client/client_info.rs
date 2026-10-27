@@ -53,7 +53,9 @@ pub fn client_info(conn: &mut dyn CommandConn, ctx: &mut ServerContext) -> Value
     let argv_mem = conn.req_bytes_curr_cmd();
     let multi_mem = conn.transaction_memory_usage();
     let omem = conn.output_buffer_memory_usage();
-    let tot_mem = conn.total_memory_usage();
+    let tot_mem = conn
+        .total_memory_usage()
+        .saturating_add(ctx.pubsub().client_name_memory_usage(conn.token().0));
     // C networking.c exposes CLIENT_CAPA_REDIRECT as the compact `r` flag.
     let capa = if conn
         .capa_flags()
@@ -94,7 +96,6 @@ pub fn client_info(conn: &mut dyn CommandConn, ctx: &mut ServerContext) -> Value
         conn.tot_net_out(),
         conn.cmd_count(),
     );
-    let _ = ctx;
     Value::bulk(Bytes::from(info))
 }
 

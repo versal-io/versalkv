@@ -240,14 +240,40 @@ impl<'a> RdbScanner<'a> {
                 "Unexpected EOF reading SLOT INFO",
             )?,
             RDB_OPCODE_SLOT_IMPORT => {
-                self.load_string(
+                let job_name = self.load_string(
                     RdbCheckPhase::ReadLength,
                     "Unexpected EOF reading SLOT IMPORT",
                 )?;
-                self.load_len(
+                if job_name.len() != 40 {
+                    return self.fail(
+                        RdbCheckPhase::ReadLength,
+                        "Invalid slot import job name length in RDB",
+                    );
+                }
+                let (num_slot_ranges, _) = self.load_len(
                     RdbCheckPhase::ReadLength,
                     "Unexpected EOF reading SLOT IMPORT",
                 )?;
+                if num_slot_ranges == u64::MAX {
+                    return self.fail(
+                        RdbCheckPhase::ReadLength,
+                        "Unexpected EOF reading SLOT IMPORT",
+                    );
+                }
+                for _ in 0..num_slot_ranges {
+                    for _ in 0..2 {
+                        let (slot, _) = self.load_len(
+                            RdbCheckPhase::ReadLength,
+                            "Unexpected EOF reading SLOT IMPORT",
+                        )?;
+                        if slot == u64::MAX {
+                            return self.fail(
+                                RdbCheckPhase::ReadLength,
+                                "Unexpected EOF reading SLOT IMPORT",
+                            );
+                        }
+                    }
+                }
             }
             _ => return Ok(false),
         }

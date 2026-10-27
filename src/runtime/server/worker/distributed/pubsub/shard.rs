@@ -18,7 +18,7 @@ impl ServerWorkerState {
             return false;
         };
         let meta = crate::runtime::server::worker::flows::request::dispatch::CmdPreconditions {
-            name: spec.name,
+            name: spec.name.clone(),
             arity: spec.arity,
             flags: spec.flags,
             first_key: spec.first_key,
@@ -337,7 +337,7 @@ mod tests {
         let outcome = backend.pre_dispatch_exec(
             connection_token,
             CmdPreconditions {
-                name: spec.name,
+                name: spec.name.clone(),
                 arity: spec.arity,
                 flags: spec.flags,
                 first_key: spec.first_key,
