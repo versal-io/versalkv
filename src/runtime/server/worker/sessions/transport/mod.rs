@@ -77,6 +77,25 @@ impl ServerWorkerState {
             replies.push(reply);
             return Some(false);
         }
+        let allows_busy = crate::framework::generated::commands::top_level_meta(name_lower)
+            .is_some_and(|meta| meta.flags & crate::engine::command::CMD_ALLOW_BUSY != 0);
+        if self.ctx.is_script_busy() && !self.ctx.is_loading() && !allows_busy {
+            self.ctx.end_cmd(name_lower, true);
+            let reply = Value::error(
+                "BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.",
+            );
+            crate::runtime::server::worker::flows::request::dispatch::record_error_reply(
+                &mut self.ctx,
+                &reply,
+                None,
+            );
+            replies.push(if resp3 {
+                serialize_to_vec_resp3(&reply)
+            } else {
+                serialize_to_vec_resp2(&reply)
+            });
+            return Some(false);
+        }
         match name_lower {
             "replconf" => {
                 Some(self.handle_replconf(connection_token, token_value, args, resp3, replies))
@@ -135,6 +154,73 @@ mod tests {
             },
         );
         (backend, token.0, connection_id)
+    }
+
+    #[test]
+    fn transport_busy_rejections_preserve_replication_and_count_errors() {
+        for (name, resp3) in [("psync", false), ("sync", true)] {
+            let (mut backend, token, connection_id) = backend_with_primary_link();
+            backend.ctx.set_script_busy(false, false);
+            let args = CommandArgs {
+                name: Bytes::copy_from_slice(name.as_bytes()),
+                args: if name == "psync" {
+                    vec![Bytes::from_static(b"?"), Bytes::from_static(b"-1")]
+                } else {
+                    Vec::new()
+                },
+            };
+            let mut replies = Vec::new();
+            let mut unblocks = Vec::new();
+            backend.ctx.begin_cmd();
+
+            assert_eq!(
+                backend.try_handle_transport_cmd(
+                    token,
+                    token,
+                    &args,
+                    name,
+                    resp3,
+                    &mut replies,
+                    &mut unblocks,
+                ),
+                Some(false)
+            );
+            assert!(matches!(replies.as_slice(), [reply] if reply.starts_with(b"-BUSY ")));
+            assert_eq!(backend.ctx.stats().total_error_replies, 1);
+            assert_eq!(backend.ctx.stats().error_stats.get("BUSY"), Some(&1));
+            assert_eq!(backend.ctx.stats().sync_full, 0);
+            assert_eq!(
+                backend
+                    .replication_runtime
+                    .primary_for_connection(connection_id)
+                    .unwrap()
+                    .state(),
+                PrimaryLinkState::AwaitingPsync
+            );
+            replies.clear();
+            let replconf = CommandArgs {
+                name: Bytes::from_static(b"REPLCONF"),
+                args: vec![
+                    Bytes::from_static(b"listening-port"),
+                    Bytes::from_static(b"6380"),
+                ],
+            };
+            backend.ctx.begin_cmd();
+            assert_eq!(
+                backend.try_handle_transport_cmd(
+                    token,
+                    token,
+                    &replconf,
+                    "replconf",
+                    resp3,
+                    &mut replies,
+                    &mut unblocks,
+                ),
+                Some(false)
+            );
+            assert_eq!(replies, vec![b"+OK\r\n".to_vec()]);
+            assert_eq!(backend.ctx.stats().total_error_replies, 1);
+        }
     }
 
     fn malformed_ack_with_trailing_option() -> CommandArgs {
@@ -384,6 +470,7 @@ mod tests {
         };
         let mut replies = Vec::new();
         let mut pending_unblock = Vec::new();
+        backend.ctx.set_script_busy(false, false);
 
         let handled = backend.try_handle_transport_cmd(
             connection_token,
@@ -730,6 +817,10 @@ mod tests {
         );
         assert_eq!(backend.ctx.stats().sync_full, 0);
         assert_eq!(backend.ctx.stats().sync_partial_err, 0);
+        assert_eq!(
+            backend.replication_runtime.role(ConnectionId(token.0)),
+            None
+        );
     }
 
     #[test]

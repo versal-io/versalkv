@@ -43,6 +43,15 @@ pub(crate) fn flag_char_for_conn(
     if conn.blocked.is_some() {
         flags.push('b');
     }
+    if conn.is_async_close_pending {
+        flags.push('A');
+    } else if matches!(
+        conn.state,
+        crate::framework::capabilities::connection::ConnectionState::Closing
+            | crate::framework::capabilities::connection::ConnectionState::CloseAfterReply
+    ) {
+        flags.push('c');
+    }
     if conn.no_touch {
         flags.push('N');
     }

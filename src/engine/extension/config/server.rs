@@ -160,6 +160,8 @@ pub struct ServerConfig {
     pub latency_tracking_info_percentiles: Vec<f64>,
     pub skip_checksum_validation: bool,
     pub debug_pause_after_fork: bool,
+    /// One-shot DEBUG PAUSE-BEFORE-PSYNC hook for replica handshake tests.
+    pub debug_pause_before_psync: bool,
     /// DEBUG DELAY-RDB-CLIENT-FREE-SECONDS, used by dual-channel grace tests.
     pub debug_delay_rdb_client_free_seconds: i64,
     pub maxclients: u32,
@@ -338,6 +340,7 @@ impl ServerConfig {
             latency_tracking_info_percentiles: DEFAULT_LATENCY_PERCENTILES.to_vec(),
             skip_checksum_validation: false,
             debug_pause_after_fork: false,
+            debug_pause_before_psync: false,
             debug_delay_rdb_client_free_seconds: 0,
             maxclients: 10000,
             max_new_connections_per_cycle: 10,

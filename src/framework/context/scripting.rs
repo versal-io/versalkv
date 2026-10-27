@@ -24,9 +24,14 @@ impl ServerContext {
         &mut self,
         now: crate::foundation::io::sys::time::MonotonicInstant,
     ) {
-        let expired = self.module_registry.take_expired_timers(now);
-        for timer in expired {
+        let expired = self.module_registry.expired_timer_ids(now);
+        for id in expired {
+            let Some(timer) = self.module_registry.timer_for_callback(id) else {
+                continue;
+            };
+            let module_name = timer.module_name.clone();
             crate::framework::capabilities::module::invoke_module_timer(timer, self);
+            self.module_registry.stop_timer(&module_name, id);
         }
     }
     /// Whether a script is currently in BUSY state (timeout but still running).

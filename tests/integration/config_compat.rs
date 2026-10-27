@@ -1072,7 +1072,8 @@ fn latency_tracking_defaults_to_real_command_duration_percentiles() {
     assert_config_value(&mut client, b"latency-tracking", "yes");
     assert_eq!(client.command(&[b"PING"]), b"+PONG\r\n");
     assert_eq!(client.command(&[b"DEBUG", b"SLEEP", b"0.001"]), b"+OK\r\n");
-    assert_eq!(client.command(&[b"DEBUG", b"SLEEP", b"0.03"]), b"+OK\r\n");
+    // Keep the samples distinct even when scheduling adds a few milliseconds.
+    assert_eq!(client.command(&[b"DEBUG", b"SLEEP", b"0.2"]), b"+OK\r\n");
     assert_eq!(
         client.command(&[
             b"CONFIG",

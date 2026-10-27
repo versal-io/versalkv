@@ -3,6 +3,161 @@ use std::process::Command;
 use crate::common::TestServer;
 
 #[test]
+fn valkey_update_benchmark_rejects_missing_commands_before_connecting() {
+    let server = TestServer::start_default();
+    let closed = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve port");
+    let closed_port = closed.local_addr().expect("reserved address").port();
+    drop(closed);
+    let sequences: &[&[&str]] = &[
+        &["10000"],
+        &["10000", ";"],
+        &[";"],
+        &["10000", ";", "INCR", "foo"],
+        &["INCR", "foo", ";", "10000"],
+        &[";", "INCR", "foo"],
+        &["INCR", "foo", ";", ";", "INCR", "bar"],
+        &["2", "3"],
+        &["2", "3", ";"],
+    ];
+    for port in [server.port, closed_port] {
+        for sequence in sequences {
+            let output = Command::new(binary_path("versal-benchmark"))
+                .args(["-h", "127.0.0.1", "-p", &port.to_string(), "-n", "1", "--"])
+                .args(*sequence)
+                .output()
+                .expect("run invalid benchmark sequence");
+            assert_eq!(output.status.code(), Some(1), "{sequence:?}");
+            assert_eq!(
+                String::from_utf8_lossy(&output.stderr),
+                "Invalid command sequence: a command is missing.\n\
+                 Use -n <requests> to set the total number of requests.\n",
+                "port={port}, sequence={sequence:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn valkey_update_benchmark_accepts_initial_repeat_and_trailing_separator() {
+    let server = TestServer::start_default();
+    let output = Command::new(binary_path("versal-benchmark"))
+        .args([
+            "-h",
+            "127.0.0.1",
+            "-p",
+            &server.port.to_string(),
+            "-n",
+            "12",
+            "-c",
+            "1",
+            "--",
+        ])
+        .args(["2", "3", "INCR", "foo", ";", "INCR", "bar", ";"])
+        .output()
+        .expect("run repeated benchmark sequence");
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mut client = server.connect();
+    assert_eq!(client.command(&[b"GET", b"foo"]), b"$1\r\n9\r\n");
+    assert_eq!(client.command(&[b"GET", b"bar"]), b"$1\r\n3\r\n");
+    assert_command_calls(&server, "incr", 12);
+}
+
+#[test]
+fn valkey_update_benchmark_idle_ignores_custom_command_sequence() {
+    let server = TestServer::start_default();
+    for selection in ["ping", "fcall"] {
+        let status = crate::common::command_status_with_timeout(
+            Command::new(binary_path("versal-benchmark"))
+                .args([
+                    "-h",
+                    "127.0.0.1",
+                    "-p",
+                    &server.port.to_string(),
+                    "-I",
+                    "-c",
+                    "1",
+                    "-t",
+                    selection,
+                    "--",
+                    ";",
+                ])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null()),
+            std::time::Duration::from_secs(1),
+        )
+        .expect("run idle benchmark");
+        assert!(
+            status.is_none(),
+            "idle mode must keep connections open: selection={selection}, status={status:?}"
+        );
+    }
+}
+
+#[test]
+fn valkey_update_benchmark_idle_ignores_dataset_workload() {
+    let server = TestServer::start_default();
+    let dataset = server.data_dir().join("idle.csv");
+    std::fs::write(&dataset, "content\nvalue\n").expect("write idle dataset");
+    let status = crate::common::command_status_with_timeout(
+        Command::new(binary_path("versal-benchmark"))
+            .args([
+                "-h",
+                "127.0.0.1",
+                "-p",
+                &server.port.to_string(),
+                "-I",
+                "-c",
+                "1",
+                "--dataset",
+            ])
+            .arg(&dataset)
+            .args(["--", "SET", "doc", "__field:content__"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()),
+        std::time::Duration::from_secs(1),
+    )
+    .expect("run idle dataset benchmark");
+    assert!(
+        status.is_none(),
+        "idle dataset mode must remain connected: {status:?}"
+    );
+    assert_command_calls(&server, "set", 0);
+    for template in [
+        &["SET", "doc", "value"][..],
+        &["SET", "doc", "__field:missing__"][..],
+    ] {
+        let status = crate::common::command_status_with_timeout(
+            Command::new(binary_path("versal-benchmark"))
+                .args([
+                    "-h",
+                    "127.0.0.1",
+                    "-p",
+                    &server.port.to_string(),
+                    "-I",
+                    "-c",
+                    "1",
+                    "--dataset",
+                ])
+                .arg(&dataset)
+                .arg("--")
+                .args(template)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null()),
+            std::time::Duration::from_secs(1),
+        )
+        .expect("run invalid idle dataset benchmark");
+        assert!(
+            status.is_some_and(|status| !status.success()),
+            "idle mode must validate dataset fields: {template:?}"
+        );
+    }
+}
+
+#[test]
 fn benchmark_ratio_one_to_one_runs_set_and_get() {
     let server = TestServer::start_default();
     let output = Command::new(binary_path("versal-benchmark"))

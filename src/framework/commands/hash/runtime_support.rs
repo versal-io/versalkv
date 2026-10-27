@@ -110,26 +110,89 @@ pub fn parse_fields(
     args: &[Bytes],
     start_idx: usize,
 ) -> Result<(usize, Vec<Bytes>), crate::foundation::io::protocol::Value> {
+    parse_fields_with_count_error(
+        args,
+        start_idx,
+        "ERR numfields should be greater than 0 and match the provided number of fields",
+    )
+}
+
+pub fn parse_query_fields(
+    args: &[Bytes],
+    start_idx: usize,
+) -> Result<(usize, Vec<Bytes>), crate::foundation::io::protocol::Value> {
+    parse_fields_with_count_error(args, start_idx, "ERR syntax error")
+}
+
+fn parse_fields_with_count_error(
+    args: &[Bytes],
+    start_idx: usize,
+    count_error: &'static str,
+) -> Result<(usize, Vec<Bytes>), crate::foundation::io::protocol::Value> {
     use crate::foundation::io::protocol::Value;
     if start_idx >= args.len() {
         return Err(Value::error("ERR wrong number of arguments"));
     }
     if !args[start_idx].eq_ignore_ascii_case(b"fields") {
-        return Ok((1, vec![args[start_idx].clone()]));
+        return Err(Value::error("ERR syntax error"));
     }
     if start_idx + 1 >= args.len() {
-        return Err(Value::error(
-            "ERR numfields should be greater than 0 and match the provided number of fields",
-        ));
+        return Err(Value::error(count_error));
     }
-    let count = std::str::from_utf8(&args[start_idx + 1])
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .ok_or_else(|| Value::error("ERR numfields should be greater than 0"))?;
-    if count == 0 || start_idx + 2 + count > args.len() {
-        return Err(Value::error(
-            "ERR numfields should be greater than 0 and match the provided number of fields",
-        ));
+    let count = match parse_i64_range(&args[start_idx + 1], i64::MIN, i64::MAX) {
+        ParseIntResult::Ok(count) => count,
+        ParseIntResult::NotInteger | ParseIntResult::OutOfRange => {
+            return Err(Value::error(NOT_INT));
+        }
+    };
+    let fields_start = start_idx + 2;
+    if count <= 0 || usize::try_from(count).ok() != Some(args.len() - fields_start) {
+        return Err(Value::error(count_error));
     }
+    let count = args.len() - fields_start;
     Ok((2 + count, args[start_idx + 2..start_idx + 2 + count].to_vec()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_fields, parse_query_fields, NOT_INT};
+    use crate::foundation::io::protocol::Value;
+    use bytes::Bytes;
+
+    #[test]
+    fn fields_parser_distinguishes_syntax_integer_and_count_errors() {
+        let count_error =
+            "ERR numfields should be greater than 0 and match the provided number of fields";
+        for (input, expected) in [
+            (vec!["key", "other", "1", "field"], "ERR syntax error"),
+            (vec!["key", "FIELDS", "other", "field"], NOT_INT),
+            (vec!["key", "FIELDS", "9223372036854775808", "field"], NOT_INT),
+            (vec!["key", "FIELDS", "01", "field"], NOT_INT),
+            (vec!["key", "FIELDS", "-1", "field"], count_error),
+            (vec!["key", "FIELDS", "0", "field"], count_error),
+            (vec!["key", "FIELDS", "2", "field"], count_error),
+            (vec!["key", "FIELDS", "1", "first", "second"], count_error),
+        ] {
+            let args: Vec<_> = input.iter().map(|value| Bytes::from(*value)).collect();
+            assert_eq!(parse_fields(&args, 1), Err(Value::error(expected)), "{input:?}");
+            let query_error = if expected == count_error { "ERR syntax error" } else { expected };
+            assert_eq!(
+                parse_query_fields(&args, 1),
+                Err(Value::error(query_error)),
+                "{input:?}"
+            );
+        }
+        let args = [
+            Bytes::from_static(b"key"),
+            Bytes::from_static(b"fIeLdS"),
+            Bytes::from_static(b"2"),
+            Bytes::from_static(b"first"),
+            Bytes::from_static(b"second"),
+        ];
+        assert_eq!(
+            parse_fields(&args, 1),
+            Ok((4, vec![Bytes::from_static(b"first"), Bytes::from_static(b"second")]))
+        );
+        assert_eq!(parse_query_fields(&args, 1), parse_fields(&args, 1));
+    }
 }

@@ -270,6 +270,16 @@ impl ServerWorkerState {
         request: PsyncRequest<'_>,
         replies: &mut Vec<Vec<u8>>,
     ) -> bool {
+        if self.ctx.replication().is_replica()
+            && self.ctx.config().replication.master_link_status != "up"
+        {
+            self.reject_psync(
+                request.command.name(),
+                b"-NOMASTERLINK Can't SYNC while not connected with my master\r\n",
+                replies,
+            );
+            return false;
+        }
         if self
             .replication_runtime
             .primary_for_connection(request.connection_id)
@@ -289,16 +299,6 @@ impl ServerWorkerState {
                     error
                 );
             }
-        }
-        if self.ctx.replication().is_replica()
-            && self.ctx.config().replication.master_link_status != "up"
-        {
-            self.reject_psync(
-                request.command.name(),
-                b"-NOMASTERLINK Can't SYNC while not connected with my master\r\n",
-                replies,
-            );
-            return false;
         }
         true
     }

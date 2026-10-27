@@ -134,6 +134,7 @@ pub fn debug_cmd(conn: &mut dyn CommandConn, args: &CommandArgs, ctx: &mut Serve
             crate::framework::commands::server::config::config_rewrite(ctx)
         }
         "pause-after-fork" => introspection::debug_pause_after_fork(args, ctx),
+        "pause-before-psync" => introspection::debug_pause_before_psync(args, ctx),
         "delay-rdb-client-free-seconds" => {
             introspection::debug_delay_rdb_client_free_seconds(args, ctx)
         }

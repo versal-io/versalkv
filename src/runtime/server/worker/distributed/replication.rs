@@ -1437,6 +1437,11 @@ impl ServerWorkerState {
         for action in actions {
             match action {
                 ReplicaAction::Send(frame) => {
+                    if frame.starts_with(b"*3\r\n$5\r\nPSYNC\r\n")
+                        || frame.starts_with(b"*4\r\n$5\r\nPSYNC\r\n")
+                    {
+                        self.pause_before_replica_psync();
+                    }
                     if frame
                         .windows(b"set-rdb-client-id".len())
                         .any(|window| window.eq_ignore_ascii_case(b"set-rdb-client-id"))
@@ -1454,6 +1459,7 @@ impl ServerWorkerState {
                     main_has_output = true;
                 }
                 ReplicaAction::SendDualPsync(frame) => {
+                    self.pause_before_replica_psync();
                     if self.consume_debug_pause_after_fork() {
                         crate::server_log!(
                             debug,
@@ -1504,6 +1510,12 @@ impl ServerWorkerState {
             self.transport
                 .set_interest(token, Interest::ReadWritable)
                 .ok();
+        }
+    }
+
+    fn pause_before_replica_psync(&mut self) {
+        if std::mem::take(&mut self.ctx.config_mut().server.debug_pause_before_psync) {
+            let _ = crate::framework::capabilities::process::stop_current_process();
         }
     }
 

@@ -43,6 +43,7 @@ pub(super) fn debug_help() -> Value {
         "REPLYBUFFER PEAK-RESET-TIME <NEVER|RESET|time>",
         "REPLYBUFFER RESIZING <0|1>",
         "PAUSE-AFTER-FORK <0|1>",
+        "PAUSE-BEFORE-PSYNC <0|1>",
         "DELAY-RDB-CLIENT-FREE-SECONDS <seconds>",
         "DICT-RESIZING <0|1>",
         "HASHTABLE-CAN-ABORT-SHRINK <0|1>",

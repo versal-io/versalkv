@@ -3,6 +3,79 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 #[test]
+fn valkey_update_resetstat_clears_acl_counters_and_preserves_log() {
+    let server = TestServer::start_default();
+    let mut admin = server.connect();
+    let mut restricted = server.connect();
+    assert_eq!(
+        admin.command(&[
+            b"ACL",
+            b"SETUSER",
+            b"resetstat-user",
+            b"on",
+            b">secret",
+            b"-@all",
+            b"+get",
+            b"+publish",
+            b"+select",
+            b"~allowed",
+            b"&allowed",
+            b"db=0",
+        ]),
+        b"+OK\r\n"
+    );
+    assert!(restricted
+        .command(&[b"AUTH", b"resetstat-user", b"wrong"])
+        .starts_with(b"-WRONGPASS"));
+    assert_eq!(
+        restricted.command(&[b"AUTH", b"resetstat-user", b"secret"]),
+        b"+OK\r\n"
+    );
+    for command in [
+        &[b"PING".as_slice()][..],
+        &[b"GET".as_slice(), b"denied"][..],
+        &[b"PUBLISH".as_slice(), b"denied", b"message"][..],
+        &[b"SELECT".as_slice(), b"1"][..],
+    ] {
+        assert!(restricted.command(command).starts_with(b"-NOPERM"));
+    }
+    let counters = [
+        "acl_access_denied_auth",
+        "acl_access_denied_cmd",
+        "acl_access_denied_key",
+        "acl_access_denied_channel",
+        "acl_access_denied_db",
+    ];
+    let stats = admin.command_str(&[b"INFO", b"stats"]);
+    for counter in counters {
+        assert!(stats.contains(&format!("{counter}:1\r\n")), "{stats}");
+    }
+    let log = acl_log_without_ages(admin.command(&[b"ACL", b"LOG"]));
+    assert_eq!(admin.command(&[b"CONFIG", b"RESETSTAT"]), b"+OK\r\n");
+    let stats = admin.command_str(&[b"INFO", b"stats"]);
+    for counter in counters {
+        assert!(stats.contains(&format!("{counter}:0\r\n")), "{stats}");
+    }
+    assert_eq!(acl_log_without_ages(admin.command(&[b"ACL", b"LOG"])), log);
+    assert!(restricted.command(&[b"PING"]).starts_with(b"-NOPERM"));
+    let stats = admin.command_str(&[b"INFO", b"stats"]);
+    assert!(stats.contains("acl_access_denied_cmd:1\r\n"), "{stats}");
+}
+
+fn acl_log_without_ages(reply: Vec<u8>) -> String {
+    let reply = String::from_utf8(reply).expect("UTF-8 ACL log");
+    let marker = "$11\r\nage-seconds\r\n";
+    let mut entries = reply.split(marker);
+    let mut normalized = entries.next().expect("ACL reply").to_string();
+    for entry in entries {
+        normalized.push_str(marker);
+        normalized.push_str("$1\r\n0\r\n");
+        normalized.push_str(entry.splitn(3, "\r\n").nth(2).expect("bulk age value"));
+    }
+    normalized
+}
+
+#[test]
 fn acl_setuser_state_modifiers_are_case_insensitive() {
     let server = TestServer::start_default();
     let mut admin = server.connect();

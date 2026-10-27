@@ -48,7 +48,7 @@ jobs:
           ulimit -a
 
       - name: Install Rust check dependencies
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends nodejs build-essential clang lld
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends nodejs build-essential clang lld iproute2
 
       - name: Format check
         run: make fmt

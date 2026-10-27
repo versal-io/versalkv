@@ -277,6 +277,22 @@ pub(super) fn debug_pause_after_fork(args: &CommandArgs, ctx: &mut ServerContext
     }
 }
 
+pub(super) fn debug_pause_before_psync(args: &CommandArgs, ctx: &mut ServerContext) -> Value {
+    if args.args.len() != 2 {
+        return CommandError::syntax_error();
+    }
+    match std::str::from_utf8(&args.args[1])
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+    {
+        Some(value) => {
+            ctx.config_mut().server.debug_pause_before_psync = value != 0;
+            Value::ok()
+        }
+        None => Value::error("ERR value is not an integer or out of range"),
+    }
+}
+
 pub(super) fn debug_set_integer(args: &CommandArgs) -> Value {
     if args.args.len() != 2 {
         return CommandError::syntax_error();

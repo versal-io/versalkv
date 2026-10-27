@@ -16,6 +16,18 @@ pub struct CommandPlan {
 
 impl CommandPlan {
     pub fn from_config(config: &BenchConfig) -> Result<Self, String> {
+        if config.idle {
+            // Dataset validation still needs the raw template's field metadata.
+            let tests = if config.dataset.is_some() {
+                vec![TestTemplate {
+                    name: "IDLE".to_string(),
+                    sequence: vec![config.command.clone()],
+                }]
+            } else {
+                Vec::new()
+            };
+            return Ok(Self { tests });
+        }
         let mut tests = if config.command.is_empty() {
             select_default_tests(config)?
         } else {
@@ -251,30 +263,41 @@ fn test_is_selected(requested: &[String], candidate: &str) -> bool {
 
 fn parse_command_sequence(args: &[String]) -> Result<Vec<Vec<String>>, String> {
     let mut sequence = Vec::new();
-    let mut current = Vec::new();
-    let mut repeat_next = 1usize;
-    let mut i = 0;
-    while i < args.len() {
-        let arg = &args[i];
-        if arg == ";" {
-            push_repeated(&mut sequence, &current, repeat_next);
-            current.clear();
-            repeat_next = 1;
-            i += 1;
-            if i < args.len() {
-                if let Ok(repeat) = args[i].parse::<usize>() {
-                    repeat_next = repeat;
-                    i += 1;
-                }
+    let mut segments = args.split(|arg| arg == ";").peekable();
+    let missing_command = || {
+        "Invalid command sequence: a command is missing.\n\
+         Use -n <requests> to set the total number of requests."
+            .to_string()
+    };
+    while let Some(mut command) = segments.next() {
+        // A trailing separator ends the last command without starting a new one.
+        if command.is_empty() {
+            if segments.peek().is_some() {
+                return Err(missing_command());
             }
             continue;
         }
-        current.push(arg.clone());
-        i += 1;
+        let mut repeat = 1;
+        while command
+            .first()
+            .is_some_and(|arg| matches!(arg.as_bytes().first(), Some(b'1'..=b'9')))
+        {
+            let digits: String = command[0]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect();
+            repeat = digits
+                .parse::<usize>()
+                .map_err(|_| "Invalid command repeat count".to_string())?;
+            command = &command[1..];
+        }
+        if command.is_empty() {
+            return Err(missing_command());
+        }
+        push_repeated(&mut sequence, command, repeat);
     }
-    push_repeated(&mut sequence, &current, repeat_next);
     if sequence.is_empty() {
-        return Err("No command specified".to_string());
+        return Err(missing_command());
     }
     Ok(sequence)
 }

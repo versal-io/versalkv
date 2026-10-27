@@ -388,6 +388,91 @@ mod tests {
 
     thread_local! {
         static CAPTURED_NAMES: RefCell<Vec<Weak<str>>> = const { RefCell::new(Vec::new()) };
+        static TIMER_CALLBACK_PROBE: RefCell<Option<TimerCallbackProbe>> = const { RefCell::new(None) };
+    }
+
+    struct TimerCallbackProbe {
+        id: u64,
+        should_stop: bool,
+        was_registered: bool,
+        stopped_data: Option<*mut libc::c_void>,
+        calls: usize,
+    }
+
+    extern "C" fn inspect_timer_registration(_ctx: *mut ValkeyModuleCtx, _data: *mut libc::c_void) {
+        use crate::engine::extension::module::api::with_active_registry;
+
+        TIMER_CALLBACK_PROBE.with(|probe| {
+            let mut probe = probe.borrow_mut();
+            let probe = probe.as_mut().unwrap();
+            probe.calls += 1;
+            probe.was_registered = with_active_registry(|registry| {
+                registry
+                    .timer_info("timer-callback-probe", probe.id)
+                    .is_some()
+            }) == Some(true);
+            if probe.should_stop {
+                probe.stopped_data = with_active_registry(|registry| {
+                    registry.stop_timer("timer-callback-probe", probe.id)
+                })
+                .flatten();
+            }
+        });
+    }
+
+    #[test]
+    fn module_timer_callback_keeps_registration_until_callback_completion() {
+        use crate::foundation::io::sys::time::MonotonicInstant;
+        use std::time::Duration;
+
+        for should_stop in [false, true] {
+            let mut ctx = ServerContext::new(1);
+            ctx.module_registry_mut()
+                .register(ModuleRef::new(
+                    "timer-callback-probe",
+                    std::ptr::null_mut(),
+                    1,
+                    true,
+                ))
+                .unwrap();
+            let mut data = 0u8;
+            let data_ptr = (&mut data as *mut u8).cast();
+            let id = ctx
+                .module_registry_mut()
+                .create_timer(
+                    "timer-callback-probe",
+                    0,
+                    0,
+                    inspect_timer_registration,
+                    data_ptr,
+                )
+                .unwrap();
+            TIMER_CALLBACK_PROBE.with(|probe| {
+                *probe.borrow_mut() = Some(TimerCallbackProbe {
+                    id,
+                    should_stop,
+                    was_registered: false,
+                    stopped_data: None,
+                    calls: 0,
+                });
+            });
+            ctx.run_expired_module_timers(
+                MonotonicInstant::now().saturating_add(Duration::from_secs(1)),
+            );
+            TIMER_CALLBACK_PROBE.with(|probe| {
+                let probe = probe.borrow_mut().take().unwrap();
+                assert!(probe.was_registered);
+                assert_eq!(probe.calls, 1);
+                assert_eq!(probe.stopped_data, should_stop.then_some(data_ptr));
+            });
+            assert_eq!(
+                ctx.module_registry().timer_info("timer-callback-probe", id),
+                None
+            );
+            ctx.run_expired_module_timers(
+                MonotonicInstant::now().saturating_add(Duration::from_secs(2)),
+            );
+        }
     }
 
     fn capture_command_names(

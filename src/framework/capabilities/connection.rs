@@ -140,6 +140,8 @@ pub struct Connection {
     pub query_buffer_capacity: usize,
     accounted_normal_memory: usize,
     pub protected: bool,
+    /// Retirement was requested while a protected command still owned this client.
+    pub(crate) is_async_close_pending: bool,
     pub module_auth_callback: Option<(extern "C" fn(u64, *mut libc::c_void), *mut libc::c_void)>,
     pub module_auth_user: Option<String>,
 }
@@ -225,6 +227,7 @@ impl Connection {
             query_buffer_capacity: 0,
             accounted_normal_memory: 0,
             protected: false,
+            is_async_close_pending: false,
             module_auth_callback: None,
             module_auth_user: None,
         }
@@ -919,6 +922,7 @@ impl Connection {
             query_buffer_capacity: 0,
             accounted_normal_memory: 0,
             protected: false,
+            is_async_close_pending: false,
             module_auth_callback: None,
             module_auth_user: None,
         }

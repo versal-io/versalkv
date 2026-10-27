@@ -4,12 +4,13 @@ use crate::framework::CMD_ADMIN;
 use crate::framework::CMD_NOSCRIPT;
 use crate::framework::CMD_NO_ASYNC_LOADING;
 use crate::framework::CMD_NO_MULTI;
+use crate::framework::CMD_STALE;
 use crate::framework::{CmdFlags, CommandMeta, DispatchGroup};
 
 pub const PSYNC_META: CommandMeta = CommandMeta {
     name: "psync",
     arity: -3,
-    flags: (CMD_NO_ASYNC_LOADING | CMD_ADMIN | CMD_NO_MULTI | CMD_NOSCRIPT) as CmdFlags,
+    flags: (CMD_NO_ASYNC_LOADING | CMD_ADMIN | CMD_STALE | CMD_NO_MULTI | CMD_NOSCRIPT) as CmdFlags,
     dispatch_group: DispatchGroup::Transport,
     first_key: 0,
     last_key: 0,

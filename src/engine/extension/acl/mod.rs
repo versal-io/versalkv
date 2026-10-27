@@ -12,7 +12,7 @@ pub(crate) use user::{
 };
 
 pub(crate) use selector::{
-    acl_log, add_acl_log_entry, context_str, now_ms, reason_str, reset_acl_log,
+    acl_log, add_acl_log_entry, context_str, now_ms, reason_str, reset_acl_log, reset_acl_stats,
     set_acl_log_max_len, AclLogEntry, ACL_DENIED_AUTH, ACL_DENIED_CHANNEL, ACL_DENIED_CMD,
     ACL_DENIED_DB, ACL_DENIED_KEY, ACL_LOG_CTX_LUA, ACL_LOG_CTX_MODULE, ACL_LOG_CTX_MULTI,
     ACL_LOG_CTX_TOPLEVEL, ACL_STATS_AUTH, ACL_STATS_CHANNEL, ACL_STATS_CMD, ACL_STATS_DB,

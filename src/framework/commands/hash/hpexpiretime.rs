@@ -1,5 +1,5 @@
 
-use super::runtime_support::parse_fields;
+use super::runtime_support::parse_query_fields;
 use crate::engine::core::{CommandOutcome, Value};
 use crate::framework::commands::command_runtime::CommandRuntime;
 use crate::framework::{CommandArgs, CommandError};
@@ -23,7 +23,7 @@ fn hpexpiretime_reply(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> V
     };
     let key = &args.args[0];
 
-    let (consumed, fields) = match parse_fields(&args.args, 1) {
+    let (consumed, fields) = match parse_query_fields(&args.args, 1) {
         Ok(v) => v,
         Err(e) => return e,
     };

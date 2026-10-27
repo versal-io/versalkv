@@ -35,6 +35,7 @@ pub struct ModuleCommandInfo {
     pub arity: Option<i32>,
 }
 
+#[derive(Clone)]
 pub struct ModuleTimer {
     pub module_name: String,
     pub db_idx: u32,
@@ -589,15 +590,18 @@ impl ModuleRegistry {
         ))
     }
 
-    pub fn take_expired_timers(&mut self, now: MonotonicInstant) -> Vec<ModuleTimer> {
-        let ids: Vec<u64> = self
+    pub fn expired_timer_ids(&self, now: MonotonicInstant) -> Vec<u64> {
+        let mut ids: Vec<_> = self
             .timers
             .iter()
-            .filter_map(|(&id, timer)| (timer.deadline <= now).then_some(id))
+            .filter_map(|(&id, timer)| (timer.deadline <= now).then_some((timer.deadline, id)))
             .collect();
-        ids.into_iter()
-            .filter_map(|id| self.timers.remove(&id))
-            .collect()
+        ids.sort_unstable();
+        ids.into_iter().map(|(_, id)| id).collect()
+    }
+
+    pub fn timer_for_callback(&self, id: u64) -> Option<ModuleTimer> {
+        self.timers.get(&id).cloned()
     }
 
     pub fn command_module_name(&self, name: &str) -> Option<&str> {
@@ -771,13 +775,11 @@ mod tests {
             24
         );
         assert!(registry
-            .take_expired_timers(origin.saturating_add(Duration::from_millis(24)))
+            .expired_timer_ids(origin.saturating_add(Duration::from_millis(24)))
             .is_empty());
         assert_eq!(
-            registry
-                .take_expired_timers(origin.saturating_add(Duration::from_millis(25)))
-                .len(),
-            1
+            registry.expired_timer_ids(origin.saturating_add(Duration::from_millis(25))),
+            vec![id]
         );
     }
 

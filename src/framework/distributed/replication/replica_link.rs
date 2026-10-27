@@ -427,10 +427,18 @@ impl ReplicaLink {
                     } else if self.failover_request {
                         self.failover_request = false;
                         return Err(LinkError::FailoverRejected);
-                    } else if line.starts_with(b"-NOMASTERLINK") || line.starts_with(b"-LOADING") {
-                        // C's replicaProcessPsyncReply() classifies both replies
+                    } else if line.starts_with(b"-NOMASTERLINK")
+                        || line.starts_with(b"-LOADING")
+                        || line.starts_with(b"-BUSY")
+                    {
+                        // C's replicaProcessPsyncReply() classifies these replies
                         // as PSYNC_TRY_LATER: the primary is temporarily unable
                         // to serve PSYNC, not speaking an invalid protocol.
+                        crate::server_log!(
+                            notice,
+                            "Primary is currently unable to PSYNC but should be in the future: {}",
+                            String::from_utf8_lossy(&line)
+                        );
                         return Err(LinkError::TryLater);
                     } else {
                         return Err(LinkError::Protocol);
