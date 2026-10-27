@@ -42,7 +42,7 @@ impl Fixture {
     fn compile(&self, flavor: &str, define: Option<&str>) -> String {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         let path = self.0.join(format!("{flavor}.so"));
-        let mut cc = Command::new(std::env::var_os("CC").unwrap_or_else(|| "cc".into()));
+        let mut cc = Command::new(std::env::var_os("CC").unwrap_or_else(|| "clang".into()));
         cc.args(["-shared", "-fPIC", "-Wall", "-Wextra", "-Werror"]);
         if cfg!(target_os = "macos") {
             cc.arg("-Wl,-undefined,dynamic_lookup");

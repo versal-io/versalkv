@@ -2714,6 +2714,19 @@ def command_check_ci_support(_args: argparse.Namespace, ctx: RepoContext) -> int
         failures.append("CI must install clang before Rust unit tests")
     if "CC: clang" not in pipeline:
         failures.append("Rust Check must force module fixture compilation through clang")
+    module_fixture_sources = (
+        ctx.root / "src/engine/extension/module/loader.rs",
+        ctx.root / "src/framework/capabilities/module.rs",
+        ctx.root / "src/framework/capabilities/module_loader_tests.rs",
+        ctx.root / "tests/integration/module_ffi.rs",
+    )
+    for source in module_fixture_sources:
+        if 'unwrap_or_else(|| "cc".into())' in read_text(source):
+            failures.append(
+                "{} module fixture compiler fallback must be clang".format(
+                    source.relative_to(ctx.root).as_posix()
+                )
+            )
     if docs_pipeline and '"scripts/versal-util.py"' not in docs_pipeline:
         failures.append("documentation pipeline does not watch versal-util.py")
     if "python3 \"$ROOT_DIR/scripts/versal-util.py\" tcl binaries" not in moduleapi:

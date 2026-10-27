@@ -278,7 +278,7 @@ mod lifecycle_tests {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let path = temp.0.join("auto_memory_lifecycle.so");
         let mut compiler =
-            std::process::Command::new(std::env::var_os("CC").unwrap_or_else(|| "cc".into()));
+            std::process::Command::new(std::env::var_os("CC").unwrap_or_else(|| "clang".into()));
         compiler
             .args(["-shared", "-fPIC", "-Wall", "-Wextra", "-Werror"])
             .arg("-I")
