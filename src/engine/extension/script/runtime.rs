@@ -44,7 +44,7 @@ pub trait ScriptRuntime {
     fn record_command_failure(&mut self, name: &str);
     fn command_stats_name(&self, command: CommandDescriptor, args: &CommandArgs) -> String {
         let _ = args;
-        command.name.to_ascii_lowercase()
+        command.name.as_str().to_ascii_lowercase()
     }
     /// Observation gates captured once when script invocation starts, so
     /// nested commands never re-read slowlog/commandlog config or MONITOR

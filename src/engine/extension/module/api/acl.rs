@@ -196,7 +196,7 @@ pub unsafe extern "C" fn ValkeyModule_GetCurrentUserName(
 ) -> *mut ValkeyModuleString {
     unsafe {
         let name = current_name(ctx);
-        Box::into_raw(ValkeyModuleString::from_bytes(name.as_bytes()))
+        super::super::auto_memory::create_auto_string(ctx, name.as_bytes())
     }
 }
 
@@ -252,7 +252,7 @@ pub unsafe extern "C" fn ValkeyModule_ACLCheckCommandPermissions(
         let resolved =
             crate::engine::extension::module::capability::with_active_runtime(|runtime| {
                 let descriptor = runtime.lookup_command(command_args.name.as_ref())?;
-                let categories = runtime.command_acl_categories(descriptor, &command_args);
+                let categories = runtime.command_acl_categories(descriptor.clone(), &command_args);
                 Some((descriptor, categories))
             })
             .flatten();
@@ -260,7 +260,7 @@ pub unsafe extern "C" fn ValkeyModule_ACLCheckCommandPermissions(
             set_errno(libc::ENOENT);
             return VALKEYMODULE_ERR;
         };
-        let command = AclCommand::new(descriptor.name, &command_args.args, acl_categories);
+        let command = AclCommand::new(descriptor.name.as_str(), &command_args.args, acl_categories);
         if user.can_execute_command_with_args(command) {
             VALKEYMODULE_OK
         } else {
@@ -334,7 +334,7 @@ pub unsafe extern "C" fn ValkeyModule_ACLCheckPermissions(
         let resolved =
             crate::engine::extension::module::capability::with_active_runtime(|runtime| {
                 let descriptor = runtime.lookup_command(command_args.name.as_ref())?;
-                let categories = runtime.command_acl_categories(descriptor, &command_args);
+                let categories = runtime.command_acl_categories(descriptor.clone(), &command_args);
                 Some((descriptor, categories, runtime.num_dbs()))
             })
             .flatten();
@@ -345,7 +345,7 @@ pub unsafe extern "C" fn ValkeyModule_ACLCheckPermissions(
             set_errno(libc::EINVAL);
             return VALKEYMODULE_ERR;
         };
-        let name = descriptor.name;
+        let name = descriptor.name.as_str();
         let args = &command_args.args;
         if dbid < 0 || dbid as usize >= num_dbs {
             set_errno(libc::EINVAL);

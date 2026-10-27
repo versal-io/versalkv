@@ -93,7 +93,7 @@ fn module_acl_error(
     conn: &dyn CommandConn,
 ) -> Option<String> {
     let keys = command.extract_keys(args).unwrap_or_default();
-    let set_reads_old_value = command.name.eq_ignore_ascii_case("set")
+    let set_reads_old_value = command.name.as_str().eq_ignore_ascii_case("set")
         && args
             .args
             .iter()
@@ -110,17 +110,17 @@ fn module_acl_error(
     let key_requirements: Vec<(&[u8], u8)> =
         keys.iter().map(|key| (key.as_ref(), required)).collect();
     let acl_categories = crate::framework::spec::effective_acl_categories(
-        command.name,
+        command.name.as_str(),
         command.acl_categories,
         args.args.first().map(|arg| arg.as_ref()),
     );
     let should_restrict = crate::engine::extension::acl::should_restrict_cmd(
-        command.name,
+        command.name.as_str(),
         acl_categories,
         !keys.is_empty(),
     );
     let db_req = crate::engine::extension::acl::compute_db_requirement(
-        command.name,
+        command.name.as_str(),
         &args.args,
         command.flags & CMD_ALL_DBS != 0,
         should_restrict,
@@ -128,22 +128,29 @@ fn module_acl_error(
         ctx.num_dbs(),
     );
     let users = crate::engine::extension::acl::acl_users().lock().unwrap();
-    let acl_command =
-        crate::engine::extension::acl::AclCommand::new(command.name, &args.args, acl_categories);
+    let acl_command = crate::engine::extension::acl::AclCommand::new(
+        command.name.as_str(),
+        &args.args,
+        acl_categories,
+    );
     let denial = users.get(conn.username())?.check_command_perm(
         acl_command,
         &db_req,
         ctx.num_dbs(),
         &key_requirements,
     )?;
-    let (reason, object, message) =
-        module_acl_denial(command.name, conn.username(), denial, &key_requirements);
+    let (reason, object, message) = module_acl_denial(
+        command.name.as_str(),
+        conn.username(),
+        denial,
+        &key_requirements,
+    );
     crate::engine::extension::acl::add_acl_log_entry(
         reason,
         crate::engine::extension::acl::ACL_LOG_CTX_MODULE,
         object,
         conn.username().to_string(),
-        format!("addr={} cmd={}", conn.peer_addr(), command.name),
+        format!("addr={} cmd={}", conn.peer_addr(), command.name.as_str()),
     );
     Some(message)
 }
@@ -190,7 +197,7 @@ impl ScriptRuntime for ServerContext {
         args: &CommandArgs,
     ) -> &'static [&'static str] {
         crate::framework::spec::effective_acl_categories(
-            command.name,
+            command.name.as_str(),
             command.acl_categories,
             args.args.first().map(|arg| arg.as_ref()),
         )
@@ -219,7 +226,7 @@ impl ScriptRuntime for ServerContext {
         {
             return Some(Value::error(format!(
                 "ERR Can not execute a command '{}' while the cluster is down",
-                command.name
+                command.name.as_str()
             )));
         }
         let slot = crate::engine::distributed::cluster::node::key_hash_slot(keys[0]) as usize;
@@ -255,7 +262,7 @@ impl ScriptRuntime for ServerContext {
             crate::engine::distributed::cluster::ClusterRouteDecision::ClusterDown => {
                 Some(Value::error(format!(
                     "ERR Can not execute a command '{}' while the cluster is down",
-                    command.name
+                    command.name.as_str()
                 )))
             }
             crate::engine::distributed::cluster::ClusterRouteDecision::ReadOnly => Some(
@@ -354,7 +361,7 @@ impl ScriptRuntime for ServerContext {
     }
 
     fn command_stats_name(&self, command: CommandDescriptor, args: &CommandArgs) -> String {
-        let name_lower = command.name.to_ascii_lowercase();
+        let name_lower = command.name.as_str().to_ascii_lowercase();
         if !crate::engine::command::is_subcommand_container(&name_lower) {
             return name_lower;
         }
@@ -599,7 +606,7 @@ impl ModuleRuntime for ServerContext {
         args: &CommandArgs,
     ) -> &'static [&'static str] {
         crate::framework::spec::effective_acl_categories(
-            command.name,
+            command.name.as_str(),
             command.acl_categories,
             args.args.first().map(|arg| arg.as_ref()),
         )
@@ -687,7 +694,7 @@ impl ModuleRuntime for ServerContext {
 
     fn register_module_command(
         &mut self,
-        name: &'static str,
+        name: &str,
         arity: i32,
         flags: CmdFlags,
         first_key: i32,
@@ -699,7 +706,7 @@ impl ModuleRuntime for ServerContext {
             return false;
         }
         let spec = CommandSpec {
-            name,
+            name: crate::engine::command::CommandName::Shared(std::sync::Arc::from(name)),
             arity,
             flags: flags | CMD_MODULE,
             dispatch_group: DispatchGroup::Default,
@@ -808,8 +815,137 @@ fn erase_conn_lifetime(conn: &mut dyn CommandConn) -> *mut dyn CommandConn {
 
 #[cfg(test)]
 mod tests {
+    use crate::engine::command::CommandName;
     use crate::engine::extension::module::capability::ModuleRuntime;
     use crate::framework::context::ServerContext;
+    use crate::framework::CommandRegistry;
+    use std::sync::Arc;
+
+    fn unregister_script_command(
+        _conn: &mut dyn crate::engine::command::context::CommandConn,
+        args: &crate::engine::command::CommandArgs,
+        ctx: &mut ServerContext,
+    ) -> crate::foundation::io::protocol::Value {
+        let name = std::str::from_utf8(&args.name).unwrap();
+        assert!(ctx.script_mut().command_registry.unregister(name));
+        crate::foundation::io::protocol::Value::ok()
+    }
+
+    #[test]
+    fn lua_statistics_and_monitor_survive_command_removal_during_execution() {
+        use crate::engine::command::CommandArgs;
+        use crate::foundation::io::protocol::Value;
+        use crate::framework::capabilities::connection::Connection;
+        use crate::framework::CommandExecutor;
+        use bytes::Bytes;
+
+        for (name, script, stats_name) in [
+            (
+                CommandName::Shared(Arc::from("Module.Script")),
+                b"return redis.call('MODULE.SCRIPT')".as_slice(),
+                "module.script",
+            ),
+            (
+                CommandName::Static("ping"),
+                b"return redis.call('PING')",
+                "ping",
+            ),
+            (
+                CommandName::Shared(Arc::from("object")),
+                b"return redis.call('OBJECT','ENCODING','key')",
+                "object|encoding",
+            ),
+        ] {
+            let weak = match &name {
+                CommandName::Shared(owner) => Some(Arc::downgrade(owner)),
+                CommandName::Static(_) => None,
+            };
+            let expected_name = name.as_str().to_string();
+            let mut spec = crate::framework::commands::string::get::GET_SPEC;
+            spec.name = name;
+            spec.arity = -1;
+            spec.first_key = 0;
+            spec.last_key = 0;
+            spec.executor = CommandExecutor::Immediate(unregister_script_command);
+            let mut ctx = ServerContext::new(1);
+            ctx.script_mut().command_registry.register(spec);
+            ctx.register_monitor_client(7);
+            let mut conn = Connection::new_fake();
+            let args = CommandArgs::from_parts(vec![
+                Bytes::from_static(b"EVAL"),
+                Bytes::from_static(script),
+                Bytes::from_static(b"0"),
+            ]);
+            assert_eq!(
+                crate::framework::commands::scripting::eval::eval(&mut conn, &args, &mut ctx),
+                Value::ok()
+            );
+            assert!(weak.is_none_or(|weak| weak.upgrade().is_none()));
+            assert!(ctx
+                .command_registry()
+                .lookup(expected_name.as_bytes())
+                .is_none());
+            assert_eq!(ctx.stats().cmd_stats[stats_name].calls, 1);
+            let event = ctx.script().pending_internal_monitor.last().unwrap();
+            assert!(event.argv[0].eq_ignore_ascii_case(expected_name.as_bytes()));
+            assert_eq!(event.source, "lua");
+        }
+    }
+
+    #[test]
+    fn module_registration_shares_names_between_main_and_script_tables() {
+        let mut registry = Box::new(CommandRegistry::new());
+        let mut ctx = ServerContext::new(1);
+        ctx.set_module_command_registry(&mut *registry);
+        let text = String::from("Module.Shared");
+        assert!(ModuleRuntime::register_module_command(
+            &mut ctx, &text, 1, 0, 0, 0, 0
+        ));
+        drop(text);
+        let weak = {
+            let CommandName::Shared(main) = &registry.lookup(b"module.shared").unwrap().name else {
+                panic!("module names must be shared");
+            };
+            let CommandName::Shared(script) = &ctx
+                .command_registry()
+                .lookup(b"module.shared")
+                .unwrap()
+                .name
+            else {
+                panic!("script module names must be shared");
+            };
+            assert!(Arc::ptr_eq(main, script));
+            Arc::downgrade(main)
+        };
+        assert_eq!(weak.strong_count(), 4);
+        assert!(registry.unregister("MODULE.SHARED"));
+        assert_eq!(weak.strong_count(), 2);
+        assert_eq!(
+            ctx.command_registry()
+                .lookup(b"module.shared")
+                .unwrap()
+                .name
+                .as_str(),
+            "Module.Shared"
+        );
+        assert!(ctx
+            .script_mut()
+            .command_registry
+            .unregister("Module.Shared"));
+        assert!(weak.upgrade().is_none());
+        ctx.set_module_command_registry(std::ptr::null_mut());
+    }
+
+    #[test]
+    fn unavailable_module_registration_leaves_script_table_unchanged() {
+        let mut ctx = ServerContext::new(1);
+        let text = String::from("Module.Unavailable");
+        assert!(!ModuleRuntime::register_module_command(
+            &mut ctx, &text, 1, 0, 0, 0, 0
+        ));
+        assert!(ctx.command_registry().lookup(text.as_bytes()).is_none());
+        assert!(ctx.command_registry().lookup_original(&text).is_none());
+    }
 
     #[test]
     fn module_oom_uses_logical_memory_after_exclusions() {

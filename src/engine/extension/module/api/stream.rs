@@ -34,7 +34,7 @@ unsafe fn stream_id_to_c(id: StreamID, out: *mut ValkeyModuleStreamID) {
 
 // SAFETY: id is null or points to a valid stream ID supplied by module code.
 pub unsafe extern "C" fn ValkeyModule_CreateStringFromStreamID(
-    _ctx: *mut ValkeyModuleCtx,
+    ctx: *mut ValkeyModuleCtx,
     id: *const ValkeyModuleStreamID,
 ) -> *mut ValkeyModuleString {
     unsafe {
@@ -42,7 +42,7 @@ pub unsafe extern "C" fn ValkeyModule_CreateStringFromStreamID(
             return std::ptr::null_mut();
         }
         let text = format!("{}-{}", (*id).ms, (*id).seq);
-        Box::into_raw(ValkeyModuleString::from_bytes(text.as_bytes()))
+        super::super::auto_memory::create_auto_string(ctx, text.as_bytes())
     }
 }
 
@@ -287,10 +287,10 @@ pub unsafe extern "C" fn ValkeyModule_StreamIteratorNextField(
         };
         iterator.field_index += 1;
         if !field.is_null() {
-            *field = Box::into_raw(ValkeyModuleString::from_bytes(field_bytes));
+            *field = super::super::auto_memory::create_string_for_owner(handle.owner, field_bytes);
         }
         if !value.is_null() {
-            *value = Box::into_raw(ValkeyModuleString::from_bytes(value_bytes));
+            *value = super::super::auto_memory::create_string_for_owner(handle.owner, value_bytes);
         }
         VALKEYMODULE_OK
     }

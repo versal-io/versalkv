@@ -29,7 +29,7 @@ pub(crate) struct SpecialCommandCompletion {
 
 impl ServerWorkerState {
     pub(crate) fn check_no_multi_pure(
-        meta: CmdPreconditions,
+        meta: &CmdPreconditions,
         name_lower: &str,
         command_name: &str,
     ) -> Option<Value> {
@@ -100,7 +100,7 @@ impl ServerWorkerState {
                     .unwrap_or(DispatchGroup::Default),
                 spec.map(|s| {
                     super::subcmd_flags::effective_command_flags_for_call(
-                        s.name,
+                        s.name.as_str(),
                         s.flags,
                         &input.args,
                         &self.ctx,

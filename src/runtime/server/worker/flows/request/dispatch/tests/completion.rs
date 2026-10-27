@@ -234,7 +234,7 @@ fn exec_aggregate_reply_is_accounted_once_at_the_command_boundary() {
     assert!(backend.connection_registry[token].transaction.begin(0, 0));
     assert!(backend.connection_registry[token]
         .transaction
-        .queue(make_args(&[b"PING"])));
+        .queue(backend.ctx.num_dbs(), make_args(&[b"PING"])));
     let mut effects = ReadBatchEffects::default();
 
     backend.process_parsed_command(

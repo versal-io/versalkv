@@ -47,7 +47,7 @@ impl ServerWorkerState {
                 .expect("preflight target must still be registered"),
         );
         let client_asking = facts.asking;
-        if consumes_asking(meta.name) && !facts.transaction {
+        if consumes_asking(meta.name.as_str()) && !facts.transaction {
             self.connection_registry[facts.token].asking = false;
         }
         let call_flags = CmdCallFlags {

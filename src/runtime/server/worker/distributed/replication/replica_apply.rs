@@ -1075,7 +1075,7 @@ impl ServerWorkerState {
                 self.connection_registry
                     [crate::framework::capabilities::io::Token(connection_token)]
                 .transaction
-                .queue(args.clone());
+                .queue(self.ctx.num_dbs(), args.clone());
                 self.relay_replication_transaction_frame(&frame);
                 Ok(true)
             }
@@ -1098,10 +1098,13 @@ impl ServerWorkerState {
         let db_text = db.to_string();
         self.connection_registry[crate::framework::capabilities::io::Token(connection_token)]
             .transaction
-            .queue(CommandArgs::from_parts(vec![
-                Bytes::from_static(b"SELECT"),
-                Bytes::copy_from_slice(db_text.as_bytes()),
-            ]));
+            .queue(
+                self.ctx.num_dbs(),
+                CommandArgs::from_parts(vec![
+                    Bytes::from_static(b"SELECT"),
+                    Bytes::copy_from_slice(db_text.as_bytes()),
+                ]),
+            );
         let frame = crate::engine::distributed::replication::protocol::encode_command(&[
             b"SELECT",
             db_text.as_bytes(),
@@ -1307,7 +1310,7 @@ impl ServerWorkerState {
         };
         let command_flags =
             crate::runtime::server::worker::flows::request::dispatch::subcmd_flags::effective_command_flags_for_call(
-                spec.name, spec.flags, args, &self.ctx,
+                spec.name.as_str(), spec.flags, args, &self.ctx,
             );
         let cmd_name = String::from_utf8_lossy(&args.name).to_ascii_lowercase();
         let started = std::time::Instant::now();

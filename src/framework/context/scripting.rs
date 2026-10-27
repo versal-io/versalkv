@@ -131,7 +131,10 @@ impl ServerContext {
             .get(1)
             .and_then(|subcommand| {
                 std::str::from_utf8(subcommand).ok().and_then(|subcommand| {
-                    crate::framework::generated::commands::subcommand_meta(command.name, subcommand)
+                    crate::framework::generated::commands::subcommand_meta(
+                        command.name.as_str(),
+                        subcommand,
+                    )
                 })
             })
             .map_or(command.flags, |meta| command.flags | meta.flags);

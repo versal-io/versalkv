@@ -90,7 +90,7 @@ impl TransactionState {
         self.multi.as_ref().map(|multi| multi.db_id)
     }
 
-    pub(crate) fn queue(&mut self, command: CommandArgs) -> bool {
+    pub(crate) fn queue(&mut self, num_dbs: usize, command: CommandArgs) -> bool {
         let Some(multi) = &mut self.multi else {
             return false;
         };
@@ -99,9 +99,10 @@ impl TransactionState {
                 .args
                 .first()
                 .and_then(|arg| std::str::from_utf8(arg).ok())
-                .and_then(|arg| arg.parse::<i64>().ok())
+                .and_then(|arg| arg.parse::<u32>().ok())
+                .filter(|db_id| usize::try_from(*db_id).is_ok_and(|db_id| db_id < num_dbs))
             {
-                multi.db_id = db_id;
+                multi.db_id = i64::from(db_id);
             }
         }
         multi.commands.push(command);
@@ -221,6 +222,9 @@ impl TransactionState {
             .keys
             .capacity()
             .saturating_mul(std::mem::size_of::<WatchedKey>())
+            .saturating_add(self.watch.keys.iter().fold(0usize, |total, watched| {
+                total.saturating_add(watched.key.len())
+            }))
     }
 }
 
@@ -256,7 +260,7 @@ mod tests {
     fn populated_transaction() -> TransactionState {
         let mut state = TransactionState::default();
         assert!(state.begin(2, 11));
-        assert!(state.queue(command(&[b"SET", b"key", b"value"])));
+        assert!(state.queue(16, command(&[b"SET", b"key", b"value"])));
         assert_eq!(
             state.watch_many(vec![WatchedKey::new(
                 2,
@@ -285,8 +289,8 @@ mod tests {
         let mut state = TransactionState::default();
 
         assert!(state.begin(3, 10));
-        assert!(state.queue(command(&[b"PING"])));
-        assert!(state.queue(command(&[b"SELECT", b"7"])));
+        assert!(state.queue(16, command(&[b"PING"])));
+        assert!(state.queue(16, command(&[b"SELECT", b"7"])));
         state.record_input(20);
 
         assert!(state.is_active());
@@ -296,6 +300,36 @@ mod tests {
         assert!(!state.begin(9, 100));
         assert!(state.has_queue_error());
         assert_eq!(state.selected_db(), Some(7));
+    }
+
+    #[test]
+    fn queued_select_matches_database_index_validity_from_nonzero_db() {
+        for (select_db, expected_db) in [
+            (b"-0".as_slice(), 1),
+            (b"-1", 1),
+            (b"16", 1),
+            (b"9223372036854775807", 1),
+            (b"4294967296", 1),
+            (b"0", 0),
+            (b"1", 1),
+            (b"15", 15),
+        ] {
+            let mut state = TransactionState::default();
+            assert!(state.begin(1, 0));
+            let select = command(&[b"SELECT", select_db]);
+
+            assert!(state.queue(16, select.clone()));
+
+            assert_eq!(
+                state.selected_db(),
+                Some(expected_db),
+                "SELECT {}",
+                String::from_utf8_lossy(select_db)
+            );
+            assert_eq!(state.queued_commands().len(), 1);
+            assert_eq!(state.queued_commands()[0].args, select.args);
+            assert!(!state.has_queue_error());
+        }
     }
 
     #[test]

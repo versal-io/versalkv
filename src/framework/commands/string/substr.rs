@@ -2,7 +2,7 @@
 pub const SUBSTR_SPEC: crate::framework::CommandSpec = {
     use crate::framework::generated::commands::SUBSTR_META as META;
     crate::framework::CommandSpec {
-        name: META.name,
+        name: crate::engine::command::CommandName::Static(META.name),
         arity: META.arity,
         flags: META.flags,
         dispatch_group: META.dispatch_group,

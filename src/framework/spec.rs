@@ -1,6 +1,6 @@
 use crate::engine::command::context::CommandConn;
-use crate::engine::command::CommandArgs;
 use crate::engine::command::{CmdFlags, DispatchGroup};
+use crate::engine::command::{CommandArgs, CommandName};
 use crate::foundation::io::protocol::Value;
 use crate::framework::context::ServerContext;
 
@@ -64,7 +64,7 @@ impl CommandExecutor {
 
 #[derive(Clone)]
 pub struct CommandSpec {
-    pub name: &'static str,
+    pub name: CommandName,
     pub arity: i32,
     pub flags: CmdFlags,
     pub dispatch_group: DispatchGroup,
@@ -99,7 +99,7 @@ impl CommandSpec {
 
     pub fn descriptor(&self) -> crate::engine::command::CommandDescriptor {
         crate::engine::command::CommandDescriptor {
-            name: self.name,
+            name: self.name.clone(),
             arity: self.arity,
             flags: self.flags,
             first_key: self.first_key,

@@ -74,7 +74,7 @@ mod tests {
             let native = registry
                 .lookup(runtime_spec.meta.name.as_bytes())
                 .unwrap_or_else(|| panic!("missing native command {}", runtime_spec.meta.name));
-            assert_eq!(native.name, runtime_spec.meta.name);
+            assert_eq!(native.name.as_str(), runtime_spec.meta.name);
             assert_eq!(native.arity, runtime_spec.meta.arity);
             assert_eq!(native.flags, runtime_spec.meta.flags);
             assert_eq!(native.dispatch_group, runtime_spec.meta.dispatch_group);

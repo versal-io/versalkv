@@ -250,6 +250,27 @@ fn config_file_transfers_prefetch_batch_size_to_runtime() {
 }
 
 #[test]
+fn config_file_captures_registry_only_io_thread_settings_for_startup_replay() {
+    let cfg = load_temp_config(
+        "io-threads-runtime",
+        "io-threads 5\nio-threads-always-active yes\n",
+    )
+    .expect("valid io thread config file");
+    let mut runtime = RuntimeConfig::new();
+
+    cfg.apply_to(&mut runtime);
+    for (key, value) in &cfg.extra_cli_configs {
+        crate::framework::commands::server::config::config_registry()
+            .try_set_startup(&mut runtime, key, value)
+            .expect("registry-only config should be known")
+            .expect("registry-only config should be valid");
+    }
+
+    assert_eq!(runtime.server.io_threads, 5);
+    assert!(runtime.server.io_threads_always_active);
+}
+
+#[test]
 fn config_file_transfers_tls_listener_material_to_runtime() {
     let mut cfg = default_config();
     cfg.parse_config_string(

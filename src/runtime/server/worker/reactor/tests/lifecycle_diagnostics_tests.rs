@@ -57,6 +57,91 @@ fn capture_logs(action: impl FnOnce()) -> Vec<String> {
     capture.finish()
 }
 
+#[test]
+fn rdb_receive_reports_disk_installation_once_after_payload_starts() {
+    use crate::framework::distributed::replication::RdbLoadMode;
+
+    for mode in [
+        RdbLoadMode::DiskBacked,
+        RdbLoadMode::Direct,
+        RdbLoadMode::Swap,
+    ] {
+        for is_eof_framed in [true, false] {
+            let mut backend = ServerWorkerState::new(1).unwrap();
+            backend.ctx.replication_mut().switch_to_replica();
+            backend.ctx.db_mut(0).unwrap().set(
+                b"old".to_vec(),
+                crate::foundation::io::store::Robj::string(Bytes::from_static(b"value")),
+            );
+            let mut connection = Connection::new_fake();
+            connection.set_token_for_test(Token(41));
+            let token = backend.connection_registry.insert(connection);
+            let mut link = ReplicaLink::new(
+                ConnectionId(41),
+                MasterInfo {
+                    host: "127.0.0.1".to_string(),
+                    port: 6379,
+                },
+            );
+            link.pin_rdb_load_mode(mode);
+            link.connected(None, None);
+            link.on_bytes(b"+PONG\r\n+OK\r\n+OK\r\n", 6379).unwrap();
+            link.on_bytes(
+                b"+FULLRESYNC 0123456789abcdef0123456789abcdef01234567 0\r\n",
+                6379,
+            )
+            .unwrap();
+            let header = if is_eof_framed {
+                b"$EOF:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n".as_slice()
+            } else {
+                b"$1000\r\n".as_slice()
+            };
+            link.on_bytes(header, 6379).unwrap();
+            let header_logs = capture_logs(|| {
+                backend
+                    .drive_streaming_decode(41, token, &mut link)
+                    .unwrap();
+            });
+            assert!(!header_logs.iter().any(|log| log.contains("to disk")));
+
+            link.rdb_receive_mut().unwrap().feed(b"VALKEY080");
+            let logs = capture_logs(|| {
+                backend
+                    .drive_streaming_decode(41, token, &mut link)
+                    .unwrap();
+                backend
+                    .drive_streaming_decode(41, token, &mut link)
+                    .unwrap();
+            });
+            let disk_logs: Vec<_> = logs.iter().filter(|log| log.contains("to disk")).collect();
+            if mode == RdbLoadMode::DiskBacked {
+                assert_eq!(
+                    disk_logs.len(),
+                    1,
+                    "DiskBacked receive must report delayed disk installation"
+                );
+                assert!(disk_logs[0].contains("receiving streamed RDB from primary"));
+                assert!(disk_logs[0].contains("buffering"));
+                assert!(disk_logs[0].contains("delayed installation"));
+                assert!(backend
+                    .ctx
+                    .db(0)
+                    .unwrap()
+                    .get_allow_expired(b"old")
+                    .is_some());
+            } else {
+                assert!(disk_logs.is_empty());
+            }
+            assert_eq!(
+                logs.iter()
+                    .filter(|log| log.contains("Loading DB in memory"))
+                    .count(),
+                1
+            );
+        }
+    }
+}
+
 fn refused_master(backend: &mut ServerWorkerState) -> Token {
     let listener = TcpListener::bind("127.0.0.1:0").expect("reserve refused port");
     let peer_addr = listener.local_addr().expect("reserved address");

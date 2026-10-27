@@ -44,7 +44,7 @@ impl ServerWorkerState {
         let rejected = match self.decide_multi_queue(&input) {
             MultiQueueDecision::Queue => {
                 let conn = &mut self.connection_registry[token];
-                conn.transaction.queue(args.clone());
+                conn.transaction.queue(self.ctx.num_dbs(), args.clone());
                 self.finish_multi_queue_reply(
                     input,
                     replies,
@@ -88,7 +88,7 @@ impl ServerWorkerState {
             return MultiQueueDecision::Dispatch(outcome);
         }
         let command_name = super::super::dispatch::command_stats_name(input.name, input.args);
-        if let Some(reply) = Self::check_no_multi_pure(meta, input.name, &command_name) {
+        if let Some(reply) = Self::check_no_multi_pure(&meta, input.name, &command_name) {
             return MultiQueueDecision::Reply(reply);
         }
         let outcome = self.pre_dispatch_exec(input.token.0, meta, input.args);
@@ -105,17 +105,20 @@ impl ServerWorkerState {
         args: &CommandArgs,
     ) -> CmdPreconditions {
         CmdPreconditions {
-            name: spec.name,
+            name: spec.name.clone(),
             arity: spec.arity,
             flags: super::super::dispatch::subcmd_flags::effective_command_flags_for_call(
-                spec.name, spec.flags, args, &self.ctx,
+                spec.name.as_str(),
+                spec.flags,
+                args,
+                &self.ctx,
             ),
             first_key: spec.first_key,
             last_key: spec.last_key,
             key_step: spec.key_step,
             key_flags: spec.key_flags,
             acl_categories: super::super::dispatch::subcmd_flags::effective_acl_categories(
-                spec.name,
+                spec.name.as_str(),
                 spec.acl_categories,
                 args.args.first().map(|arg| arg.as_ref()),
             ),

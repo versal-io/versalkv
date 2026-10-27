@@ -80,9 +80,16 @@ pub unsafe extern "C" fn ValkeyModule_Scan(
         };
         (*cursor).index += 1;
         let key_string = Box::into_raw(ValkeyModuleString::from_bytes(&key));
-        callback.expect("callback checked above")(ctx, key_string, std::ptr::null_mut(), privdata);
-        (*key_string).free();
-        let _ = Box::from_raw(key_string);
+        {
+            let _context_scope = super::ActiveModuleContextScope::enter(ctx);
+            callback.expect("callback checked above")(
+                ctx,
+                key_string,
+                std::ptr::null_mut(),
+                privdata,
+            );
+        }
+        ValkeyModuleString::release(key_string);
         if (*cursor).index >= keys.len() {
             (*cursor).done = true;
             set_errno(0);
@@ -114,11 +121,13 @@ pub unsafe extern "C" fn ValkeyModule_ScanKey(
             set_errno(libc::EINVAL);
             return 0;
         };
-        let Some(ctx) = super::active_registry::active_module_context() else {
-            set_errno(libc::EINVAL);
-            return 0;
+        let internal = if let Some(owner) = handle.owner {
+            owner.as_ptr()
+        } else if let Some(ctx) = super::active_registry::active_module_context() {
+            (*ctx).internal
+        } else {
+            std::ptr::null_mut()
         };
-        let internal = (*ctx).internal;
         if internal.is_null() {
             set_errno(libc::EINVAL);
             return 0;
@@ -147,12 +156,8 @@ pub unsafe extern "C" fn ValkeyModule_ScanKey(
             .map(|bytes| Box::into_raw(ValkeyModuleString::from_bytes(bytes)))
             .unwrap_or(std::ptr::null_mut());
         callback.expect("callback checked above")(key, field_ptr, value_ptr, privdata);
-        (*field_ptr).free();
-        let _ = Box::from_raw(field_ptr);
-        if !value_ptr.is_null() {
-            (*value_ptr).free();
-            let _ = Box::from_raw(value_ptr);
-        }
+        ValkeyModuleString::release(field_ptr);
+        ValkeyModuleString::release(value_ptr);
         if (*cursor).index >= entries.len() {
             (*cursor).done = true;
             set_errno(0);

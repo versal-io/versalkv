@@ -265,9 +265,8 @@ impl ClusterBusManager {
             CLUSTER_NODE_HANDSHAKE, CLUSTER_NODE_NOADDR,
         };
 
-        // Mirror the configured cluster timeout so fast-failover test layouts
-        // do not keep stale asymmetric repairs alive for an extra second.
-        let timeout_ms = node_timeout_ms.max(1).min(i64::MAX as u64) as i64;
+        // Use the same minimum window as C getHandshakeTimeout.
+        let timeout_ms = node_timeout_ms.max(1_000).min(i64::MAX as u64) as i64;
         for connection in self.connections.values_mut().filter(|connection| {
             connection.is_outgoing
                 && connection.send_meet
@@ -571,7 +570,7 @@ mod tests {
     }
 
     #[test]
-    fn zero_timeout_retries_asymmetric_meet_on_next_tick() {
+    fn zero_timeout_waits_for_handshake_window_before_asymmetric_meet() {
         let mut manager = ClusterBusManager::new();
         let mut state = ClusterState::new("127.0.0.1", 6379, 16379);
         let node_id = "known".to_string();
@@ -593,7 +592,78 @@ mod tests {
         assert!(manager.connections.get(&7).unwrap().handshake_sent);
 
         manager.schedule_asymmetric_meets(&mut state, 1_002, 0);
+        assert!(manager.connections.get(&7).unwrap().handshake_sent);
+        assert!(state.pending_connects.is_empty());
+
+        manager.schedule_asymmetric_meets(&mut state, 2_000, 0);
+        assert!(manager.connections.get(&7).unwrap().handshake_sent);
+        assert!(state.pending_connects.is_empty());
+
+        manager.schedule_asymmetric_meets(&mut state, 2_001, 0);
         assert!(!manager.connections.get(&7).unwrap().handshake_sent);
+    }
+
+    #[test]
+    fn anonymous_meet_retry_waits_for_minimum_handshake_window() {
+        for timeout_ms in [0, 1, 500] {
+            let mut manager = ClusterBusManager::new();
+            let mut state = ClusterState::new("127.0.0.1", 6379, 16379);
+            manager.register_outgoing_for_node(
+                Token(7),
+                "127.0.0.1:16380".parse().unwrap(),
+                true,
+                String::new(),
+            );
+            let connection = manager.connections.get_mut(&7).unwrap();
+            connection.handshake_sent = true;
+            connection.meet_sent_at = 1_000;
+
+            for now_ms in [1_002, 1_501, 1_999, 2_000] {
+                manager.schedule_asymmetric_meets(&mut state, now_ms, timeout_ms);
+                assert!(
+                    manager.connections[&7].handshake_sent,
+                    "timeout={timeout_ms}, now={now_ms}"
+                );
+            }
+            manager.schedule_asymmetric_meets(&mut state, 2_001, timeout_ms);
+            assert!(!manager.connections[&7].handshake_sent);
+        }
+    }
+
+    #[test]
+    fn known_node_asymmetric_meet_obeys_minimum_handshake_window_and_cooldown() {
+        let mut manager = ClusterBusManager::new();
+        let mut state = ClusterState::new("127.0.0.1", 6379, 16379);
+        let node_id = "known".to_string();
+        let mut node =
+            ClusterNode::new(node_id.clone(), "127.0.0.1".to_string(), 6380, 16380, true);
+        node.flags &= !CLUSTER_NODE_MYSELF;
+        node.inbound_link_missing_since = 1_000;
+        node.has_seen_inbound_link = true;
+        node.meet_sent_at = 1_500;
+        state.nodes.insert(node_id.clone(), node);
+        manager.register_outgoing_for_node(
+            Token(7),
+            "127.0.0.1:16380".parse().unwrap(),
+            false,
+            node_id.clone(),
+        );
+        manager.connections.get_mut(&7).unwrap().handshake_sent = true;
+
+        for now_ms in [1_002, 2_000, 2_001, 2_500] {
+            manager.schedule_asymmetric_meets(&mut state, now_ms, 1);
+            assert!(manager.connections[&7].handshake_sent, "now={now_ms}");
+            assert!(!state.nodes[&node_id].meet_pending, "now={now_ms}");
+            assert!(state.pending_connects.is_empty(), "now={now_ms}");
+        }
+        manager.schedule_asymmetric_meets(&mut state, 2_501, 1);
+
+        assert!(!manager.connections[&7].handshake_sent);
+        assert!(state.nodes[&node_id].meet_pending);
+        assert_eq!(
+            state.pending_connects,
+            vec![("127.0.0.1".to_string(), 16380, true)]
+        );
     }
 
     #[test]

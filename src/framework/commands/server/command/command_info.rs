@@ -14,7 +14,7 @@ pub(crate) fn make_entry(
     modules: &ModuleRegistry,
 ) -> Value {
     let module_info = modules
-        .lookup_cmd_func(spec.name)
+        .lookup_cmd_func(spec.name.as_str())
         .and_then(|entry| entry.info.as_ref());
     let mut flag_strs = flags_to_strings(spec.flags);
     if let Some(info) = module_info {
@@ -55,19 +55,19 @@ pub(crate) fn make_entry(
         .iter()
         .filter(|meta| {
             meta.container
-                .is_some_and(|container| container.eq_ignore_ascii_case(spec.name))
+                .is_some_and(|container| container.eq_ignore_ascii_case(spec.name.as_str()))
         })
         .map(|meta| make_generated_entry(meta))
         .collect::<Vec<_>>();
     subcommands.extend(
         modules
-        .subcommand_names(spec.name)
+        .subcommand_names(spec.name.as_str())
         .into_iter()
         .filter_map(|name| registry.lookup(name.as_bytes()))
         .map(|subcommand| make_entry(subcommand, registry, modules)),
     );
     Value::Array(vec![
-        Value::bulk(Bytes::copy_from_slice(spec.name.as_bytes())), // 0: name
+        Value::bulk(Bytes::copy_from_slice(spec.name.as_str().as_bytes())), // 0: name
         Value::integer(spec.arity as i64),                         // 1: arity
         Value::set(flag_vals),                                     // 2: flags (set in RESP3)
         Value::integer(spec.first_key as i64),                     // 3: first_key

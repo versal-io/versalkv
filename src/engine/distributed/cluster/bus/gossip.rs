@@ -339,7 +339,6 @@ impl ClusterBusManager {
         node.pong_received = 0;
         node.config_epoch = entry.config_epoch as u64;
         node.asymmetric_meet_started_at = now_ms;
-        node.meet_pending = true;
         state.insert_node(node);
         state.queue_connect((entry.ip.clone(), entry.bus_port, false));
     }

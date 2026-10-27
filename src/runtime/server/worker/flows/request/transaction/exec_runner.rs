@@ -404,7 +404,10 @@ impl ServerWorkerState {
             flags
                 | self.registry.lookup(&command.name).map_or(0, |spec| {
                     super::super::dispatch::subcmd_flags::effective_command_flags_for_call(
-                        spec.name, spec.flags, command, &self.ctx,
+                        spec.name.as_str(),
+                        spec.flags,
+                        command,
+                        &self.ctx,
                     )
                 })
         });

@@ -191,11 +191,11 @@ mod tests {
                 .collect();
             let result = hash_set_pairs(key, flags, fields.as_ptr(), values.as_ptr(), pairs.len());
             for field in fields {
-                let _ = Box::from_raw(field.cast::<ValkeyModuleString>());
+                ValkeyModuleString::release(field.cast());
             }
             for value in values {
                 if value as usize != HASH_DELETE {
-                    let _ = Box::from_raw(value);
+                    ValkeyModuleString::release(value);
                 }
             }
             let _ = Box::from_raw(key as *mut ModuleKeyHandle);

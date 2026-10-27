@@ -1,8 +1,7 @@
 #![allow(non_snake_case)]
 
+use super::super::super::auto_memory::{create_auto_string, internal_owner, remove_string};
 use libc::{c_char, c_int, size_t};
-use std::mem;
-use std::ptr;
 
 use super::super::super::{
     ValkeyModuleCtx, ValkeyModuleKey, ValkeyModuleString, VALKEYMODULE_ERR, VALKEYMODULE_OK,
@@ -14,16 +13,16 @@ use super::super::super::{
 // SAFETY: Called from C shim; caller must pass a valid or NULL pointer. If data is non-NULL, len must be the exact byte length of the pointed-to buffer.
 #[no_mangle]
 pub unsafe extern "C" fn VM_CreateStringFromBuffer(
-    _ctx: *mut ValkeyModuleCtx,
+    ctx: *mut ValkeyModuleCtx,
     data: *const c_char,
     len: size_t,
 ) -> *mut ValkeyModuleString {
     unsafe {
         if data.is_null() || len == 0 {
-            return Box::into_raw(ValkeyModuleString::from_bytes(b"" as &[u8]));
+            return create_auto_string(ctx, b"");
         }
         let slice = std::slice::from_raw_parts(data.cast::<u8>(), len);
-        Box::into_raw(ValkeyModuleString::from_bytes(slice))
+        create_auto_string(ctx, slice)
     }
 }
 
@@ -41,21 +40,16 @@ pub unsafe extern "C" fn ValkeyModule_StringAppendBuffer(
         return VALKEYMODULE_ERR;
     }
     let _ = ctx;
-    // SAFETY: str_ and data satisfy the caller contract and remain live while
-    // their bytes are copied into owned storage.
-    let mut new_data = unsafe { (*str_).as_bytes().to_vec() };
-    // SAFETY: data points to exactly len readable bytes by the ABI contract.
-    new_data.extend_from_slice(unsafe { std::slice::from_raw_parts(data.cast::<u8>(), len) });
-    // SAFETY: str_ is exclusively owned for this mutation and its old payload
-    // is released exactly once before replacement.
-    unsafe { (*str_).free() };
-    let new_str = ValkeyModuleString::from_bytes(&new_data);
-    // SAFETY: ptr::read moves the replacement value, forget prevents its Box
-    // from freeing that moved value, and ptr::write initializes str_ again.
+    // SAFETY: str_ is live and data points to len readable bytes. Copy first
+    // because the source may alias the string's current buffer.
     unsafe {
-        let value = ptr::read(new_str.as_ref());
-        mem::forget(new_str);
-        ptr::write(str_, value);
+        if ValkeyModuleString::ref_count(str_) != 1 {
+            return VALKEYMODULE_ERR;
+        }
+        let suffix = std::slice::from_raw_parts(data.cast::<u8>(), len).to_vec();
+        if !ValkeyModuleString::append(str_, &suffix) {
+            return VALKEYMODULE_ERR;
+        }
     }
     VALKEYMODULE_OK
 }
@@ -65,13 +59,17 @@ pub unsafe extern "C" fn ValkeyModule_StringAppendBuffer(
 
 // SAFETY: Called from C shim or module code; caller must pass valid or NULL pointers.
 pub unsafe extern "C" fn ValkeyModule_RetainString(
-    _ctx: *mut ValkeyModuleCtx,
+    ctx: *mut ValkeyModuleCtx,
     str_: *mut ValkeyModuleString,
 ) -> *mut ValkeyModuleString {
     if !str_.is_null() {
-        let _ = super::super::active_registry::with_active_registry(|registry| {
-            registry.retain_string(str_);
-        });
+        // SAFETY: str_ is live; a matching automatic entry transfers its
+        // existing reference, otherwise retaining adds a new reference.
+        unsafe {
+            if !remove_string(internal_owner(ctx), str_) {
+                ValkeyModuleString::incr_ref(str_);
+            }
+        }
     }
     str_
 }

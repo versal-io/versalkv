@@ -31,11 +31,14 @@ fn suppressed_exec_aggregate_reply_records_zero_slot_egress() {
         connection.set_custom_reply_enabled(false);
         connection.set_skip_propagation(false);
         assert!(connection.transaction.begin(0, 48));
-        assert!(connection.transaction.queue(CommandArgs::from_parts(vec![
-            Bytes::from_static(b"SET"),
-            key,
-            Bytes::from_static(b"value"),
-        ])));
+        assert!(connection.transaction.queue(
+            backend.ctx.num_dbs(),
+            CommandArgs::from_parts(vec![
+                Bytes::from_static(b"SET"),
+                key,
+                Bytes::from_static(b"value"),
+            ])
+        ));
         if reply_skip {
             connection.set_reply_skip(true);
         } else {
@@ -78,11 +81,14 @@ fn exec_records_transaction_wire_bytes_for_its_single_slot() {
     connection.set_custom_reply_enabled(false);
     assert!(connection.transaction.begin(0, 48));
     connection.set_request_bytes_for_test(14);
-    assert!(connection.transaction.queue(CommandArgs::from_parts(vec![
-        Bytes::from_static(b"SET"),
-        Bytes::from_static(b"key"),
-        Bytes::from_static(b"value"),
-    ])));
+    assert!(connection.transaction.queue(
+        backend.ctx.num_dbs(),
+        CommandArgs::from_parts(vec![
+            Bytes::from_static(b"SET"),
+            Bytes::from_static(b"key"),
+            Bytes::from_static(b"value"),
+        ])
+    ));
     let _connection_token = backend.connection_registry.insert(connection);
     let mut effects = CommandEffects::default();
 

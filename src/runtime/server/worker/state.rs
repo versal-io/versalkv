@@ -839,27 +839,70 @@ mod tests {
 
     #[test]
     fn tcp_listener_rebind_is_atomic() {
+        use crate::foundation::io::sys::socket::socket_port_raw;
+        use socket2::{Domain, Protocol, Socket, Type};
         use std::net::{SocketAddr, TcpListener, TcpStream};
 
         let mut backend = ServerWorkerState::new(1).expect("event loop test runtime");
-        let old_probe = TcpListener::bind("127.0.0.1:0").expect("reserve old port");
-        let old_port = old_probe.local_addr().unwrap().port();
-        drop(old_probe);
         backend
-            .bind(SocketAddr::from(([127, 0, 0, 1], old_port)))
+            .bind(SocketAddr::from(([127, 0, 0, 1], 0)))
             .expect("bind old listener");
-        backend.ctx.config_mut().server.listening_port = old_port;
         let old_tokens = backend.listeners.tcp.clone();
+        assert_eq!(old_tokens.len(), 1);
+        let old_fd = backend.listeners.inherited_fds[&old_tokens[0].0];
+        let old_port = socket_port_raw(old_fd, false).expect("read old listener port");
+        assert_ne!(old_port, 0);
+        backend.ctx.config_mut().server.listening_port = old_port;
 
-        let new_probe = TcpListener::bind("127.0.0.1:0").expect("reserve new port");
-        let new_port = new_probe.local_addr().unwrap().port();
-        drop(new_probe);
+        // Keep a non-listening wildcard reservation until the specific listener
+        // is bound. A same-address reservation conflicts with it on macOS.
+        let reservation =
+            Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).expect("new port socket");
+        reservation
+            .set_reuse_address(true)
+            .expect("allow listener address reuse");
+        reservation
+            .bind(&SocketAddr::from(([0, 0, 0, 0], 0)).into())
+            .expect("reserve new port");
+        let new_port = reservation
+            .local_addr()
+            .expect("read reserved address")
+            .as_socket()
+            .expect("reserved IP address")
+            .port();
+        assert_ne!(new_port, 0);
+        assert_ne!(new_port, old_port);
+
         backend
             .rebind_tcp_listeners("127.0.0.1", new_port)
             .expect("rebind listener");
+        drop(reservation);
 
         assert_eq!(backend.ctx.config().server.listening_port, new_port);
         assert!(old_tokens
+            .iter()
+            .all(|token| !backend.transport.is_registered(*token)));
+        assert_eq!(backend.listeners.tcp.len(), old_tokens.len());
+        assert!(backend
+            .listeners
+            .tcp
+            .iter()
+            .all(|token| backend.transport.is_registered(*token)));
+        let occupied = TcpListener::bind("127.0.0.1:0").expect("reserve occupied port");
+        let occupied_port = occupied.local_addr().unwrap().port();
+        let previous_tokens = backend.listeners.tcp.clone();
+        let previous_bind = backend.ctx.config().server.bind.clone();
+        let previous_addresses = backend.listeners.bind_addrs.clone();
+        let error = backend
+            .rebind_tcp_listeners("127.0.0.1", occupied_port)
+            .expect_err("occupied listener must prevent rebind");
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+        assert_eq!(backend.ctx.config().server.listening_port, new_port);
+        assert_eq!(backend.ctx.config().server.bind, previous_bind);
+        assert_eq!(backend.listeners.bind_addrs, previous_addresses);
+        // Failed replacement restores the endpoint with fresh runtime tokens.
+        assert_eq!(backend.listeners.tcp.len(), previous_tokens.len());
+        assert!(previous_tokens
             .iter()
             .all(|token| !backend.transport.is_registered(*token)));
         assert!(backend
@@ -868,13 +911,6 @@ mod tests {
             .iter()
             .all(|token| backend.transport.is_registered(*token)));
         assert!(TcpStream::connect(("127.0.0.1", new_port)).is_ok());
-
-        let occupied = TcpListener::bind("127.0.0.1:0").expect("reserve occupied port");
-        let occupied_port = occupied.local_addr().unwrap().port();
-        assert!(backend
-            .rebind_tcp_listeners("127.0.0.1", occupied_port)
-            .is_err());
-        assert_eq!(backend.ctx.config().server.listening_port, new_port);
-        assert!(TcpStream::connect(("127.0.0.1", new_port)).is_ok());
+        drop(occupied);
     }
 }

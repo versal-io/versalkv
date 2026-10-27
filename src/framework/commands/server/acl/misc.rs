@@ -143,7 +143,7 @@ pub(super) fn acl_dryrun(args: &CommandArgs, ctx: &ServerContext) -> Value {
     let dbid = 0i64;
     let num_dbs = ctx.num_dbs();
     let acl_categories = crate::framework::spec::effective_acl_categories(
-        spec.name,
+        spec.name.as_str(),
         spec.acl_categories,
         cmd_args.first().map(|arg| arg.as_ref()),
     );

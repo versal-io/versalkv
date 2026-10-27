@@ -25,7 +25,7 @@ pub struct CommandRegistry {
     commands: HashMap<String, RegisteredCommand>,
     /// Original command table — written once at registration, never modified.
     /// Used for ACL permission checks (always based on original name).
-    orig_commands: HashMap<&'static str, CommandSpec>,
+    orig_commands: HashMap<String, CommandSpec>,
     executors: Slab<RegisteredExecutor>,
     registry_id: u64,
     next_generation: u64,
@@ -55,18 +55,15 @@ impl CommandRegistry {
     }
 
     pub fn register(&mut self, spec: CommandSpec) {
-        // Automatically register in both tables: active table uses String key,
-        // original table uses &'static str key.
-        let name = spec.name.to_string();
-        let orig_name = spec.name;
+        // Both tables own their normalized lookup keys and share the spec name.
+        let name = spec.name.as_str().to_ascii_lowercase();
         let generation = self.next_generation;
         self.next_generation = self.next_generation.wrapping_add(1).max(1);
         let execution_id = self.executors.insert(RegisteredExecutor {
             executor: spec.executor,
             generation,
         });
-        // Clone is cheap: CommandSpec only contains Copy fields + fn pointer
-        self.orig_commands.insert(orig_name, spec.clone());
+        self.orig_commands.insert(name.clone(), spec.clone());
         if let Some(previous) = self.commands.insert(
             name,
             RegisteredCommand {
@@ -86,11 +83,11 @@ impl CommandRegistry {
         let removed_ids = self
             .commands
             .values()
-            .filter(|command| command.spec.name.eq_ignore_ascii_case(&lower))
+            .filter(|command| command.spec.name.as_str().eq_ignore_ascii_case(&lower))
             .map(|command| command.execution_id)
             .collect::<Vec<_>>();
         self.commands
-            .retain(|_, command| !command.spec.name.eq_ignore_ascii_case(&lower));
+            .retain(|_, command| !command.spec.name.as_str().eq_ignore_ascii_case(&lower));
         for execution_id in removed_ids {
             self.executors.remove(execution_id);
         }
@@ -111,7 +108,7 @@ impl CommandRegistry {
             .commands
             .values_mut()
             .map(|command| &mut command.spec)
-            .filter(|spec| spec.name.eq_ignore_ascii_case(&lower))
+            .filter(|spec| spec.name.as_str().eq_ignore_ascii_case(&lower))
         {
             if let Some(arity) = arity {
                 spec.arity = arity;
@@ -173,7 +170,7 @@ impl CommandRegistry {
     #[allow(dead_code)]
     // TODO(dead_code): reserved for ACL permission checks (always based on original name)
     pub fn lookup_original(&self, name: &str) -> Option<&CommandSpec> {
-        self.orig_commands.get(name)
+        self.orig_commands.get(&name.to_ascii_lowercase())
     }
 
     /// Rename a command: remove old name from active table, insert new name.
@@ -238,7 +235,7 @@ mod tests {
 
     fn test_spec(name: &'static str) -> CommandSpec {
         CommandSpec {
-            name,
+            name: crate::engine::command::CommandName::Static(name),
             arity: 0,
             flags: 0,
             dispatch_group: DispatchGroup::Default,
@@ -273,6 +270,90 @@ mod tests {
     }
 
     #[test]
+    fn unregister_reclaims_mixed_case_original_entries() {
+        for alias in ["module.alias", ""] {
+            let mut registry = CommandRegistry::new();
+            registry.register(test_spec("Module.Command"));
+            registry.rename("Module.Command", alias);
+
+            assert!(registry.unregister("MODULE.COMMAND"));
+            assert!(registry.orig_commands.is_empty());
+            assert!(registry.commands.is_empty());
+            assert!(registry.executors.is_empty());
+        }
+    }
+
+    #[test]
+    fn shared_names_live_until_the_last_registry_consumer_drops() {
+        use crate::engine::command::CommandName;
+        use std::sync::Arc;
+
+        for alias in ["module.alias", ""] {
+            let owner: Arc<str> = Arc::from("Module.Command");
+            let weak = Arc::downgrade(&owner);
+            let mut spec = test_spec("unused");
+            spec.name = CommandName::Shared(owner);
+            let mut registry = CommandRegistry::new();
+            registry.register(spec);
+            let resolved = registry.resolve(b"MODULE.COMMAND").unwrap();
+            let descriptor = resolved.descriptor();
+            let spec = registry.lookup(b"module.command").unwrap().clone();
+            let snapshot = registry.clone();
+            assert_eq!(weak.strong_count(), 7);
+            registry.rename("module.command", alias);
+
+            assert!(registry.unregister("MODULE.COMMAND"));
+            assert!(registry.commands.is_empty());
+            assert!(registry.orig_commands.is_empty());
+            registry.register(test_spec("replacement"));
+            let replacement = registry.resolve(b"replacement").unwrap();
+            let (_, old_slot, old_generation) = resolved.execution_token();
+            let (_, new_slot, new_generation) = replacement.execution_token();
+            assert_eq!(old_slot, new_slot);
+            assert_ne!(old_generation, new_generation);
+            assert!(registry.executor(resolved.clone()).is_none());
+            assert!(snapshot.executor(resolved.clone()).is_none());
+            assert_eq!(resolved.descriptor().name.as_str(), "Module.Command");
+            assert_eq!(descriptor.name.as_str(), "Module.Command");
+            assert_eq!(spec.name.as_str(), "Module.Command");
+            assert_eq!(
+                snapshot.lookup(b"module.command").unwrap().name.as_str(),
+                "Module.Command"
+            );
+            drop(registry);
+            drop(resolved);
+            drop(descriptor);
+            drop(spec);
+            assert_eq!(weak.strong_count(), 2);
+            drop(snapshot);
+            assert!(weak.upgrade().is_none());
+        }
+    }
+
+    #[test]
+    fn replacing_shared_names_does_not_keep_an_intern_root() {
+        use crate::engine::command::CommandName;
+        use std::sync::Arc;
+
+        let mut registry = CommandRegistry::new();
+        for index in 0..16 {
+            let text = format!("module.command{index}");
+            let first: Arc<str> = Arc::from(text.as_str());
+            let first_weak = Arc::downgrade(&first);
+            let mut spec = test_spec("unused");
+            spec.name = CommandName::Shared(first);
+            registry.register(spec.clone());
+            let replacement: Arc<str> = Arc::from(text.as_str());
+            let replacement_weak = Arc::downgrade(&replacement);
+            spec.name = CommandName::Shared(replacement);
+            registry.register(spec);
+            assert!(first_weak.upgrade().is_none());
+            assert!(registry.unregister(&text));
+            assert!(replacement_weak.upgrade().is_none());
+        }
+    }
+
+    #[test]
     fn resolved_command_keeps_its_executor_after_alias_lookup() {
         let mut registry = CommandRegistry::new();
         registry.register(test_spec("get"));
@@ -280,7 +361,7 @@ mod tests {
 
         let resolved = registry.resolve(b"fetch").unwrap();
 
-        assert_eq!(resolved.descriptor().name, "get");
+        assert_eq!(resolved.descriptor().name.as_str(), "get");
         assert!(registry.lookup(b"get").is_none());
         assert!(matches!(
             registry.executor(resolved).unwrap(),

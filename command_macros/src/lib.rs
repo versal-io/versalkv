@@ -93,7 +93,7 @@ pub fn command(attr: TokenStream, item: TokenStream) -> TokenStream {
         #vis const #spec_ident: crate::framework::CommandSpec = {
             use crate::framework::generated::commands::#meta_ident as META;
             crate::framework::CommandSpec {
-                name:             META.name,
+                name:             crate::engine::command::CommandName::Static(META.name),
                 arity:            META.arity,
                 flags:            #flags_expr,
                 dispatch_group:   META.dispatch_group,

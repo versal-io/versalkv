@@ -1832,6 +1832,39 @@ mod tests {
     }
 
     #[test]
+    fn cluster_cron_expires_anonymous_handshake_without_meet_feedback() {
+        let mut backend = ServerWorkerState::new(1).unwrap();
+        backend.ctx.config_mut().server.cluster_enabled = true;
+        backend.ctx.config_mut().server.cluster_node_timeout = 1;
+        let mut state = ClusterState::new("127.0.0.1", 6379, 16_379);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handshake_id = state.ensure_handshake_node(
+            "127.0.0.1",
+            addr.port(),
+            addr.port(),
+            crate::foundation::io::sys::time::mstime().saturating_sub(1_001),
+        );
+        let handle = backend.transport.connect_tcp(addr).unwrap();
+        let _peer = listener.accept().unwrap();
+        backend.cluster_bus.register_outgoing_for_node(
+            handle.token,
+            addr,
+            false,
+            handshake_id.clone(),
+        );
+        *backend.ctx.cluster_state_mut() = Some(Box::new(state));
+
+        backend.run_cluster_cron();
+        backend.run_cluster_cron();
+
+        let state = backend.ctx.cluster_state().as_ref().unwrap();
+        assert!(!state.nodes.contains_key(&handshake_id));
+        assert!(state.pending_connects.is_empty());
+        assert!(backend.cluster_bus.connections.is_empty());
+    }
+
+    #[test]
     fn cluster_cron_keeps_asymmetric_meet_repair_after_slot_ownership() {
         let mut backend = ServerWorkerState::new(1).unwrap();
         backend.ctx.config_mut().server.cluster_enabled = true;

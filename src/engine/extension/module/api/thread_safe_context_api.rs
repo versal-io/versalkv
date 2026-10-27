@@ -23,6 +23,7 @@ pub unsafe extern "C" fn ValkeyModule_GetDetachedThreadSafeContext(
         let internal = Box::new(ModuleInternalCtx {
             module_name: module_name.into_raw(),
             module_ref: source.module_ref,
+            module_options: source.module_options.clone(),
             onload: 0,
             reply_ptr: std::ptr::null_mut(),
             runtime_handle: std::ptr::null_mut(),
@@ -31,6 +32,7 @@ pub unsafe extern "C" fn ValkeyModule_GetDetachedThreadSafeContext(
             username: CString::new("default").unwrap().into_raw(),
             module_auth_user: std::ptr::null_mut(),
             current_command_name: std::ptr::null_mut(),
+            auto_memory: Default::default(),
         });
         Box::into_raw(create_module_ctx(Box::into_raw(internal)))
     }

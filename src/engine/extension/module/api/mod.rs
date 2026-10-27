@@ -26,6 +26,8 @@ mod get_api;
 mod hash_api;
 mod key_api;
 mod key_eviction_api;
+#[cfg(test)]
+mod lifecycle_tests;
 mod list_api;
 mod memory_api;
 mod pubsub_api;

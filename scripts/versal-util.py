@@ -1835,6 +1835,12 @@ def command_check_generated_metadata(_args: argparse.Namespace, ctx: RepoContext
         fixture = Path(directory)
         project = fixture / "project"
         (project / "src/framework/commands").mkdir(parents=True)
+        for module in ("command_runtime", "introspection", "key_extractors", "pattern"):
+            write_fixture(
+                project,
+                "src/framework/commands/{}.rs".format(module),
+                "// Static module stub for the metadata-only fixture.\n",
+            )
         command_dir = project / "thirdparty/valkey/src/commands"
         command_dir.mkdir(parents=True)
         shutil.copy2(str(root / "build.rs"), str(project / "build.rs"))
@@ -2695,6 +2701,44 @@ def command_check_ci_support(_args: argparse.Namespace, ctx: RepoContext) -> int
         failures.append("CI wasm check does not install Node.js with apt")
     elif wasm_check < 0 or install_node > wasm_check:
         failures.append("CI must install Node.js before running wasm-check")
+    rust_unit = pipeline.find("run: cargo test --lib")
+    install_build_essential = pipeline.find("build-essential")
+    install_clang = pipeline.find("clang")
+    install_lld = pipeline.find("lld")
+    if install_build_essential < 0:
+        failures.append("Rust Check must install build-essential for runtime module tests")
+    elif rust_unit < 0 or install_build_essential > rust_unit:
+        failures.append("CI must install build-essential before Rust unit tests")
+    if install_clang < 0:
+        failures.append("Rust Check must install clang for runtime module tests")
+    elif rust_unit < 0 or install_clang > rust_unit:
+        failures.append("CI must install clang before Rust unit tests")
+    if install_lld < 0:
+        failures.append("Rust Check must install lld for runtime module tests")
+    elif rust_unit < 0 or install_lld > rust_unit:
+        failures.append("CI must install lld before Rust unit tests")
+    if "CC: clang" not in pipeline:
+        failures.append("Rust Check must force module fixture compilation through clang")
+    module_fixture_sources = (
+        ctx.root / "src/engine/extension/module/loader.rs",
+        ctx.root / "src/framework/capabilities/module.rs",
+        ctx.root / "src/framework/capabilities/module_loader_tests.rs",
+        ctx.root / "tests/integration/module_ffi.rs",
+    )
+    for source in module_fixture_sources:
+        source_text = read_text(source)
+        if 'unwrap_or_else(|| "cc".into())' in source_text:
+            failures.append(
+                "{} module fixture compiler fallback must be clang".format(
+                    source.relative_to(ctx.root).as_posix()
+                )
+            )
+        if "-fuse-ld=lld" not in source_text:
+            failures.append(
+                "{} module fixture compiler must select lld on Linux".format(
+                    source.relative_to(ctx.root).as_posix()
+                )
+            )
     if docs_pipeline and '"scripts/versal-util.py"' not in docs_pipeline:
         failures.append("documentation pipeline does not watch versal-util.py")
     if "python3 \"$ROOT_DIR/scripts/versal-util.py\" tcl binaries" not in moduleapi:

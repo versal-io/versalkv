@@ -147,11 +147,14 @@ fn postponed_writable_replica_exec_does_not_relay_local_write() {
     connection.selected_db = 0;
     connection.transaction.end(TransactionEnd::Reset);
     assert!(connection.transaction.begin(0, 0));
-    assert!(connection.transaction.queue(CommandArgs::from_parts(vec![
-        Bytes::from_static(b"SET"),
-        Bytes::from_static(b"exec-local-key"),
-        Bytes::from_static(b"value"),
-    ])));
+    assert!(connection.transaction.queue(
+        backend.ctx.num_dbs(),
+        CommandArgs::from_parts(vec![
+            Bytes::from_static(b"SET"),
+            Bytes::from_static(b"exec-local-key"),
+            Bytes::from_static(b"value"),
+        ])
+    ));
     backend.ctx.replication_mut().switch_to_replica();
     backend.ctx.replication_mut().backlog.activate();
     backend.ctx.config_mut().replication.replica_read_only = false;
@@ -198,11 +201,14 @@ fn postponed_exec_honors_client_reply_off() {
     connection.selected_db = 0;
     connection.transaction.end(TransactionEnd::Reset);
     assert!(connection.transaction.begin(0, 0));
-    assert!(connection.transaction.queue(CommandArgs::from_parts(vec![
-        Bytes::from_static(b"SET"),
-        Bytes::from_static(b"exec-off-key"),
-        Bytes::from_static(b"value"),
-    ])));
+    assert!(connection.transaction.queue(
+        backend.ctx.num_dbs(),
+        CommandArgs::from_parts(vec![
+            Bytes::from_static(b"SET"),
+            Bytes::from_static(b"exec-off-key"),
+            Bytes::from_static(b"value"),
+        ])
+    ));
     connection.set_reply_off(true);
     let args = CommandArgs::from_parts(vec![Bytes::from_static(b"EXEC")]);
     connection.postpone_transaction_command(&args);
@@ -235,11 +241,14 @@ fn postponed_exec_honors_client_reply_skip_once() {
     connection.selected_db = 0;
     connection.transaction.end(TransactionEnd::Reset);
     assert!(connection.transaction.begin(0, 0));
-    assert!(connection.transaction.queue(CommandArgs::from_parts(vec![
-        Bytes::from_static(b"SET"),
-        Bytes::from_static(b"exec-skip-key"),
-        Bytes::from_static(b"value"),
-    ])));
+    assert!(connection.transaction.queue(
+        backend.ctx.num_dbs(),
+        CommandArgs::from_parts(vec![
+            Bytes::from_static(b"SET"),
+            Bytes::from_static(b"exec-skip-key"),
+            Bytes::from_static(b"value"),
+        ])
+    ));
     connection.set_reply_skip(true);
     let args = CommandArgs::from_parts(vec![Bytes::from_static(b"EXEC")]);
     connection.postpone_transaction_command(&args);
@@ -293,11 +302,14 @@ fn postponed_exec_reply_precedes_same_client_pubsub_push() {
     connection.selected_db = 0;
     connection.transaction.end(TransactionEnd::Reset);
     assert!(connection.transaction.begin(0, 0));
-    assert!(connection.transaction.queue(CommandArgs::from_parts(vec![
-        Bytes::from_static(b"PUBLISH"),
-        channel.clone(),
-        Bytes::from_static(b"message"),
-    ])));
+    assert!(connection.transaction.queue(
+        backend.ctx.num_dbs(),
+        CommandArgs::from_parts(vec![
+            Bytes::from_static(b"PUBLISH"),
+            channel.clone(),
+            Bytes::from_static(b"message"),
+        ])
+    ));
     backend.ctx.pubsub_mut().subscribe(token.0, channel);
     let args = CommandArgs::from_parts(vec![Bytes::from_static(b"EXEC")]);
     connection.postpone_transaction_command(&args);
@@ -320,10 +332,13 @@ fn postponed_exec_with_psubscribe_custom_push_completes_outer_cycle() {
     connection.authenticated = true;
     connection.resp_version = 3;
     connection.transaction.take_queued_commands();
-    assert!(connection.transaction.queue(CommandArgs::from_parts(vec![
-        Bytes::from_static(b"PSUBSCRIBE"),
-        Bytes::from_static(b"pattern*"),
-    ])));
+    assert!(connection.transaction.queue(
+        backend.ctx.num_dbs(),
+        CommandArgs::from_parts(vec![
+            Bytes::from_static(b"PSUBSCRIBE"),
+            Bytes::from_static(b"pattern*"),
+        ])
+    ));
     let args = CommandArgs::from_parts(vec![Bytes::from_static(b"EXEC")]);
     connection.postpone_transaction_command(&args);
     backend.ctx.paused_clients_mut().insert(token);
@@ -362,7 +377,7 @@ fn postpone_exec_with_commands(
     let connection = &mut backend.connection_registry[token];
     assert!(connection.transaction.begin(0, 0));
     for command in commands {
-        assert!(connection.transaction.queue(command));
+        assert!(connection.transaction.queue(backend.ctx.num_dbs(), command));
     }
     let exec = CommandArgs::from_parts(vec![Bytes::from_static(b"EXEC")]);
     connection.postpone_transaction_command(&exec);
@@ -628,7 +643,7 @@ fn postponed_client_reply_off_suppresses_its_wakeup_reply() {
 fn postponed_custom_reply_is_suppressed_when_reply_mode_is_off() {
     let (mut backend, connection_token, token) = _backend_with_connection();
     backend.registry.register(crate::framework::CommandSpec {
-        name: "custom-write",
+        name: crate::engine::command::CommandName::Static("custom-write"),
         arity: 1,
         flags: CMD_WRITE,
         dispatch_group: crate::engine::command::DispatchGroup::Default,
@@ -670,7 +685,7 @@ fn postponed_custom_reply_is_suppressed_when_reply_mode_is_off() {
 fn postponed_wakeup_applies_dynamic_argument_redaction_to_command_log() {
     let (mut backend, connection_token, token) = _backend_with_connection();
     backend.registry.register(crate::framework::CommandSpec {
-        name: "redact-write",
+        name: crate::engine::command::CommandName::Static("redact-write"),
         arity: 2,
         flags: CMD_WRITE,
         dispatch_group: crate::engine::command::DispatchGroup::Default,

@@ -155,7 +155,10 @@ impl ServerWorkerState {
             .any(|cmd| {
                 self.registry.lookup(&cmd.name).is_some_and(|s| {
                     (super::dispatch::subcmd_flags::effective_command_flags_for_call(
-                        s.name, s.flags, cmd, &self.ctx,
+                        s.name.as_str(),
+                        s.flags,
+                        cmd,
+                        &self.ctx,
                     ) & CMD_WRITE)
                         != 0
                 })
@@ -178,7 +181,10 @@ impl ServerWorkerState {
             .any(|cmd| {
                 self.registry.lookup(&cmd.name).is_some_and(|s| {
                     (super::dispatch::subcmd_flags::effective_command_flags_for_call(
-                        s.name, s.flags, cmd, &self.ctx,
+                        s.name.as_str(),
+                        s.flags,
+                        cmd,
+                        &self.ctx,
                     ) & CMD_DENYOOM)
                         != 0
                 })
@@ -193,7 +199,10 @@ impl ServerWorkerState {
             .any(|cmd| {
                 self.registry.lookup(&cmd.name).is_some_and(|s| {
                     (super::dispatch::subcmd_flags::effective_command_flags_for_call(
-                        s.name, s.flags, cmd, &self.ctx,
+                        s.name.as_str(),
+                        s.flags,
+                        cmd,
+                        &self.ctx,
                     ) & CMD_STALE)
                         == 0
                 })
@@ -251,7 +260,10 @@ impl ServerWorkerState {
                     return false;
                 };
                 let flags = super::dispatch::subcmd_flags::effective_command_flags_for_call(
-                    spec.name, spec.flags, cmd, &self.ctx,
+                    spec.name.as_str(),
+                    spec.flags,
+                    cmd,
+                    &self.ctx,
                 );
                 let has_write_flag = (flags & (CMD_WRITE | CMD_MAY_REPLICATE)) != 0;
                 if !has_write_flag {
@@ -373,7 +385,10 @@ impl ServerWorkerState {
             return None;
         };
         let flags = super::dispatch::subcmd_flags::effective_command_flags_for_call(
-            spec.name, spec.flags, args, &self.ctx,
+            spec.name.as_str(),
+            spec.flags,
+            args,
+            &self.ctx,
         );
         if let Some(reply) = self.exec_check_acl(ExecAclRequest {
             token: state.token,
@@ -385,7 +400,7 @@ impl ServerWorkerState {
             state.results.push(reply);
             return None;
         }
-        if super::dispatch::monitor::is_explicit_script_monitor_command(spec.name) {
+        if super::dispatch::monitor::is_explicit_script_monitor_command(spec.name.as_str()) {
             self.exec_emit_item_monitor(state.token, args, flags, true);
         }
         Some((spec, flags))
@@ -462,7 +477,7 @@ impl ServerWorkerState {
             TransactionPropagationInput {
                 token: item.token,
                 args: item.args,
-                name: item.spec.name,
+                name: item.spec.name.as_str(),
                 command_flags: item.spec.flags,
                 rejected: matches!(item.reply, Value::Error(_)),
             },
@@ -584,6 +599,280 @@ impl ServerWorkerState {
 }
 
 #[cfg(test)]
+mod database_acl_tests {
+    use super::*;
+    use crate::engine::extension::acl::{acl_users, AclUser};
+    use crate::foundation::io::store::Robj;
+    use crate::framework::capabilities::connection::{Connection, TransactionEnd};
+
+    struct UserGuard(String);
+
+    impl Drop for UserGuard {
+        fn drop(&mut self) {
+            acl_users().lock().unwrap().remove(&self.0);
+        }
+    }
+
+    fn command(parts: &[&[u8]]) -> CommandArgs {
+        CommandArgs::from_parts(
+            parts
+                .iter()
+                .map(|part| Bytes::copy_from_slice(part))
+                .collect(),
+        )
+    }
+
+    fn setup(allowed_dbs: &str, scenario: &str) -> (ServerWorkerState, Token, UserGuard) {
+        let mut backend = ServerWorkerState::new(16).unwrap();
+        crate::framework::commands::register_all(&mut backend.registry);
+        backend.ctx.set_command_registry_snapshot(&backend.registry);
+        backend.ctx.db_mut(0).unwrap().set(
+            b"source".to_vec(),
+            Robj::string(Bytes::from_static(b"value")),
+        );
+        let username = format!("transaction-db-{scenario}");
+        let mut user = AclUser::new_disabled();
+        for rule in ["on", "nopass", "allcommands", "allkeys", allowed_dbs] {
+            user.apply_rule(rule).unwrap();
+        }
+        acl_users().lock().unwrap().insert(username.clone(), user);
+        let guard = UserGuard(username.clone());
+        let mut connection = Connection::new_fake();
+        connection.set_token_for_test(Token(41));
+        connection.set_custom_reply_enabled(false);
+        connection.username = username;
+        assert!(connection.transaction.begin(0, 0));
+        let token = Token(backend.connection_registry.insert(connection));
+        (backend, token, guard)
+    }
+
+    #[test]
+    fn invalid_queued_select_preserves_source_db_for_move_and_copy() {
+        for select_db in [b"-1".as_slice(), b"16", b"9223372036854775807"] {
+            for operation in ["move", "copy"] {
+                let scenario = format!("{operation}-{}", String::from_utf8_lossy(select_db));
+                let (mut backend, token, _guard) = setup("db=0,1", &scenario);
+                let select = command(&[b"SELECT", select_db]);
+                let transfer = if operation == "move" {
+                    command(&[b"MOVE", b"source", b"1"])
+                } else {
+                    command(&[b"COPY", b"source", b"destination", b"DB", b"1"])
+                };
+                let mut replies = Vec::new();
+                assert_eq!(
+                    backend.try_handle_multi_queue(token, &select, "select", false, &mut replies),
+                    Some(false)
+                );
+                assert_eq!(
+                    backend.try_handle_multi_queue(
+                        token,
+                        &transfer,
+                        operation,
+                        false,
+                        &mut replies
+                    ),
+                    Some(false),
+                    "{scenario}: both commands must be queued"
+                );
+                assert_eq!(replies, vec![b"+QUEUED\r\n".to_vec(); 2]);
+                assert_eq!(
+                    backend.connection_registry[token].transaction.selected_db(),
+                    Some(0)
+                );
+                assert!(!backend.connection_registry[token]
+                    .transaction
+                    .has_queue_error());
+                let output =
+                    backend.exec_run_commands(CommandTarget::new(Token(41)), &mut Vec::new());
+                assert_eq!(output.results.len(), 2);
+                assert!(matches!(&output.results[0], Value::Error(error)
+                    if !error.starts_with(b"NOPERM") && error.windows(b"out of range".len()).any(|part| part == b"out of range")));
+                assert_eq!(output.results[1], Value::Integer(1), "{scenario}");
+                let destination = if operation == "move" {
+                    b"source".as_slice()
+                } else {
+                    b"destination"
+                };
+                assert!(backend
+                    .ctx
+                    .db(1)
+                    .unwrap()
+                    .get_allow_expired(destination)
+                    .is_some());
+                assert_eq!(
+                    backend
+                        .ctx
+                        .db(0)
+                        .unwrap()
+                        .get_allow_expired(b"source")
+                        .is_some(),
+                    operation == "copy"
+                );
+            }
+        }
+    }
+
+    fn assert_negative_zero_select_source_acl(should_reject: bool) {
+        for operation in ["move", "copy"] {
+            let scenario = format!("negative-zero-{operation}-reject-{should_reject}");
+            let (mut backend, token, _guard) = setup("db=0,1,2", &scenario);
+            let connection = &mut backend.connection_registry[token];
+            connection.selected_db = 1;
+            connection.transaction.end(TransactionEnd::Reset);
+            assert!(connection.transaction.begin(1, 0));
+            backend.ctx.db_mut(1).unwrap().set(
+                b"source".to_vec(),
+                Robj::string(Bytes::from_static(b"db1-value")),
+            );
+            let select = command(&[b"SELECT", b"-0"]);
+            let transfer = if operation == "move" {
+                command(&[b"MOVE", b"source", b"2"])
+            } else {
+                command(&[b"COPY", b"source", b"destination", b"DB", b"2"])
+            };
+            let mut replies = Vec::new();
+            assert_eq!(
+                backend.try_handle_multi_queue(token, &select, "select", false, &mut replies),
+                Some(false)
+            );
+            assert_eq!(replies, vec![b"+QUEUED\r\n".to_vec()]);
+            assert_eq!(backend.connection_registry[token].selected_db, 1);
+            let username = backend.connection_registry[token].username.clone();
+            let rule = if should_reject { "db=0,2" } else { "db=1,2" };
+            acl_users()
+                .lock()
+                .unwrap()
+                .get_mut(&username)
+                .unwrap()
+                .apply_rule(rule)
+                .unwrap();
+            assert_eq!(
+                backend.try_handle_multi_queue(token, &transfer, operation, false, &mut replies),
+                Some(should_reject),
+                "{scenario}: ACL must use the unchanged DB1 source"
+            );
+            let transaction = &backend.connection_registry[token].transaction;
+            assert_eq!(transaction.selected_db(), Some(1));
+            assert_eq!(transaction.has_queue_error(), should_reject);
+            let destination = if operation == "move" {
+                b"source".as_slice()
+            } else {
+                b"destination"
+            };
+            if should_reject {
+                assert!(replies[1].starts_with(b"-NOPERM "));
+                assert_eq!(transaction.queued_commands().len(), 1);
+                assert!(backend
+                    .ctx
+                    .db(2)
+                    .unwrap()
+                    .get_allow_expired(destination)
+                    .is_none());
+            } else {
+                assert_eq!(replies[1], b"+QUEUED\r\n");
+                assert_eq!(transaction.queued_commands().len(), 2);
+                let output =
+                    backend.exec_run_commands(CommandTarget::new(Token(41)), &mut Vec::new());
+                assert_eq!(output.results.len(), 2);
+                assert_eq!(output.results[0], CommandError::db_index_out_of_range());
+                assert_eq!(output.results[1], Value::Integer(1), "{scenario}");
+                assert_eq!(
+                    backend
+                        .ctx
+                        .db(2)
+                        .unwrap()
+                        .get_allow_expired(destination)
+                        .unwrap()
+                        .as_bytes(),
+                    b"db1-value"
+                );
+            }
+            assert_eq!(
+                backend
+                    .ctx
+                    .db(0)
+                    .unwrap()
+                    .get_allow_expired(b"source")
+                    .unwrap()
+                    .as_bytes(),
+                b"value"
+            );
+            let source = backend.ctx.db(1).unwrap().get_allow_expired(b"source");
+            if should_reject || operation == "copy" {
+                assert_eq!(source.unwrap().as_bytes(), b"db1-value");
+            } else {
+                assert!(source.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn negative_zero_select_allows_transfer_when_only_db0_is_revoked() {
+        assert_negative_zero_select_source_acl(false);
+    }
+
+    #[test]
+    fn negative_zero_select_rejects_transfer_when_db1_is_revoked() {
+        assert_negative_zero_select_source_acl(true);
+    }
+
+    #[test]
+    fn legal_queued_select_updates_source_db_acl() {
+        for (select_db, expected_db, should_reject) in
+            [(b"1".as_slice(), 1, false), (b"15".as_slice(), 15, true)]
+        {
+            for operation in ["move", "copy"] {
+                let scenario = format!("valid-{operation}-{expected_db}");
+                let (mut backend, token, _guard) = setup("db=1,15", &scenario);
+                let select = command(&[b"SELECT", select_db]);
+                let mut replies = Vec::new();
+                assert_eq!(
+                    backend.try_handle_multi_queue(token, &select, "select", false, &mut replies),
+                    Some(false)
+                );
+                assert_eq!(
+                    backend.connection_registry[token].transaction.selected_db(),
+                    Some(expected_db)
+                );
+                let transfer = if operation == "move" {
+                    command(&[b"MOVE", b"source", b"0"])
+                } else {
+                    command(&[b"COPY", b"source", b"destination", b"DB", b"0"])
+                };
+                // Replace the DB permissions, keeping the destination allowed.
+                let username = backend.connection_registry[token].username.clone();
+                let rule = if should_reject { "db=0,1" } else { "db=0,1,15" };
+                acl_users()
+                    .lock()
+                    .unwrap()
+                    .get_mut(&username)
+                    .unwrap()
+                    .apply_rule(rule)
+                    .unwrap();
+                assert_eq!(
+                    backend.try_handle_multi_queue(
+                        token,
+                        &transfer,
+                        operation,
+                        false,
+                        &mut replies
+                    ),
+                    Some(should_reject)
+                );
+                if should_reject {
+                    assert!(replies[1].starts_with(b"-NOPERM "));
+                    assert!(backend.connection_registry[token]
+                        .transaction
+                        .has_queue_error());
+                } else {
+                    assert_eq!(replies[1], b"+QUEUED\r\n");
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod cluster_publish_tests {
     use super::ServerWorkerState;
     use crate::engine::command::CommandArgs;
@@ -598,7 +887,7 @@ mod cluster_publish_tests {
     fn begin_with_commands(connection: &mut Connection, commands: Vec<CommandArgs>) {
         assert!(connection.transaction.begin(0, 0));
         for command in commands {
-            assert!(connection.transaction.queue(command));
+            assert!(connection.transaction.queue(1, command));
         }
     }
 
@@ -630,11 +919,14 @@ mod cluster_publish_tests {
             [crate::framework::capabilities::io::Token(connection_token)]
         .transaction;
         transaction.take_queued_commands();
-        assert!(transaction.queue(CommandArgs::from_parts(vec![
-            Bytes::from_static(b"SET"),
-            Bytes::from_static(b"key"),
-            Bytes::from_static(b"value"),
-        ])));
+        assert!(transaction.queue(
+            backend.ctx.num_dbs(),
+            CommandArgs::from_parts(vec![
+                Bytes::from_static(b"SET"),
+                Bytes::from_static(b"key"),
+                Bytes::from_static(b"value"),
+            ])
+        ));
         assert!(
             backend
                 .exec_compute_prechecks(connection_token)
@@ -923,11 +1215,14 @@ mod standalone_redirect_tests {
         connection.set_custom_reply_enabled(false);
         assert!(connection.transaction.begin(0, 0));
         connection.capa_flags.push("redirect".to_string());
-        assert!(connection.transaction.queue(CommandArgs::from_parts(vec![
-            Bytes::from_static(b"SET"),
-            Bytes::from_static(b"key"),
-            Bytes::from_static(b"value"),
-        ])));
+        assert!(connection.transaction.queue(
+            backend.ctx.num_dbs(),
+            CommandArgs::from_parts(vec![
+                Bytes::from_static(b"SET"),
+                Bytes::from_static(b"key"),
+                Bytes::from_static(b"value"),
+            ])
+        ));
         let connection_token = backend.connection_registry.insert(connection);
         let mut effects = CommandEffects::default();
 

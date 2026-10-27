@@ -4,6 +4,8 @@ pub mod context;
 #[cfg(not(feature = "wasm"))]
 mod descriptor;
 mod metadata;
+#[cfg(not(feature = "wasm"))]
+mod name;
 mod session;
 
 #[cfg(not(feature = "wasm"))]
@@ -12,6 +14,8 @@ pub use args::{CommandArgs, CommandError};
 #[cfg(not(feature = "wasm"))]
 pub use descriptor::{CommandDescriptor, CommandKeyIndices, ResolvedCommand};
 pub use metadata::*;
+#[cfg(not(feature = "wasm"))]
+pub use name::CommandName;
 pub use session::SessionId;
 
 /// Commands that dispatch to subcommands (e.g. `CLIENT KILL`). Nested script

@@ -47,8 +47,8 @@ jobs:
           df -h
           ulimit -a
 
-      - name: Install Node.js (for wasm-check)
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends nodejs
+      - name: Install Rust check dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends nodejs build-essential clang lld
 
       - name: Format check
         run: make fmt
@@ -63,12 +63,15 @@ jobs:
 
       - name: Unit tests
         env:
+          CC: clang
           CARGO_BUILD_JOBS: "1"
           CARGO_INCREMENTAL: "0"
           RUSTFLAGS: "-C opt-level=0 -C debuginfo=0"
         run: cargo test --lib -- --test-threads=2
 
       - name: Integration tests
+        env:
+          CC: clang
         run: cargo test --test integration
 
       - name: Property tests

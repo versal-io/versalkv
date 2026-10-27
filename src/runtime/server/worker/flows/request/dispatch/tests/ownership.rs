@@ -9,9 +9,10 @@ fn hosted_exec_connection_removal_stops_without_reindexing_the_registry() {
     let (_target_peer, _, target) = add_socket_connection(&mut backend);
     let (mut controller, _, _) = add_socket_connection(&mut backend);
     assert!(backend.connection_registry[target].transaction.begin(0, 0));
-    assert!(backend.connection_registry[target]
-        .transaction
-        .queue(make_args(&[b"EVAL", b"while true do end", b"0"])));
+    assert!(backend.connection_registry[target].transaction.queue(
+        backend.ctx.num_dbs(),
+        make_args(&[b"EVAL", b"while true do end", b"0"])
+    ));
     let target_id = backend.connection_registry[target].client_id().to_string();
     let controller_commands = format!(
         "*4\r\n$6\r\nCLIENT\r\n$4\r\nKILL\r\n$2\r\nID\r\n${}\r\n{}\r\n*2\r\n$6\r\nSCRIPT\r\n$4\r\nKILL\r\n",

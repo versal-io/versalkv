@@ -67,7 +67,7 @@ fn make_spec(
     key_step: i32,
 ) -> CommandSpec {
     CommandSpec {
-        name,
+        name: crate::engine::command::CommandName::Static(name),
         arity,
         flags,
         dispatch_group: crate::engine::command::DispatchGroup::Default,
@@ -89,7 +89,7 @@ fn make_args(parts: &[&[u8]]) -> CommandArgs {
 
 fn meta_from_spec(spec: &CommandSpec) -> CmdPreconditions {
     CmdPreconditions {
-        name: spec.name,
+        name: spec.name.clone(),
         arity: spec.arity,
         flags: spec.flags,
         first_key: spec.first_key,
@@ -99,6 +99,41 @@ fn meta_from_spec(spec: &CommandSpec) -> CmdPreconditions {
         acl_categories: spec.acl_categories,
         get_keys: spec.get_keys,
     }
+}
+
+#[test]
+fn preconditions_keep_shared_names_after_registry_removal() {
+    use crate::engine::command::CommandName;
+    use std::sync::Arc;
+
+    let mut backend = ServerWorkerState::new(1).unwrap();
+    let connection_token = add_fake_connection(&mut backend);
+    let owner: Arc<str> = Arc::from("Module.Preflight");
+    let weak = Arc::downgrade(&owner);
+    let mut spec = make_spec("unused", 2, 0, 1, 1, 1);
+    spec.name = CommandName::Shared(owner);
+    backend.registry.register(spec);
+    let spec = backend
+        .registry
+        .lookup(b"module.preflight")
+        .unwrap()
+        .clone();
+    let meta = meta_from_spec(&spec);
+    let transaction_meta = meta_from_spec(&spec.clone());
+    drop(spec);
+    assert!(backend.registry.unregister("MODULE.PREFLIGHT"));
+    assert_eq!(weak.strong_count(), 2);
+    assert_eq!(meta.name.as_str(), "Module.Preflight");
+    let outcome = backend.pre_dispatch_exec(
+        connection_token,
+        meta,
+        &make_args(&[b"MODULE.PREFLIGHT", b"key"]),
+    );
+    assert_eq!(outcome.action, DispatchAction::Execute);
+    assert_eq!(weak.strong_count(), 1);
+    assert_eq!(transaction_meta.name.as_str(), "Module.Preflight");
+    drop(transaction_meta);
+    assert!(weak.upgrade().is_none());
 }
 
 fn add_fake_connection(backend: &mut ServerWorkerState) -> usize {
@@ -393,7 +428,7 @@ fn pipelined_pending_replies_trigger_client_eviction_before_the_next_command() {
     let mut backend = ServerWorkerState::new(1).expect("create runtime");
     backend.ctx.config_mut().server.maxmemory_clients = "128kb".to_string();
     backend.registry.register(CommandSpec {
-        name: "bigreply",
+        name: crate::engine::command::CommandName::Static("bigreply"),
         arity: 1,
         flags: 0,
         dispatch_group: DispatchGroup::Default,
@@ -1285,7 +1320,7 @@ fn pre_dispatch_rejects_below_min_arity() {
 fn no_multi_rejects_flagged_command_inside_tx() {
     let spec = make_spec("save", 1, crate::framework::CMD_NO_MULTI, 0, 0, 0);
     let meta = meta_from_spec(&spec);
-    let err = ServerWorkerState::check_no_multi_pure(meta, "save", "save");
+    let err = ServerWorkerState::check_no_multi_pure(&meta, "save", "save");
     assert!(err.is_some(), "SAVE should be rejected inside MULTI");
     let msg = err.unwrap();
     match msg {
@@ -1302,7 +1337,7 @@ fn no_multi_exempts_tx_control_commands() {
     for &name in &["exec", "discard", "multi", "reset", "watch", "unwatch"] {
         let spec = make_spec(name, 1, crate::framework::CMD_NO_MULTI, 0, 0, 0);
         let meta = meta_from_spec(&spec);
-        let err = ServerWorkerState::check_no_multi_pure(meta, name, name);
+        let err = ServerWorkerState::check_no_multi_pure(&meta, name, name);
         assert!(err.is_none(), "{} should be exempt from NO_MULTI", name);
     }
 }
@@ -1311,7 +1346,7 @@ fn no_multi_exempts_tx_control_commands() {
 fn no_multi_allows_commands_without_flag() {
     let spec = make_spec("get", 2, 0, 1, 1, 1);
     let meta = meta_from_spec(&spec);
-    let err = ServerWorkerState::check_no_multi_pure(meta, "get", "get");
+    let err = ServerWorkerState::check_no_multi_pure(&meta, "get", "get");
     assert!(
         err.is_none(),
         "GET (without NO_MULTI flag) should be allowed in MULTI"
@@ -1323,7 +1358,7 @@ fn no_multi_error_uses_the_resolved_subcommand_name() {
     let spec = make_spec("client", -2, crate::framework::CMD_NO_MULTI, 0, 0, 0);
     let meta = meta_from_spec(&spec);
     assert_eq!(
-        ServerWorkerState::check_no_multi_pure(meta, "client", "client|reply"),
+        ServerWorkerState::check_no_multi_pure(&meta, "client", "client|reply"),
         Some(Value::error(
             "ERR Command 'client|reply' not allowed inside a transaction"
         ))
@@ -1870,7 +1905,7 @@ fn cluster_redirect_uses_dynamic_migrate_keys() {
     crate::framework::commands::register_all(&mut backend.registry);
     let spec = backend.registry.lookup(b"migrate").unwrap();
     let meta = CmdPreconditions {
-        name: spec.name,
+        name: spec.name.clone(),
         arity: spec.arity,
         flags: spec.flags,
         first_key: spec.first_key,
@@ -1891,7 +1926,7 @@ fn cluster_redirect_uses_dynamic_migrate_keys() {
         b"actual-key",
     ]);
 
-    let keys = ServerWorkerState::cluster_redirect_keys(meta, &args);
+    let keys = ServerWorkerState::cluster_redirect_keys(&meta, &args);
 
     assert_eq!(keys, vec![b"actual-key".to_vec()]);
 }

@@ -1,7 +1,5 @@
 use libc::{c_int, c_void};
 use std::collections::HashMap;
-use std::collections::HashSet;
-use std::ffi::CString;
 use std::time::Duration;
 
 use crate::foundation::io::sys::time::MonotonicInstant;
@@ -9,7 +7,7 @@ use crate::foundation::io::sys::time::MonotonicInstant;
 use super::{
     ModuleInternalCtx, ModuleUnloadFunc, ValkeyModuleCmdFunc, ValkeyModuleEvent,
     ValkeyModuleEventCallback, ValkeyModuleTimerProc, ValkeyModuleType,
-    VALKEYMODULE_EVENT_EVENTLOOP, VALKEYMODULE_OK,
+    VALKEYMODULE_EVENT_EVENTLOOP,
 };
 
 // ============================================================================
@@ -107,11 +105,30 @@ pub enum ModuleKeyFindKeys {
 // ============================================================================
 // ============================================================================
 
+#[derive(Clone, Debug, Default)]
+pub struct ModuleOptions {
+    value: std::sync::Arc<std::sync::atomic::AtomicI32>,
+}
+
+impl ModuleOptions {
+    // Tests read the owning module's state; production currently only stores flags.
+    #[cfg(test)]
+    pub fn get(&self) -> c_int {
+        self.value.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn set(&self, options: c_int) {
+        self.value
+            .store(options, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 pub struct ModuleRef {
     pub handle: *mut c_void,
     pub name: String,
     pub ver: i32,
     pub is_static: bool,
+    pub options: ModuleOptions,
     pub commands: Vec<String>,
     pub types: Vec<&'static ValkeyModuleType>,
     pub onunload: Option<ModuleUnloadFunc>,
@@ -127,6 +144,7 @@ impl ModuleRef {
             name: name.to_string(),
             ver,
             is_static,
+            options: ModuleOptions::default(),
             commands: Vec::new(),
             types: Vec::new(),
             onunload: None,
@@ -181,6 +199,7 @@ unsafe impl Send for InternalCtxPtr {}
 
 pub struct ModuleRegistry {
     modules: HashMap<String, Box<ModuleRef>>,
+    load_order: Vec<String>,
     types: HashMap<u64, &'static ValkeyModuleType>,
     internal_ctxs: Vec<InternalCtxPtr>,
     module_cmds: HashMap<String, ModuleCmdEntry>,
@@ -189,13 +208,13 @@ pub struct ModuleRegistry {
     timers: HashMap<u64, ModuleTimer>,
     server_event_listeners: Vec<ModuleServerEventListener>,
     next_timer_id: u64,
-    retained_strings: HashSet<usize>,
 }
 
 impl ModuleRegistry {
     pub fn new() -> Self {
         Self {
             modules: HashMap::new(),
+            load_order: Vec::new(),
             types: HashMap::new(),
             internal_ctxs: Vec::new(),
             module_cmds: HashMap::new(),
@@ -203,7 +222,6 @@ impl ModuleRegistry {
             timers: HashMap::new(),
             server_event_listeners: Vec::new(),
             next_timer_id: 1,
-            retained_strings: HashSet::new(),
         }
     }
 
@@ -212,29 +230,37 @@ impl ModuleRegistry {
         if self.modules.contains_key(&name) {
             return Err(ModuleError::NameBusy(name));
         }
+        self.load_order.push(name.clone());
         self.modules.insert(name, Box::new(module_ref));
         Ok(())
     }
 
-    pub fn unload(&mut self, name: &str) -> Result<(), ModuleError> {
+    /// Copy the callback without carrying a registry borrow across module code.
+    pub fn prepare_unload(&self, name: &str) -> Result<Option<ModuleUnloadFunc>, ModuleError> {
+        let module = self
+            .modules
+            .get(name)
+            .ok_or_else(|| ModuleError::NotFound(name.to_string()))?;
+        if !module.types.is_empty() {
+            return Err(ModuleError::InitFailed(
+                "the module exports one or more module-side data types, can't unload".to_string(),
+            ));
+        }
         if self.timers.values().any(|timer| timer.module_name == name) {
             return Err(ModuleError::InitFailed(
                 "the module holds timer that is not fired".to_string(),
             ));
         }
+        Ok(module.onunload)
+    }
+
+    /// Remove registrations after OnUnload succeeds; the caller owns dlclose.
+    pub fn finish_unload(&mut self, name: &str) -> Result<Box<ModuleRef>, ModuleError> {
         let module = self
             .modules
             .remove(name)
             .ok_or_else(|| ModuleError::NotFound(name.to_string()))?;
-
-        if let Some(onunload) = module.onunload {
-            let ctx = std::ptr::null_mut();
-            let ret = onunload(ctx);
-            if ret != VALKEYMODULE_OK {
-                log::warn!("Module '{}' OnUnload returned error", name);
-            }
-        }
-
+        self.load_order.retain(|entry| entry != name);
         for cmd_name in &module.commands {
             self.module_cmds.remove(&normalize_command_name(cmd_name));
             log::debug!("Module '{}' unregistered command: {}", name, cmd_name);
@@ -244,42 +270,42 @@ impl ModuleRegistry {
         }
         self.server_event_listeners
             .retain(|listener| listener.module_name != name);
-
+        self.timers.retain(|_, timer| timer.module_name != name);
         for mt in &module.types {
             self.types.retain(|_, v| !std::ptr::eq(*v, *mt));
         }
-
-        if !module.is_static && !module.handle.is_null() {
-            // SAFETY: The handle is a valid dlopen handle obtained from
-            // ModuleLoader::load_dynamic. We have verified it is non-null and
-            // the module is not static. The handle is no longer needed after
-            // the module is unloaded from the registry.
+        let module_ptr = (&*module as *const ModuleRef as *mut ModuleRef).cast::<c_void>();
+        self.internal_ctxs.retain(|ctx| {
+            // SAFETY: internal_ctxs owns each context. The module box is still
+            // live, and matching contexts are freed once before its library closes.
             unsafe {
-                libc::dlclose(module.handle);
+                if (*ctx.0).module_ref == module_ptr {
+                    super::free_module_ctx(Box::into_raw(super::create_module_ctx(ctx.0)));
+                    false
+                } else {
+                    true
+                }
             }
-        }
-
-        Ok(())
+        });
+        self.command_handles.retain(|handle| {
+            // SAFETY: command_handles owns these Box allocations. No callback
+            // is active; handles belonging to the removed module cannot escape.
+            unsafe {
+                if (**handle).module_name == name {
+                    drop(Box::from_raw(*handle));
+                    false
+                } else {
+                    true
+                }
+            }
+        });
+        Ok(module)
     }
 
     /// Roll back a module whose OnLoad returned an error. The loader owns the
     /// dlopen handle and closes it after this registry-only cleanup.
     pub fn abort_load(&mut self, name: &str) -> Result<(), ModuleError> {
-        let module = self
-            .modules
-            .remove(name)
-            .ok_or_else(|| ModuleError::NotFound(name.to_string()))?;
-        for cmd_name in &module.commands {
-            self.module_cmds.remove(&normalize_command_name(cmd_name));
-        }
-        for category in &module.acl_categories {
-            crate::engine::extension::module::api::acl::remove_module_acl_category_all(category);
-        }
-        self.server_event_listeners
-            .retain(|listener| listener.module_name != name);
-        for mt in &module.types {
-            self.types.retain(|_, v| !std::ptr::eq(*v, *mt));
-        }
+        self.finish_unload(name)?;
         Ok(())
     }
 
@@ -292,7 +318,9 @@ impl ModuleRegistry {
     }
 
     pub fn list(&self) -> impl Iterator<Item = &ModuleRef> {
-        self.modules.values().map(Box::as_ref)
+        self.load_order
+            .iter()
+            .filter_map(|name| self.modules.get(name).map(Box::as_ref))
     }
 
     pub fn set_load_path(&mut self, module_name: &str, path: String, args: Vec<String>) -> bool {
@@ -510,30 +538,28 @@ impl ModuleRegistry {
             .collect()
     }
 
-    // SAFETY: key and ctx are live module ABI objects for the synchronous callbacks.
-    pub unsafe fn notify_keyspace_event(
+    pub(crate) fn keyspace_callbacks(
         &self,
         module_name: &str,
         event_type: c_int,
-        event: &std::ffi::CString,
-        key: *mut super::ValkeyModuleString,
-        ctx: *mut super::ValkeyModuleCtx,
-    ) {
-        let callbacks: Vec<_> = self
-            .modules
+    ) -> Vec<(String, *mut c_void, super::ValkeyModuleNotificationFunc)> {
+        self.modules
             .get(module_name)
-            .map(|module| {
+            .into_iter()
+            .flat_map(|module| {
                 module
                     .notifications
                     .iter()
                     .filter(|notification| notification.types & event_type != 0)
-                    .map(|notification| notification.callback)
-                    .collect()
+                    .map(|notification| {
+                        (
+                            module.name.clone(),
+                            module.as_ref() as *const ModuleRef as *mut c_void,
+                            notification.callback,
+                        )
+                    })
             })
-            .unwrap_or_default();
-        for callback in callbacks {
-            callback(ctx, event_type, event.as_ptr(), key);
-        }
+            .collect()
     }
 
     pub fn stop_timer(&mut self, module_name: &str, id: u64) -> Option<*mut c_void> {
@@ -572,20 +598,6 @@ impl ModuleRegistry {
         ids.into_iter()
             .filter_map(|id| self.timers.remove(&id))
             .collect()
-    }
-
-    pub fn retain_string(&mut self, string: *mut super::ValkeyModuleString) {
-        if !string.is_null() {
-            self.retained_strings.insert(string as usize);
-        }
-    }
-
-    pub fn release_string(&mut self, string: *mut super::ValkeyModuleString) -> bool {
-        !string.is_null() && self.retained_strings.remove(&(string as usize))
-    }
-
-    pub fn is_string_retained(&self, string: *mut super::ValkeyModuleString) -> bool {
-        !string.is_null() && self.retained_strings.contains(&(string as usize))
     }
 
     pub fn command_module_name(&self, name: &str) -> Option<&str> {
@@ -660,13 +672,8 @@ impl Drop for ModuleRegistry {
                 // via from_raw is safe because we are the sole owner taking back
                 // ownership during drop.
                 unsafe {
-                    if !(*ptr).module_name.is_null() {
-                        let _ = CString::from_raw((*ptr).module_name);
-                    }
-                    if !(*ptr).current_command_name.is_null() {
-                        let _ = CString::from_raw((*ptr).current_command_name);
-                    }
-                    let _ = Box::from_raw(ptr);
+                    let ctx = Box::into_raw(super::create_module_ctx(ptr));
+                    super::free_module_ctx(ctx);
                 }
             }
         }
@@ -801,7 +808,10 @@ mod tests {
             .is_empty());
 
         assert!(registry.subscribe_server_event("events", event, Some(first_event_callback)));
-        registry.unload("events").expect("unload event module");
+        assert!(registry.prepare_unload("events").unwrap().is_none());
+        registry
+            .finish_unload("events")
+            .expect("unload event module");
         assert!(registry
             .server_event_listeners(VALKEYMODULE_EVENT_EVENTLOOP)
             .is_empty());

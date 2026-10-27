@@ -41,7 +41,7 @@ pub(crate) fn command_list(reg: &CommandRegistry, ctx: &ServerContext, args: &[B
 
     let all_names: Vec<&str> = reg
         .iter()
-        .map(|spec| spec.name)
+        .map(|spec| spec.name.as_str())
         .chain(SUBCOMMAND_NAMES.iter().copied())
         .collect();
     let mut names: Vec<Value> = all_names
@@ -50,7 +50,7 @@ pub(crate) fn command_list(reg: &CommandRegistry, ctx: &ServerContext, args: &[B
             if is_sentinel {
                 let has_sentinel_flag = reg
                     .iter()
-                    .find(|spec| spec.name == *name)
+                    .find(|spec| spec.name.as_str() == *name)
                     .map(|spec| (spec.flags & crate::framework::CMD_SENTINEL) != 0)
                     .unwrap_or_else(|| {
                         name.split('|')

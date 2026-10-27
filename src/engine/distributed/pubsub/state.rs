@@ -172,6 +172,18 @@ impl PubSubState {
             .unwrap_or_default()
     }
 
+    pub fn client_name_memory_usage(&self, token: usize) -> usize {
+        [
+            self.clients.get(&token),
+            self.client_patterns.get(&token),
+            self.shard_clients.get(&token),
+        ]
+        .into_iter()
+        .flatten()
+        .flat_map(|names| names.iter())
+        .fold(0usize, |total, name| total.saturating_add(name.len()))
+    }
+
     pub fn subscribed_client_count(&self) -> usize {
         let mut clients = HashSet::new();
         clients.extend(self.clients.keys().copied());

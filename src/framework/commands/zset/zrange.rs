@@ -43,6 +43,7 @@ pub(super) struct ZRangeRequest {
     pub reverse: bool,
     pub limit: Option<ZRangeLimit>,
     pub with_scores: bool,
+    pub should_require_key: bool,
 }
 
 struct RangeParseSpec {
@@ -54,6 +55,7 @@ struct RangeParseSpec {
     allow_mode_options: bool,
     allow_with_scores: bool,
     allow_limit: bool,
+    allow_xx: bool,
 }
 
 impl ZRangeRequest {
@@ -72,12 +74,14 @@ impl ZRangeRequest {
                 allow_mode_options: true,
                 allow_with_scores: true,
                 allow_limit: true,
+                allow_xx: true,
             },
         )
     }
 
     fn parse_with(args: &CommandArgs, spec: RangeParseSpec) -> Result<Self, Value> {
-        let (kind, reverse, limit, with_scores, lex_seen) = parse_range_options(args, &spec)?;
+        let (kind, reverse, limit, with_scores, lex_seen, should_require_key) =
+            parse_range_options(args, &spec)?;
         if limit.is_some_and(|limit| limit.count >= 0) && kind == RangeKind::Rank {
             return Err(CommandError::syntax_error());
         }
@@ -91,6 +95,7 @@ impl ZRangeRequest {
             reverse,
             limit,
             with_scores,
+            should_require_key,
         })
     }
 }
@@ -98,12 +103,13 @@ impl ZRangeRequest {
 fn parse_range_options(
     args: &CommandArgs,
     spec: &RangeParseSpec,
-) -> Result<(RangeKind, bool, Option<ZRangeLimit>, bool, bool), Value> {
+) -> Result<(RangeKind, bool, Option<ZRangeLimit>, bool, bool, bool), Value> {
     let mut kind = spec.initial_kind;
     let mut reverse = spec.reverse;
     let mut limit = None;
     let mut with_scores = false;
     let mut lex_seen = kind == RangeKind::Lex;
+    let mut should_require_key = false;
     let mut index = spec.options_start;
     while index < args.args.len() {
         let option = &args.args[index];
@@ -122,6 +128,9 @@ fn parse_range_options(
         } else if option.eq_ignore_ascii_case(b"withscores") && spec.allow_with_scores {
             with_scores = true;
             index += 1;
+        } else if option.eq_ignore_ascii_case(b"xx") && spec.allow_xx {
+            should_require_key = true;
+            index += 1;
         } else if option.eq_ignore_ascii_case(b"limit") && spec.allow_limit {
             limit = Some(parse_limit(args, index)?);
             index += 3;
@@ -129,7 +138,14 @@ fn parse_range_options(
             return Err(CommandError::syntax_error());
         }
     }
-    Ok((kind, reverse, limit, with_scores, lex_seen))
+    Ok((
+        kind,
+        reverse,
+        limit,
+        with_scores,
+        lex_seen,
+        should_require_key,
+    ))
 }
 
 fn parse_limit(args: &CommandArgs, index: usize) -> Result<ZRangeLimit, Value> {
@@ -252,6 +268,7 @@ pub fn zrange(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> CommandOu
         return CommandOutcome::reply(CommandError::db_index_out_of_range());
     };
     let zset = match db.get_zset_object(&request.key) {
+        Ok(None) if request.should_require_key => return CommandOutcome::reply(Value::NullArray),
         Ok(None) => return CommandOutcome::reply(Value::Array(Vec::new())),
         Ok(Some(zset)) => zset,
         Err(_) => return CommandOutcome::reply(CommandError::wrong_type()),
@@ -279,6 +296,7 @@ impl ZRangeRequest {
                 allow_mode_options: true,
                 allow_with_scores: false,
                 allow_limit: true,
+                allow_xx: false,
             },
         )
     }
@@ -303,6 +321,7 @@ impl ZRangeRequest {
                 allow_mode_options: false,
                 allow_with_scores,
                 allow_limit: kind != RangeKind::Rank,
+                allow_xx: true,
             },
         )
     }
@@ -317,6 +336,7 @@ pub(super) fn execute_zrange_request(
         return CommandOutcome::reply(CommandError::db_index_out_of_range());
     };
     let zset = match db.get_zset_object(&request.key) {
+        Ok(None) if request.should_require_key => return CommandOutcome::reply(Value::NullArray),
         Ok(None) => return CommandOutcome::reply(Value::Array(Vec::new())),
         Ok(Some(zset)) => zset,
         Err(_) => return CommandOutcome::reply(CommandError::wrong_type()),

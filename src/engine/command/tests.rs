@@ -140,7 +140,7 @@ fn dispatch_groups_are_stable_copyable_values() {
 #[test]
 fn command_descriptor_carries_handler_independent_metadata() {
     let descriptor = CommandDescriptor {
-        name: "set",
+        name: super::CommandName::Static("set"),
         arity: -3,
         flags: CMD_WRITE | CMD_DENYOOM,
         first_key: 1,
@@ -150,7 +150,7 @@ fn command_descriptor_carries_handler_independent_metadata() {
         acl_categories: &["STRING", "WRITE"],
     };
 
-    assert_eq!(descriptor.name, "set");
+    assert_eq!(descriptor.name.as_str(), "set");
     assert_eq!(descriptor.arity, -3);
     assert_eq!(descriptor.flags, CMD_WRITE | CMD_DENYOOM);
     assert_eq!((descriptor.first_key, descriptor.last_key), (1, 1));

@@ -1594,17 +1594,275 @@ fn explicit_meet_pong_learns_gossiped_node_as_trusted() {
 
     assert!(!manager.readable(&mut state, &mut reader, token.0, 200));
 
-    // C clusterProcessGossipSection: the gossip-learned node is trusted from
-    // the start (no handshake), and the asymmetric-meet repair is armed so a
-    // reciprocal MEET establishes the bidirectional link.
+    // C clusterProcessGossipSection trusts the real gossip ID without a
+    // handshake or initial MEET. Keep the discovery clock for delayed repair
+    // if the peer does not establish an inbound link.
     let gossip_node = state.nodes.get(&gossip_id).unwrap();
     assert!(!gossip_node.has_flag(CLUSTER_NODE_HANDSHAKE));
     assert!(gossip_node.asymmetric_meet_started_at > 0);
-    assert!(gossip_node.meet_pending);
+    assert!(!gossip_node.meet_pending);
     assert!(
         !manager.connections[&token.0].send_meet,
         "a successful explicit MEET must not be retried after later teardown"
     );
+}
+
+fn learn_peer_from_explicit_meet_pong(
+) -> (ClusterBusManager, ClusterState, ClusterNode, ClusterNode) {
+    let mut manager = ClusterBusManager::new();
+    let mut state = ClusterState::new("127.0.0.1", 5694, 5693);
+    state.myself.name = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".to_string();
+    state.myself.shard_id = state.myself.name.clone();
+    let mut seed = ClusterNode::new(
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        "127.0.0.1".to_string(),
+        5700,
+        5699,
+        true,
+    );
+    seed.flags &= !CLUSTER_NODE_MYSELF;
+    let mut peer = ClusterNode::new(
+        "cccccccccccccccccccccccccccccccccccccccc".to_string(),
+        "127.0.0.1".to_string(),
+        5697,
+        5696,
+        true,
+    );
+    peer.flags &= !CLUSTER_NODE_MYSELF;
+    let now_ms = crate::foundation::io::sys::time::mstime();
+    let handshake_id = state.ensure_handshake_node(&seed.ip, seed.port, seed.cport, now_ms);
+    manager.register_outgoing_for_handshake(
+        Token(40),
+        "127.0.0.1:5699".parse().unwrap(),
+        handshake_id,
+    );
+    manager.queue_initial_handshake(&mut state, 40);
+    let (initial, _) = msg::parse_msg(&manager.connections[&40].write_buf).unwrap();
+    assert_eq!(initial.msg_type, ClusterMsgType::Meet);
+    let gossip = GossipEntry {
+        node_id: peer.name.clone(),
+        flags: CLUSTER_NODE_PRIMARY,
+        ping_sent: 0,
+        pong_received: 0,
+        ip: peer.ip.clone(),
+        port: peer.port,
+        tls_port: 0,
+        bus_port: peer.cport,
+        config_epoch: 0,
+    };
+    let mut reader = PacketReader {
+        packet: Some(msg::encode_msg(ClusterMsgType::Pong, &seed, 0, &[gossip])),
+    };
+    assert!(!manager.readable(&mut state, &mut reader, 40, now_ms));
+    assert_eq!(manager.connections[&40].node_name, seed.name);
+    assert!(manager.connections[&40].handshake_node_name.is_empty());
+    assert!(!manager.connections[&40].send_meet);
+    let learned = &state.nodes[&peer.name];
+    assert_eq!(learned.flags, CLUSTER_NODE_PRIMARY);
+    assert!(learned.asymmetric_meet_started_at > 0);
+    assert_eq!(learned.ip, peer.ip);
+    assert_eq!(learned.port, peer.port);
+    assert_eq!(learned.cport, peer.cport);
+    assert!(state
+        .take_pending_connects()
+        .contains(&(peer.ip.clone(), peer.cport, false)));
+    manager.register_outgoing_for_node(
+        Token(41),
+        "127.0.0.1:5696".parse().unwrap(),
+        false,
+        peer.name.clone(),
+    );
+    (manager, state, seed, peer)
+}
+
+#[test]
+fn ordinary_gossip_discovery_sends_ping_first() {
+    let (mut manager, mut state, _, peer) = learn_peer_from_explicit_meet_pong();
+    let discovery_ms = state.nodes[&peer.name].asymmetric_meet_started_at;
+    manager.queue_initial_handshake(&mut state, 41);
+    let connection = &manager.connections[&41];
+    let (first, frame_len) = msg::parse_msg(&connection.write_buf).unwrap();
+    eprintln!(
+        "ordinary gossip first={:?}, sender={}, send_meet={}, meet_pending={}, discovery_ms={}",
+        first.msg_type,
+        first.sender_id,
+        connection.send_meet,
+        state.nodes[&peer.name].meet_pending,
+        discovery_ms
+    );
+    assert_eq!(frame_len, connection.write_buf.len());
+    assert_eq!(first.sender_id, state.myself.name);
+    assert!(!connection.send_meet);
+    assert_eq!(first.msg_type, ClusterMsgType::Ping);
+    assert!(!state.nodes[&peer.name].meet_pending);
+    assert_eq!(
+        state.nodes[&peer.name].asymmetric_meet_started_at,
+        discovery_ms
+    );
+    assert!(state.nodes[&peer.name].ping_sent > 0);
+}
+
+#[test]
+fn ordinary_gossip_discovery_waits_for_asymmetric_meet_window() {
+    for node_timeout_ms in [0, 1, 1_000, 4_000] {
+        let (mut manager, mut state, _, peer) = learn_peer_from_explicit_meet_pong();
+        let discovery_ms = state.nodes[&peer.name].asymmetric_meet_started_at;
+        let window_ms = node_timeout_ms.max(1_000) as i64;
+        manager.queue_initial_handshake(&mut state, 41);
+        let (first, first_len) = msg::parse_msg(&manager.connections[&41].write_buf).unwrap();
+        assert_eq!(first.msg_type, ClusterMsgType::Ping);
+        for elapsed_ms in [1, window_ms - 1, window_ms] {
+            manager.schedule_asymmetric_meets(
+                &mut state,
+                discovery_ms + elapsed_ms,
+                node_timeout_ms,
+            );
+            assert!(
+                !state.nodes[&peer.name].meet_pending,
+                "elapsed_ms={elapsed_ms}"
+            );
+            assert!(manager.connections[&41].handshake_sent);
+            assert!(state.pending_connects.is_empty());
+            assert_eq!(
+                state.nodes[&peer.name].asymmetric_meet_started_at,
+                discovery_ms
+            );
+        }
+
+        manager.schedule_asymmetric_meets(
+            &mut state,
+            discovery_ms + window_ms + 1,
+            node_timeout_ms,
+        );
+        assert!(state.nodes[&peer.name].meet_pending);
+        assert!(!manager.connections[&41].handshake_sent);
+        assert!(!manager.connections[&41].send_meet);
+        assert_eq!(
+            state.take_pending_connects(),
+            vec![(peer.ip.clone(), peer.cport, true)]
+        );
+        manager.queue_initial_handshake(&mut state, 41);
+        let write_buf = &manager.connections[&41].write_buf;
+        let (repair, repair_len) = msg::parse_msg(&write_buf[first_len..]).unwrap();
+        assert_eq!(repair.msg_type, ClusterMsgType::Meet);
+        assert_eq!(first_len + repair_len, write_buf.len());
+        assert!(state.nodes[&peer.name].meet_sent_at > 0);
+        assert_eq!(
+            state.nodes[&peer.name].asymmetric_meet_started_at,
+            discovery_ms
+        );
+    }
+}
+
+#[test]
+fn ordinary_gossip_discovery_does_not_duplicate_inbound_identity() {
+    let (mut sender_bus, mut sender_state, seed, peer) = learn_peer_from_explicit_meet_pong();
+    sender_bus.queue_initial_handshake(&mut sender_state, 41);
+    let write_buf = &sender_bus.connections[&41].write_buf;
+    let (first, frame_len) = msg::parse_msg(write_buf).unwrap();
+    assert_eq!(frame_len, write_buf.len());
+    assert_eq!(first.sender_id, sender_state.myself.name);
+    let mut receiver_bus = ClusterBusManager::new();
+    let mut receiver_state = ClusterState::new(&peer.ip, peer.port, peer.cport);
+    receiver_state.myself.name = peer.name.clone();
+    receiver_state.myself.shard_id = peer.name.clone();
+    receiver_state.insert_node(seed.clone());
+    for (node_id, port, bus_port) in [
+        ("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", 5698, 15698),
+        ("dddddddddddddddddddddddddddddddddddddddd", 5695, 15695),
+    ] {
+        let mut node = ClusterNode::new(
+            node_id.to_string(),
+            "127.0.0.1".to_string(),
+            port,
+            bus_port,
+            true,
+        );
+        node.flags &= !CLUSTER_NODE_MYSELF;
+        receiver_state.insert_node(node);
+    }
+    let snapshot = |state: &ClusterState| {
+        let mut nodes = state
+            .nodes
+            .values()
+            .chain(std::iter::once(&state.myself))
+            .map(|node| {
+                (
+                    node.name.clone(),
+                    node.flags,
+                    node.ip.clone(),
+                    node.port,
+                    node.cport,
+                )
+            })
+            .collect::<Vec<_>>();
+        nodes.sort();
+        nodes
+    };
+    assert_eq!(receiver_state.nodes.len() + 1, 4);
+    assert!(receiver_state
+        .info_str()
+        .contains("cluster_known_nodes:4\r\n"));
+    eprintln!("before first frame: {:?}", snapshot(&receiver_state));
+    receiver_bus.register_incoming(Token(42), "127.0.0.1:25375".parse().unwrap());
+    let mut reader = PacketReader {
+        packet: Some(write_buf[..frame_len].to_vec()),
+    };
+    assert!(!receiver_bus.readable(&mut receiver_state, &mut reader, 42, 10_000));
+    let after_first = receiver_state.nodes.len() + 1;
+    let first_info = receiver_state.info_str();
+    let handshake_id = receiver_bus.connections[&42].handshake_node_name.clone();
+    eprintln!(
+        "after {:?}: nodes={:?}, node_name={}, handshake_node_name={}, info={}",
+        first.msg_type,
+        snapshot(&receiver_state),
+        receiver_bus.connections[&42].node_name,
+        handshake_id,
+        first_info
+    );
+    let (reply, _) = msg::parse_msg(&receiver_bus.connections[&42].write_buf).unwrap();
+    assert_eq!(reply.msg_type, ClusterMsgType::Pong);
+
+    // Deliver trusted third-party gossip before any cron or handshake PONG.
+    receiver_bus.register_incoming(Token(43), "127.0.0.1:25376".parse().unwrap());
+    let gossip = GossipEntry {
+        node_id: sender_state.myself.name.clone(),
+        flags: CLUSTER_NODE_PRIMARY,
+        ping_sent: 0,
+        pong_received: 0,
+        ip: sender_state.myself.ip.clone(),
+        port: sender_state.myself.port,
+        tls_port: 0,
+        bus_port: sender_state.myself.cport,
+        config_epoch: 0,
+    };
+    let mut reader = PacketReader {
+        packet: Some(msg::encode_msg(ClusterMsgType::Ping, &seed, 0, &[gossip])),
+    };
+    assert!(!receiver_bus.readable(&mut receiver_state, &mut reader, 43, 10_001));
+    let after_gossip = receiver_state.nodes.len() + 1;
+    let final_info = receiver_state.info_str();
+    eprintln!(
+        "after seed gossip: nodes={:?}, info={}",
+        snapshot(&receiver_state),
+        final_info
+    );
+    let learned = &receiver_state.nodes[&sender_state.myself.name];
+    assert_eq!(learned.flags, CLUSTER_NODE_PRIMARY);
+    assert_eq!(learned.ip, sender_state.myself.ip);
+    assert_eq!(learned.port, sender_state.myself.port);
+    assert_eq!(learned.cport, sender_state.myself.cport);
+    assert_eq!(receiver_bus.connections[&43].node_name, seed.name);
+    assert!(receiver_state.pending_link_closes.is_empty());
+    assert_eq!([4, after_first, after_gossip], [4, 4, 5]);
+    assert_eq!(first.msg_type, ClusterMsgType::Ping);
+    assert!(handshake_id.is_empty());
+    assert!(receiver_state
+        .nodes
+        .values()
+        .all(|node| !node.has_flag(CLUSTER_NODE_HANDSHAKE)));
+    assert!(first_info.contains("cluster_known_nodes:4\r\n"));
+    assert!(final_info.contains("cluster_known_nodes:5\r\n"));
 }
 
 #[test]
@@ -1624,9 +1882,9 @@ fn pong_on_gossip_discovered_outbound_ping_keeps_reciprocal_meet_pending() {
     sender.asymmetric_meet_started_at = 100;
     sender.meet_pending = true;
     state.nodes.insert(sender_id.clone(), sender.clone());
-    // A gossip-discovered peer receives an ordinary outbound PING first. Its
-    // PONG only proves liveness, not that it knows this node, so the pending
-    // reciprocal MEET must survive until that MEET is sent.
+    // A peer already armed for delayed repair may return a PONG for an earlier
+    // ordinary PING. That PONG only proves liveness, so the pending reciprocal
+    // MEET must survive until the repair MEET is sent.
     manager.register_outgoing_for_node(
         token,
         "127.0.0.1:16380".parse().unwrap(),

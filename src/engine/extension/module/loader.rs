@@ -4,7 +4,7 @@ use std::ffi::{CStr, CString};
 use super::api::{module_get_api_impl, ActiveModuleRegistryScope};
 use super::{
     create_module_ctx, create_module_internal_ctx, free_module_ctx, ModuleLoadFunc, ModuleRef,
-    ModuleRegistry, ValkeyModuleString, VALKEYMODULE_OK,
+    ModuleRegistry, ModuleUnloadFunc, ValkeyModuleString, VALKEYMODULE_OK,
 };
 
 pub struct ModuleLoader;
@@ -85,6 +85,20 @@ impl ModuleLoader {
         // matches the extern "C" calling convention of ModuleLoadFunc.
         let onload: ModuleLoadFunc = unsafe { std::mem::transmute(onload_ptr) };
 
+        // SAFETY: handle remains open. Both optional symbols have the module
+        // OnUnload ABI; a missing symbol stays None and is never called.
+        let onunload: Option<ModuleUnloadFunc> = unsafe {
+            let mut ptr = libc::dlsym(handle, c"ValkeyModule_OnUnload".as_ptr());
+            if ptr.is_null() {
+                ptr = libc::dlsym(handle, c"RedisModule_OnUnload".as_ptr());
+            }
+            if ptr.is_null() {
+                None
+            } else {
+                Some(std::mem::transmute::<*mut c_void, ModuleUnloadFunc>(ptr))
+            }
+        };
+
         let internal = create_module_internal_ctx("pending", std::ptr::null_mut());
         let internal_ptr = Box::into_raw(internal);
         // SAFETY: internal_ptr was just allocated via Box::into_raw and is uniquely
@@ -115,12 +129,13 @@ impl ModuleLoader {
             let _context_scope = super::api::ActiveModuleContextScope::enter(ctx_ptr);
             onload(ctx_ptr as *mut c_void, argv, arg_strings.len() as c_int)
         };
+        // SAFETY: OnLoad has returned; collect before rollback or unloading code.
+        unsafe { super::auto_memory::collect(internal_ptr) };
         for string in arg_strings.drain(..) {
             // SAFETY: each argument string was allocated for this synchronous
             // OnLoad call and is no longer borrowed after OnLoad returns.
             unsafe {
-                let mut string = Box::from_raw(string);
-                string.free();
+                ValkeyModuleString::release(string);
             }
         }
 
@@ -194,6 +209,7 @@ impl ModuleLoader {
             // internal ModuleInternalCtx, properly dropping them.
             unsafe {
                 free_module_ctx(ctx_ptr);
+                libc::dlclose(handle);
             }
             return Err(ModuleError::InitFailed(
                 "Module did not call ValkeyModule_Init during OnLoad".to_string(),
@@ -207,6 +223,7 @@ impl ModuleLoader {
 
         if let Some(m) = registry.lookup_mut(module_name) {
             m.handle = handle;
+            m.onunload = onunload;
         }
         // SAFETY: internal_ptr is a valid non-null pointer from Box::into_raw.
         // Writing onload is safe because the struct is still alive and uniquely
@@ -225,5 +242,116 @@ impl ModuleLoader {
 
         log::info!("Module '{}' loaded from {}", module_name, path);
         Ok(module_name.to_string())
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use crate::engine::extension::module::lifecycle_test_support::{snapshot, Drops};
+    use std::cell::Cell;
+
+    thread_local! {
+        static UNLOAD_DROPS: Cell<Option<Drops>> = const { Cell::new(None) };
+    }
+
+    extern "C" fn observe_cleanup() {
+        UNLOAD_DROPS.with(|observed| observed.set(Some(snapshot())));
+    }
+
+    struct FixtureDir(std::path::PathBuf);
+
+    impl Drop for FixtureDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn compile_fixture() -> (FixtureDir, String) {
+        static NEXT_FIXTURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = NEXT_FIXTURE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let temp = FixtureDir(std::env::temp_dir().join(format!(
+            "versal-module-lifecycle-{}-{id}",
+            std::process::id(),
+        )));
+        std::fs::create_dir(&temp.0).unwrap();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let path = temp.0.join("auto_memory_lifecycle.so");
+        let mut compiler =
+            std::process::Command::new(std::env::var_os("CC").unwrap_or_else(|| "clang".into()));
+        compiler
+            .args(["-shared", "-fPIC", "-Wall", "-Wextra", "-Werror"])
+            .arg("-I")
+            .arg(root.join("thirdparty/valkey/src"))
+            .arg("-o")
+            .arg(&path)
+            .arg(root.join("tests/fixtures/module_ffi/auto_memory_lifecycle.c"));
+        #[cfg(target_os = "linux")]
+        compiler.arg("-fuse-ld=lld");
+        #[cfg(target_os = "macos")]
+        compiler.arg("-Wl,-undefined,dynamic_lookup");
+        let result = compiler.output().unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        (temp, path.to_string_lossy().into_owned())
+    }
+
+    #[test]
+    fn failed_onload_collects_automatic_strings_before_dlclose() {
+        let (_temp, path) = compile_fixture();
+        let mut registry = ModuleRegistry::new();
+        let probe = format!("probe:{:x}", observe_cleanup as *const () as usize);
+        let before = snapshot();
+        let result = ModuleLoader::load_dynamic(
+            &path,
+            &[b"fail", probe.as_bytes()],
+            &mut registry,
+            std::ptr::null_mut(),
+        );
+        assert!(result.is_err());
+        assert!(registry.lookup("auto-memory-lifecycle").is_none());
+        assert_eq!(snapshot().strings - before.strings, 5);
+        UNLOAD_DROPS.with(|observed| {
+            assert_eq!(
+                observed.get().expect("dlclose must invoke probe").strings - before.strings,
+                5
+            );
+        });
+    }
+
+    #[test]
+    fn successful_onload_collects_scope_immediately_but_keeps_retained_argument() {
+        let (_temp, path) = compile_fixture();
+        let mut registry = ModuleRegistry::new();
+        let before = snapshot();
+        assert_eq!(
+            ModuleLoader::load_dynamic(&path, &[b"argument"], &mut registry, std::ptr::null_mut(),)
+                .unwrap(),
+            "auto-memory-lifecycle"
+        );
+        assert_eq!(snapshot().strings - before.strings, 3);
+        let handle = registry.lookup("auto-memory-lifecycle").unwrap().handle;
+        let callback = registry
+            .lookup_cmd_func("lifecycle.argv")
+            .unwrap()
+            .func
+            .unwrap();
+        let internal = super::super::create_module_cmd_ctx(
+            "auto-memory-lifecycle",
+            "lifecycle.argv",
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+        let ctx = Box::into_raw(create_module_ctx(Box::into_raw(internal)));
+        assert_eq!(callback(ctx, std::ptr::null_mut(), 0), VALKEYMODULE_OK);
+        assert_eq!(snapshot().strings - before.strings, 4);
+        // SAFETY: the invocation context is owned and no callback remains active.
+        unsafe { free_module_ctx(ctx) };
+        drop(registry);
+        // SAFETY: test owns the fixture's successful dlopen handle; callbacks are gone.
+        unsafe { assert_eq!(libc::dlclose(handle), 0) };
     }
 }

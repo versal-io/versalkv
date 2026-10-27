@@ -78,10 +78,10 @@ impl ServerWorkerState {
         };
         let executor = spec.executor;
         let preconditions = CmdPreconditions {
-            name: spec.name,
+            name: spec.name.clone(),
             arity: spec.arity,
             flags: super::subcmd_flags::effective_command_flags_for_call(
-                spec.name,
+                spec.name.as_str(),
                 spec.flags,
                 invocation.args,
                 &self.ctx,
@@ -91,7 +91,7 @@ impl ServerWorkerState {
             key_step: spec.key_step,
             key_flags: spec.key_flags,
             acl_categories: super::subcmd_flags::effective_acl_categories(
-                spec.name,
+                spec.name.as_str(),
                 spec.acl_categories,
                 invocation.args.args.first().map(|arg| arg.as_ref()),
             ),

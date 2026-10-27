@@ -1,4 +1,5 @@
 use libc::{c_char, c_int, c_void};
+use std::ptr::NonNull;
 
 pub type ValkeyModuleCmdFunc = Option<
     extern "C" fn(
@@ -50,6 +51,7 @@ pub struct ValkeyModuleCtx {
 pub struct ModuleInternalCtx {
     pub module_name: *mut c_char,
     pub module_ref: *mut c_void,
+    pub(crate) module_options: Option<super::registry::ModuleOptions>,
     pub onload: c_int,
     pub reply_ptr: *mut c_void,
     pub runtime_handle: *mut c_void,
@@ -58,6 +60,7 @@ pub struct ModuleInternalCtx {
     pub username: *mut c_char,
     pub module_auth_user: *mut c_char,
     pub current_command_name: *mut c_char,
+    pub(super) auto_memory: super::auto_memory::ModuleAutoMemoryScope,
 }
 
 #[repr(C)]
@@ -68,6 +71,15 @@ pub struct ValkeyModuleString {
 struct ModuleStringData {
     bytes: Vec<u8>,
     len: usize,
+    ref_count: usize,
+    auto_owner: Option<NonNull<ModuleInternalCtx>>,
+}
+
+#[cfg(test)]
+impl Drop for ModuleStringData {
+    fn drop(&mut self) {
+        super::lifecycle_test_support::string_dropped();
+    }
 }
 
 impl ValkeyModuleString {
@@ -78,6 +90,8 @@ impl ValkeyModuleString {
         let value = Box::new(ModuleStringData {
             bytes,
             len: data.len(),
+            ref_count: 1,
+            auto_owner: None,
         });
         Box::new(ValkeyModuleString {
             _data: Box::into_raw(value).cast(),
@@ -97,16 +111,65 @@ impl ValkeyModuleString {
         }
     }
 
-    // SAFETY: The caller must ensure that `self` has not already been freed and
-    // that no other code holds a reference to the underlying data. After
-    // this call, `self._data` is set to null and any previous pointer is
-    // invalidated.
-    pub unsafe fn free(&mut self) {
+    // SAFETY: string is a live module string.
+    pub unsafe fn incr_ref(string: *mut Self) {
+        // SAFETY: the caller owns a live reference to the shell and payload.
         unsafe {
-            if !self._data.is_null() {
-                let _ = Box::from_raw(self._data as *mut ModuleStringData);
-                self._data = std::ptr::null_mut();
+            let value = &mut *(*string)._data.cast::<ModuleStringData>();
+            let Some(count) = value.ref_count.checked_add(1) else {
+                std::process::abort();
+            };
+            value.ref_count = count;
+        }
+    }
+
+    // SAFETY: string is null or owns one live reference; its auto owner is live.
+    pub unsafe fn release(string: *mut Self) {
+        if string.is_null() {
+            return;
+        }
+        // SAFETY: only the final reference reclaims the shell and payload.
+        unsafe {
+            let payload = (*string)._data.cast::<ModuleStringData>();
+            (*payload).ref_count -= 1;
+            if (*payload).ref_count != 0 {
+                return;
             }
+            let owner = (*payload).auto_owner;
+            super::auto_memory::remove_string(owner, string);
+            drop(Box::from_raw(payload));
+            drop(Box::from_raw(string));
+        }
+    }
+
+    // SAFETY: string points to a live shell and payload.
+    pub(super) unsafe fn set_auto_owner(
+        string: *mut Self,
+        owner: Option<NonNull<ModuleInternalCtx>>,
+    ) {
+        // SAFETY: the caller guarantees a live payload.
+        unsafe { (*(*string)._data.cast::<ModuleStringData>()).auto_owner = owner };
+    }
+
+    // SAFETY: string points to a live shell and payload.
+    pub(super) unsafe fn ref_count(string: *mut Self) -> usize {
+        // SAFETY: the payload remains live while reading its count.
+        unsafe { (*(*string)._data.cast::<ModuleStringData>()).ref_count }
+    }
+
+    // SAFETY: string is live; bytes have been copied if they alias its payload.
+    pub(super) unsafe fn append(string: *mut Self, bytes: &[u8]) -> bool {
+        // SAFETY: mutate the existing payload only when its reference is unique.
+        unsafe {
+            let value = &mut *(*string)._data.cast::<ModuleStringData>();
+            if value.ref_count != 1 {
+                return false;
+            }
+            value.bytes.pop();
+            value.bytes.extend_from_slice(bytes);
+            value.len = value.bytes.len();
+            value.bytes.push(0);
+            true
         }
     }
 }
@@ -128,6 +191,14 @@ pub struct ModuleKeyHandle {
     pub list_max_listpack_size: i64,
     pub uses_lfu: bool,
     pub stream_iterator: Option<ModuleStreamIterator>,
+    pub(super) owner: Option<NonNull<ModuleInternalCtx>>,
+}
+
+#[cfg(test)]
+impl Drop for ModuleKeyHandle {
+    fn drop(&mut self) {
+        super::lifecycle_test_support::key_dropped();
+    }
 }
 
 pub struct ModuleStreamIterator {
@@ -152,6 +223,7 @@ impl ModuleKeyHandle {
             list_max_listpack_size,
             uses_lfu,
             stream_iterator: None,
+            owner: None,
         })
     }
 }
@@ -241,12 +313,39 @@ mod tests {
 
     #[test]
     fn module_string_preserves_interior_nul_bytes() {
-        let mut value = ValkeyModuleString::from_bytes(b"1\0x");
+        let value = Box::into_raw(ValkeyModuleString::from_bytes(b"1\0x"));
 
         // SAFETY: value owns a live module string for the duration of the assertion.
-        assert_eq!(unsafe { value.as_bytes() }, b"1\0x");
+        assert_eq!(unsafe { (*value).as_bytes() }, b"1\0x");
 
         // SAFETY: value is uniquely owned and has not previously been freed.
-        unsafe { value.free() };
+        unsafe { ValkeyModuleString::release(value) };
+    }
+
+    #[test]
+    fn module_string_append_keeps_payload_allocation() {
+        use crate::engine::extension::module::api::call::ValkeyModule_StringAppendBuffer;
+        let value = Box::into_raw(ValkeyModuleString::from_bytes(b"a\0b"));
+        let before = super::super::lifecycle_test_support::snapshot();
+        // SAFETY: value is a live, uniquely owned string throughout this test.
+        unsafe {
+            let payload = (*value)._data;
+            assert_eq!(
+                ValkeyModule_StringAppendBuffer(
+                    std::ptr::null_mut(),
+                    value,
+                    b"x".as_ptr().cast(),
+                    1
+                ),
+                0
+            );
+            assert_eq!(
+                super::super::lifecycle_test_support::snapshot().strings,
+                before.strings
+            );
+            assert_eq!((*value)._data, payload);
+            assert_eq!((*value).as_bytes(), b"a\0bx");
+            ValkeyModuleString::release(value);
+        }
     }
 }

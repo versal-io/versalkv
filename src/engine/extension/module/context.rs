@@ -8,6 +8,7 @@ pub fn create_module_internal_ctx(name: &str, module_ref: *mut c_void) -> Box<Mo
     Box::new(ModuleInternalCtx {
         module_name: cname.into_raw(),
         module_ref,
+        module_options: None,
         onload: 1,
         reply_ptr: std::ptr::null_mut(),
         runtime_handle: std::ptr::null_mut(),
@@ -16,6 +17,7 @@ pub fn create_module_internal_ctx(name: &str, module_ref: *mut c_void) -> Box<Mo
         username: CString::new("default").unwrap().into_raw(),
         module_auth_user: std::ptr::null_mut(),
         current_command_name: std::ptr::null_mut(),
+        auto_memory: Default::default(),
     })
 }
 
@@ -33,6 +35,7 @@ pub fn create_module_cmd_ctx(
     Box::new(ModuleInternalCtx {
         module_name: cname.into_raw(),
         module_ref,
+        module_options: None,
         onload: 0,
         reply_ptr,
         runtime_handle,
@@ -41,6 +44,7 @@ pub fn create_module_cmd_ctx(
         username: CString::new("default").unwrap().into_raw(),
         module_auth_user: std::ptr::null_mut(),
         current_command_name: command_name.into_raw(),
+        auto_memory: Default::default(),
     })
 }
 
@@ -73,6 +77,7 @@ pub unsafe fn free_module_ctx(ctx: *mut ValkeyModuleCtx) {
         if !ctx.is_null() {
             let internal = (*ctx).internal;
             if !internal.is_null() {
+                super::auto_memory::collect(internal);
                 free_reply_buffer(internal);
                 if !(*internal).module_name.is_null() {
                     let _ = CString::from_raw((*internal).module_name);
