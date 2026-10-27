@@ -47,8 +47,8 @@ jobs:
           df -h
           ulimit -a
 
-      - name: Install Node.js (for wasm-check)
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends nodejs
+      - name: Install Rust check dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends nodejs build-essential
 
       - name: Format check
         run: make fmt
