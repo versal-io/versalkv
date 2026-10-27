@@ -628,7 +628,6 @@ impl ClusterState {
         };
         if !requester_node.is_replica()
             || requester_node.replicaof != self.myself.replicaof
-            || requester_node.replica_priority == 0
             || requester_node
                 .has_flag(crate::engine::distributed::cluster::node::CLUSTER_NODE_NOFAILOVER)
         {
@@ -641,10 +640,12 @@ impl ClusterState {
         };
         let requester_rank = super::failover::ReplicaRankKey {
             replication_offset: requester_node.repl_offset,
+            cluster_replica_priority: requester_node.cluster_replica_priority,
             node_id: requester.clone(),
         };
         let local_rank = super::failover::ReplicaRankKey {
             replication_offset: self.myself.repl_offset,
+            cluster_replica_priority: self.myself.cluster_replica_priority,
             node_id: local_id,
         };
         if requester_rank >= local_rank {
@@ -835,6 +836,7 @@ impl ClusterState {
         let previous_nodes = self.nodes.keys().cloned().collect::<Vec<_>>();
         let next_generation = self.topology_generation().wrapping_add(1);
         let mut new_self = Self::new(ip, port, cport);
+        new_self.myself.cluster_replica_priority = self.myself.cluster_replica_priority;
         new_self.gossip_percentage = self.gossip_percentage;
         new_self.bus_stats.link_memory = self.bus_stats.link_memory;
         new_self.topology_generation = next_generation;

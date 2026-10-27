@@ -292,3 +292,79 @@ file appendonly.aof.1.incr.aof seq 1 type i\n",
     );
     assert!(!stdout.contains("Ready to accept connections"));
 }
+
+#[test]
+fn upgrade_581_legacy_rdb_aof_recovers_truncated_multi_before_creating_increment() {
+    let dir = TestDir::new("legacy-rdb-aof-truncated-multi");
+    let mut dbs = DbSet::new(1);
+    dbs.get_mut(0)
+        .expect("DB 0")
+        .set(b"stable".to_vec(), Robj::string("preserved"));
+    let preamble = serialize_all(&dbs, 0);
+    let mut aof = preamble.clone();
+    for parts in [
+        vec![b"MULTI".as_slice()],
+        vec![b"SET".as_slice(), b"partial", b"discarded"],
+    ] {
+        append_resp_command(&mut aof, &parts);
+    }
+    let mut exec = Vec::new();
+    append_resp_command(&mut exec, &[b"EXEC"]);
+    aof.extend_from_slice(&exec[..exec.len() - 1]);
+    std::fs::write(dir.path().join("appendonly.aof"), aof).expect("write legacy AOF");
+
+    for restart in 0..2 {
+        let port = reserve_port();
+        let config_path = dir.path().join("valkey.conf");
+        std::fs::write(
+            &config_path,
+            format!(
+                "bind 127.0.0.1\nport {port}\ndir {}\nsave \"\"\nappendonly yes\nappendfsync always\nappenddirname appendonlydir\nappendfilename appendonly.aof\naof-load-truncated yes\n",
+                dir.path().display()
+            ),
+        )
+        .expect("write legacy AOF startup config");
+        let stdout_path = dir.path().join("stdout.log");
+        let stderr_path = dir.path().join("stderr.log");
+        let mut child = ChildGuard::spawn(
+            &[config_path.to_str().expect("UTF-8 config path")],
+            &stdout_path,
+            &stderr_path,
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let stdout = std::fs::read_to_string(&stdout_path).unwrap_or_default();
+            assert!(
+                child.0.try_wait().expect("inspect startup child").is_none(),
+                "server exited while recovering legacy AOF:\n{stdout}"
+            );
+            if stdout.contains("Ready to accept connections") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "legacy AOF startup timed out:\n{stdout}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mut client = super::common::Client::connect_to(port);
+        assert_eq!(client.command(&[b"GET", b"stable"]), b"$9\r\npreserved\r\n");
+        assert_eq!(client.command(&[b"GET", b"partial"]), b"$-1\r\n");
+        assert_eq!(
+            std::fs::read(dir.path().join("appendonlydir/appendonly.aof"))
+                .expect("read recovered legacy base"),
+            preamble,
+            "recovery must preserve the complete RDB preamble"
+        );
+        if restart == 0 {
+            assert_eq!(client.command(&[b"SET", b"later", b"durable"]), b"+OK\r\n");
+        } else {
+            assert_eq!(client.command(&[b"GET", b"later"]), b"$7\r\ndurable\r\n");
+        }
+        send_signal(child.pid() as i32, ProcessSignal::Terminate).expect("stop recovered server");
+        assert!(child
+            .wait_for_exit(Duration::from_secs(3))
+            .expect("recovered server did not stop")
+            .success());
+    }
+}

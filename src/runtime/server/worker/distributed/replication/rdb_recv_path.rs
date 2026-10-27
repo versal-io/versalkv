@@ -557,6 +557,12 @@ impl ServerWorkerState {
             Some(recv) if recv.is_uninit() => {}
             _ => return Ok(()),
         }
+        if let Some(recv) = link.rdb_receive_mut() {
+            recv.set_zset_limits(
+                self.ctx.config().encoding.zset_max_ziplist_entries as usize,
+                self.ctx.config().encoding.zset_max_ziplist_value as usize,
+            );
+        }
         let load_mode = link
             .rdb_load_mode()
             .unwrap_or(crate::framework::distributed::replication::RdbLoadMode::Direct);

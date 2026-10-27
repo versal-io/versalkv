@@ -52,7 +52,7 @@ impl ServerWorkerState {
                     }
                 }
                 Err(error) => {
-                    *self.ctx.config_mut() = request.previous_config;
+                    self.restore_runtime_config(request.previous_config);
                     if let Some(previous) = request.previous_oom_score_adj {
                         let _ = crate::framework::commands::server::config::write_oom_score_adj(
                             previous,
@@ -103,7 +103,7 @@ impl ServerWorkerState {
                 Value::ok()
             }
             Err(error) => {
-                *self.ctx.config_mut() = previous_config;
+                self.restore_runtime_config(previous_config);
                 let _ = self.configure_tls_server_from_config();
                 if request.rebind_cluster_bus {
                     let _ = self.rebind_cluster_bus_transport();
@@ -114,6 +114,22 @@ impl ServerWorkerState {
                 ))
             }
         })
+    }
+
+    fn restore_runtime_config(
+        &mut self,
+        previous_config: crate::framework::context::RuntimeConfig,
+    ) {
+        *self.ctx.config_mut() = previous_config;
+        if let Err(error) =
+            crate::framework::commands::server::config::apply_cluster_config_snapshot(&mut self.ctx)
+        {
+            crate::server_log!(
+                warning,
+                "Failed restoring local cluster configuration after listener reconfiguration error: {}",
+                error
+            );
+        }
     }
 
     pub(crate) fn rebind_tcp_listeners(&mut self, bind: &str, port: u16) -> io::Result<()> {

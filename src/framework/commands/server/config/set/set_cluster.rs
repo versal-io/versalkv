@@ -52,6 +52,7 @@ pub(crate) fn apply_cluster_config_snapshot(ctx: &mut ServerContext) -> Result<(
     endpoints.set_client_tls_port(config.cluster_announce_client_tls_port);
 
     state.apply_local_cluster_config(endpoints, config.cluster_replica_no_failover);
+    state.myself.cluster_replica_priority = config.cluster_replica_priority;
     state.set_require_full_coverage(config.cluster_require_full_coverage);
     state.set_gossip_percentage(config.cluster_message_gossip_perc as usize);
     state.bump_topology_generation();

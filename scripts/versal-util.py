@@ -1366,6 +1366,7 @@ EXPLICIT_STATUS = {
     "cluster-port": "startup_only",
     "cluster-preferred-endpoint-type": "implemented",
     "cluster-replica-no-failover": "implemented",
+    "cluster-replica-priority": "implemented",
     "cluster-replica-validity-factor": "implemented",
     "cluster-require-full-coverage": "implemented",
     "cluster-slot-migration-log-max-len": "implemented",

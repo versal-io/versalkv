@@ -2,7 +2,7 @@ use super::ClusterBusManager;
 use crate::engine::command::context::Token;
 use crate::engine::distributed::cluster::action::{ClusterAction, Promotion};
 use crate::engine::distributed::cluster::msg::{
-    self, ClusterBusBody, ClusterMessageFlags, ClusterMsgType,
+    self, ClusterBusBody, ClusterExtension, ClusterMessageFlags, ClusterMsgType,
 };
 use crate::engine::distributed::cluster::node::{
     ClusterNode, CLUSTER_NODE_FAIL, CLUSTER_NODE_MIGRATE_TO, CLUSTER_NODE_MYSELF,
@@ -49,6 +49,95 @@ fn requester(primary_id: &str, requester_id: &str) -> ClusterNode {
     requester.flags |= CLUSTER_NODE_REPLICA;
     requester.replicaof = primary_id.to_string();
     requester
+}
+
+#[test]
+fn non_heartbeat_sender_updates_preserve_learned_cluster_priority() {
+    for kind in [
+        ClusterMsgType::FailoverAuthRequest,
+        ClusterMsgType::Update,
+        ClusterMsgType::MfStart,
+    ] {
+        let mut state = ClusterState::new("127.0.0.1", 6379, 16379);
+        let peer = requester(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        );
+        let mut learned = peer.clone();
+        learned.cluster_replica_priority = 10;
+        state.nodes.insert(peer.name.clone(), learned);
+        let body = if kind == ClusterMsgType::Update {
+            ClusterBusBody::Update(msg::SlotOwnershipUpdate {
+                config_epoch: 1,
+                node_id: NodeId::parse(peer.name.as_bytes()).unwrap(),
+                slots: msg::slots_to_bytes(&peer.slots),
+            })
+        } else {
+            ClusterBusBody::Empty
+        };
+        let packet = msg::ClusterBusMessage::from_node(kind, &peer, 1, body)
+            .encode()
+            .unwrap();
+        let (message, _) = msg::ClusterBusMessage::decode(&packet).unwrap();
+
+        ClusterBusManager::add_or_update_node(&mut state, &message, true);
+
+        assert_eq!(
+            state.nodes[&peer.name].cluster_replica_priority, 10,
+            "{kind:?}"
+        );
+    }
+}
+
+#[test]
+fn heartbeat_sender_updates_clear_missing_priority_and_apply_last_full_u32() {
+    for kind in [
+        ClusterMsgType::Ping,
+        ClusterMsgType::Pong,
+        ClusterMsgType::Meet,
+    ] {
+        for has_extensions in [false, true] {
+            let mut state = ClusterState::new("127.0.0.1", 6379, 16379);
+            let mut peer = requester(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            );
+            peer.cluster_replica_priority = 10;
+            state.nodes.insert(peer.name.clone(), peer.clone());
+            let mut message = msg::ClusterBusMessage::from_node(
+                kind,
+                &peer,
+                1,
+                ClusterBusBody::Gossip(Vec::new()),
+            );
+            message.extensions.clear();
+            if has_extensions {
+                message.set_message_flag(ClusterMessageFlags::EXT_DATA);
+                message
+                    .extensions
+                    .push(ClusterExtension::HumanNodeName("peer".to_string()));
+            } else {
+                message.header.message_flags[0] &= !ClusterMessageFlags::EXT_DATA;
+            }
+            ClusterBusManager::add_or_update_node(&mut state, &message, true);
+            assert_eq!(
+                state.nodes[&peer.name].cluster_replica_priority, 0,
+                "{kind:?}"
+            );
+
+            message.set_message_flag(ClusterMessageFlags::EXT_DATA);
+            message.extensions.extend([
+                ClusterExtension::ReplicaPriority(5),
+                ClusterExtension::ReplicaPriority(u32::MAX),
+            ]);
+            ClusterBusManager::add_or_update_node(&mut state, &message, true);
+            assert_eq!(
+                state.nodes[&peer.name].cluster_replica_priority,
+                u32::MAX,
+                "{kind:?}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -138,6 +227,7 @@ fn equal_primary_epoch_claim_resets_an_active_election() {
         cluster_view_stale: false,
         loading: false,
         priority: 100,
+        cluster_replica_priority: 0,
         replication_offset: 42,
         data_age_ms: 0,
         node_timeout_ms: 5_000,
@@ -205,6 +295,32 @@ fn equal_primary_epoch_claim_resets_an_active_election() {
 
 #[test]
 fn better_sibling_auth_request_defers_local_election_once() {
+    assert_sibling_auth_request_deferral(1_384, 0, 0, true);
+}
+
+#[test]
+fn equal_offset_lower_priority_sibling_auth_request_defers_local_election_once() {
+    for (local_priority, requester_priority) in [(5, 0), (10, 5)] {
+        assert_sibling_auth_request_deferral(750, local_priority, requester_priority, true);
+    }
+}
+
+#[test]
+fn equal_offset_higher_priority_sibling_auth_request_preserves_local_election_deadline() {
+    assert_sibling_auth_request_deferral(750, 5, 10, false);
+}
+
+#[test]
+fn higher_offset_sibling_auth_request_defers_despite_higher_priority() {
+    assert_sibling_auth_request_deferral(1_384, 5, 10, true);
+}
+
+fn assert_sibling_auth_request_deferral(
+    requester_offset: i64,
+    local_priority: u32,
+    requester_priority: u32,
+    should_defer: bool,
+) {
     let mut manager = ClusterBusManager::new();
     let mut state = ClusterState::new("127.0.0.1", 6380, 16380);
     let primary_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -214,6 +330,7 @@ fn better_sibling_auth_request_defers_local_election_once() {
     state.myself.flags |= CLUSTER_NODE_REPLICA;
     state.myself.replicaof = primary_id.to_string();
     state.myself.repl_offset = 750;
+    state.myself.cluster_replica_priority = local_priority;
 
     let mut primary = ClusterNode::new(
         primary_id.to_string(),
@@ -231,11 +348,27 @@ fn better_sibling_auth_request_defers_local_election_once() {
     state.nodes.insert(primary_id.to_string(), primary);
 
     let mut requester = requester(primary_id, requester_id);
-    requester.repl_offset = 1_384;
+    requester.repl_offset = requester_offset;
     requester.replica_priority = 100;
-    state
-        .nodes
-        .insert(requester_id.to_string(), requester.clone());
+    requester.cluster_replica_priority = requester_priority;
+    let mut heartbeat = msg::ClusterBusMessage::from_node(
+        ClusterMsgType::Pong,
+        &requester,
+        9,
+        ClusterBusBody::Gossip(Vec::new()),
+    );
+    if requester_priority != 0 {
+        heartbeat.set_message_flag(ClusterMessageFlags::EXT_DATA);
+        heartbeat
+            .extensions
+            .push(ClusterExtension::ReplicaPriority(requester_priority));
+    }
+    let (heartbeat, _) = msg::ClusterBusMessage::decode(&heartbeat.encode().unwrap()).unwrap();
+    ClusterBusManager::add_or_update_node(&mut state, &heartbeat, true);
+    assert_eq!(
+        state.nodes[requester_id].cluster_replica_priority,
+        requester_priority
+    );
 
     let local = ReplicaEligibility {
         node_id: NodeId::parse(state.myself.name.as_bytes()).unwrap(),
@@ -244,6 +377,7 @@ fn better_sibling_auth_request_defers_local_election_once() {
         cluster_view_stale: false,
         loading: false,
         priority: 100,
+        cluster_replica_priority: local_priority,
         replication_offset: 750,
         data_age_ms: 0,
         node_timeout_ms: 5_000,
@@ -273,7 +407,8 @@ fn better_sibling_auth_request_defers_local_election_once() {
                 cluster_view_stale: false,
                 loading: false,
                 priority: 100,
-                replication_offset: 1_384,
+                cluster_replica_priority: requester_priority,
+                replication_offset: requester_offset,
                 data_age_ms: 0,
                 node_timeout_ms: 5_000,
                 repl_ping_period_ms: 10_000,
@@ -302,10 +437,18 @@ fn better_sibling_auth_request_defers_local_election_once() {
 
     assert!(!manager.readable(&mut state, &mut first, token.0, 1_100));
     let deferred_deadline = state.automatic_failover.deadline_ms();
-    assert!(
-        deferred_deadline > original_deadline,
-        "a better sibling election must restart the lower-ranked delay"
+    assert_eq!(
+        state.nodes[requester_id].cluster_replica_priority,
+        requester_priority
     );
+    if should_defer {
+        assert!(
+            deferred_deadline > original_deadline,
+            "a better sibling election must restart the lower-ranked delay"
+        );
+    } else {
+        assert_eq!(deferred_deadline, original_deadline);
+    }
 
     let mut duplicate = PacketReader {
         packet: Some(encoded),
@@ -658,6 +801,7 @@ fn failover_auth_acks_are_deduplicated_by_voting_primary_identity() {
         cluster_view_stale: false,
         loading: false,
         priority: 100,
+        cluster_replica_priority: 0,
         replication_offset: 42,
         data_age_ms: 0,
         node_timeout_ms: 1_000,

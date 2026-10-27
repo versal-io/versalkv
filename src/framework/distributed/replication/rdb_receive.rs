@@ -104,6 +104,10 @@ impl RdbReceive {
         self.target = RdbTarget::Direct;
     }
 
+    pub fn set_zset_limits(&mut self, max_entries: usize, max_value_size: usize) {
+        self.decoder.set_zset_limits(max_entries, max_value_size);
+    }
+
     /// Decode as many complete records as the buffer allows into the configured
     /// target. `serving` is the process DbSet, used only by `Direct`.
     pub fn drive(

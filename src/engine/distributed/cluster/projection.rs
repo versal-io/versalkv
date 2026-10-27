@@ -151,6 +151,7 @@ mod tests {
                 cluster_view_stale: false,
                 loading: false,
                 priority: 100,
+                cluster_replica_priority: 0,
                 replication_offset: 1,
                 data_age_ms: 0,
                 node_timeout_ms: 1_000,

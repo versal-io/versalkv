@@ -8,8 +8,6 @@ use bytes::Bytes;
 use command_macros::command;
 use std::collections::HashMap;
 
-use crate::foundation::io::store::structure::zset::ZSetSl;
-
 #[command("ZINTERSTORE", runtime, get_keys = crate::framework::commands::key_extractors::zsetstore_get_keys)]
 pub fn zinterstore(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> CommandOutcome {
     if args.args.len() < 3 {
@@ -19,6 +17,7 @@ pub fn zinterstore(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> Comm
         Ok(v) => v,
         Err(e) => return CommandOutcome::reply(e),
     };
+    let (max_entries, max_value_size) = runtime.zset_encoding_limits();
     let db_index = runtime.selected_db();
     let Some(db) = runtime.db_mut() else {
         return CommandOutcome::reply(CommandError::db_index_out_of_range());
@@ -102,8 +101,10 @@ pub fn zinterstore(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> Comm
         for (k, v) in result {
             ht.insert(k, v);
         }
-        let zset = ZSetSl::from_dict(ht);
-        db.set(dest.to_vec(), Robj::ZSetSkiplist(zset));
+        db.set(
+            dest.to_vec(),
+            Robj::zset_from_dict_with_limits(ht, max_entries, max_value_size),
+        );
         changed = true;
     }
     CommandOutcome {

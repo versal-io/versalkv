@@ -129,8 +129,6 @@ fn object_encoding_limits(ctx: &ServerContext) -> ObjectEncodingLimits {
         list_max_listpack_size: ctx.config().encoding.list_max_listpack_size,
         hash_max_listpack_entries: ctx.config().encoding.hash_max_listpack_entries as usize,
         hash_max_listpack_value: ctx.config().encoding.hash_max_listpack_value as usize,
-        zset_max_listpack_entries: ctx.config().encoding.zset_max_ziplist_entries as usize,
-        zset_max_listpack_value: ctx.config().encoding.zset_max_ziplist_value as usize,
     }
 }
 

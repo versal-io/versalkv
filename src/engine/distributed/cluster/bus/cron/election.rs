@@ -59,6 +59,7 @@ impl ClusterBusManager {
                 } else {
                     node.replica_priority
                 },
+                cluster_replica_priority: node.cluster_replica_priority,
                 replication_offset: repl_offsets
                     .get(&node.name)
                     .copied()
@@ -179,11 +180,16 @@ impl ClusterBusManager {
             }
             crate::server_log!(
                 notice,
-                "Start of election delayed for {} milliseconds (rank #{}, primary rank #{}, offset {}).",
+                "Start of election delayed for {} milliseconds (rank #{}, primary rank #{}, offset {}, replica priority {}).",
                 state.automatic_failover.deadline_ms().saturating_sub(now_ms),
                 state.automatic_failover.rank(),
                 state.automatic_failover.failed_primary_rank(),
                 offset,
+                facts
+                    .local
+                    .as_ref()
+                    .map(|local| local.cluster_replica_priority)
+                    .unwrap_or_default(),
             );
         } else if previous_phase == AutomaticFailoverPhase::WaitingRankDelay
             && state.automatic_failover.deadline_ms() < previous_deadline_ms

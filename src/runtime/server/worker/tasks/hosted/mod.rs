@@ -147,6 +147,10 @@ impl ServerWorkerState {
                 crate::foundation::io::persistence::RdbDecodePolicy::persisted(
                     strict,
                     self.ctx.config().persistence.key_load_delay,
+                )
+                .with_zset_limits(
+                    self.ctx.config().encoding.zset_max_ziplist_entries as usize,
+                    self.ctx.config().encoding.zset_max_ziplist_value as usize,
                 ),
                 crate::framework::host_tasks::DatasetVisibility::Visible,
                 self.ctx

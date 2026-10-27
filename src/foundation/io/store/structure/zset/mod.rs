@@ -1,3 +1,4 @@
+pub mod ordered_index;
 pub mod skiplist;
 
 #[cfg(test)]

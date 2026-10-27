@@ -10,25 +10,17 @@ pub struct ObjectEncodingLimits {
     pub list_max_listpack_size: i64,
     pub hash_max_listpack_entries: usize,
     pub hash_max_listpack_value: usize,
-    pub zset_max_listpack_entries: usize,
-    pub zset_max_listpack_value: usize,
 }
 
 /// Compute the encoding name as reported by OBJECT ENCODING / DEBUG OBJECT.
-/// For most types this is just `obj.encoding_name()`, but list/hash/zset use
-/// size-based inference to decide between "listpack" and the structural
-/// encoding, matching Valkey's OBJECT ENCODING behavior.
+/// Lists and legacy hashes use size-based inference. ZSets report their
+/// physical encoding so configuration changes cannot downgrade existing trees.
 pub fn encoding_display_name(
     obj: &Robj,
     limits: ObjectEncodingLimits,
     hash_has_volatile: bool,
 ) -> &'static str {
     match obj {
-        Robj::ZSetSkiplist(m) => crate::foundation::io::store::structure::zset::infer_zset_encoding(
-            m.dict(),
-            limits.zset_max_listpack_entries,
-            limits.zset_max_listpack_value,
-        ),
         Robj::ListQuicklist(l) => l.encoding_name(limits.list_max_listpack_size),
         Robj::HashHashtable(h) => {
             let enc = crate::foundation::io::store::structure::hash::infer_hash_encoding(
@@ -56,13 +48,10 @@ pub fn object_cmd(
 
 fn object_reply(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> Value {
     let (hash_max_listpack_entries, hash_max_listpack_value) = runtime.hash_encoding_limits();
-    let (zset_max_listpack_entries, zset_max_listpack_value) = runtime.zset_encoding_limits();
     let limits = ObjectEncodingLimits {
         list_max_listpack_size: runtime.list_max_listpack_size(),
         hash_max_listpack_entries,
         hash_max_listpack_value,
-        zset_max_listpack_entries,
-        zset_max_listpack_value,
     };
     let sub = String::from_utf8_lossy(&args.args[0]).to_ascii_lowercase();
     match sub.as_str() {

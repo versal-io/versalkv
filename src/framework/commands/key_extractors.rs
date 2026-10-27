@@ -38,14 +38,19 @@ pub(crate) fn georadius_get_keys(args: &[Bytes]) -> Vec<(&[u8], Vec<&'static str
     };
     let mut result = vec![(source.as_ref(), vec!["RO", "access"])];
     let mut index = 4;
+    let mut destination = None;
     while index + 1 < args.len() {
         if args[index].eq_ignore_ascii_case(b"store")
             || args[index].eq_ignore_ascii_case(b"storedist")
         {
-            result.push((args[index + 1].as_ref(), vec!["OW", "update"]));
-            break;
+            destination = Some(args[index + 1].as_ref());
+            index += 2;
+        } else {
+            index += 1;
         }
-        index += 1;
+    }
+    if let Some(destination) = destination {
+        result.push((destination, vec!["OW", "update"]));
     }
     result
 }

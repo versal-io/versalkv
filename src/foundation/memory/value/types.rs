@@ -33,6 +33,7 @@ pub enum Encoding {
     Hashtable,
     Intset,
     Skiplist,
+    Btree,
     StreamP,
 }
 
@@ -47,6 +48,7 @@ impl Encoding {
             Encoding::Hashtable => "hashtable",
             Encoding::Intset => "intset",
             Encoding::Skiplist => "skiplist",
+            Encoding::Btree => "btree",
             Encoding::StreamP => "stream",
         }
     }
@@ -76,6 +78,7 @@ mod tests {
         assert_eq!(Encoding::Hashtable.name(), "hashtable");
         assert_eq!(Encoding::Intset.name(), "intset");
         assert_eq!(Encoding::Skiplist.name(), "skiplist");
+        assert_eq!(Encoding::Btree.name(), "btree");
         assert_eq!(Encoding::StreamP.name(), "stream");
     }
 

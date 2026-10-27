@@ -1,14 +1,14 @@
 use bytes::Bytes;
-use std::ops::{Deref, DerefMut};
+use std::ops::Deref;
 
-use super::skiplist::SkipList;
+use super::ordered_index::OrderedIndex;
 use crate::foundation::io::store::structure::hashtable::HashTable;
 use crate::foundation::memory::value::{Encoding, EncodingChange, ZSetOps};
 
 #[derive(Debug, Clone, PartialEq)]
 struct Repr {
     dict: HashTable<f64>,
-    zsl: Box<SkipList>,
+    zsl: Box<OrderedIndex>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -18,12 +18,6 @@ impl Deref for ZSetSl {
     type Target = HashTable<f64>;
     fn deref(&self) -> &Self::Target {
         &self.0.dict
-    }
-}
-
-impl DerefMut for ZSetSl {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0.dict
     }
 }
 
@@ -39,16 +33,25 @@ impl ZSetSl {
     pub fn new() -> Self {
         Self(Box::new(Repr {
             dict: HashTable::new(),
-            zsl: Box::new(SkipList::new()),
+            zsl: Box::new(OrderedIndex::new()),
         }))
     }
 
-    /// Build a dual-struct ZSetSl from an already-populated dict by replaying
-    /// its (member, score) pairs into a fresh skiplist. Dict ownership is moved.
-    pub fn from_dict(dict: HashTable<f64>) -> Self {
-        let mut zsl = Box::new(SkipList::new());
-        for (member, score) in &dict {
-            zsl.insert(*score, member.clone());
+    /// Build the dictionary and counted B+tree from unique member scores.
+    pub fn from_dict(mut dict: HashTable<f64>) -> Self {
+        let mut zsl = Box::new(OrderedIndex::new());
+        let entries: Vec<_> = dict
+            .iter()
+            .map(|(member, score)| (member.clone(), *score))
+            .collect();
+        for (member, score) in entries {
+            if score.is_nan() {
+                dict.remove(&member);
+                continue;
+            }
+            let score = if score == 0.0 { 0.0 } else { score };
+            dict.insert(member.clone(), score);
+            zsl.insert(score, member);
         }
         Self(Box::new(Repr { dict, zsl }))
     }
@@ -60,14 +63,24 @@ impl ZSetSl {
     pub fn dict(&self) -> &HashTable<f64> {
         &self.0.dict
     }
-    pub fn dict_mut(&mut self) -> &mut HashTable<f64> {
-        &mut self.0.dict
+    pub fn into_dict(self) -> HashTable<f64> {
+        self.0.dict
     }
-    pub fn zsl(&self) -> &SkipList {
+
+    pub fn ordered_index(&self) -> &OrderedIndex {
         &self.0.zsl
     }
-    pub fn zsl_mut(&mut self) -> &mut SkipList {
-        &mut self.0.zsl
+
+    /// Retained dictionary/tree allocations plus member payloads counted once.
+    /// Allocator metadata, size-class rounding, and Bytes owner metadata are
+    /// excluded, matching the collection memory estimator's contract.
+    pub fn memory_usage(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + std::mem::size_of::<Repr>()
+            + std::mem::size_of::<OrderedIndex>()
+            + self.0.dict.allocated_bytes()
+            + self.0.zsl.memory_usage()
+            + self.0.dict.keys().map(|member| member.len()).sum::<usize>()
     }
 
     pub fn rank(&self, member: &[u8]) -> Option<usize> {
@@ -170,7 +183,7 @@ impl ZSetSl {
     }
 
     pub fn encoding(&self) -> Encoding {
-        Encoding::Skiplist
+        Encoding::Btree
     }
 }
 
@@ -182,11 +195,17 @@ impl Default for ZSetSl {
 
 impl ZSetOps for ZSetSl {
     fn add(&mut self, member: &[u8], score: f64) -> Result<bool, EncodingChange> {
-        let member_bytes = Bytes::copy_from_slice(member);
+        if score.is_nan() {
+            return Ok(false);
+        }
+        let score = if score == 0.0 { 0.0 } else { score };
         let repr = self.0.as_mut();
         let (dict, zsl) = (&mut repr.dict, &mut repr.zsl);
-        match dict.get(member).copied() {
-            Some(old_score) => {
+        match dict
+            .get_key_value(member)
+            .map(|(key, score)| (key.clone(), *score))
+        {
+            Some((member_bytes, old_score)) => {
                 if old_score == score {
                     return Ok(false);
                 }
@@ -196,6 +215,7 @@ impl ZSetOps for ZSetSl {
                 Ok(false)
             }
             None => {
+                let member_bytes = Bytes::copy_from_slice(member);
                 dict.insert(member_bytes.clone(), score);
                 zsl.insert(score, member_bytes);
                 Ok(true)
@@ -228,7 +248,7 @@ impl ZSetOps for ZSetSl {
     }
 
     fn encoding(&self) -> Encoding {
-        Encoding::Skiplist
+        Encoding::Btree
     }
 }
 
@@ -238,14 +258,14 @@ pub fn infer_zset_encoding(
     max_value_size: usize,
 ) -> &'static str {
     if max_entries == 0 {
-        return "skiplist";
+        return "btree";
     }
     if data.peak_len() > max_entries {
-        return "skiplist";
+        return "btree";
     }
     for k in data.keys() {
         if k.len() > max_value_size {
-            return "skiplist";
+            return "btree";
         }
     }
     "listpack"
@@ -258,14 +278,14 @@ pub fn check_zset_encoding_upgrade(
     max_value_size: usize,
 ) -> Option<&'static str> {
     if max_entries == 0 {
-        return Some("skiplist");
+        return Some("btree");
     }
     let is_new_member = !data.keys().any(|member| member.as_ref() == new_member);
     if data.len() > max_entries || (is_new_member && data.len() >= max_entries) {
-        return Some("skiplist");
+        return Some("btree");
     }
     if new_member.len() > max_value_size {
-        return Some("skiplist");
+        return Some("btree");
     }
     None
 }

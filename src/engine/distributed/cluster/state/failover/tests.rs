@@ -111,6 +111,7 @@ fn eligible_replica(id: u8, offset: i64) -> ReplicaEligibility {
         cluster_view_stale: false,
         loading: false,
         priority: 100,
+        cluster_replica_priority: 0,
         replication_offset: offset,
         data_age_ms: 25_000,
         node_timeout_ms: 5_000,
@@ -154,9 +155,9 @@ fn replica_eligibility_rejects_each_disqualifying_fact() {
             expected: false,
         },
         Case {
-            name: "priority zero",
+            name: "ordinary replica priority zero does not disable cluster failover",
             mutate: |candidate| candidate.priority = 0,
-            expected: false,
+            expected: true,
         },
         Case {
             name: "data older than validity window",
@@ -227,6 +228,7 @@ fn rank_key_is_explicit() {
         established.rank_key(),
         Some(ReplicaRankKey {
             replication_offset: 1,
+            cluster_replica_priority: 0,
             node_id: node_id(b'a'),
         })
     );

@@ -2,7 +2,6 @@ use super::geohash_util::{
     geohash_encode, parse_double, GEO_LAT_MAX, GEO_LAT_MIN, GEO_LONG_MAX, GEO_LONG_MIN,
 };
 use crate::engine::core::{CommandEffects, CommandOutcome, CoreEvent, Value};
-use crate::foundation::memory::value::ZSetOps;
 use crate::framework::commands::command_runtime::CommandRuntime;
 use crate::framework::{CommandArgs, CommandError};
 use command_macros::command;
@@ -33,18 +32,7 @@ pub fn geoadd(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> CommandOu
     if remaining == 0 || !remaining.is_multiple_of(3) {
         return CommandOutcome::reply(CommandError::syntax_error());
     }
-    let db_idx = runtime.selected_db();
-    let db = match runtime.db_mut() {
-        Some(d) => d,
-        None => return CommandOutcome::reply(CommandError::db_index_out_of_range()),
-    };
-    let key = &args.args[0];
-    let map = match db.get_or_create_zset(key) {
-        Ok(m) => m,
-        Err(_) => return CommandOutcome::reply(CommandError::wrong_type()),
-    };
-    let mut added = 0i64;
-    let mut updated = 0i64;
+    let mut pairs = Vec::with_capacity(remaining / 3);
     let mut j = i;
     while j + 2 < args.args.len() {
         let lon = match parse_double(&args.args[j]) {
@@ -71,33 +59,46 @@ pub fn geoadd(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> CommandOu
                 )))
             }
         };
-        match map.dict().get(&member) {
-            Some(&old_score) => {
+        pairs.push((member, score));
+        j += 3;
+    }
+    let db_idx = runtime.selected_db();
+    let (max_entries, max_value_size) = runtime.zset_encoding_limits();
+    let db = match runtime.db_mut() {
+        Some(d) => d,
+        None => return CommandOutcome::reply(CommandError::db_index_out_of_range()),
+    };
+    let key = &args.args[0];
+    let mut added = 0i64;
+    let mut updated = 0i64;
+    for (member, score) in pairs {
+        let current = match db.get_zset_object(key) {
+            Ok(Some(zset)) => zset.zset_score(&member),
+            Ok(None) => None,
+            Err(_) => return CommandOutcome::reply(CommandError::wrong_type()),
+        };
+        match current {
+            Some(old_score) => {
                 if nx {
-                    j += 3;
                     continue;
                 }
-                if (score - old_score).abs() > f64::EPSILON {
-                    // Update: remove old, insert new — ZSetOps::add handles both dict and zsl
-                    // The trait add method automatically replaces existing members.
-                    let _ = ZSetOps::add(map, &member, score);
+                if score != old_score {
+                    if db.zset_add_with_limits(key, &member, score, max_entries, max_value_size).is_err() {
+                        return CommandOutcome::reply(CommandError::wrong_type());
+                    }
                     updated += 1;
                 }
             }
             None => {
                 if xx {
-                    j += 3;
                     continue;
                 }
-                let _ = ZSetOps::add(map, &member, score);
+                if db.zset_add_with_limits(key, &member, score, max_entries, max_value_size).is_err() {
+                    return CommandOutcome::reply(CommandError::wrong_type());
+                }
                 added += 1;
             }
         }
-        j += 3;
-    }
-    let is_empty = map.is_empty();
-    if is_empty {
-        db.del(key);
     }
     let reply = if ch {
         Value::integer(added + updated)

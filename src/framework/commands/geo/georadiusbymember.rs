@@ -21,10 +21,10 @@ pub fn get_member_center(
         Some(d) => d,
         None => return Err(CommandError::db_index_out_of_range()),
     };
-    let score = match db.get_zset(&args.args[key_pos]) {
+    let score = match db.get_zset_object(&args.args[key_pos]) {
         Ok(None) => return Ok(MemberCenterResult::NotFound),
-        Ok(Some(m)) => match m.dict().get(&args.args[member_pos]) {
-            Some(&s) => s,
+        Ok(Some(m)) => match m.zset_score(&args.args[member_pos]) {
+            Some(s) => s,
             None => return Ok(MemberCenterResult::MemberMissing),
         },
         Err(_) => return Err(CommandError::wrong_type()),
@@ -35,20 +35,26 @@ pub fn get_member_center(
     }
 }
 
-fn handle_not_found(
+pub(super) fn handle_not_found(
     args: &CommandArgs,
     runtime: &mut dyn CommandRuntime,
-    key_pos: usize,
     opt_start: usize,
     allow_store: bool,
 ) -> Value {
-    let (_, storekey) =
-        parse_radius_optional_args(args, opt_start, allow_store, "georadiusbymember")
-            .unwrap_or((SearchResultOptions::default(), None));
+    let (_, storekey) = match parse_radius_optional_args(
+        args,
+        opt_start,
+        allow_store,
+        "STORE option in GEORADIUS",
+    ) {
+        Ok(options) => options,
+        Err(error) => return error,
+    };
     if let Some((skey, _)) = storekey {
-        let db = runtime.db_mut().unwrap();
+        let Some(db) = runtime.db_mut() else {
+            return CommandError::db_index_out_of_range();
+        };
         db.del(&skey);
-        let _ = key_pos;
         return Value::integer(0);
     }
     Value::Array(Vec::new())
@@ -85,7 +91,7 @@ fn georadiusbymember_reply(runtime: &mut dyn CommandRuntime, args: &CommandArgs)
             4,
             true,
         ),
-        Ok(MemberCenterResult::NotFound) => handle_not_found(args, runtime, 0, 4, true),
+        Ok(MemberCenterResult::NotFound) => handle_not_found(args, runtime, 4, true),
         Ok(MemberCenterResult::MemberMissing) => {
             let member_str = String::from_utf8_lossy(&args.args[1]);
             Value::error(format!("ERR member {} does not exist", member_str))

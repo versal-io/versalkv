@@ -204,10 +204,14 @@ impl ServerWorkerState {
                     .is_some(),
                 ReplicationSwitchMode::ForceFull => {
                     self.replication_runtime.force_full_sync_pending()
-                        || self
-                            .replication_runtime
-                            .replica_link()
-                            .is_some_and(|link| link.master() == &master)
+                        || self.replication_runtime.replica_link().is_some_and(|link| {
+                            link.master() == &master
+                                && (link.is_streaming()
+                                    || self
+                                        .replication_runtime
+                                        .replica_resume_for(&master)
+                                        .is_none())
+                        })
                 }
             };
         if already_following {
@@ -265,6 +269,10 @@ impl ServerWorkerState {
         self.abort_replica_session_for_role_change();
         self.install_cluster_replication_target(target, resume);
         state.request_topology_broadcast();
+        // C replicationSetPrimary starts the nonblocking connection during the
+        // role change. This state is temporarily outside ServerContext, so pass
+        // the local node ID explicitly for the replication handshake.
+        self.drive_cluster_replication(&state.myself.name);
         true
     }
 
@@ -752,6 +760,85 @@ mod tests {
     }
 
     #[test]
+    fn cluster_role_switch_starts_upstream_connect_before_next_cron() {
+        use crate::engine::distributed::replication::protocol;
+        use crate::framework::distributed::replication::ReplicaAction;
+        use std::net::TcpListener;
+
+        for mode in [
+            ReplicationSwitchMode::TryPartial,
+            ReplicationSwitchMode::ForceFull,
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let mut runtime = ServerWorkerState::new(1).unwrap();
+            runtime.ctx.replication_mut().backlog.activate();
+            runtime
+                .ctx
+                .replication_mut()
+                .backlog
+                .append(&[b'x'; 42])
+                .unwrap();
+            let replid = runtime.ctx.replication().backlog.replid().to_string();
+            let mut state = ClusterState::new("127.0.0.1", 6380, 16_380);
+            let local_id = state.myself.name.clone();
+            let mut primary = ClusterNode::new(
+                PRIMARY_ID.to_string(),
+                "127.0.0.1".to_string(),
+                port,
+                16_379,
+                true,
+            );
+            primary.flags &= !CLUSTER_NODE_MYSELF;
+            state.nodes.insert(primary.name.clone(), primary);
+
+            // Cluster packet processing holds this state outside ServerContext.
+            assert!(runtime.ctx.cluster_state().is_none());
+            runtime.execute_cluster_actions(
+                &mut state,
+                vec![ClusterAction::FollowPrimary(ReplicationTarget {
+                    node_id: NodeId::parse(PRIMARY_ID.as_bytes()).unwrap(),
+                    host: "127.0.0.1".to_string(),
+                    port,
+                    mode,
+                })],
+                1_000,
+            );
+
+            assert_eq!(
+                runtime.ctx.config().replication.master_link_status,
+                "connect"
+            );
+            assert_eq!(
+                runtime
+                    .ctx
+                    .replication()
+                    .primary_failover_data_age_ms(2_000),
+                u64::MAX,
+                "starting TCP must not make an unsynchronized replica eligible"
+            );
+            let link = runtime
+                .replication_runtime
+                .replica_link_mut()
+                .expect("the role switch must start its nonblocking connection immediately");
+            assert_eq!(link.master().port, port);
+            link.connected(None, None);
+            let (_, actions) = link.on_bytes(b"+PONG\r\n", 6380).unwrap();
+            assert!(actions.contains(&ReplicaAction::Send(
+                protocol::build_replconf_cluster_node_id(&local_id)
+            )));
+            let (_, actions) = link
+                .on_bytes(b"+OK\r\n+OK\r\n+OK\r\n+OK\r\n", 6380)
+                .unwrap();
+            let expected = match mode {
+                ReplicationSwitchMode::TryPartial => protocol::build_psync(&replid, 43),
+                ReplicationSwitchMode::ForceFull => protocol::build_psync_full(),
+            };
+            assert_eq!(actions, vec![ReplicaAction::Send(expected)]);
+        }
+    }
+
+    #[test]
     fn follow_primary_honors_partial_and_full_sync_modes() {
         for mode in [
             ReplicationSwitchMode::TryPartial,
@@ -806,7 +893,9 @@ mod tests {
                         .is_some());
                 }
                 ReplicationSwitchMode::ForceFull => {
-                    assert!(runtime.replication_runtime.take_force_full_sync());
+                    let link = runtime.replication_runtime.replica_link().unwrap();
+                    assert!(link.master_replid().is_none());
+                    assert!(!runtime.replication_runtime.force_full_sync_pending());
                 }
             }
         }
@@ -980,7 +1069,15 @@ mod tests {
             1_001,
         );
 
-        assert!(runtime.replication_runtime.force_full_sync_pending());
+        let link = runtime.replication_runtime.replica_link().unwrap();
+        assert!(link.master_replid().is_none());
+        assert_eq!(
+            runtime
+                .replication_runtime
+                .replica_resume_for(link.master()),
+            None
+        );
+        assert!(!runtime.replication_runtime.force_full_sync_pending());
     }
 
     #[test]
@@ -1016,7 +1113,13 @@ mod tests {
             vec![ClusterAction::FollowPrimary(target.clone())],
             1_000,
         );
-        assert!(runtime.replication_runtime.force_full_sync_pending());
+        assert!(!runtime.replication_runtime.force_full_sync_pending());
+        assert!(runtime
+            .replication_runtime
+            .replica_link()
+            .unwrap()
+            .master_replid()
+            .is_none());
         assert_eq!(runtime.ctx.replication().slave_repl_offset, offset(0));
         assert_eq!(runtime.ctx.replication().slave_read_repl_offset, offset(0));
         runtime

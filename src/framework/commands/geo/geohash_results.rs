@@ -3,7 +3,7 @@ use crate::framework::commands::geo::geohash_util::{
 };
 use crate::framework::CommandError;
 use crate::foundation::io::protocol::Value;
-use crate::foundation::io::store::structure::hashtable::HashTable;
+use crate::foundation::io::store::Robj;
 use bytes::Bytes;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -93,7 +93,7 @@ pub fn format_search_results(points: &[GeoPoint], opts: &SearchResultOptions) ->
 }
 
 pub fn search_and_process(
-    zset: &HashTable<f64>,
+    zset: &Robj,
     shape: &GeoShape,
     opts: &SearchResultOptions,
     conversion: f64,
@@ -179,16 +179,10 @@ pub fn parse_radius_optional_args(
             opts.count = Some(c);
             i += 2;
         } else if arg.eq_ignore_ascii_case(b"store") && i + 1 < args.args.len() && allow_store {
-            if storekey.is_some() {
-                return Err(CommandError::syntax_error());
-            }
             storekey = Some((args.args[i + 1].clone(), false));
             i += 2;
         } else if arg.eq_ignore_ascii_case(b"storedist") && i + 1 < args.args.len() && allow_store
         {
-            if storekey.is_some() {
-                return Err(CommandError::syntax_error());
-            }
             storekey = Some((args.args[i + 1].clone(), true));
             i += 2;
         } else {

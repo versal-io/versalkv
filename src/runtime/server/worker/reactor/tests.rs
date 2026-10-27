@@ -2221,6 +2221,9 @@ fn readable_hup_removes_a_blocked_client_without_buffered_pipeline() {
     );
     assert!(backend.transport.is_registered(peer.token));
 
+    // The first readable event may contain only the command bytes. Wait for
+    // the subsequent EOF readiness before driving the blocked HUP continuation.
+    backend.transport.wait_readable_for_test(peer.token);
     backend.drive_one_pending_client_read();
 
     assert!(!backend.transport.is_registered(peer.token));

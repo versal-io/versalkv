@@ -35,10 +35,10 @@ impl ZSetLp {
             p += entry_size;
             count += 1;
         }
-        if count != num {
+        if num != usize::from(u16::MAX) && count != num {
             return None;
         }
-        if !num.is_multiple_of(2) {
+        if !count.is_multiple_of(2) {
             return None;
         }
         Some(ZSetLp { lp })
@@ -73,7 +73,7 @@ impl ZSetLp {
                 Some(v) => v,
                 None => return Ok(false),
             };
-            if (old_val - score).abs() < f64::EPSILON {
+            if old_val == score {
                 return Ok(false);
             }
             lp_remove_pair(&mut self.lp, pair_idx);
@@ -154,7 +154,20 @@ impl ZSetOps for ZSetLp {
 }
 
 fn lp_num_pairs(lp: &[u8]) -> usize {
-    (u16::from_le_bytes(lp[4..6].try_into().unwrap_or([0, 0])) as usize) / 2
+    let cached = u16::from_le_bytes(lp[4..6].try_into().unwrap_or([0, 0]));
+    if cached != u16::MAX {
+        return usize::from(cached) / 2;
+    }
+    let mut count = 0usize;
+    let mut offset = LP_HDR_SIZE;
+    while offset < lp.len() - 1 {
+        let Some(entry_size) = lp_entry_total_size(lp, offset) else {
+            break;
+        };
+        offset += entry_size;
+        count += 1;
+    }
+    count / 2
 }
 
 fn lp_set_header(buf: &mut [u8], total: u32, num_items: u16) {
@@ -403,7 +416,7 @@ fn lp_insert_pair_at(
 
     let new_total = lp.len() as u32;
     let old_num = u16::from_le_bytes(lp[4..6].try_into().unwrap_or([0, 0]));
-    let new_num = old_num + 2;
+    let new_num = old_num.saturating_add(2);
     lp_set_header(lp, new_total, new_num);
 }
 
@@ -425,7 +438,11 @@ fn lp_remove_pair(lp: &mut Vec<u8>, pair_idx: usize) {
 
     let new_total = lp.len() as u32;
     let old_num = u16::from_le_bytes(lp[4..6].try_into().unwrap_or([0, 0]));
-    let new_num = old_num - 2;
+    let new_num = if old_num == u16::MAX {
+        u16::MAX
+    } else {
+        old_num - 2
+    };
     lp_set_header(lp, new_total, new_num);
 }
 

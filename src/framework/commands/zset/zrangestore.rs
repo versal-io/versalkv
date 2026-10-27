@@ -1,7 +1,6 @@
 use crate::engine::command::{CommandArgs, CommandError};
 use crate::engine::core::{CommandEffects, CommandOutcome, CoreEvent, Value};
 use crate::foundation::io::store::structure::hashtable::HashTable;
-use crate::foundation::io::store::structure::zset::ZSetSl;
 use crate::foundation::io::store::Robj;
 use crate::framework::commands::command_runtime::CommandRuntime;
 use crate::framework::commands::zset::zrange::{collect_range_entries, ZRangeRequest};
@@ -14,6 +13,7 @@ pub fn zrangestore(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> Comm
         Ok(request) => request,
         Err(error) => return CommandOutcome::reply(error),
     };
+    let (max_entries, max_value_size) = runtime.zset_encoding_limits();
     let destination = args.args[0].clone();
     let db_index = runtime.selected_db();
     let Some(db) = runtime.db_mut() else {
@@ -24,7 +24,7 @@ pub fn zrangestore(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> Comm
         Ok(Some(zset)) => collect_range_entries(zset, &request),
         Err(_) => return CommandOutcome::reply(CommandError::wrong_type()),
     };
-    let (reply, changed) = store_range(db, &destination, entries);
+    let (reply, changed) = store_range(db, &destination, entries, max_entries, max_value_size);
     CommandOutcome {
         reply,
         effects: CommandEffects {
@@ -49,6 +49,8 @@ fn store_range(
     db: &mut crate::foundation::io::store::kv_engine::Db,
     destination: &[u8],
     entries: Vec<(Bytes, f64)>,
+    max_entries: usize,
+    max_value_size: usize,
 ) -> (Value, bool) {
     let count = entries.len() as i64;
     let changed = if entries.is_empty() {
@@ -60,7 +62,7 @@ fn store_range(
         }
         db.set(
             destination.to_vec(),
-            Robj::ZSetSkiplist(ZSetSl::from_dict(result)),
+            Robj::zset_from_dict_with_limits(result, max_entries, max_value_size),
         );
         true
     };

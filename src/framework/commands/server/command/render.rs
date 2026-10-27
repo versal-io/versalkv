@@ -72,6 +72,9 @@ pub(crate) fn metadata_name(meta: &CommandMeta) -> String {
 }
 
 fn metadata_key_specs(meta: &CommandMeta) -> Vec<Value> {
+    if let Some(key_specs) = geo_key_specs(meta.name) {
+        return key_specs;
+    }
     if meta.first_key <= 0 {
         return Vec::new();
     }
@@ -106,6 +109,62 @@ fn metadata_key_specs(meta: &CommandMeta) -> Vec<Value> {
             ),
         ),
     ])]
+}
+
+/// Preserve variable destination specs instead of merging their write flags
+/// into the read-only source spec.
+pub(crate) fn geo_key_specs(name: &str) -> Option<Vec<Value>> {
+    let start_from = if name.eq_ignore_ascii_case("georadius") {
+        6
+    } else if name.eq_ignore_ascii_case("georadiusbymember") {
+        5
+    } else {
+        return None;
+    };
+    let source = geo_key_spec(
+        &["RO", "access"],
+        typed_spec("index", Value::Map(vec![(bulk("index"), Value::integer(1))])),
+    );
+    let mut specs = vec![source];
+    for keyword in ["STORE", "STOREDIST"] {
+        specs.push(geo_key_spec(
+            &["OW", "update", "variable_flags"],
+            typed_spec(
+                "keyword",
+                Value::Map(vec![
+                    (bulk("keyword"), bulk(keyword)),
+                    (bulk("startfrom"), Value::integer(start_from)),
+                ]),
+            ),
+        ));
+    }
+    Some(specs)
+}
+
+fn geo_key_spec(flags: &[&'static str], begin_search: Value) -> Value {
+    Value::Map(vec![
+        (
+            bulk("flags"),
+            Value::Array(
+                flags
+                    .iter()
+                    .map(|flag| Value::SimpleString(Bytes::from_static(flag.as_bytes())))
+                    .collect(),
+            ),
+        ),
+        (bulk("begin_search"), begin_search),
+        (
+            bulk("find_keys"),
+            typed_spec(
+                "range",
+                Value::Map(vec![
+                    (bulk("lastkey"), Value::integer(0)),
+                    (bulk("keystep"), Value::integer(1)),
+                    (bulk("limit"), Value::integer(0)),
+                ]),
+            ),
+        ),
+    ])
 }
 
 fn typed_spec(kind: &'static str, spec: Value) -> Value {

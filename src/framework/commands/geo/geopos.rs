@@ -36,7 +36,7 @@ fn geopos_reply(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> Value {
         Some(d) => d,
         None => return CommandError::db_index_out_of_range(),
     };
-    let map = match db.get_zset(&args.args[0]) {
+    let map = match db.get_zset_object(&args.args[0]) {
         Ok(None) => {
             let n = args.args.len() - 1;
             let mut out = Vec::with_capacity(n);
@@ -50,8 +50,8 @@ fn geopos_reply(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> Value {
     };
     let mut out = Vec::new();
     for i in 1..args.args.len() {
-        match map.dict().get(&args.args[i]) {
-            Some(&score) => match geohash_decode(score as u64) {
+        match map.zset_score(&args.args[i]) {
+            Some(score) => match geohash_decode(score as u64) {
                 Some((lon, lat)) => {
                     out.push(Value::Array(vec![
                         Value::bulk(fmt_coord(lon)),

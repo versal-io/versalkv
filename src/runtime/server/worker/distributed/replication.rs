@@ -744,8 +744,19 @@ struct ConnectUpstreamArgs {
 
 impl ServerWorkerState {
     pub(crate) fn drive_replication(&mut self) {
+        self.drive_replication_with_cluster_node_id(None);
+    }
+
+    pub(crate) fn drive_cluster_replication(&mut self, cluster_node_id: &str) {
+        self.drive_replication_with_cluster_node_id(Some(cluster_node_id));
+    }
+
+    fn drive_replication_with_cluster_node_id(&mut self, cluster_node_id: Option<&str>) {
         let released_grace_waits = self.expire_grace_psync_waits();
-        let facts = self.build_replication_tick_facts(released_grace_waits);
+        let mut facts = self.build_replication_tick_facts(released_grace_waits);
+        if let Some(cluster_node_id) = cluster_node_id {
+            facts.cluster_node_id = Some(cluster_node_id.to_string());
+        }
         let actions = self.replication_runtime.plan_tick(&facts);
         for action in actions {
             self.execute_replication_action(action);

@@ -416,7 +416,8 @@ pub(crate) fn listpack_encode(items: &[Vec<u8>]) -> Vec<u8> {
     let mut buf = Vec::new();
     let total_pos = buf.len();
     buf.extend_from_slice(&[0u8; 4]);
-    buf.extend_from_slice(&(items.len() as u16).to_le_bytes());
+    let cached_count = u16::try_from(items.len()).unwrap_or(u16::MAX);
+    buf.extend_from_slice(&cached_count.to_le_bytes());
 
     for item in items {
         let entry_start = buf.len();

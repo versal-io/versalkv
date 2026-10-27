@@ -27,5 +27,5 @@ fn zcount_reply(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> Value {
         Ok(Some(m)) => m,
         Err(_) => return CommandError::wrong_type(),
     };
-    Value::integer(zset.zset_range_by_score(min, max, 0, -1, false).len() as i64)
+    Value::integer(zset.zset_count_by_score(min, max) as i64)
 }

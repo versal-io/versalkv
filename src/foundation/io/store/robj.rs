@@ -2,6 +2,7 @@ use bytes::{Bytes, BytesMut};
 use std::fmt::Debug;
 
 use crate::foundation::io::store::structure::hash::{HashHt, HashLp};
+use crate::foundation::io::store::structure::hashtable::HashTable;
 use crate::foundation::io::store::structure::list::{ListLp, ListValue};
 use crate::foundation::io::store::structure::set::{IntSet, SetLp, ValkeySet};
 use crate::foundation::io::store::structure::stream::{StreamLp, ValkeyStream};
@@ -125,11 +126,7 @@ impl Collection for ZSetSl {
         self.dict().len()
     }
     fn memory_usage(&self) -> usize {
-        self.dict()
-            .keys()
-            .map(|k| k.len() + std::mem::size_of::<Bytes>() + std::mem::size_of::<f64>())
-            .sum::<usize>()
-            + std::mem::size_of_val(self)
+        ZSetSl::memory_usage(self)
     }
 }
 
@@ -662,6 +659,70 @@ impl Robj {
 
     // ---- ZSet typed methods ----
 
+    /// Choose physical storage for a newly created STORE result.
+    pub fn zset_from_dict_with_limits(
+        dict: HashTable<f64>,
+        max_entries: usize,
+        max_value_size: usize,
+    ) -> Self {
+        if max_entries == 0
+            || dict.len() > max_entries
+            || dict.keys().any(|member| member.len() > max_value_size)
+        {
+            return Robj::ZSetSkiplist(ZSetSl::from_dict(dict));
+        }
+        let mut listpack = ZSetLp::new();
+        for (member, score) in &dict {
+            listpack
+                .add_with_threshold(member, *score, max_entries, max_value_size)
+                .expect("new zset members were checked against listpack limits");
+        }
+        Robj::ZSetListpack(listpack)
+    }
+
+    /// Explicitly choose storage for load or STORE, never for ordinary writes.
+    /// These creation paths may downgrade a tree to listpack.
+    pub fn zset_convert_with_limits(&mut self, max_entries: usize, max_value_size: usize) {
+        match self {
+            Robj::ZSetSkiplist(zset) => {
+                if max_entries > 0
+                    && ZSetOps::len(zset) <= max_entries
+                    && zset
+                        .dict()
+                        .keys()
+                        .all(|member| member.len() <= max_value_size)
+                {
+                    let dict = std::mem::take(zset).into_dict();
+                    *self = Self::zset_from_dict_with_limits(dict, max_entries, max_value_size);
+                }
+            }
+            Robj::ZSetListpack(listpack)
+                if max_entries == 0
+                    || ZSetOps::len(listpack) > max_entries
+                    || listpack
+                        .all_pairs()
+                        .iter()
+                        .any(|(member, _)| member.len() > max_value_size) =>
+            {
+                self.zset_upgrade_to_tree();
+            }
+            _ => {}
+        }
+    }
+
+    /// Destructively upgrade a compact object for commands such as SORT.
+    /// The caller retains the DB entry and its expiration metadata.
+    pub fn zset_upgrade_to_tree(&mut self) {
+        let Robj::ZSetListpack(listpack) = self else {
+            return;
+        };
+        let mut dict = HashTable::new();
+        for (member, score) in listpack.all_pairs() {
+            dict.insert(Bytes::from(member), score);
+        }
+        *self = Robj::ZSetSkiplist(ZSetSl::from_dict(dict));
+    }
+
     pub fn zset_add(&mut self, member: &[u8], score: f64) -> bool {
         match self {
             Robj::ZSetSkiplist(z) => {
@@ -827,6 +888,21 @@ impl Robj {
         }
     }
 
+    pub fn zset_count_by_score(&self, min: (f64, bool), max: (f64, bool)) -> usize {
+        match self {
+            Robj::ZSetSkiplist(zset) => zset.count_by_score(min, max),
+            Robj::ZSetListpack(zset) => zset
+                .all_pairs()
+                .into_iter()
+                .filter(|(_, score)| {
+                    (*score > min.0 || (min.1 && *score == min.0))
+                        && (*score < max.0 || (max.1 && *score == max.0))
+                })
+                .count(),
+            _ => panic!("Robj::zset_count_by_score called on non-zset type"),
+        }
+    }
+
     /// Return a lex interval using the same bound markers and reverse ordering
     /// as the Skiplist-backed implementation.
     pub fn zset_range_by_lex(
@@ -867,6 +943,40 @@ impl Robj {
                 entries
             }
             _ => panic!("Robj::zset_range_by_lex called on non-zset type"),
+        }
+    }
+
+    pub fn zset_count_by_lex(
+        &self,
+        min: &[u8],
+        min_inclusive: bool,
+        max: &[u8],
+        max_inclusive: bool,
+    ) -> usize {
+        match self {
+            Robj::ZSetSkiplist(zset) => zset.count_by_lex(min, min_inclusive, max, max_inclusive),
+            Robj::ZSetListpack(zset) => zset
+                .all_pairs()
+                .into_iter()
+                .filter(|(member, _)| {
+                    let meets_min = min == b"-"
+                        || (min != b"+"
+                            && if min_inclusive {
+                                member.as_slice() >= min
+                            } else {
+                                member.as_slice() > min
+                            });
+                    let meets_max = max == b"+"
+                        || (max != b"-"
+                            && if max_inclusive {
+                                member.as_slice() <= max
+                            } else {
+                                member.as_slice() < max
+                            });
+                    meets_min && meets_max
+                })
+                .count(),
+            _ => panic!("Robj::zset_count_by_lex called on non-zset type"),
         }
     }
 
@@ -1018,7 +1128,7 @@ mod tests {
             (Robj::ListQuicklist(ListValue::new()), "list", "quicklist"),
             (Robj::HashHashtable(HashHt::new()), "hash", "hashtable"),
             (Robj::SetHashtable(set), "set", "hashtable"),
-            (Robj::ZSetSkiplist(ZSetSl::new()), "zset", "skiplist"),
+            (Robj::ZSetSkiplist(ZSetSl::new()), "zset", "btree"),
             (Robj::StreamListpack(Box::default()), "stream", "stream"),
         ];
 

@@ -39,8 +39,10 @@ pub struct ClusterNode {
     pub config_epoch: u64,
     /// Last advertised replication offset.
     pub repl_offset: i64,
-    /// Replica election priority. Zero makes the replica ineligible.
+    /// Ordinary replication priority, independent of cluster elections.
     pub replica_priority: i64,
+    /// Cluster election tie-breaker. Lower values rank first, including zero.
+    pub cluster_replica_priority: u32,
     /// Slot bitmap: 16384 bits (2048 bytes).
     pub slots: Vec<bool>,
     /// Last compact bitmap received directly from this node. Stable cluster
@@ -110,6 +112,7 @@ impl ClusterNode {
             config_epoch: 0,
             repl_offset: 0,
             replica_priority: 100,
+            cluster_replica_priority: 0,
             slots: vec![false; 16384],
             advertised_slots: vec![0; SLOT_BYTES],
             has_advertised_slots: false,
