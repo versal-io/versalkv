@@ -391,13 +391,19 @@ impl AutomaticFailover {
         {
             return false;
         }
-        // A known-better sibling gets the same bounded vote-collection window
-        // as C clusterHandleReplicaFailover. Starting a newer local epoch
-        // inside that window can supersede the winner before its topology
-        // broadcast reaches this replica.
-        let auth_timeout_ms = node_timeout_ms.saturating_mul(2).max(2_000);
-        let holdoff_deadline = now_ms.saturating_add(auth_timeout_ms.min(i64::MAX as u64) as i64);
-        self.started_at_ms = now_ms;
+        // Give a better sibling propagation and rank delay to publish its
+        // claim. Waiting for the whole vote timeout instead blocks recovery
+        // when concurrent shard elections split the votes in one epoch.
+        let base_delay_ms = (node_timeout_ms / 30).min(500);
+        let holdoff_ms = base_delay_ms
+            .saturating_add(self.propagation_jitter_ms)
+            .saturating_add(
+                base_delay_ms
+                    .saturating_mul(2)
+                    .saturating_mul(self.rank.max(1) as u64),
+            )
+            .saturating_add(base_delay_ms.saturating_mul(self.failed_primary_rank as u64));
+        let holdoff_deadline = now_ms.saturating_add(holdoff_ms.min(i64::MAX as u64) as i64);
         self.deadline_ms = self.deadline_ms.max(holdoff_deadline);
         self.deferred_for_competing_epoch = request_epoch;
         true

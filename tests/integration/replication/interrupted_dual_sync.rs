@@ -13,6 +13,7 @@ struct DualSync {
     replica: TestServer,
     control: Client,
     receiver: Client,
+    is_disk_backed: bool,
 }
 
 impl DualSync {
@@ -41,10 +42,11 @@ impl DualSync {
             replica,
             control,
             receiver,
+            is_disk_backed: load_mode == "disabled",
         }
     }
 
-    fn begin_load(&mut self) {
+    fn begin_transfer(&mut self) {
         assert_eq!(
             self.receiver.command(&[
                 b"REPLICAOF",
@@ -53,12 +55,17 @@ impl DualSync {
             ]),
             b"+OK\r\n"
         );
+        let start_notice = if self.is_disk_backed {
+            "receiving streamed RDB from primary for persistence to disk"
+        } else {
+            "Loading RDB produced"
+        };
         assert!(
             super::wait_until(
-                || self.replica.server_log().contains("Loading RDB produced"),
+                || self.replica.server_log().contains(start_notice),
                 Duration::from_secs(10)
             ),
-            "replica never started loading: {}",
+            "replica never started the expected RDB phase: {}",
             self.replica.server_log()
         );
         // Ensure this tests the paired protocol, including successful main
@@ -140,7 +147,7 @@ impl DualSync {
 
 fn assert_interrupted_load_recovers(load_mode: &str, close_rdb: bool) {
     let mut sync = DualSync::start(load_mode);
-    sync.begin_load();
+    sync.begin_transfer();
     sync.interrupt(close_rdb);
     sync.assert_recovered();
 }

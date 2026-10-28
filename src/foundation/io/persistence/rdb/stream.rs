@@ -164,6 +164,14 @@ impl RdbDecoder {
         self.policy = self.policy.with_zset_limits(max_entries, max_value_size);
     }
 
+    pub fn set_key_load_delay(&mut self, key_load_delay_us: i64) {
+        self.policy.key_load_delay_us = key_load_delay_us;
+    }
+
+    pub fn consumed_bytes(&self) -> usize {
+        self.discarded_prefix.saturating_add(self.cursor)
+    }
+
     pub fn loaded(&self) -> usize {
         self.loaded
     }
@@ -243,7 +251,7 @@ impl RdbDecoder {
             );
         RdbDecodedMetadata {
             loaded: self.loaded,
-            consumed: self.discarded_prefix.saturating_add(self.cursor),
+            consumed: self.consumed_bytes(),
             expired: self.expired,
             empty_keys: self.empty_keys,
             function_codes: self.function_codes.clone(),
@@ -525,7 +533,7 @@ impl RdbDecoder {
         dbs: &mut DbSet,
         key_load_delay_us: i64,
     ) -> Result<StreamStep, LoadError> {
-        self.policy.key_load_delay_us = key_load_delay_us;
+        self.set_key_load_delay(key_load_delay_us);
         loop {
             match self.step(dbs)? {
                 RdbStep::NeedInput => return Ok(StreamStep::NeedMore),

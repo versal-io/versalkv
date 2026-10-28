@@ -827,7 +827,7 @@ mod automatic {
 
         assert!(failover.defer_for_better_replica_election(10, 1_100, current.node_timeout_ms,));
         let auth_deadline = failover.deadline_ms();
-        assert_eq!(auth_deadline, 11_100);
+        assert_eq!(auth_deadline, old_rank_deadline + 100);
 
         current.now_ms = old_rank_deadline.max(1_101);
         assert!(failover.on_tick(&current).is_empty());
@@ -841,6 +841,31 @@ mod automatic {
             failover.on_tick(&current).as_slice(),
             [ClusterAction::BroadcastFailoverAuthRequest { .. }]
         ));
+    }
+
+    #[test]
+    fn better_sibling_request_preserves_manual_and_started_elections() {
+        let mut manual = AutomaticFailover::default();
+        let mut manual_facts = facts(1_000);
+        manual_facts.manual = true;
+        assert!(manual.on_tick(&manual_facts).is_empty());
+        assert!(!manual.defer_for_better_replica_election(10, 1_000, 5_000));
+        assert_eq!(manual.deadline_ms(), 1_000);
+        assert_eq!(
+            manual.on_tick(&manual_facts),
+            vec![ClusterAction::BroadcastFailoverAuthRequest {
+                election_epoch: 10,
+                force_ack: true,
+            }]
+        );
+
+        let mut automatic = AutomaticFailover::default();
+        let current = facts(1_000);
+        assert!(automatic.on_tick(&current).is_empty());
+        assert!(!automatic.on_tick(&current).is_empty());
+        assert!(!automatic.defer_for_better_replica_election(11, 1_100, 5_000));
+        assert_eq!(automatic.election_epoch(), 10);
+        assert_eq!(automatic.phase(), AutomaticFailoverPhase::RequestingVotes);
     }
 
     #[test]
@@ -872,6 +897,139 @@ mod automatic {
 
         assert_eq!(first.failed_primary(), Some(&node_id(b'p')));
         assert_eq!(second.failed_primary(), Some(&node_id(b'q')));
+    }
+
+    #[test]
+    fn split_votes_across_shards_recover_before_preferred_elections_expire() {
+        let mut first = AutomaticFailover::default();
+        let mut second = AutomaticFailover::default();
+        let mut backup = AutomaticFailover::default();
+        let mut first_facts = facts(1_100);
+        first_facts.current_epoch = 12;
+        first_facts.voting_primaries = 5;
+        first_facts.local = Some(eligible_replica(b'a', 42));
+        first_facts.siblings = vec![
+            first_facts.local.clone().unwrap(),
+            eligible_replica(b'u', 41),
+        ];
+        let mut second_facts = first_facts.clone();
+        second_facts.local = Some(eligible_replica(b'b', 42));
+        second_facts.siblings = vec![
+            second_facts.local.clone().unwrap(),
+            eligible_replica(b'v', 41),
+        ];
+        let mut second_primary = primary(b'q', true);
+        second_primary.shard_id = node_id(b't');
+        second_primary.slots[7] = false;
+        second_primary.slots[8] = true;
+        second_facts.primary = Some(second_primary);
+        let mut backup_facts = first_facts.clone();
+        backup_facts.now_ms = 1_000;
+        backup_facts.local = Some(eligible_replica(b'u', 41));
+        assert!(backup.on_tick(&backup_facts).is_empty());
+
+        for (candidate, current) in [(&mut first, &first_facts), (&mut second, &second_facts)] {
+            assert!(candidate.on_tick(current).is_empty());
+            assert_eq!(
+                candidate.on_tick(current),
+                vec![ClusterAction::BroadcastFailoverAuthRequest {
+                    election_epoch: 13,
+                    force_ack: true,
+                }]
+            );
+        }
+        assert!(backup.defer_for_better_replica_election(13, 1_100, 5_000));
+        let mut voters = [
+            AutomaticFailover::default(),
+            AutomaticFailover::default(),
+            AutomaticFailover::default(),
+        ];
+        let request = |requester, epoch| VoteRequestFacts {
+            requester: node_id(requester),
+            local_is_voting_primary: true,
+            safe_to_vote: true,
+            requester_is_replica: true,
+            requester_primary_known: true,
+            requester_primary_failed: true,
+            force_ack: false,
+            request_epoch: epoch,
+            current_epoch: epoch,
+            request_config_epoch: 7,
+            maximum_claimed_slot_epoch: 7,
+            persisted_last_vote_epoch: 0,
+        };
+
+        // Two shards can observe the second FAIL in different receive turns.
+        // Their preferred candidates request the same epoch and split quorum.
+        for (index, voter) in voters.iter_mut().enumerate() {
+            let requester = if index == 0 { b'a' } else { b'b' };
+            let other = if index == 0 { b'b' } else { b'a' };
+            assert!(!voter.on_vote_request(&request(requester, 13)).is_empty());
+            assert!(voter.on_vote_request(&request(other, 13)).is_empty());
+            let candidate = if index == 0 { &mut first } else { &mut second };
+            assert!(candidate
+                .on_vote_ack(node_id(b'c' + index as u8), 13, true)
+                .is_empty());
+        }
+        assert_eq!(first.voter_count(), 1);
+        assert_eq!(second.voter_count(), 2);
+
+        // The lower-ranked sibling must be able to try a fresh epoch after
+        // its ordinary delay, while both original elections are still valid.
+        backup_facts.now_ms = 2_000;
+        backup_facts.current_epoch = 13;
+        assert_eq!(
+            backup.on_tick(&backup_facts),
+            vec![ClusterAction::BroadcastFailoverAuthRequest {
+                election_epoch: 14,
+                force_ack: false,
+            }]
+        );
+        for (index, voter) in voters.iter_mut().enumerate() {
+            assert!(!voter.on_vote_request(&request(b'u', 14)).is_empty());
+            let actions = backup.on_vote_ack(node_id(b'c' + index as u8), 14, true);
+            if index < 2 {
+                assert!(actions.is_empty());
+            } else {
+                assert!(matches!(
+                    actions.as_slice(),
+                    [ClusterAction::PromoteSelf(promotion)]
+                        if promotion.old_primary == node_id(b'p')
+                            && promotion.config_epoch == 14
+                ));
+            }
+        }
+        assert!(first.reset_on_competing_primary_claim(14));
+        assert!(second.reset_on_competing_primary_claim(14));
+        assert_eq!(first.phase(), AutomaticFailoverPhase::Idle);
+        assert_eq!(second.phase(), AutomaticFailoverPhase::Idle);
+
+        // The remaining shard can now claim a later epoch without waiting for
+        // the expired-election retry window of its original split vote.
+        second_facts.now_ms = 2_001;
+        second_facts.current_epoch = 14;
+        assert!(second.on_tick(&second_facts).is_empty());
+        assert_eq!(
+            second.on_tick(&second_facts),
+            vec![ClusterAction::BroadcastFailoverAuthRequest {
+                election_epoch: 15,
+                force_ack: true,
+            }]
+        );
+        for (index, voter) in voters.iter_mut().enumerate() {
+            assert!(!voter.on_vote_request(&request(b'b', 15)).is_empty());
+            let actions = second.on_vote_ack(node_id(b'c' + index as u8), 15, true);
+            if index < 2 {
+                assert!(actions.is_empty());
+            } else {
+                assert!(matches!(
+                    actions.as_slice(),
+                    [ClusterAction::PromoteSelf(promotion)]
+                        if promotion.old_primary == node_id(b'q')
+                            && promotion.config_epoch == 15
+                ));
+            }
+        }
     }
 
     #[test]

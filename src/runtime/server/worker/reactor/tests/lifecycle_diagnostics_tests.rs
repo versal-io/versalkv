@@ -136,7 +136,8 @@ fn rdb_receive_reports_disk_installation_once_after_payload_starts() {
                 logs.iter()
                     .filter(|log| log.contains("Loading DB in memory"))
                     .count(),
-                1
+                usize::from(mode != RdbLoadMode::DiskBacked),
+                "disk-backed loading starts only after the full transfer is received"
             );
         }
     }

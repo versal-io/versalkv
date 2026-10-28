@@ -323,6 +323,7 @@ fn assert_sibling_auth_request_deferral(
 ) {
     let mut manager = ClusterBusManager::new();
     let mut state = ClusterState::new("127.0.0.1", 6380, 16380);
+    state.set_failure_report_node_timeout_ms(5_000);
     let primary_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     let requester_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     state.current_epoch = 9;
@@ -445,6 +446,10 @@ fn assert_sibling_auth_request_deferral(
         assert!(
             deferred_deadline > original_deadline,
             "a better sibling election must restart the lower-ranked delay"
+        );
+        assert!(
+            deferred_deadline < 2_000,
+            "the normal rank delay must leave time to recover a split vote"
         );
     } else {
         assert_eq!(deferred_deadline, original_deadline);
