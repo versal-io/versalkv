@@ -177,6 +177,89 @@ fn bgrewriteaof_inside_exec_is_scheduled_without_forking() {
 }
 
 #[test]
+fn bgrewriteaof_is_scheduled_for_every_non_aof_child() {
+    use crate::engine::persistence::PersistenceChild;
+
+    for child in [
+        PersistenceChild::Rdb {
+            pid: 4242,
+            dirty_at_fork: 0,
+        },
+        PersistenceChild::DisklessSync { pid: 4242 },
+        PersistenceChild::DiskSync { pid: 4242 },
+        PersistenceChild::SlotMigration { pid: 4242 },
+    ] {
+        let mut ctx = ServerContext::new(1);
+        match child {
+            PersistenceChild::Rdb { pid, .. } => {
+                ctx.persistence_mut().begin_rdb_child(pid, 1_000).unwrap()
+            }
+            PersistenceChild::DisklessSync { pid } => {
+                ctx.persistence_mut().begin_diskless_child(pid).unwrap()
+            }
+            PersistenceChild::DiskSync { pid } => {
+                ctx.persistence_mut().begin_disk_sync_child(pid).unwrap()
+            }
+            PersistenceChild::SlotMigration { pid } => ctx
+                .persistence_mut()
+                .begin_slot_migration_child(pid)
+                .unwrap(),
+            PersistenceChild::AofRewrite { .. } => unreachable!("non-AOF child cases only"),
+        }
+        ctx.persistence_mut().set_aof_selected_db(9);
+        let mut conn = Connection::new_fake();
+        let args = CommandArgs::from_parts(vec![Bytes::from_static(b"BGREWRITEAOF")]);
+        let reply = bgrewriteaof(&mut conn, &args, &mut ctx);
+        let child_after_command = ctx.persistence().child();
+        let selected_db = ctx.persistence().aof_selected_db();
+        let is_scheduled = ctx.persistence().aof_rewrite_scheduled();
+        super::check_scheduled_aof_rewrite(&mut ctx);
+        let child_after_cron = ctx.persistence().child();
+        ctx.persistence_mut().abort_child();
+
+        assert_eq!(
+            reply,
+            crate::foundation::io::protocol::Value::SimpleString(
+                "Background append only file rewriting scheduled".into()
+            ),
+            "active child: {child:?}"
+        );
+        assert!(is_scheduled, "active child: {child:?}");
+        assert_eq!(child_after_command, Some(child));
+        assert_eq!(child_after_cron, Some(child));
+        assert_eq!(selected_db, 9);
+    }
+}
+
+#[test]
+fn bgrewriteaof_rejects_active_aof_child_even_inside_exec() {
+    for is_in_transaction in [false, true] {
+        let mut ctx = ServerContext::new(1);
+        ctx.persistence_mut()
+            .begin_aof_rewrite_child(4242, 1_000)
+            .unwrap();
+        let mut conn = Connection::new_fake();
+        if is_in_transaction {
+            assert!(conn.transaction.begin(0, 0));
+        }
+        let args = CommandArgs::from_parts(vec![Bytes::from_static(b"BGREWRITEAOF")]);
+        let reply = bgrewriteaof(&mut conn, &args, &mut ctx);
+        let active_pid = ctx.persistence().aof_rewrite_child_pid();
+        let is_scheduled = ctx.persistence().aof_rewrite_scheduled();
+        ctx.persistence_mut().abort_child();
+
+        assert_eq!(
+            reply,
+            crate::foundation::io::protocol::Value::error(
+                "ERR Background append only file rewriting already in progress"
+            )
+        );
+        assert!(!is_scheduled);
+        assert_eq!(active_pid, Some(4242));
+    }
+}
+
+#[test]
 fn rewrite_file_options_carry_incremental_fsync_policy() {
     let mut ctx = ServerContext::new(1);
     ctx.config_mut().persistence.aof_rewrite_incremental_fsync = false;

@@ -51,7 +51,7 @@ pub fn bgrewriteaof(
     if ctx.persistence().aof_rewrite_child_pid().is_some() {
         return Value::error("ERR Background append only file rewriting already in progress");
     }
-    if ctx.persistence().rdb_child_pid().is_some() || conn.in_transaction() {
+    if ctx.persistence().has_active_child() || conn.in_transaction() {
         ctx.persistence_mut().set_aof_rewrite_scheduled(true);
         crate::server_log!(notice, "Background append only file rewriting scheduled.");
         return Value::SimpleString("Background append only file rewriting scheduled".into());
