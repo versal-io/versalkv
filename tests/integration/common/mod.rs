@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use std::ffi::OsString;
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -23,6 +23,11 @@ pub fn command_status_with_timeout(
             return Ok(Some(status));
         }
         std::thread::sleep(Duration::from_millis(10));
+    }
+    // The child may have exited while this thread was descheduled past the
+    // deadline. Preserve its status before deciding to terminate it.
+    if let Some(status) = child.try_wait()? {
+        return Ok(Some(status));
     }
     let _ = child.kill();
     let _ = child.wait();
@@ -68,7 +73,8 @@ impl TestServer {
         let debug_server_url = std::env::var("DEBUG_SERVER_URL").ok();
         for attempt in 0..MAX_ATTEMPTS {
             let guard = SERVER_START_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            let port = free_port();
+            let reserved_ports = reserve_port_pair();
+            let port = reserved_ports.client.local_addr().unwrap().port();
             let data_dir = next_dir();
             let port_str = port.to_string();
             let mut args: Vec<&str> = vec![
@@ -101,12 +107,17 @@ impl TestServer {
                 let _ = Command::new("curl").args(["-sS", "-o", "/dev/null", "--noproxy", "*", "-H", "Content-Type: application/json", "-X", "POST", debug_server_url, "-d", &format!("{{\"sessionId\":\"sigterm-startup-segv\",\"runId\":\"pre-fix\",\"hypothesisId\":\"A\",\"location\":\"tests/integration/common/mod.rs:spawn-before\",\"msg\":\"[DEBUG] spawning test server\",\"data\":{{\"attempt\":{},\"ownsDir\":{},\"port\":{},\"rdbBytes\":{}}}}}", attempt + 1, owns_dir, port, rdb_meta.unwrap_or(0))]).status();
             }
             // #endregion
-            let mut child = Command::new(bin)
+            let mut command = Command::new(bin);
+            command
                 .args(&args)
                 .envs(env.iter().map(|(key, value)| (key, value)))
                 .current_dir(&data_dir)
                 .stdout(Stdio::from(stdout_file))
-                .stderr(Stdio::from(stderr_file))
+                .stderr(Stdio::from(stderr_file));
+            // Hold both ports through fixture preparation, then release them
+            // immediately before the child must bind its own listeners.
+            drop(reserved_ports);
+            let mut child = command
                 .spawn()
                 .expect("failed to spawn versal-server binary");
             // #region debug-point D:child-identity
@@ -289,19 +300,44 @@ pub fn make_socket_test_dir() -> PathBuf {
     dir
 }
 
-fn free_port() -> u16 {
+struct ReservedPorts {
+    client: TcpListener,
+    bus: TcpListener,
+}
+
+fn map_default_port_pair(allocated_port: u16) -> (u16, u16) {
+    if allocated_port > u16::MAX - 10_000 {
+        (allocated_port - 10_000, allocated_port)
+    } else {
+        (allocated_port, allocated_port + 10_000)
+    }
+}
+
+fn reserve_port_pair() -> ReservedPorts {
     // Config files can enable Cluster too, so every generated fixture port
-    // must leave room for its default bus port, with both listeners available.
+    // must leave room for its default bus port. Keep both sockets bound until
+    // the caller deliberately releases the pair.
     for _ in 0..128 {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind :0 failed");
         let allocated_port = listener.local_addr().unwrap().port();
-        let (port, other_port) = if allocated_port > u16::MAX - 10_000 {
-            (allocated_port - 10_000, allocated_port - 10_000)
+        let (client_port, bus_port) = map_default_port_pair(allocated_port);
+        let other_port = if allocated_port == client_port {
+            bus_port
         } else {
-            (allocated_port, allocated_port + 10_000)
+            client_port
         };
-        if TcpListener::bind(("127.0.0.1", other_port)).is_ok() {
-            return port;
+        if let Ok(other_listener) = TcpListener::bind(("127.0.0.1", other_port)) {
+            return if allocated_port == client_port {
+                ReservedPorts {
+                    client: listener,
+                    bus: other_listener,
+                }
+            } else {
+                ReservedPorts {
+                    client: other_listener,
+                    bus: listener,
+                }
+            };
         }
     }
     panic!("could not allocate an available client and default Cluster Bus port pair");
@@ -332,13 +368,60 @@ fn socket_fixture_directory_is_short_private_and_isolated() {
 fn allocated_ports_allow_an_available_default_cluster_bus() {
     let _guard = SERVER_START_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     for _ in 0..32 {
-        let port = free_port();
-        let bus_port = port
-            .checked_add(10_000)
-            .expect("fixture port must leave room for the default Cluster Bus");
-        let _client = TcpListener::bind(("127.0.0.1", port)).expect("bind allocated client port");
-        let _bus = TcpListener::bind(("127.0.0.1", bus_port)).expect("bind allocated bus port");
+        let reserved_ports = reserve_port_pair();
+        let client_addr = reserved_ports.client.local_addr().unwrap();
+        let bus_addr = reserved_ports.bus.local_addr().unwrap();
+        assert_eq!(
+            client_addr.port().checked_add(10_000),
+            Some(bus_addr.port())
+        );
+        for address in [client_addr, bus_addr] {
+            let error = TcpListener::bind(address)
+                .expect_err("a competing owner must not take a reserved port");
+            assert_eq!(error.kind(), ErrorKind::AddrInUse);
+        }
     }
+}
+
+#[test]
+fn default_port_pair_mapping_preserves_bus_offset() {
+    for (allocated_port, expected_pair) in [
+        (1, (1, 10_001)),
+        (49_152, (49_152, 59_152)),
+        (55_535, (55_535, 65_535)),
+        (55_536, (45_536, 55_536)),
+        (65_535, (55_535, 65_535)),
+    ] {
+        let pair = map_default_port_pair(allocated_port);
+        assert_eq!(pair, expected_pair);
+        assert_eq!(pair.0.checked_add(10_000), Some(pair.1));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn command_status_observes_exit_and_enforces_timeout() {
+    for exit_code in [0, 7] {
+        let status = command_status_with_timeout(
+            Command::new("/bin/sh")
+                .args(["-c", &format!("exit {exit_code}")])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null()),
+            Duration::from_secs(5),
+        )
+        .expect("run terminating command")
+        .expect("completed command must retain its status");
+        assert_eq!(status.code(), Some(exit_code));
+    }
+    let status = command_status_with_timeout(
+        Command::new("/bin/sh")
+            .args(["-c", "exec sleep 5"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+        Duration::from_millis(20),
+    )
+    .expect("run command past deadline");
+    assert!(status.is_none(), "a running command must time out");
 }
 
 fn wait_child_ready(child: &mut Child, port: u16) -> Result<(), String> {
