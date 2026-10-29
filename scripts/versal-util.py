@@ -949,6 +949,115 @@ def command_tcl_binaries(args: argparse.Namespace, _ctx: RepoContext) -> int:
     return EXIT_OK
 
 
+TCL_PROCESS_INIT = r"""
+# Load the real standard library before installing host process primitives.
+set ::tcl_library $::env(VERSAL_TCL_STANDARD_LIBRARY)
+source [file join $::tcl_library init.tcl]
+
+if {[package vcompare [info tclversion] 8.6] >= 0
+    && $::tcl_platform(os) eq "Linux"
+    && ![catch {package require Tclx}]
+    && ![catch {exec getconf CLK_TCK} ::versal_clock_ticks]
+    && [string is integer -strict $::versal_clock_ticks]
+    && $::versal_clock_ticks > 0} {
+    namespace eval ::versal_process {
+        variable clock_ticks $::versal_clock_ticks
+
+        proc read_proc {path} {
+            set channel [open $path rb]
+            try {
+                return [read $channel]
+            } finally {
+                close $channel
+            }
+        }
+
+        # Report genuine /proc data in the BSD job-status column order.
+        # Unusual layouts, terminal-backed processes, and read errors fall
+        # back to the system ps, which retains its normal error semantics.
+        proc job_status {process_id} {
+            variable clock_ticks
+            set base /proc/$process_id
+            set stat [read_proc $base/stat]
+            if {![regexp {^[0-9]+ \((.*)\) (.*)$} $stat -> command fields]} {
+                error "unrecognized proc stat layout"
+            }
+            set fields [split [string trim $fields]]
+            lassign $fields state parent group session terminal foreground
+            if {$terminal != 0 || [llength $fields] < 22} {
+                error "unsupported proc job layout"
+            }
+            set status [read_proc $base/status]
+            if {![regexp -line {^Uid:\s+[0-9]+\s+([0-9]+)} $status -> user]} {
+                error "proc status has no effective UID"
+            }
+            set nice [lindex $fields 16]
+            if {$nice < 0} {append state <}
+            if {$nice > 0} {append state N}
+            if {[regexp -line {^VmLck:\s+([0-9]+)} $status -> locked] && $locked > 0} {
+                append state L
+            }
+            if {$session == $process_id} {append state s}
+            if {[lindex $fields 17] > 1} {append state l}
+            set seconds [expr {([lindex $fields 11] + [lindex $fields 12]) / $clock_ticks}]
+            set cpu_time [format {%d:%02d} [expr {$seconds / 60}] [expr {$seconds % 60}]]
+            set arguments [string trimright [string map [list \x00 " "] [read_proc $base/cmdline]]]
+            if {$arguments eq ""} {
+                set arguments [format {[%s]} $command]
+                if {[string index $state 0] eq "Z"} {append arguments " <defunct>"}
+            }
+            regsub -all {[[:cntrl:]]} $arguments ? arguments
+            return "PPID PID PGID SID TTY TPGID STAT UID TIME COMMAND\n$parent $process_id $group $session ? $foreground $state $user $cpu_time $arguments"
+        }
+    }
+    rename ::exec ::versal_process::external_exec
+    proc ::exec {args} {
+        if {[llength $args] == 3 && [regexp {^[1-9][0-9]*$} [lindex $args 2]]} {
+            lassign $args program option process_id
+            if {$program eq "kill" && $option in {-SIGSTOP -SIGCONT}} {
+                # Tclx accepts SIGSTOP/SIGCONT without the shell option dash.
+                if {![catch {::kill [string range $option 1 end] $process_id}]} {
+                    return ""
+                }
+            } elseif {$program eq "ps" && $option eq "j"} {
+                if {![catch {::versal_process::job_status $process_id} result]} {
+                    return $result
+                }
+            }
+        }
+        tailcall ::versal_process::external_exec {*}$args
+    }
+}
+unset -nocomplain ::versal_clock_ticks
+"""
+
+
+def command_tcl_run(args: argparse.Namespace, _ctx: RepoContext) -> int:
+    command = list(args.command)
+    if command[:1] == ["--"]:
+        command.pop(0)
+    if not command:
+        raise ToolError("tcl run requires a command after --", EXIT_USAGE)
+    env = dict(os.environ)
+    with tempfile.TemporaryDirectory(prefix="versal-tcl-library-") as directory:
+        # The inherited bootstrap also initializes Tcl workers launched through
+        # info nameofexecutable. Upstream Tcl files remain byte-for-byte intact.
+        if sys.platform == "linux" and shutil.which("tclsh"):
+            library = subprocess.run(
+                ["tclsh"], input="puts [info library]\n",
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                universal_newlines=True,
+            )
+            path = Path(library.stdout.strip())
+            if library.returncode == 0 and path.is_absolute() and (path / "init.tcl").is_file():
+                bootstrap = Path(directory) / "init.tcl"
+                bootstrap.write_text(TCL_PROCESS_INIT, encoding="utf-8")
+                env["VERSAL_TCL_STANDARD_LIBRARY"] = str(path)
+                env["TCL_LIBRARY"] = directory
+        result = run_command(command, env=env)
+    return result.returncode if result.returncode >= 0 else 128 - result.returncode
+
+
 def command_tcl_module_fixtures(args: argparse.Namespace, _ctx: RepoContext) -> int:
     units = args.units
     module_units = [unit for unit in units if unit.startswith("unit/moduleapi/")]
@@ -2066,6 +2175,105 @@ def selftest_stage_binaries(_ctx: RepoContext) -> None:
             _assert(not os.path.lexists(str(valkey / "valkey-{}".format(binary))), "absent binary left behind")
 
 
+def selftest_tcl_process(ctx: RepoContext) -> None:
+    with tempfile.TemporaryDirectory(prefix="versal-tcl-process-") as directory:
+        root = Path(directory)
+        missing = invoke_cli(["tcl", "run"], ctx.root)
+        _assert(missing.returncode == EXIT_USAGE, "empty Tcl launch must be rejected")
+        forwarded = invoke_cli(
+            ["tcl", "run", "--", sys.executable, "-c",
+             "import sys; print(repr(sys.argv[1:])); sys.exit(23)", "a b", "--single"],
+            ctx.root,
+        )
+        _assert(forwarded.returncode == 23, "launcher must preserve command failure")
+        _assert(forwarded.stdout.strip() == "['a b', '--single']", "launcher changed arguments")
+        if sys.platform != "linux" or shutil.which("tclsh") is None:
+            return
+        probe = subprocess.run(
+            ["tclsh"], input="puts [catch {package require Tclx}]\n",
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True,
+        )
+        if probe.returncode != 0 or probe.stdout.strip() != "0":
+            print("tcl-process: native process checks require Linux Tclx")
+            return
+        marker = root / "external.jsonl"
+        for program in ("ps", "kill"):
+            write_executable(
+                root, "bin/" + program,
+                "#!/usr/bin/env python3\nimport json, os, sys\n"
+                "with open(os.environ['PROCESS_EXEC_MARKER'], 'a') as out:\n"
+                "    out.write(json.dumps([os.path.basename(sys.argv[0])] + sys.argv[1:]) + '\\n')\n"
+                "os.execv('/bin/' + os.path.basename(sys.argv[0]), [sys.argv[0]] + sys.argv[1:])\n",
+            )
+        child = write_fixture(root, "child.tcl", r"""
+set p [lindex [exec sleep 30 &] 0]
+try {
+    exec kill -SIGSTOP $p
+    set stopped 0
+    for {set i 0} {$i < 50} {incr i} {
+        set row [exec ps j $p]
+        if {[string match {*T*} [lindex $row 16]]} {
+            set stopped 1
+            break
+        }
+        after 1
+    }
+    if {!$stopped} {error "kernel did not confirm the stopped state"}
+    set reference [exec /bin/ps j $p]
+    foreach index {10 11 12 13 14 15 16 17 18} {
+        if {[lindex $row $index] ne [lindex $reference $index]} {
+            error "job status column $index differs from ps"
+        }
+    }
+    exec kill -SIGCONT $p
+    set running 0
+    for {set i 0} {$i < 50} {incr i} {
+        if {![string match {*T*} [lindex [exec ps j $p] 16]]} {
+            set running 1
+            break
+        }
+        after 1
+    }
+    if {!$running} {error "kernel did not confirm the resumed state"}
+    if {[file exists $env(PROCESS_EXEC_MARKER)]} {
+        error "process control spawned external kill or ps"
+    }
+    if {[exec sh -c {printf alpha} | tr a-z A-Z] ne "ALPHA"} {
+        error "ordinary exec pipeline changed"
+    }
+    set failed [catch {exec sh -c {exit 7}} message options]
+    if {!$failed || [lindex [dict get $options -errorcode] 2] != 7} {
+        error "ordinary exec error propagation changed"
+    }
+    if {![catch {exec ps j 2147483647}]} {error "missing PID reported success"}
+    if {![catch {exec kill -SIGSTOP 2147483647}]} {error "missing signal PID reported success"}
+    exec ps -p $p -o pid=
+    puts "native process checks passed"
+} finally {
+    catch {exec /bin/kill -9 $p}
+}
+""")
+        parent = write_fixture(root, "parent.tcl", "puts [exec [info nameofexecutable] $env(PROCESS_CHILD)]\n")
+        env = dict(os.environ)
+        env.update({
+            "PATH": str(root / "bin") + os.pathsep + env.get("PATH", ""),
+            "PROCESS_EXEC_MARKER": str(marker),
+            "PROCESS_CHILD": str(child),
+        })
+        checked = run_command(
+            [sys.executable, str(SCRIPT_PATH), "tcl", "run", "--", "tclsh", str(parent)],
+            env=env, capture=True,
+        )
+        _assert(checked.returncode == 0, checked.stderr)
+        _assert(checked.stdout.strip() == "native process checks passed", checked.stdout)
+        calls = [json.loads(line) for line in read_text(marker).splitlines()]
+        _assert(calls == [
+            ["ps", "j", "2147483647"],
+            ["kill", "-SIGSTOP", "2147483647"],
+            ["ps", "-p", calls[-1][2], "-o", "pid="],
+        ], "unmatched exec commands must retain external behavior")
+
+
 def selftest_tcl_module_fixtures(_ctx: RepoContext) -> None:
     with tempfile.TemporaryDirectory(prefix="versal-tcl-module-") as directory:
         root = Path(directory)
@@ -2164,6 +2372,7 @@ def selftest_runtest(ctx: RepoContext) -> None:
         root = Path(directory)
         shutil.copy2(str(ctx.root / "runtest"), str(root / "runtest"))
         (root / "runtest").chmod(0o755)
+        write_fixture(root, "scripts/versal-util.py", read_text(SCRIPT_PATH))
         populate_fake_binaries(root)
         valkey_src = root / "thirdparty/valkey/src"
         (root / "thirdparty/valkey/tests/unit").mkdir(parents=True)
@@ -2225,6 +2434,7 @@ def selftest_runtest_sentinel(ctx: RepoContext) -> None:
         root = Path(directory)
         shutil.copy2(str(ctx.root / "runtest-sentinel"), str(root / "runtest-sentinel"))
         (root / "runtest-sentinel").chmod(0o755)
+        write_fixture(root, "scripts/versal-util.py", read_text(SCRIPT_PATH))
         runner = read_text(root / "runtest-sentinel")
         _assert('temporary="$destination.tmp.$$"' in runner, "Sentinel binary staging must use a process-unique temporary path")
         _assert('mv -f "$temporary" "$destination"' in runner, "Sentinel binary staging must replace the destination inode atomically")
@@ -2592,6 +2802,7 @@ SELFTESTS = {
     "script-entry-policy": selftest_script_entry_policy,
     "stage-binaries": selftest_stage_binaries,
     "tcl-module-fixtures": selftest_tcl_module_fixtures,
+    "tcl-process": selftest_tcl_process,
     "sentinel-support": selftest_sentinel_support,
     "unsafe-boundaries": selftest_unsafe_boundaries,
     "unsafe-safety": selftest_unsafe_safety,
@@ -2782,7 +2993,7 @@ def command_check_ci_support(_args: argparse.Namespace, ctx: RepoContext) -> int
         return EXIT_FAILURE
     return run_selftest_names(
         ctx,
-        ("ci-commands", "tcl-module-fixtures", "runtest", "runtest-moduleapi", "stage-binaries"),
+        ("ci-commands", "tcl-module-fixtures", "tcl-process", "runtest", "runtest-moduleapi", "stage-binaries"),
     )
 
 
@@ -2831,6 +3042,9 @@ def build_parser() -> argparse.ArgumentParser:
     tcl = subparsers.add_parser("tcl", help="manage Tcl test tooling")
     tcl_commands = tcl.add_subparsers(dest="tcl_command")
     tcl_commands.required = True
+    launch = tcl_commands.add_parser("run", help="launch Tcl with native Linux process control")
+    launch.add_argument("command", nargs=argparse.REMAINDER)
+    launch.set_defaults(handler=command_tcl_run)
     binaries = tcl_commands.add_parser("binaries")
     binary_commands = binaries.add_subparsers(dest="binary_action")
     binary_commands.required = True

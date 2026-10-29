@@ -21,6 +21,6 @@ done
 (
     cd thirdparty/valkey
     unset VALKEY_BIN_DIR
-    tclsh tests/sentinel/run.tcl \
+    python3 ../../scripts/versal-util.py tcl run -- tclsh tests/sentinel/run.tcl \
         --skip-leaks --dont-clean
 )
