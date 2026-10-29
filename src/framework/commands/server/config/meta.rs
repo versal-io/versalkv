@@ -214,7 +214,11 @@ fn legacy_config_meta() -> Vec<ConfigMeta> {
             &["reload_apply"],
         ),
         ConfigMeta::new_special("save", &["reload_apply", "replication"]),
-        ConfigMeta::new_bool("rdbcompression", &["reload_apply", "replication"]),
+        ConfigMeta::new_enum(
+            "rdbcompression",
+            &["no", "yes", "lzf", "lz4"],
+            &["reload_apply", "replication"],
+        ),
         ConfigMeta::new_bool("rdbchecksum", &["reload_apply", "replication"]),
         ConfigMeta::new_bool("stop-writes-on-bgsave-error", &["reload_apply", "replication"]),
         ConfigMeta::new_numeric("auto-aof-rewrite-percentage", 0, i64::MAX, &["reload_apply"]),

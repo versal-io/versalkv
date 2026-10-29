@@ -1,20 +1,23 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 struct TempDir(PathBuf);
 
 impl TempDir {
     fn new() -> Self {
+        static NEXT_DIRECTORY_ID: AtomicU64 = AtomicU64::new(0);
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock should follow the Unix epoch")
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "versal-checker-cli-{}-{}",
+            "versal-checker-cli-{}-{}-{}",
             std::process::id(),
-            nonce
+            nonce,
+            NEXT_DIRECTORY_ID.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir(&path).expect("checker test directory should be creatable");
         Self(path)

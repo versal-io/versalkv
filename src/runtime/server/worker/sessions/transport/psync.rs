@@ -925,7 +925,7 @@ impl ServerWorkerState {
             Some(&replication),
             &slot_imports,
             crate::foundation::io::persistence::RdbSerializeOptions {
-                compression: self.ctx.config().persistence.rdbcompression,
+                compression: self.ctx.config().persistence.rdbcompression.uses_lzf(),
                 checksum: true,
             },
         );

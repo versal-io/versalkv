@@ -36,7 +36,10 @@ pub fn script_cmd(
         "flush" => script_flush(ctx),
         "show" => script_show(args, ctx),
         "kill" => script_kill(conn, ctx),
-        "debug" => script_debug(args),
+        "debug" => {
+            ctx.script_mut().debug_session = None;
+            script_debug(args)
+        }
         _ => Value::error(format!("ERR Unknown subcommand '{}'", subcmd)),
     }
 }

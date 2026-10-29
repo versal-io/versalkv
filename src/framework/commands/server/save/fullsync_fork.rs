@@ -312,7 +312,7 @@ fn fork_rdb_pipe_child(
     // (rdb.c). Reading it in the parent avoids touching shared config post-fork.
     let key_delay_us = ctx.config().persistence.rdb_key_save_delay;
     let serialization = crate::foundation::io::persistence::RdbSerializeOptions {
-        compression: ctx.config().persistence.rdbcompression,
+        compression: ctx.config().persistence.rdbcompression.uses_lzf(),
         checksum: true,
     };
     let bgsave_affinity = match prepare_bgsave_cpu_affinity(&ctx.config().server.bgsave_cpulist) {
@@ -431,7 +431,7 @@ pub fn fork_direct_diskless_rdb_child(
     let mut child_fds = fds.to_vec();
     let key_delay_us = ctx.config().persistence.rdb_key_save_delay;
     let serialization = crate::foundation::io::persistence::RdbSerializeOptions {
-        compression: ctx.config().persistence.rdbcompression,
+        compression: ctx.config().persistence.rdbcompression.uses_lzf(),
         checksum: true,
     };
     let bgsave_affinity = match prepare_bgsave_cpu_affinity(&ctx.config().server.bgsave_cpulist) {
@@ -529,7 +529,7 @@ pub fn fork_disk_rdb_file_child(
     let slot_imports = ctx.slot_import_dbs();
     let key_delay_us = ctx.config().persistence.rdb_key_save_delay;
     let serialization = crate::foundation::io::persistence::RdbSerializeOptions {
-        compression: ctx.config().persistence.rdbcompression,
+        compression: ctx.config().persistence.rdbcompression.uses_lzf(),
         checksum: true,
     };
     let bgsave_affinity = match prepare_bgsave_cpu_affinity(&ctx.config().server.bgsave_cpulist) {

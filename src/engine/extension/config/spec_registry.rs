@@ -166,7 +166,7 @@ impl ConfigRegistry {
                     .any(|allowed| allowed.eq_ignore_ascii_case(value))
                 {
                     return Some(Err(format!(
-                        "ERR argument {} must be one of: {}",
+                        "ERR CONFIG SET failed (possibly related to argument '{}') - argument(s) must be one of the following: {}",
                         spec.name,
                         spec.enum_values.join(", ")
                     )));

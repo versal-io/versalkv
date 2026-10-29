@@ -49,6 +49,9 @@ impl ServerWorkerState {
         link: &mut ReplicaLink,
     ) -> Result<(), crate::framework::distributed::replication::LinkError> {
         let partial_resync_accepted = link.take_partial_resync_accepted();
+        if link.take_full_resync_accepted() {
+            self.ctx.replication_mut().begin_full_sync();
+        }
         if let Some(new_replid) = link.take_primary_replid_change() {
             self.adopt_changed_primary_replid(
                 link.connection_id(),
@@ -624,6 +627,7 @@ impl ServerWorkerState {
             }
         } else {
             self.ctx.config_mut().replication.master_link_status = "up".to_string();
+            self.ctx.replication_mut().complete_full_sync();
             self.ctx.replication_mut().mark_failover_complete();
             if link.can_ack_primary() {
                 // C sends the classic full-sync terminal ACK before restarting
@@ -669,6 +673,7 @@ impl ServerWorkerState {
             notice,
             "Dual channel replication: Psync established after rdb load"
         );
+        self.ctx.replication_mut().complete_full_sync();
         self.drain_dual_main_before_handoff(main_connection_token, link)?;
         if self
             .replication_runtime

@@ -17,7 +17,7 @@ pub fn save_with_replication(
         replication,
         additional_datasets,
         options.incremental_fsync,
-        crate::foundation::io::persistence::RdbSerializeOptions {
+        crate::foundation::io::persistence::rdb::compression::RdbSnapshotOptions {
             compression: options.compression,
             checksum: options.checksum,
         },
@@ -41,7 +41,7 @@ pub fn save_with_functions_and_replication(
         replication,
         additional_datasets,
         options.incremental_fsync,
-        crate::foundation::io::persistence::RdbSerializeOptions {
+        crate::foundation::io::persistence::rdb::compression::RdbSnapshotOptions {
             compression: options.compression,
             checksum: options.checksum,
         },
@@ -92,7 +92,7 @@ mod tests {
             dir: dir.clone(),
             filename: "dump.rdb".to_string(),
             key_delay_us: 0,
-            compression: true,
+            compression: crate::foundation::io::persistence::rdb::compression::RdbCompression::Yes,
             checksum: false,
             incremental_fsync: false,
         };

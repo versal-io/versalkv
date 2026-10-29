@@ -2,14 +2,13 @@
 
 use crate::framework::CMD_LOADING;
 use crate::framework::CMD_NOSCRIPT;
-use crate::framework::CMD_SKIP_COMMANDLOG;
 use crate::framework::CMD_STALE;
 use crate::framework::{CmdFlags, CommandMeta, DispatchGroup};
 
 pub const EXEC_META: CommandMeta = CommandMeta {
     name: "exec",
     arity: 1,
-    flags: (CMD_NOSCRIPT | CMD_LOADING | CMD_STALE | CMD_SKIP_COMMANDLOG) as CmdFlags,
+    flags: (CMD_NOSCRIPT | CMD_LOADING | CMD_STALE) as CmdFlags,
     dispatch_group: DispatchGroup::Transaction,
     first_key: 0,
     last_key: 0,

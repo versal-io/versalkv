@@ -1,3 +1,4 @@
+pub mod compression;
 mod encoder;
 pub mod serialize;
 mod stream;
@@ -201,7 +202,20 @@ pub fn load_rdb_bytes_with_policy(
     dbs: &mut crate::foundation::io::store::kv_engine::DbSet,
     policy: RdbDecodePolicy,
 ) -> Result<RdbDecodedMetadata, LoadError> {
+    let decoded = compression::decode_rdb_stream(bytes, false).map_err(|error| {
+        log::warn!("{}", error.message());
+        LoadError::Corrupt
+    })?;
+    let bytes = if let Some(decoded) = &decoded {
+        log::info!("Logical RDB CRC64 skipped for streaming-compressed input");
+        decoded.bytes.as_slice()
+    } else {
+        bytes
+    };
     let mut decoder = RdbDecoder::with_policy(policy);
+    if decoded.is_some() {
+        decoder.skip_checksum();
+    }
     decoder.feed(bytes);
     loop {
         match decoder.step(dbs)? {

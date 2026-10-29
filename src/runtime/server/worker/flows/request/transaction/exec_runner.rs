@@ -15,6 +15,7 @@ use crate::runtime::server::worker::flows::request::outcome::{
     CommandDisposition, CommandExecutionStatus, SpecialCommandResult,
 };
 use bytes::Bytes;
+use std::time::Instant;
 
 enum ExecDecision {
     Execute,
@@ -69,8 +70,10 @@ struct ExecAccounting {
 
 #[derive(Clone, Copy)]
 struct ExecContext<'a> {
+    started: Instant,
     target: CommandTarget,
     name: &'a str,
+    log_name: &'a str,
     resp3: bool,
     cluster_metric_slot: Option<u16>,
     transaction_input_bytes: u64,
@@ -84,16 +87,17 @@ impl ServerWorkerState {
         resp3: bool,
         effects: &mut CommandEffects,
     ) -> SpecialCommandResult {
-        if name_lower != "exec" {
+        if !name_lower.eq_ignore_ascii_case("exec") {
             return SpecialCommandResult::NotHandled;
         }
         let Some(token) = target.resolve(self) else {
             return SpecialCommandResult::Handled(CommandDisposition::ConnectionGone);
         };
-        self.ctx.begin_cmd();
         let context = ExecContext {
+            started: Instant::now(),
             target,
-            name: name_lower,
+            name: "exec",
+            log_name: name_lower,
             resp3,
             cluster_metric_slot: self.exec_cluster_metric_slot(token.0),
             transaction_input_bytes: self.connection_registry[token]
@@ -315,7 +319,11 @@ impl ServerWorkerState {
         execution: &ExecExecution,
     ) -> ExecAccounting {
         let rejected = execution.status.is_rejected();
-        let duration_us = self.ctx.end_cmd(context.name, rejected);
+        let duration_us = self.ctx.end_cmd_with_duration(
+            context.name,
+            rejected,
+            context.started.elapsed().as_micros() as u64,
+        );
         super::super::dispatch::record_error_reply(
             &mut self.ctx,
             &execution.reply,
@@ -372,6 +380,15 @@ impl ServerWorkerState {
                 serialize_to_vec_resp2(&execution.reply)
             }
         });
+        self.ctx.push_cmd_logs(
+            vec![Bytes::copy_from_slice(context.log_name.as_bytes())],
+            accounting.duration_us,
+            &connection.peer_addr,
+            connection.name.clone(),
+            connection.request_bytes_current_command(),
+            encoded.as_ref().map_or(0, Vec::len),
+            crate::framework::generated::commands::EXEC_META.flags,
+        );
         if !execution.status.is_rejected() {
             if let Some(slot) = context.cluster_metric_slot {
                 effects.defer_slot_metric(

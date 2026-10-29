@@ -177,7 +177,7 @@ impl CommandRuntime for ServerCommandRuntime<'_> {
             extended_redis_compatibility: self.ctx.config().server.extended_redis_compatibility,
             hll_sparse_max_bytes: self.ctx.config().server.hll_sparse_max_bytes,
             preserve_expired_keys: self.conn.import_source() || is_read_only_replica,
-            rdb_compression: self.ctx.config().persistence.rdbcompression,
+            rdb_compression: self.ctx.config().persistence.rdbcompression.uses_lzf(),
             skip_checksum_validation: self.ctx.config().server.skip_checksum_validation,
             rdb_version_check_relaxed: self.ctx.config().rdb_version_check_relaxed(),
             lazyfree_server_del: self.ctx.config().server.lazyfree_lazy_server_del,

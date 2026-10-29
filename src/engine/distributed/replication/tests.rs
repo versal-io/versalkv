@@ -15,6 +15,35 @@ fn replication_role_is_canonical_runtime_state() {
 }
 
 #[test]
+fn full_sync_duration_survives_failed_sync_but_resets_on_promotion() {
+    let mut state = ReplicationState::new("replid".to_string(), 16);
+    state.switch_to_replica();
+    state.full_sync_started =
+        Some(std::time::Instant::now() - std::time::Duration::from_millis(25));
+    state.complete_full_sync();
+    assert!(state.last_successful_sync_duration_ms >= 25);
+    let successful_duration_ms = state.last_successful_sync_duration_ms;
+
+    state.begin_full_sync();
+    state.observe_primary_disconnected(100);
+    state.complete_full_sync();
+    assert_eq!(
+        state.last_successful_sync_duration_ms,
+        successful_duration_ms
+    );
+    state.switch_to_replica();
+    assert_eq!(
+        state.last_successful_sync_duration_ms,
+        successful_duration_ms
+    );
+
+    state.switch_to_primary();
+    state.switch_to_replica();
+    assert_eq!(state.last_successful_sync_duration_ms, -1);
+    assert!(state.full_sync_started.is_none());
+}
+
+#[test]
 fn aof_only_primary_propagation_advances_without_retaining_history() {
     let mut state = ReplicationState::new("replid".to_string(), 16);
 

@@ -383,7 +383,7 @@ impl ServerWorkerState {
 
         let exec_result = self.try_handle_exec(
             CommandTarget::new(Token(token_value)),
-            name_lower,
+            std::str::from_utf8(&args.name).unwrap_or(name_lower),
             resp3,
             fx,
         );

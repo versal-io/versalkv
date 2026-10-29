@@ -27,6 +27,15 @@ pub fn acl_cmd(conn: &mut dyn CommandConn, args: &CommandArgs, ctx: &mut ServerC
     };
     match subcmd.as_str() {
         "list" => acl_list(),
+        "digest" => {
+            if args.args.len() != 1 {
+                return Value::error("ERR wrong number of arguments for 'acl|digest' command");
+            }
+            match crate::engine::extension::acl::digest() {
+                Ok(digest) => Value::bulk(Bytes::from(digest)),
+                Err(error) => Value::error(format!("ERR {error}")),
+            }
+        }
         "whoami" => Value::bulk(Bytes::from(conn.username().as_bytes().to_vec())),
         "users" => acl_users_list(),
         "getuser" => {
@@ -56,6 +65,7 @@ pub fn acl_cmd(conn: &mut dyn CommandConn, args: &CommandArgs, ctx: &mut ServerC
                 "GETUSER <username>",
                 "SETUSER <username> [rule [rule ...]]",
                 "DELUSER <username> [<username> ...]",
+                "DIGEST",
                 "CAT",
                 "CAT <category>",
                 "GENPASS [<bits>]",

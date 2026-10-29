@@ -204,6 +204,11 @@ fn render_address(node: &ClusterNode) -> String {
     append_aux(&mut address, "nodename", node.endpoints.human_name());
     append_aux(
         &mut address,
+        "replica-priority",
+        (node.cluster_replica_priority != 0).then(|| node.cluster_replica_priority.to_string()),
+    );
+    append_aux(
+        &mut address,
         "tcp-port",
         Some(&node.endpoints.port().to_string()),
     );
@@ -379,6 +384,11 @@ fn parse_address(raw: &str) -> Result<ParsedAddress<'_>, String> {
 fn apply_aux_field(node: &mut ClusterNode, name: &str, value: &str) -> Result<(), String> {
     let endpoints = &mut node.endpoints;
     match name {
+        "replica-priority" => {
+            node.cluster_replica_priority = value
+                .parse::<u32>()
+                .map_err(|_| format!("invalid replica-priority: {value}"))?;
+        }
         "shard-id" => {
             node.shard_id = NodeId::parse(value.as_bytes())
                 .map_err(|error| error.to_string())?

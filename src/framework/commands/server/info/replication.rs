@@ -18,6 +18,11 @@ pub(super) fn gen_replication_section(
         emit_line(&mut s, "role", "slave");
         emit_line(
             &mut s,
+            "last_successful_sync_duration_ms",
+            replication.last_successful_sync_duration_ms,
+        );
+        emit_line(
+            &mut s,
             "master_host",
             rcfg.replication.master_host.as_deref().unwrap_or(""),
         );

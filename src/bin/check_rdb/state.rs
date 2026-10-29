@@ -31,6 +31,7 @@ pub struct RdbState {
     pub databases: u64,
     pub rdbver: u64,
     pub final_offset: u64,
+    pub physical_offset: Option<u64>,
     pub type_counts: Vec<[u64; 6]>,
 }
 
@@ -45,6 +46,7 @@ impl RdbState {
             databases: 0,
             rdbver: 0,
             final_offset: 0,
+            physical_offset: None,
             type_counts: vec![[0; 6]],
         }
     }
@@ -68,7 +70,14 @@ pub fn print_info(state: &RdbState) {
 
 pub fn rdb_check_error(failure: &RdbCheckFailure) {
     println!("--- RDB ERROR DETECTED ---");
-    println!("[offset {}] {}", failure.offset, failure.message);
+    if let Some(physical) = failure.state.physical_offset {
+        println!(
+            "[logical offset {}, physical offset {}] {}",
+            failure.offset, physical, failure.message
+        );
+    } else {
+        println!("[offset {}] {}", failure.offset, failure.message);
+    }
     println!("[additional info] While doing: {}", failure.phase.as_str());
     if failure.state.keys > 0 {
         println!("[info] {} keys read", failure.state.keys);

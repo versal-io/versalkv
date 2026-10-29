@@ -74,6 +74,8 @@ impl ServerWorkerState {
         let Some(spec) = self.registry.lookup(&invocation.args.name) else {
             return Ok(CommandExecution::rejected(unknown_command_reply(
                 invocation.args,
+                self.connection_registry[invocation.target.token()].session_id(),
+                &self.ctx,
             )));
         };
         let executor = spec.executor;
@@ -290,8 +292,24 @@ impl ServerWorkerState {
     }
 }
 
-fn unknown_command_reply(args: &crate::engine::command::CommandArgs) -> Value {
+fn unknown_command_reply(
+    args: &crate::engine::command::CommandArgs,
+    session: crate::engine::command::SessionId,
+    ctx: &crate::framework::context::ServerContext,
+) -> Value {
     if crate::framework::commands::scripting::script_cmd::script_debug_enabled() {
+        if (args.name.eq_ignore_ascii_case(b"print") || args.name.eq_ignore_ascii_case(b"p"))
+            && args.args.len() == 1
+        {
+            let value = (ctx.script().debug_session == Some(session))
+                .then(|| std::str::from_utf8(&args.args[0]).ok())
+                .flatten()
+                .and_then(crate::engine::extension::lua::runtime::debug_global);
+            return Value::SimpleString(Bytes::from(match value {
+                Some(value) => format!("<value> {value:?}"),
+                None => "No such variable.".to_string(),
+            }));
+        }
         if args.name.eq_ignore_ascii_case(b"server")
             && args
                 .args

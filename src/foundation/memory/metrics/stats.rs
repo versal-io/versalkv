@@ -543,6 +543,30 @@ impl ServerStats {
     }
 
     pub fn end_cmd(&mut self, name: &str, rejected: bool, track_latency: bool) -> u64 {
+        let duration_us = self
+            .last_cmd_start
+            .take()
+            .map(|start| start.elapsed().as_micros() as u64);
+        self.record_cmd_completion(name, rejected, track_latency, duration_us)
+    }
+
+    pub fn end_cmd_with_duration(
+        &mut self,
+        name: &str,
+        rejected: bool,
+        track_latency: bool,
+        elapsed_us: u64,
+    ) -> u64 {
+        self.record_cmd_completion(name, rejected, track_latency, Some(elapsed_us))
+    }
+
+    fn record_cmd_completion(
+        &mut self,
+        name: &str,
+        rejected: bool,
+        track_latency: bool,
+        elapsed_us: Option<u64>,
+    ) -> u64 {
         let stat = self.cmd_stats.entry(name.to_ascii_lowercase()).or_default();
         let mut duration_us = 0u64;
         if rejected {
@@ -551,13 +575,12 @@ impl ServerStats {
         } else {
             stat.calls += 1;
             self.total_commands_processed += 1;
-            if let Some(start) = self.last_cmd_start.take() {
-                let us = start.elapsed().as_micros() as u64;
-                stat.usec += us;
-                self.active_time_usec += us;
-                duration_us = us;
+            if let Some(elapsed_us) = elapsed_us {
+                stat.usec += elapsed_us;
+                self.active_time_usec += elapsed_us;
+                duration_us = elapsed_us;
                 if track_latency {
-                    stat.record_latency_usec(us);
+                    stat.record_latency_usec(elapsed_us);
                 }
             }
             let lat_name = self

@@ -217,7 +217,7 @@ fn snapshot_items(
     keys: &[Bytes],
     ctx: &mut ServerContext,
 ) -> Result<Vec<PreparedItem>, Value> {
-    let rdb_compression = ctx.config().persistence.rdbcompression;
+    let rdb_compression = ctx.config().persistence.rdbcompression.uses_lzf();
     let db = ctx
         .dbs_mut()
         .get_mut(dbid)

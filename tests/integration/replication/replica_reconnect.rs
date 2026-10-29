@@ -2,6 +2,7 @@ use crate::common::TestServer;
 use crate::replication::common::wait_until;
 use crate::replication::psync2::extract_field;
 use std::time::Duration;
+use versal::foundation::io::sys::process::{send_signal, ProcessSignal};
 
 #[test]
 fn partial_resync_resumes_on_cached_selected_db() {
@@ -47,22 +48,12 @@ fn partial_resync_resumes_on_cached_selected_db() {
             .parse()
             .unwrap_or(0);
 
-    // resume state）
+    // Pause the replica while closing its actual transport. Promotion discards
+    // the cached primary in C Valkey and would force a fresh full sync.
+    send_signal(replica.pid() as i32, ProcessSignal::Stop).expect("pause replica");
     assert_eq!(
-        replica.connect().command(&[b"REPLICAOF", b"NO", b"ONE"]),
-        b"+OK\r\n"
-    );
-    assert!(
-        wait_until(
-            || {
-                replica
-                    .connect()
-                    .command_str(&[b"INFO", b"replication"])
-                    .contains("role:master")
-            },
-            Duration::from_secs(5),
-        ),
-        "replica did not switch to master role"
+        mc.command(&[b"CLIENT", b"KILL", b"TYPE", b"replica"]),
+        b":1\r\n"
     );
 
     for i in 0..5 {
@@ -74,12 +65,7 @@ fn partial_resync_resumes_on_cached_selected_db() {
         );
     }
 
-    assert_eq!(
-        replica
-            .connect()
-            .command(&[b"REPLICAOF", b"127.0.0.1", master_port.as_bytes()]),
-        b"+OK\r\n"
-    );
+    send_signal(replica.pid() as i32, ProcessSignal::Continue).expect("resume replica");
     assert!(
         wait_until(
             || {

@@ -274,7 +274,7 @@ pub(crate) fn prepare_debug_task(
         ctx.config()
             .persistence
             .loading_process_events_interval_bytes,
-    );
+    ).with_skip_codec_checksums(ctx.config().server.skip_checksum_validation);
     ctx.set_host_task_loading(true);
     Ok(crate::framework::host_tasks::PreparedHostTask::DebugRdb(
         crate::framework::host_tasks::DebugRdbTask::new(

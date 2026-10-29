@@ -1,4 +1,7 @@
 use super::super::Snapshot;
+use crate::foundation::io::persistence::rdb::compression::{
+    encode_rdb_stream, RdbCompression, RdbSnapshotOptions,
+};
 use crate::foundation::io::store::kv_engine::DbSet;
 use std::io::Write;
 use std::path::Path;
@@ -121,8 +124,8 @@ pub fn save_rdb_atomically_with_functions_and_replication_and_incremental_fsync_
         replication,
         additional_datasets,
         incremental_fsync,
-        crate::foundation::io::persistence::RdbSerializeOptions {
-            compression: true,
+        RdbSnapshotOptions {
+            compression: RdbCompression::Yes,
             checksum,
         },
     )
@@ -137,7 +140,7 @@ pub fn save_rdb_atomically_with_functions_and_replication_and_incremental_fsync_
     replication: Option<&crate::foundation::io::persistence::RdbReplicationInfo>,
     additional_datasets: &[&DbSet],
     incremental_fsync: bool,
-    serialization: crate::foundation::io::persistence::RdbSerializeOptions,
+    serialization: RdbSnapshotOptions,
 ) -> std::io::Result<()> {
     let path = dir.join(filename);
     let tmp = dir.join(format!("temp-{}.rdb", std::process::id()));
@@ -150,8 +153,16 @@ pub fn save_rdb_atomically_with_functions_and_replication_and_incremental_fsync_
             true,
             replication,
             additional_datasets,
-            serialization,
+            crate::foundation::io::persistence::RdbSerializeOptions {
+                compression: serialization.compression.uses_lzf(),
+                checksum: serialization.checksum && serialization.compression != RdbCompression::Lz4,
+            },
         );
+        let bytes = if serialization.compression == RdbCompression::Lz4 {
+            encode_rdb_stream(&bytes, serialization.checksum)?
+        } else {
+            bytes
+        };
         write_with_incremental_sync(&mut file, &bytes, incremental_fsync, |file| {
             file.sync_data()
         })?;

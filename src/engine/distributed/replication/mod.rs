@@ -81,6 +81,8 @@ pub struct ReplicationState {
     pub backlog_idle_deadline_ms: i64,
     primary_down_since_ms: i64,
     primary_link_was_observed: bool,
+    pub last_successful_sync_duration_ms: i64,
+    full_sync_started: Option<std::time::Instant>,
 }
 
 impl ReplicationState {
@@ -111,6 +113,8 @@ impl ReplicationState {
             backlog_idle_deadline_ms: 0,
             primary_down_since_ms: 0,
             primary_link_was_observed: false,
+            last_successful_sync_duration_ms: -1,
+            full_sync_started: None,
         }
     }
 
@@ -216,6 +220,7 @@ impl ReplicationState {
     }
 
     pub fn observe_primary_disconnected(&mut self, now_ms: i64) {
+        self.full_sync_started = None;
         self.primary_link_was_observed = true;
         if self.primary_down_since_ms == 0 {
             self.primary_down_since_ms = now_ms;
@@ -225,6 +230,17 @@ impl ReplicationState {
     pub fn observe_primary_connected(&mut self) {
         self.primary_link_was_observed = true;
         self.primary_down_since_ms = 0;
+    }
+
+    pub fn begin_full_sync(&mut self) {
+        self.full_sync_started = Some(std::time::Instant::now());
+    }
+
+    pub fn complete_full_sync(&mut self) {
+        if let Some(started) = self.full_sync_started.take() {
+            self.last_successful_sync_duration_ms =
+                i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
+        }
     }
 
     pub fn primary_data_age_ms(&self, now_ms: i64) -> u64 {
@@ -275,6 +291,8 @@ impl ReplicationState {
         self.primary_repl_offset = self.slave_repl_offset;
         self.backlog.shift_replication_id();
         self.role = ReplicationRole::Primary;
+        self.last_successful_sync_duration_ms = -1;
+        self.full_sync_started = None;
         self.backlog_idle_deadline_ms = 0;
         crate::foundation::io::sys::log::set_log_role_primary();
         self.pending_replicaof_request = false;

@@ -34,6 +34,14 @@ impl ServerContext {
         self.stats
             .end_cmd(name, rejected, self.rconfig.server.latency_tracking)
     }
+    pub fn end_cmd_with_duration(&mut self, name: &str, rejected: bool, elapsed_us: u64) -> u64 {
+        self.stats.end_cmd_with_duration(
+            name,
+            rejected,
+            self.rconfig.server.latency_tracking,
+            elapsed_us,
+        )
+    }
     pub fn set_cmd_fullname(&mut self, fullname: &str) {
         self.stats.set_cmd_fullname(fullname);
     }

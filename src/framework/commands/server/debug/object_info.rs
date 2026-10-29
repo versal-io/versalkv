@@ -61,7 +61,7 @@ pub(super) fn debug_object(
     );
     if !fast {
         let fill = ctx.config().encoding.list_max_listpack_size;
-        let compress = ctx.config().persistence.rdbcompression;
+        let compress = ctx.config().persistence.rdbcompression.uses_lzf();
         let stream_max_entries = ctx.config().encoding.stream_node_max_entries;
         let length = serialized_length(
             &obj,

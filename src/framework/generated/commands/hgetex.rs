@@ -13,7 +13,7 @@ pub const HGETEX_META: CommandMeta = CommandMeta {
     last_key: 1,
     key_step: 1,
     container: None,
-    key_flags: &["RW", "access"],
+    key_flags: &["RW", "access", "update"],
     acl_categories: &["FAST", "HASH", "WRITE"],
     get_keys: None,
 };

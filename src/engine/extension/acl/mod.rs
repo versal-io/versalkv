@@ -24,3 +24,21 @@ pub(crate) use command::{
     module_acl_category_commands, register_module_acl_category, remove_module_acl_category_all,
     should_restrict_cmd, AclCommand, BUILTIN_ACL_CATEGORY_NAMES,
 };
+
+/// Fingerprint effective rules independently of user insertion order.
+/// Include each username so equal rules on distinct users do not cancel out.
+pub(crate) fn digest() -> Result<String, &'static str> {
+    use sha2::{Digest, Sha256};
+
+    let users = acl_users()
+        .lock()
+        .map_err(|_| "ACL user registry is unavailable")?;
+    let mut digest = [0u8; 32];
+    for (name, user) in users.iter() {
+        let user_digest = Sha256::digest(user.describe(name).as_bytes());
+        for (combined, byte) in digest.iter_mut().zip(user_digest) {
+            *combined ^= byte;
+        }
+    }
+    Ok(hex::encode(digest))
+}

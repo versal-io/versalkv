@@ -261,19 +261,21 @@ pub(crate) fn register_persistence_configs(reg: &mut ConfigRegistry) {
     });
     reg.register(&ConfigSpec {
         name: "rdbcompression",
-        type_: ConfigType::Bool,
-        enum_values: &[],
+        type_: ConfigType::Enum,
+        enum_values: &["no", "yes", "lzf", "lz4"],
         numeric_min: 0,
         numeric_max: 0,
         flags: &[],
         alias: None,
-        get: |rcfg| ConfigValue::Bool(rcfg.persistence.rdbcompression),
+        get: |rcfg| ConfigValue::String(rcfg.persistence.rdbcompression.as_str().to_string()),
         set: |rcfg, val| {
-            if let ConfigValue::Bool(v) = val {
-                rcfg.persistence.rdbcompression = *v;
+            if let ConfigValue::String(v) = val {
+                rcfg.persistence.rdbcompression =
+                    crate::foundation::io::persistence::rdb::compression::RdbCompression::parse(v)
+                        .ok_or_else(|| "Invalid RDB compression mode".to_string())?;
                 Ok(())
             } else {
-                Err("rdbcompression must be a boolean".to_string())
+                Err("rdbcompression must be a string".to_string())
             }
         },
     });
