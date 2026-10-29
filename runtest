@@ -38,7 +38,7 @@ cp tests/unit/*.tcl thirdparty/valkey/tests/unit/
     # and the Cluster Bus keep system defaults.
     VALKEY_TEST_TCP_SNDBUF_BYTES=65536 \
     VALKEY_TEST_TCP_RCVBUF_BYTES=87380 \
-        python3 ../../scripts/versal-util.py tcl run -- tclsh tests/test_helper.tcl \
+        tclsh tests/test_helper.tcl \
         "$@" \
         --skip-leaks --baseport 5111 --portcount 8000 \
         --timeout 360 \
