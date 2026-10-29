@@ -796,6 +796,20 @@ fn run_pipe_mode(opts: &CliOptions) {
     }
 }
 
+fn exit_replica_mode(error: &str, operation: &str) -> ! {
+    if matches!(
+        error,
+        "Connection closed by server"
+            | "Connection closed before replication header"
+            | "Connection closed before RDB EOF marker"
+    ) {
+        eprintln!("Server closed the connection");
+    } else {
+        eprintln!("{}: {}", operation, error);
+    }
+    std::process::exit(1);
+}
+
 fn run_replica_mode(opts: &CliOptions) {
     let _password = resolve_password(opts);
     let mut conn = match connect_with_opts(opts) {
@@ -806,12 +820,17 @@ fn run_replica_mode(opts: &CliOptions) {
         }
     };
 
-    let _ = conn.send_command(&[b"REPLCONF", b"listening-port", b"0"]);
-    let _ = conn.send_command(&[b"REPLCONF", b"capa", b"eof", b"capa", b"psync2"]);
+    // Unsupported REPLCONF options are optional, but a transport failure
+    // ends the handshake before any further replication command is sent.
+    if let Err(error) = conn.send_command(&[b"REPLCONF", b"listening-port", b"0"]) {
+        exit_replica_mode(&error, "Error");
+    }
+    if let Err(error) = conn.send_command(&[b"REPLCONF", b"capa", b"eof", b"capa", b"psync2"]) {
+        exit_replica_mode(&error, "Error");
+    }
 
     if let Err(error) = conn.send_command_without_reply(&[b"PSYNC", b"?", b"-1"]) {
-        eprintln!("Error: {}", error);
-        std::process::exit(1);
+        exit_replica_mode(&error, "Error");
     }
 
     let mut sink = std::io::sink();
@@ -823,28 +842,14 @@ fn run_replica_mode(opts: &CliOptions) {
             // primary intentionally keeps post-RDB bytes gated until this ACK.
             std::thread::sleep(Duration::from_secs(1));
             if let Err(error) = conn.send_command_without_reply(&[b"REPLCONF", b"ACK", b"0"]) {
-                eprintln!("Error: {}", error);
-                std::process::exit(1);
+                exit_replica_mode(&error, "Error");
             }
         }
         Ok(ReplicationRdbTransfer::FullLength) => {
             eprintln!("Full resync with primary, discarding RDB payload...")
         }
         Ok(ReplicationRdbTransfer::Partial) => eprintln!("Partial resynchronization accepted."),
-        Err(error)
-            if matches!(
-                error.as_str(),
-                "Connection closed before replication header"
-                    | "Connection closed before RDB EOF marker"
-            ) =>
-        {
-            eprintln!("Server closed the connection");
-            std::process::exit(1);
-        }
-        Err(error) => {
-            eprintln!("Error reading replication stream: {}", error);
-            std::process::exit(1);
-        }
+        Err(error) => exit_replica_mode(&error, "Error reading replication stream"),
     }
 
     eprintln!("Entering replica output mode... (press Ctrl-C to quit)");
