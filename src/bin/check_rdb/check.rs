@@ -53,6 +53,7 @@ impl RdbCheckPhase {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RdbNotice {
     pub offset: u64,
+    pub physical_offset: Option<u64>,
     pub message: String,
 }
 
@@ -78,7 +79,26 @@ pub fn scan_rdb(data: &[u8]) -> RdbCheckResult {
 }
 
 pub fn scan_rdb_at(data: &[u8], now_ms: i64) -> RdbCheckResult {
-    RdbScanner::new(data, now_ms).scan()
+    use versal::foundation::io::persistence::rdb::compression::decode_rdb_stream;
+    match decode_rdb_stream(data, false) {
+        Ok(None) => RdbScanner::new(data, now_ms).scan(),
+        Ok(Some(decoded)) => {
+            let mut scanner = RdbScanner::new(&decoded.bytes, now_ms);
+            scanner.state.physical_offset = Some(decoded.physical_bytes as u64);
+            scanner.scan()
+        }
+        Err(error) => {
+            let mut state = RdbState::new();
+            state.physical_offset = Some(error.physical_offset as u64);
+            Err(RdbCheckFailure {
+                state: Box::new(state),
+                notices: Vec::new(),
+                phase: RdbCheckPhase::Header,
+                offset: 0,
+                message: error.message().to_string(),
+            })
+        }
+    }
 }
 
 struct ScanIssue {
@@ -398,6 +418,10 @@ impl<'a> RdbScanner<'a> {
             "Unexpected EOF reading checksum",
         )?;
         let stored = u64::from_le_bytes(bytes.try_into().unwrap());
+        if self.state.physical_offset.is_some() {
+            self.notice("Logical RDB CRC64 skipped for streaming-compressed input");
+            return Ok(());
+        }
         let computed = crc64(0, &self.data[..checksum_start]);
         if stored == 0 {
             self.notice("RDB file was saved with checksum disabled: no check performed.");
@@ -453,6 +477,7 @@ impl<'a> RdbScanner<'a> {
     fn notice(&mut self, message: impl Into<String>) {
         self.notices.push(RdbNotice {
             offset: self.pos as u64,
+            physical_offset: self.state.physical_offset,
             message: message.into(),
         });
     }

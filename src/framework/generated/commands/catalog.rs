@@ -40,6 +40,7 @@ pub const ALL_COMMAND_META: &[&CommandMeta] = &[
     &super::ACL_META,
     &super::ACL_CAT_META,
     &super::ACL_DELUSER_META,
+    &super::ACL_DIGEST_META,
     &super::ACL_DRYRUN_META,
     &super::ACL_GENPASS_META,
     &super::ACL_GETUSER_META,
@@ -731,6 +732,7 @@ pub const TOP_LEVEL_COMMANDS: &[&str] = &[
 pub const SUBCOMMAND_NAMES: &[&str] = &[
     "acl|cat",
     "acl|deluser",
+    "acl|digest",
     "acl|dryrun",
     "acl|genpass",
     "acl|getuser",
@@ -909,6 +911,11 @@ pub const SUBCOMMAND_GATE_FLAGS: &[(&str, &str, CmdFlags)] = &[
     (
         "acl",
         "deluser",
+        (CMD_ADMIN | CMD_NOSCRIPT | CMD_LOADING | CMD_STALE | CMD_SENTINEL) as CmdFlags,
+    ),
+    (
+        "acl",
+        "digest",
         (CMD_ADMIN | CMD_NOSCRIPT | CMD_LOADING | CMD_STALE | CMD_SENTINEL) as CmdFlags,
     ),
     (

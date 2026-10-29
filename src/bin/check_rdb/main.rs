@@ -53,7 +53,7 @@ fn run_check(options: &RdbCheckOptions) -> ExitCode {
 
 fn finish_success(options: &RdbCheckOptions, mut report: RdbCheckReport) -> ExitCode {
     print_notices(&report.notices);
-    if report.state.rdbver > RDB_VERSION {
+    if report.state.rdbver > RDB_VERSION || (12..=79).contains(&report.state.rdbver) {
         println!(
             "[offset {}] \\o/ RDB looks OK, but loading requires config 'rdb-version-check relaxed'",
             report.state.final_offset
@@ -82,7 +82,14 @@ fn finish_failure(failure: RdbCheckFailure) -> ExitCode {
 
 fn print_notices(notices: &[RdbNotice]) {
     for notice in notices {
-        println!("[offset {}] {}", notice.offset, notice.message);
+        if let Some(physical) = notice.physical_offset {
+            println!(
+                "[logical offset {}, physical offset {}] {}",
+                notice.offset, physical, notice.message
+            );
+        } else {
+            println!("[offset {}] {}", notice.offset, notice.message);
+        }
     }
 }
 

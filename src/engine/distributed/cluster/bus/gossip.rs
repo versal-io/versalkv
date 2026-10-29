@@ -977,6 +977,7 @@ impl ClusterBusManager {
             {
                 node.cluster_replica_priority = 0;
                 state.commit_sender_extension_observation(node);
+                state.mark_topology_changed();
             }
             return;
         }
@@ -997,6 +998,7 @@ impl ClusterBusManager {
             let previous_flags = node.flags;
             let previous_endpoints = node.endpoints.clone();
             let previous_shard_id = node.shard_id.clone();
+            let previous_priority = node.cluster_replica_priority;
             node.flags |=
                 crate::engine::distributed::cluster::node::CLUSTER_NODE_EXTENSIONS_SUPPORTED;
             let _ = node.endpoints.set_hostname(extensions.hostname.as_bytes());
@@ -1021,7 +1023,8 @@ impl ClusterBusManager {
             node.cluster_replica_priority = extensions.cluster_replica_priority;
             let changed = node.flags != previous_flags
                 || node.endpoints != previous_endpoints
-                || node.shard_id != previous_shard_id;
+                || node.shard_id != previous_shard_id
+                || node.cluster_replica_priority != previous_priority;
             state.commit_sender_extension_observation(node);
             changed
         } else {

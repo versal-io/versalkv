@@ -8,6 +8,8 @@ mod acl_cat;
 pub use acl_cat::ACL_CAT_META;
 mod acl_deluser;
 pub use acl_deluser::ACL_DELUSER_META;
+mod acl_digest;
+pub use acl_digest::ACL_DIGEST_META;
 mod acl_dryrun;
 pub use acl_dryrun::ACL_DRYRUN_META;
 mod acl_genpass;

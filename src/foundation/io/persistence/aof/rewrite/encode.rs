@@ -4,6 +4,8 @@ use crate::foundation::io::store::kv_engine::DbSet;
 use crate::foundation::io::store::Robj;
 use std::io::Write;
 
+const COMMAND_SNAPSHOT_BUFFER_BYTES: usize = 16 * 1024;
+
 #[derive(Clone, Copy)]
 pub(super) struct DbCommandSnapshotOptions {
     dbid: u32,
@@ -56,9 +58,6 @@ impl DbCommandSnapshotBuffer {
             ]));
         }
         self.count += 1;
-        crate::foundation::io::persistence::serialize::delay_after_key_save(
-            self.options.key_delay_us,
-        );
     }
 }
 
@@ -115,13 +114,26 @@ fn write_db_command_entries_with_mode(
         count: 0,
         options,
     };
+    let mut write_error = None;
     let mut encode_entry =
         |key: &[u8],
          value: &Robj,
          expire: Option<u64>,
          hash_field_expires: Option<&std::collections::HashMap<Vec<u8>, u64>>| {
-            if include(key) {
+            if write_error.is_none() && include(key) {
                 snapshot.append(key, value, expire, hash_field_expires);
+                // Keep the snapshot moving before delaying the next key, as
+                // C's rio fd writer does for migration and AOF output.
+                if snapshot.bytes.len() >= COMMAND_SNAPSHOT_BUFFER_BYTES {
+                    if let Err(error) = writer.write_all(&snapshot.bytes) {
+                        write_error = Some(error);
+                        return;
+                    }
+                    snapshot.bytes.clear();
+                }
+                crate::foundation::io::persistence::serialize::delay_after_key_save(
+                    options.key_delay_us,
+                );
             }
         };
     match mode {
@@ -129,6 +141,9 @@ fn write_db_command_entries_with_mode(
         SnapshotEntryMode::Physical => {
             db.for_each_entry_including_expired_with_hash_field_expires(&mut encode_entry)
         }
+    }
+    if let Some(error) = write_error {
+        return Err(error);
     }
     if !snapshot.bytes.is_empty() {
         writer.write_all(&snapshot.bytes)?;
@@ -413,6 +428,66 @@ mod tests {
 
         assert_eq!(count, 0);
         assert!(output.is_empty());
+    }
+
+    #[test]
+    fn command_snapshot_writes_before_finishing_and_stops_on_write_error() {
+        struct SnapshotWriter<'a> {
+            processed: &'a std::cell::Cell<usize>,
+            first_write_after: Option<usize>,
+            should_fail: bool,
+            bytes: Vec<u8>,
+        }
+
+        impl std::io::Write for SnapshotWriter<'_> {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.first_write_after.get_or_insert(self.processed.get());
+                if self.should_fail {
+                    return Err(std::io::ErrorKind::BrokenPipe.into());
+                }
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut db = Db::new();
+        for index in 0..64 {
+            db.set(
+                format!("key-{index}").into_bytes(),
+                crate::foundation::io::store::Robj::string("v".repeat(1024)),
+            );
+        }
+        for should_fail in [false, true] {
+            let processed = std::cell::Cell::new(0);
+            let mut writer = SnapshotWriter {
+                processed: &processed,
+                first_write_after: None,
+                should_fail,
+                bytes: Vec::new(),
+            };
+            let result = write_db_command_entries(
+                &db,
+                |_| {
+                    processed.set(processed.get() + 1);
+                    true
+                },
+                &mut writer,
+                DbCommandSnapshotOptions::new(0, true, 0),
+            );
+
+            assert!(writer.first_write_after.is_some_and(|count| count < 64));
+            if should_fail {
+                assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::BrokenPipe);
+                assert!(processed.get() < 64);
+            } else {
+                assert_eq!(result.unwrap(), 64);
+                assert!(!writer.bytes.is_empty());
+            }
+        }
     }
 
     #[test]

@@ -67,6 +67,7 @@ pub struct ReplicaLink {
     failover_request: bool,
     failover_accepted: bool,
     partial_resync_accepted: bool,
+    full_resync_accepted: bool,
     pending_primary_replid_change: Option<String>,
     cluster_node_id: Option<String>,
 }
@@ -107,6 +108,7 @@ impl ReplicaLink {
             failover_request: false,
             failover_accepted: false,
             partial_resync_accepted: false,
+            full_resync_accepted: false,
             pending_primary_replid_change: None,
             cluster_node_id: None,
         }
@@ -190,6 +192,10 @@ impl ReplicaLink {
 
     pub fn take_partial_resync_accepted(&mut self) -> bool {
         std::mem::take(&mut self.partial_resync_accepted)
+    }
+
+    pub fn take_full_resync_accepted(&mut self) -> bool {
+        std::mem::take(&mut self.full_resync_accepted)
     }
 
     fn mark_failover_accepted(&mut self) {
@@ -382,6 +388,7 @@ impl ReplicaLink {
                         break;
                     };
                     if protocol::parse_dual_channel_sync(&line) {
+                        self.full_resync_accepted = true;
                         self.mark_failover_accepted();
                         // The main PSYNC can continue before the direct RDB
                         // child writes its header. Do not let that window
@@ -399,6 +406,7 @@ impl ReplicaLink {
                     } else if let Some(fullresync) = protocol::parse_fullresync(&line) {
                         self.mark_failover_accepted();
                         self.begin_rdb()?;
+                        self.full_resync_accepted = true;
                         self.master_replid = Some(fullresync.replid);
                         self.requested_offset = Some(fullresync.offset);
                         self.received_offset = fullresync.offset;

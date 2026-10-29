@@ -2,7 +2,7 @@ use super::CodecLoad;
 use crate::foundation::io::persistence::codec::decoder;
 use crate::foundation::io::persistence::codec::decoder_compact::listpack_decode;
 use crate::foundation::io::persistence::codec::types::{
-    load_len, RDB_TYPE_STREAM_LISTPACKS, RDB_TYPE_STREAM_LISTPACKS_2,
+    load_len, RDB_TYPE_STREAM_LISTPACKS, RDB_TYPE_STREAM_LISTPACKS_2, RDB_TYPE_STREAM_LISTPACKS_3,
 };
 use crate::foundation::io::persistence::codec::RdbWriter;
 use crate::foundation::io::store::structure::stream::groups::{
@@ -28,17 +28,32 @@ pub(crate) enum StreamLoadError {
 
 impl CodecLoad for StreamCodec {
     fn load_dispatch(buf: &[u8], pos: &mut usize, type_byte: u8) -> Option<Robj> {
-        let stream =
-            if type_byte == RDB_TYPE_STREAM_LISTPACKS || type_byte == RDB_TYPE_STREAM_LISTPACKS_2 {
-                StreamCodec::load_legacy_listpacks(buf, pos, type_byte)?
-            } else {
-                StreamCodec::load(buf, pos)?
-            };
+        let stream = if Self::is_legacy_encoding(buf, *pos, type_byte) {
+            StreamCodec::load_legacy_listpacks(buf, pos, type_byte)?
+        } else {
+            StreamCodec::load(buf, pos)?
+        };
         Some(Robj::StreamListpack(Box::new(stream)))
     }
 }
 
 impl StreamCodec {
+    pub(crate) fn is_legacy_encoding(buf: &[u8], pos: usize, type_byte: u8) -> bool {
+        if type_byte == RDB_TYPE_STREAM_LISTPACKS || type_byte == RDB_TYPE_STREAM_LISTPACKS_2 {
+            return true;
+        }
+        if type_byte != RDB_TYPE_STREAM_LISTPACKS_3 {
+            return false;
+        }
+        let has_owned_marker = buf.get(pos) == Some(&(STREAM_DUMP_MARKER_V2.len() as u8))
+            && buf
+                .get(pos.saturating_add(1)..pos.saturating_add(1 + STREAM_DUMP_MARKER_V2.len()))
+                .is_some_and(|marker| {
+                    marker == STREAM_DUMP_MARKER_V1 || marker == STREAM_DUMP_MARKER_V2
+                });
+        !has_owned_marker
+    }
+
     pub fn save<W: RdbWriter>(stream: &ValkeyStream, w: &mut W) {
         w.write_string(STREAM_DUMP_MARKER_V2);
         w.write_len(stream.len() as u64);
@@ -142,7 +157,12 @@ impl StreamCodec {
         decode_legacy_listpack_nodes(&mut cursor, &mut builder).ok_or(StreamLoadError::Invalid)?;
         decode_legacy_metadata(&mut cursor, &mut builder, has_offsets)
             .ok_or(StreamLoadError::Invalid)?;
-        decode_legacy_groups(&mut cursor, &mut builder, has_offsets)?;
+        decode_legacy_groups(
+            &mut cursor,
+            &mut builder,
+            has_offsets,
+            type_byte >= RDB_TYPE_STREAM_LISTPACKS_3,
+        )?;
         builder
             .validate_cross_references()
             .ok_or(StreamLoadError::Invalid)?;
@@ -223,6 +243,7 @@ struct LegacyPendingEntry {
 struct LegacyConsumer {
     name: Bytes,
     seen_time_ms: i64,
+    active_time_ms: i64,
     pending: Vec<StreamID>,
 }
 
@@ -269,7 +290,7 @@ impl StreamRestoreBuilder {
     }
 
     fn set_metadata(&mut self, metadata: LegacyStreamMetadata) -> Option<()> {
-        if metadata.length > 0 && self.node_ids.is_empty() {
+        if metadata.length != self.entries.len() as u64 {
             return None;
         }
         if self.metadata.replace(metadata).is_some() {
@@ -343,7 +364,7 @@ impl LegacyConsumer {
         RestoredStreamConsumer {
             name: self.name,
             seen_time_ms: self.seen_time_ms,
-            active_time_ms: Some(self.seen_time_ms),
+            active_time_ms: Some(self.active_time_ms),
             pending: self.pending,
         }
     }
@@ -399,10 +420,11 @@ fn decode_legacy_groups(
     cursor: &mut LegacyStreamCursor<'_>,
     builder: &mut StreamRestoreBuilder,
     has_offsets: bool,
+    has_active_time: bool,
 ) -> Result<(), StreamLoadError> {
     let group_count = cursor.read_plain_len().ok_or(StreamLoadError::Invalid)?;
     for _ in 0..group_count {
-        decode_legacy_group(cursor, builder, has_offsets)?;
+        decode_legacy_group(cursor, builder, has_offsets, has_active_time)?;
     }
     Ok(())
 }
@@ -411,6 +433,7 @@ fn decode_legacy_group(
     cursor: &mut LegacyStreamCursor<'_>,
     builder: &mut StreamRestoreBuilder,
     has_offsets: bool,
+    has_active_time: bool,
 ) -> Result<(), StreamLoadError> {
     let name = Bytes::from(cursor.read_rdb_string().ok_or(StreamLoadError::Invalid)?);
     let last_id = cursor
@@ -422,7 +445,7 @@ fn decode_legacy_group(
         Some(builder.legacy_entries_read(last_id))
     };
     let pending = decode_legacy_global_pel(cursor).ok_or(StreamLoadError::Invalid)?;
-    let consumers = decode_legacy_consumers(cursor)?;
+    let consumers = decode_legacy_consumers(cursor, has_active_time)?;
     builder
         .add_group(LegacyGroup {
             name,
@@ -457,6 +480,7 @@ fn decode_legacy_global_pel(
 
 fn decode_legacy_consumers(
     cursor: &mut LegacyStreamCursor<'_>,
+    has_active_time: bool,
 ) -> Result<Vec<LegacyConsumer>, StreamLoadError> {
     let consumer_count = cursor.read_plain_len().ok_or(StreamLoadError::Invalid)?;
     let mut consumers = Vec::new();
@@ -467,6 +491,11 @@ fn decode_legacy_consumers(
             return Err(StreamLoadError::DuplicateConsumer);
         }
         let seen_time_ms = cursor.read_i64_raw().ok_or(StreamLoadError::Invalid)?;
+        let active_time_ms = if has_active_time {
+            cursor.read_i64_raw().ok_or(StreamLoadError::Invalid)?
+        } else {
+            seen_time_ms
+        };
         let pending_count = cursor.read_plain_len().ok_or(StreamLoadError::Invalid)?;
         let mut pending = Vec::new();
         let mut pending_ids = HashSet::new();
@@ -482,6 +511,7 @@ fn decode_legacy_consumers(
         consumers.push(LegacyConsumer {
             name,
             seen_time_ms,
+            active_time_ms,
             pending,
         });
     }
@@ -582,7 +612,7 @@ fn decode_legacy_stream_listpack(primary_id: StreamID, lp: &[u8]) -> Option<Deco
         entry_ids.push(id);
         live_entries.extend(entry);
     }
-    cursor.is_done().then_some(DecodedLegacyListpack {
+    (cursor.is_done() && live_entries.len() == entry_count).then_some(DecodedLegacyListpack {
         entry_ids,
         live_entries,
     })
@@ -939,7 +969,7 @@ mod tests {
         save_len(out, spec.metadata.length);
         save_len(out, spec.metadata.last_id.ms);
         save_len(out, spec.metadata.last_id.seq);
-        if spec.type_byte == RDB_TYPE_STREAM_LISTPACKS_2 {
+        if spec.type_byte >= RDB_TYPE_STREAM_LISTPACKS_2 {
             save_len(out, spec.metadata.first_id.ms);
             save_len(out, spec.metadata.first_id.seq);
             save_len(out, spec.metadata.max_deleted_entry_id.ms);
@@ -953,7 +983,7 @@ mod tests {
         append_rdb_string(out, &group.name);
         save_len(out, group.last_id.ms);
         save_len(out, group.last_id.seq);
-        if type_byte == RDB_TYPE_STREAM_LISTPACKS_2 {
+        if type_byte >= RDB_TYPE_STREAM_LISTPACKS_2 {
             save_len(out, group.entries_read);
         }
     }
@@ -967,11 +997,14 @@ mod tests {
         }
     }
 
-    fn append_legacy_consumers(out: &mut Vec<u8>, group: &LegacyGroupFixture) {
+    fn append_legacy_consumers(out: &mut Vec<u8>, type_byte: u8, group: &LegacyGroupFixture) {
         save_len(out, group.consumers.len() as u64);
         for consumer in &group.consumers {
             append_rdb_string(out, &consumer.name);
             out.extend_from_slice(&consumer.seen_time_ms.to_le_bytes());
+            if type_byte >= RDB_TYPE_STREAM_LISTPACKS_3 {
+                out.extend_from_slice(&(consumer.seen_time_ms - 5).to_le_bytes());
+            }
             save_len(out, consumer.pending.len() as u64);
             for id in &consumer.pending {
                 out.extend_from_slice(&encode_stream_id(id));
@@ -993,7 +1026,7 @@ mod tests {
             phase_ends.push(body.len());
             append_legacy_global_pel(&mut body, group);
             phase_ends.push(body.len());
-            append_legacy_consumers(&mut body, group);
+            append_legacy_consumers(&mut body, spec.type_byte, group);
         }
         LegacyFixture { body, phase_ends }
     }
@@ -1029,6 +1062,31 @@ mod tests {
             )
             .unwrap();
         stream
+    }
+
+    #[test]
+    fn third_version_stream_restores_consumer_active_time() {
+        let spec = legacy_fixture_spec(RDB_TYPE_STREAM_LISTPACKS_3, StreamID::new(1, 1));
+        let fixture = encode_legacy_fixture(&spec);
+        let stream = load_legacy_fixture(&fixture, RDB_TYPE_STREAM_LISTPACKS_3)
+            .expect("valid third-version stream");
+        let consumer = stream
+            .group(b"group")
+            .expect("group")
+            .consumers
+            .get(b"alice" as &[u8])
+            .expect("consumer");
+        assert_eq!(consumer.seen_time_ms, 100);
+        assert_eq!(consumer.active_time_ms, Some(95));
+    }
+
+    #[test]
+    fn legacy_listpack_rejects_live_deleted_split_mismatch() {
+        let mut items = minimal_legacy_listpack_items();
+        items[0] = b"0".to_vec();
+        items[1] = b"1".to_vec();
+        let listpack = listpack_encode(&items);
+        assert!(decode_legacy_stream_listpack(StreamID::new(1, 1), &listpack).is_none());
     }
 
     #[test]

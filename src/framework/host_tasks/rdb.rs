@@ -39,6 +39,7 @@ pub(crate) struct RdbLoadTask {
     dataset: DbSet,
     visibility: DatasetVisibility,
     progress_interval_bytes: u64,
+    skip_codec_checksums: bool,
 }
 
 pub(crate) struct DebugRdbTask {
@@ -145,13 +146,37 @@ impl RdbLoadTask {
             dataset,
             visibility,
             progress_interval_bytes,
+            skip_codec_checksums: false,
         }
+    }
+
+    pub(crate) fn with_skip_codec_checksums(mut self, skip: bool) -> Self {
+        self.skip_codec_checksums = skip;
+        self
     }
 
     pub(crate) fn run(
         &mut self,
         dispatcher: &mut HostDispatcher<'_>,
     ) -> Result<RdbDecodedMetadata, RdbTaskError> {
+        if self.source_offset == 0 {
+            let decoded = crate::foundation::io::persistence::rdb::compression::decode_rdb_stream(
+                &self.bytes,
+                self.skip_codec_checksums,
+            )
+            .map_err(|error| {
+                crate::server_log!(warning, "{}", error.message());
+                RdbTaskError::Load(LoadError::Corrupt)
+            })?;
+            if let Some(decoded) = decoded {
+                crate::server_log!(
+                    notice,
+                    "Logical RDB CRC64 skipped for streaming-compressed input"
+                );
+                self.decoder.skip_checksum();
+                self.bytes = decoded.bytes;
+            }
+        }
         loop {
             match self.decoder.step(&mut self.dataset)? {
                 RdbStep::Finished(metadata) => {

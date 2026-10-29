@@ -18,6 +18,7 @@ pub enum ExpiredKeyPolicy {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RdbDecodePolicy {
     pub strict_version: bool,
+    pub skip_checksum: bool,
     pub allow_duplicate_keys: bool,
     pub expired_keys: ExpiredKeyPolicy,
     pub key_load_delay_us: i64,
@@ -29,6 +30,7 @@ impl RdbDecodePolicy {
     pub fn replication(strict_version: bool, key_load_delay_us: i64) -> Self {
         Self {
             strict_version,
+            skip_checksum: false,
             allow_duplicate_keys: false,
             expired_keys: ExpiredKeyPolicy::Retain,
             key_load_delay_us,
@@ -40,6 +42,7 @@ impl RdbDecodePolicy {
     pub fn persisted(strict_version: bool, key_load_delay_us: i64) -> Self {
         Self {
             strict_version,
+            skip_checksum: false,
             allow_duplicate_keys: false,
             expired_keys: ExpiredKeyPolicy::Skip,
             key_load_delay_us,
@@ -118,6 +121,10 @@ pub struct RdbDecoder {
 }
 
 impl RdbDecoder {
+    pub fn skip_checksum(&mut self) {
+        self.policy.skip_checksum = true;
+    }
+
     pub fn new(strict: bool) -> Self {
         Self::with_policy(RdbDecodePolicy::replication(strict, 0))
     }
@@ -439,7 +446,7 @@ impl RdbDecoder {
                         let stored = u64::from_le_bytes(input[pos..pos + 8].try_into().unwrap());
                         // Advance CRC over the EOF opcode byte only, then compare.
                         let crc = crc64(self.crc, &input[..pos]);
-                        if stored != 0 && crc != stored {
+                        if !self.policy.skip_checksum && stored != 0 && crc != stored {
                             return Err(LoadError::CrcError);
                         }
                         pos += 8;

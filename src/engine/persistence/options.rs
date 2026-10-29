@@ -1,4 +1,5 @@
 use crate::engine::extension::config::PersistenceConfig;
+use crate::foundation::io::persistence::rdb::compression::RdbCompression;
 use crate::foundation::io::persistence::AofFsync;
 use std::path::PathBuf;
 
@@ -7,7 +8,7 @@ pub struct RdbSaveOptions {
     pub dir: PathBuf,
     pub filename: String,
     pub key_delay_us: i64,
-    pub compression: bool,
+    pub compression: RdbCompression,
     pub checksum: bool,
     pub incremental_fsync: bool,
 }
@@ -59,7 +60,7 @@ mod tests {
         config.dir = "/data".to_string();
         config.dbfilename = "snapshot.rdb".to_string();
         config.rdb_key_save_delay = 7;
-        config.rdbcompression = false;
+        config.rdbcompression = super::RdbCompression::No;
         config.rdbchecksum = false;
         config.aof_filename = "commands.aof".to_string();
         config.aof_appenddirname = "aof".to_string();
@@ -72,7 +73,7 @@ mod tests {
                 dir: PathBuf::from("/data"),
                 filename: "snapshot.rdb".to_string(),
                 key_delay_us: 7,
-                compression: false,
+                compression: super::RdbCompression::No,
                 checksum: false,
                 incremental_fsync: true,
             }

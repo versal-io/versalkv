@@ -802,7 +802,7 @@ impl Server {
                         use_rdb_preamble: persistence.aof_use_rdb_preamble,
                         timestamp_enabled: persistence.aof_timestamp_enabled,
                         key_delay_us: persistence.rdb_key_save_delay,
-                        rdb_compression: persistence.rdbcompression,
+                        rdb_compression: persistence.rdbcompression.uses_lzf(),
                         incremental_fsync: persistence.aof_rewrite_incremental_fsync,
                     };
                 let pid = process::id() as i32;

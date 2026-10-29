@@ -91,6 +91,7 @@ pub(crate) fn prepare_lua_task(
     ctx: &mut ServerContext,
 ) -> Result<PreparedHostTask, Value> {
     let name = String::from_utf8_lossy(&args.name).to_ascii_lowercase();
+    ctx.script_mut().debug_session = None;
     match name.as_str() {
         "eval" => prepare_eval(conn, args, ctx, false, false),
         "eval_ro" => prepare_eval(conn, args, ctx, true, false),
@@ -199,6 +200,9 @@ fn prepare_eval(
     }
     run.check_cluster_slots(&keys).map_err(Value::error)?;
     run.start_timer();
+    if crate::framework::commands::scripting::script_cmd::script_debug_enabled() {
+        ctx.script_mut().debug_session = Some(conn.session_id());
+    }
 
     let propagation_frame = (!readonly).then(|| {
         let mut parts: Vec<&[u8]> = Vec::with_capacity(3 + keys.len() + argv.len());

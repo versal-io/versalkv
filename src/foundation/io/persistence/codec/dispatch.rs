@@ -183,9 +183,7 @@ pub fn load_typed_object_with_hash_field_expires_detailed(
 ) -> Result<(Robj, HashMap<Vec<u8>, u64>), ObjectLoadError> {
     let type_byte = *buf.get(*pos).ok_or(ObjectLoadError::Invalid)?;
     *pos += 1;
-    if type_byte == super::types::RDB_TYPE_STREAM_LISTPACKS
-        || type_byte == super::types::RDB_TYPE_STREAM_LISTPACKS_2
-    {
+    if stream::StreamCodec::is_legacy_encoding(buf, *pos, type_byte) {
         let stream = stream::StreamCodec::load_legacy_listpacks_detailed(buf, pos, type_byte)
             .map_err(|error| match error {
                 stream::StreamLoadError::DuplicateConsumer => {

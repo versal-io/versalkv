@@ -380,7 +380,7 @@ fn rewrite_file_options(ctx: &ServerContext) -> AofRewriteFileOptions {
         use_rdb_preamble: config.aof_use_rdb_preamble,
         timestamp_enabled: config.aof_timestamp_enabled,
         key_delay_us: config.rdb_key_save_delay,
-        rdb_compression: config.rdbcompression,
+        rdb_compression: config.rdbcompression.uses_lzf(),
         incremental_fsync: config.aof_rewrite_incremental_fsync,
     }
 }

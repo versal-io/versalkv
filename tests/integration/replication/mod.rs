@@ -904,11 +904,12 @@ fn reconnect_uses_partial_resync_for_retained_backlog() {
         "initial full resync did not complete"
     );
 
-    assert_eq!(
-        replica_client.command(&[b"REPLICAOF", b"NO", b"ONE"]),
-        b"+OK\r\n"
-    );
+    send_signal(replica.pid() as i32, ProcessSignal::Stop).expect("pause replica");
     let mut master_client = master.connect();
+    assert_eq!(
+        master_client.command(&[b"CLIENT", b"KILL", b"TYPE", b"replica"]),
+        b":1\r\n"
+    );
     assert_eq!(
         master_client.command(&[b"SET", b"while-down", b"retained"]),
         b"+OK\r\n"
@@ -923,10 +924,7 @@ fn reconnect_uses_partial_resync_for_retained_backlog() {
         "replication backlog should retain the disconnected write: {replication_info}"
     );
 
-    assert_eq!(
-        replica_client.command(&[b"REPLICAOF", b"127.0.0.1", master_port.as_bytes()]),
-        b"+OK\r\n"
-    );
+    send_signal(replica.pid() as i32, ProcessSignal::Continue).expect("resume replica");
     assert!(
         wait_until(
             || { replica.connect().command(&[b"GET", b"while-down"]) == b"$8\r\nretained\r\n" },

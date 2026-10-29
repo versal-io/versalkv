@@ -216,6 +216,20 @@ pub(crate) fn reset_lua_runtime() {
     });
 }
 
+/// Copy a selected debugger global into an owned protocol value while its Lua
+/// handle is alive. Never recreate a runtime to service a stale debug session.
+pub(crate) fn debug_global(name: &str) -> Option<crate::foundation::io::protocol::Value> {
+    if !matches!(name, "ARGV" | "KEYS") {
+        return None;
+    }
+    LUA_RUNTIME.with(|runtime| {
+        let runtime = runtime.try_borrow().ok()?;
+        let runtime = runtime.as_ref()?;
+        let value = runtime.lua.globals().raw_get::<LuaValue>(name).ok()?;
+        Some(super::convert::lua_value_to_value_resp(&value, 2))
+    })
+}
+
 pub(crate) fn clear_function_tables() {
     LUA_RUNTIME.with(|runtime| {
         let mut runtime = runtime.borrow_mut();

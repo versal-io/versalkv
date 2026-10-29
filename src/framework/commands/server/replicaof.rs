@@ -62,10 +62,7 @@ pub fn replicaof(
                 ctx.replication_mut().rebind_replica_resume_on_next_reconnect = true;
             }
         } else if was_replica {
-            ctx.replication_mut().backlog.shift_replication_id();
-            ctx.replication_mut().role =
-                crate::engine::distributed::replication::ReplicationRole::Primary;
-            crate::foundation::io::sys::log::set_log_role_primary();
+            ctx.replication_mut().switch_to_primary();
         }
         if current_target != previous_target {
             ctx.replication_mut().pending_replicaof_request = true;

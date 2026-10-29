@@ -991,7 +991,7 @@ impl ServerWorkerState {
             Some(&replication),
             &slot_imports,
             crate::foundation::io::persistence::RdbSerializeOptions {
-                compression: self.ctx.config().persistence.rdbcompression,
+                compression: self.ctx.config().persistence.rdbcompression.uses_lzf(),
                 checksum: true,
             },
         );
@@ -1109,6 +1109,9 @@ impl ServerWorkerState {
         }
         self.ctx.replication_mut().pending_replicaof_request = false;
         self.abort_replica_session_for_role_change();
+        if !self.ctx.replication().is_replica() {
+            self.replication_runtime.clear_replica_resume();
+        }
         self.schedule_master_reconnect(MasterReconnectCause::ExplicitTargetChange);
         if self.ctx.replication().cache_primary_on_next_reconnect {
             let master = crate::framework::distributed::replication::MasterInfo {
@@ -1139,7 +1142,7 @@ impl ServerWorkerState {
                 // replaced with this primary's current history, matching C's
                 // discard + replicationCachePrimaryUsingMyself sequence. A
                 // classic cached cursor matching replid2 is still the valid
-                // former-upstream position and must survive a detach/reattach.
+                // former-upstream position for a direct target change.
                 let selected_db = self.ctx.repl_seldb().max(0) as u32;
                 self.replication_runtime.set_replica_resume(
                     master,
@@ -1691,7 +1694,7 @@ impl ServerWorkerState {
                         Some(&replication),
                         &slot_imports,
                         crate::foundation::io::persistence::RdbSerializeOptions {
-                            compression: self.ctx.config().persistence.rdbcompression,
+                            compression: self.ctx.config().persistence.rdbcompression.uses_lzf(),
                             checksum: true,
                         },
                     ),

@@ -1,3 +1,4 @@
+use crate::foundation::io::persistence::rdb::compression::RdbCompression;
 use crate::foundation::io::persistence::AofFsync;
 
 #[derive(Clone, Debug)]
@@ -45,7 +46,7 @@ pub struct PersistenceConfig {
     pub dir: String,
     pub dbfilename: String,
     pub rdb_version_check_relaxed: bool,
-    pub rdbcompression: bool,
+    pub rdbcompression: RdbCompression,
     pub rdbchecksum: bool,
     pub rdb_save_incremental_fsync: bool,
     pub rdb_del_sync_files: bool,
@@ -76,7 +77,7 @@ impl PersistenceConfig {
             dir: "./".to_string(),
             dbfilename: "dump.rdb".to_string(),
             rdb_version_check_relaxed: false,
-            rdbcompression: true,
+            rdbcompression: RdbCompression::Yes,
             rdbchecksum: true,
             rdb_save_incremental_fsync: true,
             rdb_del_sync_files: false,

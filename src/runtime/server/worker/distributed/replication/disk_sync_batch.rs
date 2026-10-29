@@ -844,9 +844,10 @@ impl ServerWorkerState {
             .as_ref()
             .is_some_and(DiskSyncBatch::is_empty);
         if should_remove {
+            let should_keep_snapshot = !self.ctx.config().persistence.rdb_del_sync_files
+                || !self.ctx.config().persistence.saveparams.is_empty();
             let persistence = self.full_sync.disk_sync_batch.as_ref().and_then(|batch| {
-                batch
-                    .persist_when_targetless
+                (batch.persist_when_targetless || should_keep_snapshot)
                     .then(|| (batch.snapshot_path.clone(), batch.dirty_at_fork))
             });
             if let Some((snapshot_path, dirty_at_fork)) = persistence {
@@ -1431,9 +1432,20 @@ mod tests {
         ));
         let snapshot = b"snapshot".to_vec();
         std::fs::write(&snapshot_path, &snapshot).unwrap();
+        let saved_path = snapshot_path.with_extension("saved.rdb");
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let mut runtime = ServerWorkerState::new(1).unwrap();
+        runtime.ctx.config_mut().persistence.dir = snapshot_path
+            .parent()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        runtime.ctx.config_mut().persistence.dbfilename = saved_path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
         let peer = runtime.transport.connect_tcp(address).unwrap();
         let (mut replica, _) = listener.accept().unwrap();
         replica
@@ -1484,6 +1496,8 @@ mod tests {
         assert_eq!(received, expected);
         assert!(runtime.full_sync.disk_sync_batch.is_none());
         assert!(!snapshot_path.exists());
+        assert_eq!(std::fs::read(&saved_path).unwrap(), snapshot);
+        std::fs::remove_file(saved_path).unwrap();
     }
 
     fn add_replica(
