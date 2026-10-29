@@ -85,6 +85,10 @@ safety.
 
 ## Testing
 
+- Never modify `runtest`, `runtest-sentinel`, `runtest-moduleapi`, other
+  `runtest*` scripts, or their supporting test-runner scripts. Fix regression
+  failures in owned Rust implementation code instead of changing the harness.
+
 ### 1. Integration regression (mainline): `./runtest`
 
 Reuses the upstream Valkey Tcl suite. Takes no arguments; runs debug build,
@@ -97,8 +101,7 @@ permanently skipped. Default concurrency must be preserved.
   specifications. Never modify, patch, relax, replace, filter, or add retries
   around them to make a failure pass.
 - Do not add test skips or reduce test concurrency. Fix failures in owned
-  implementation code or in generic harness behavior without weakening
-  upstream coverage.
+  Rust implementation code without weakening upstream coverage.
 
 ### 2. Sentinel regression: `./runtest-sentinel`
 
@@ -118,6 +121,8 @@ entries.
 
 ## Code style
 
+- Git commit messages must be written entirely in English, including both the
+  subject and body.
 - Follow official Rust style; run `make fmt` and ensure `make clippy` is
   warning-free before committing.
 - Keep changes minimal and focused; avoid mixing unrelated refactors.
