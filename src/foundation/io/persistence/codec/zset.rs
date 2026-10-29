@@ -8,40 +8,53 @@ use crate::foundation::io::persistence::codec::RdbWriter;
 use crate::foundation::io::store::structure::zset::{ZSetLp, ZSetSl};
 use crate::foundation::io::store::Robj;
 use crate::foundation::memory::value::ZSetOps;
+use std::collections::HashSet;
 
 pub struct ZSetCodec;
 
 impl CodecLoad for ZSetCodec {
     fn load_dispatch(buf: &[u8], pos: &mut usize, type_byte: u8) -> Option<Robj> {
-        if type_byte == RDB_TYPE_ZSET_LISTPACK {
+        if matches!(type_byte, RDB_TYPE_ZSET_LISTPACK | RDB_TYPE_ZSET_ZIPLIST) {
             let data = decoder::load_string(buf, pos)?;
-            validate_zset_listpack(&data)?;
-            return Some(Robj::ZSetListpack(ZSetLp::from_raw_bytes(data)?));
+            let items = if type_byte == RDB_TYPE_ZSET_LISTPACK {
+                decoder_compact::listpack_decode(&data)?
+            } else {
+                decoder_compact::ziplist_decode(&data)?
+            };
+            validate_zset_compact_items(&items)?;
+            let listpack = if type_byte == RDB_TYPE_ZSET_LISTPACK {
+                data
+            } else {
+                decoder_compact::listpack_encode(&items)
+            };
+            return Some(Robj::ZSetListpack(ZSetLp::from_raw_bytes(listpack)?));
         }
         let zset = ZSetCodec::load(buf, pos, type_byte)?;
         Some(Robj::ZSetSkiplist(zset))
     }
 }
 
-fn validate_zset_listpack(data: &[u8]) -> Option<()> {
-    let items = decoder_compact::listpack_decode(data)?;
-    load_zset_compact_items(items).map(|_| ())
-}
-
-fn load_zset_compact_items(items: Vec<Vec<u8>>) -> Option<ZSetSl> {
+fn validate_zset_compact_items(items: &[Vec<u8>]) -> Option<()> {
     if !items.len().is_multiple_of(2) {
         return None;
     }
+    let mut members = HashSet::with_capacity(items.len() / 2);
+    for pair in items.as_chunks::<2>().0 {
+        let score = crate::foundation::io::persistence::codec::types::parse_double(&pair[1])?;
+        if score.is_nan() || !members.insert(pair[0].as_slice()) {
+            return None;
+        }
+    }
+    Some(())
+}
+
+fn load_zset_compact_items(items: Vec<Vec<u8>>) -> Option<ZSetSl> {
+    validate_zset_compact_items(&items)?;
     let mut zset = ZSetSl::new();
     let mut it = items.into_iter();
     while let (Some(member), Some(score_raw)) = (it.next(), it.next()) {
         let score = crate::foundation::io::persistence::codec::types::parse_double(&score_raw)?;
-        if score.is_nan() {
-            return None;
-        }
-        if !ZSetOps::add(&mut zset, &member, score).ok()? {
-            return None;
-        }
+        ZSetOps::add(&mut zset, &member, score).ok()?;
     }
     Some(zset)
 }

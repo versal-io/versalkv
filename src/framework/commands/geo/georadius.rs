@@ -30,12 +30,13 @@ pub fn georadius_generic(
         Err(e) => return e,
     };
 
+    let (max_entries, max_value_size) = runtime.zset_encoding_limits();
     let db = match runtime.db_mut() {
         Some(d) => d,
         None => return CommandError::db_index_out_of_range(),
     };
     let key = &args.args[0];
-    let map = match db.get_zset(key) {
+    let map = match db.get_zset_object(key) {
         Ok(None) => {
             if let Some((skey, _)) = &storekey {
                 db.del(skey);
@@ -52,10 +53,9 @@ pub fn georadius_generic(
         lat,
         radius_meters,
     };
-    let results = search_and_process(map.dict(), &shape, &opts, conversion);
+    let results = search_and_process(map, &shape, &opts, conversion);
 
     if let Some((skey, storedist)) = storekey {
-        use crate::foundation::io::store::structure::zset::ZSetSl;
         use crate::foundation::io::store::structure::hashtable::HashTable;
         use crate::foundation::io::store::Robj;
         let mut ht = HashTable::new();
@@ -66,8 +66,7 @@ pub fn georadius_generic(
         if ht.is_empty() {
             db.del(&skey);
         } else {
-            let zset = ZSetSl::from_dict(ht);
-            db.set(skey.to_vec(), Robj::ZSetSkiplist(zset));
+            db.set(skey.to_vec(), Robj::zset_from_dict_with_limits(ht, max_entries, max_value_size));
         }
         return Value::integer(results.len() as i64);
     }

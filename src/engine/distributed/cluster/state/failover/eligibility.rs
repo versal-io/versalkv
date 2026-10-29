@@ -65,6 +65,7 @@ pub struct ReplicaEligibility {
     pub cluster_view_stale: bool,
     pub loading: bool,
     pub priority: i64,
+    pub cluster_replica_priority: u32,
     pub replication_offset: i64,
     /// Raw time since the last interaction with the primary. The normal
     /// node-timeout detection allowance is removed before applying the
@@ -77,7 +78,7 @@ pub struct ReplicaEligibility {
 
 impl ReplicaEligibility {
     pub fn is_eligible(&self) -> bool {
-        if self.no_failover || self.cluster_view_stale || self.loading || self.priority == 0 {
+        if self.no_failover || self.cluster_view_stale || self.loading {
             return false;
         }
         if self.replica_validity_factor == 0 {
@@ -94,6 +95,7 @@ impl ReplicaEligibility {
     pub fn rank_key(&self) -> Option<ReplicaRankKey> {
         (!self.no_failover).then(|| ReplicaRankKey {
             replication_offset: self.replication_offset,
+            cluster_replica_priority: self.cluster_replica_priority,
             node_id: self.node_id.clone(),
         })
     }
@@ -102,6 +104,7 @@ impl ReplicaEligibility {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReplicaRankKey {
     pub replication_offset: i64,
+    pub cluster_replica_priority: u32,
     pub node_id: NodeId,
 }
 
@@ -110,6 +113,10 @@ impl Ord for ReplicaRankKey {
         other
             .replication_offset
             .cmp(&self.replication_offset)
+            .then_with(|| {
+                self.cluster_replica_priority
+                    .cmp(&other.cluster_replica_priority)
+            })
             .then_with(|| self.node_id.as_str().cmp(other.node_id.as_str()))
     }
 }

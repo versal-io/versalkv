@@ -212,6 +212,16 @@ impl<V: Clone> HashTable<V> {
         self.peak_len
     }
 
+    /// Retained bucket allocations, excluding inline storage and key payloads.
+    pub fn allocated_bytes(&self) -> usize {
+        self.tables
+            .iter()
+            .map(|table| {
+                (table.buckets.capacity() + table.child_buckets) * std::mem::size_of::<Bucket<V>>()
+            })
+            .sum()
+    }
+
     pub fn pause_auto_shrink(&mut self) {
         self.pause_auto_shrink += 1;
     }
@@ -236,17 +246,19 @@ impl<V: Clone> HashTable<V> {
     }
 
     pub fn get(&self, key: &[u8]) -> Option<&V> {
+        self.get_key_value(key).map(|(_, value)| value)
+    }
+
+    pub fn get_key_value(&self, key: &[u8]) -> Option<(&Bytes, &V)> {
         if self.is_empty() {
             return None;
         }
         let hash = hash_key(key);
         let (t, top, depth, pos) = self.find(hash, key)?;
-        Some(
-            &Self::bucket_at(&self.tables[t].buckets, top, depth).entries[pos]
-                .as_ref()
-                .unwrap()
-                .1,
-        )
+        let (stored_key, value) = Self::bucket_at(&self.tables[t].buckets, top, depth).entries[pos]
+            .as_ref()
+            .expect("find returned an occupied bucket position");
+        Some((stored_key, value))
     }
 
     pub fn contains_key(&self, key: &[u8]) -> bool {

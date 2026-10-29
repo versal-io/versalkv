@@ -18,7 +18,7 @@
 
 use super::super::super::ServerWorkerState;
 use crate::engine::distributed::replication::backlog::ReplicationBacklog;
-use crate::foundation::io::persistence::StreamStep;
+use crate::foundation::io::persistence::{RdbStep, StreamStep};
 use crate::framework::capabilities::io::Token;
 use crate::framework::distributed::replication::{
     ConnectionId, LinkError, MasterReconnectCause, ReplicaAction, ReplicaEvent, ReplicaLink,
@@ -73,6 +73,19 @@ struct DualChunkContext {
     main: ConnectionId,
     rdb_token_value: usize,
     rdb_connection_token: usize,
+}
+
+fn disk_backed_transfer_is_pending(link: &ReplicaLink) -> bool {
+    if link.rdb_load_mode()
+        != Some(crate::framework::distributed::replication::RdbLoadMode::DiskBacked)
+    {
+        return false;
+    }
+    if link.is_dual_rdb_mode_active() {
+        !link.rdb_framing_is_complete()
+    } else {
+        !link.is_streaming()
+    }
 }
 
 fn rdb_phase_matches_operation(link: &ReplicaLink, operation: BlockedOperation) -> bool {
@@ -286,14 +299,14 @@ impl ServerWorkerState {
             ResumeDecision::Resume(link) => link,
             ResumeDecision::Aborted => return None,
         };
-        if self
-            .drive_streaming_decode(context.token_value, context.connection_token, &mut link)
-            .is_err()
-        {
-            self.replication_runtime.set_replica_link(link);
-            self.tear_down_master_link(context.token_value);
-            return None;
-        }
+        link = match self.drive_replica_rdb_decode(
+            link,
+            context.connection_token,
+            BlockedOperation::ClassicRdb { main },
+        ) {
+            ResumeDecision::Resume(link) => link,
+            ResumeDecision::Aborted => return None,
+        };
         Some(ClassicChunkResult {
             link,
             events: decoded.events,
@@ -426,11 +439,14 @@ impl ServerWorkerState {
         }
     }
 
-    /// Mirror C replication.c:2477-2501: `swapdb` with a matching master replid
-    /// takes the non-blocking `async_loading` path (old dataset stays readable);
-    /// otherwise the blocking `loading` path (reads/writes rejected). Idempotent —
-    /// safe to call on every RDB-phase chunk.
+    /// Disk-backed transfers keep serving the old dataset until all RDB framing
+    /// is received, matching C's background file download before disk loading.
+    /// Socket loading starts with the first payload; `swapdb` with the same
+    /// primary replid keeps the old dataset readable through `async_loading`.
     fn apply_streaming_loading_gate(&mut self, link: &ReplicaLink) {
+        if disk_backed_transfer_is_pending(link) {
+            return;
+        }
         let swapdb = link.rdb_load_mode()
             == Some(crate::framework::distributed::replication::RdbLoadMode::Swap);
         let same_replid = link
@@ -465,6 +481,92 @@ impl ServerWorkerState {
         }
     }
 
+    fn log_disk_backed_transfer_started(&self, link: &mut ReplicaLink) {
+        if link.rdb_load_mode()
+            == Some(crate::framework::distributed::replication::RdbLoadMode::DiskBacked)
+            && link
+                .rdb_receive_mut()
+                .is_some_and(|receive| receive.mark_transfer_started())
+        {
+            crate::server_log!(
+                notice,
+                "PRIMARY <-> REPLICA sync: receiving streamed RDB from primary for persistence to disk (buffering in memory; delayed installation after transfer completes)"
+            );
+        }
+    }
+
+    /// File-style downloads are complete before decoding starts, so socket
+    /// reads no longer provide event-service boundaries. Yield on consumed RDB
+    /// bytes while retaining the same protected operation and session checks.
+    fn drive_replica_rdb_decode(
+        &mut self,
+        mut link: ReplicaLink,
+        connection_token: usize,
+        operation: BlockedOperation,
+    ) -> ResumeDecision<ReplicaLink> {
+        let main = blocked_operation_main(operation);
+        self.log_disk_backed_transfer_started(&mut link);
+        let can_decode_file = link.rdb_load_mode()
+            == Some(crate::framework::distributed::replication::RdbLoadMode::DiskBacked)
+            && !disk_backed_transfer_is_pending(&link)
+            && link.has_received_rdb_payload();
+        if can_decode_file {
+            let is_uninit = link.rdb_receive_mut().is_some_and(|recv| recv.is_uninit());
+            if self.init_streaming_target(&mut link).is_err() {
+                self.replication_runtime.set_replica_link(link);
+                self.tear_down_master_link(main.0);
+                return ResumeDecision::Aborted;
+            }
+            if is_uninit {
+                // Decode progress must not inherit bytes counted while the
+                // complete snapshot was being downloaded.
+                self.classic_rdb_loading_progress.reset();
+                self.classic_rdb_loading_progress
+                    .begin_session(link.session_id());
+            }
+            loop {
+                let key_load_delay_us = self.ctx.config().persistence.key_load_delay;
+                let Some(recv) = link.rdb_receive_mut() else {
+                    break;
+                };
+                let before = recv.consumed_bytes();
+                let step = recv.step(self.ctx.dbs_mut(), key_load_delay_us);
+                let consumed_delta = recv.consumed_bytes().saturating_sub(before);
+                match step {
+                    Ok(RdbStep::NeedInput) => return ResumeDecision::Resume(link),
+                    Ok(RdbStep::Finished(_)) => break,
+                    Ok(RdbStep::RecordApplied) => {
+                        link = match self.service_rdb_progress_boundary(
+                            link,
+                            operation,
+                            consumed_delta,
+                        ) {
+                            ResumeDecision::Resume(link) => link,
+                            ResumeDecision::Aborted => return ResumeDecision::Aborted,
+                        };
+                    }
+                    Err(error) => {
+                        super::replica_apply::log_rdb_decode_error(&error);
+                        self.replication_runtime.set_replica_link(link);
+                        self.tear_down_master_link(main.0);
+                        return ResumeDecision::Aborted;
+                    }
+                }
+            }
+        }
+        // Socket modes still decode each bounded read. A completed file load
+        // reaches this driver only for its existing terminal commit.
+        if self
+            .drive_streaming_decode(main.0, connection_token, &mut link)
+            .is_err()
+        {
+            self.replication_runtime.set_replica_link(link);
+            self.tear_down_master_link(main.0);
+            return ResumeDecision::Aborted;
+        }
+        ResumeDecision::Resume(link)
+    }
+
     /// Drive the paced decode against the target `DbSet`. On the first drive it
     /// selects the target (swapdb temp vs. flushed serving DbSet) and logs the
     /// "Loading DB in memory" notice. On `Finished` it runs the terminal commit;
@@ -487,10 +589,12 @@ impl ServerWorkerState {
         if link.rdb_receive_mut().is_none() || (is_dual_mode && !framing_owned_by_rdb) {
             return Ok(());
         }
-        if !link.has_received_rdb_payload() {
+        self.log_disk_backed_transfer_started(link);
+        if !link.has_received_rdb_payload() || disk_backed_transfer_is_pending(link) {
             return Ok(());
         }
-        // Choose the decode target once, when the first body bytes are buffered.
+        // Socket loads start on the first payload. Disk-backed loads wait for
+        // the complete transfer before decoding or applying key-load-delay.
         self.init_streaming_target(link).map_err(|_| ())?;
         let key_load_delay_us = self.ctx.config().persistence.key_load_delay;
         let step = {
@@ -557,6 +661,12 @@ impl ServerWorkerState {
             Some(recv) if recv.is_uninit() => {}
             _ => return Ok(()),
         }
+        if let Some(recv) = link.rdb_receive_mut() {
+            recv.set_zset_limits(
+                self.ctx.config().encoding.zset_max_ziplist_entries as usize,
+                self.ctx.config().encoding.zset_max_ziplist_value as usize,
+            );
+        }
         let load_mode = link
             .rdb_load_mode()
             .unwrap_or(crate::framework::distributed::replication::RdbLoadMode::Direct);
@@ -583,12 +693,6 @@ impl ServerWorkerState {
             self.reset_downstream_after_full_sync(link.connection_id());
         }
         self.ctx.config_mut().replication.master_link_status = "sync".to_string();
-        if disk_backed {
-            crate::server_log!(
-                notice,
-                "PRIMARY <-> REPLICA sync: receiving streamed RDB from primary for persistence to disk (buffering in memory; delayed installation after transfer completes)"
-            );
-        }
         crate::server_log!(notice, "PRIMARY <-> REPLICA sync: Loading DB in memory");
         if swapdb || disk_backed {
             let temp = self.ctx.dbs().empty_like();
@@ -874,19 +978,10 @@ impl ServerWorkerState {
             ResumeDecision::Resume(link) => link,
             ResumeDecision::Aborted => return None,
         };
-        if self
-            .drive_streaming_decode(
-                context.rdb_token_value,
-                context.rdb_connection_token,
-                &mut link,
-            )
-            .is_err()
-        {
-            self.replication_runtime.set_replica_link(link);
-            self.tear_down_master_link(context.main.0);
-            return None;
+        match self.drive_replica_rdb_decode(link, context.rdb_connection_token, operation) {
+            ResumeDecision::Resume(link) => Some(link),
+            ResumeDecision::Aborted => None,
         }
-        Some(link)
     }
 
     pub(crate) fn recv_rdb_channel_streaming_chunk(
@@ -1201,6 +1296,161 @@ mod tests {
         )
         .expect("enter classic RDB receive");
         link
+    }
+
+    fn assert_disk_backed_transfer_preserves_reads(is_diskless: bool) {
+        use crate::framework::capabilities::connection::Connection;
+
+        let directory = std::env::temp_dir().join(format!(
+            "versal-rdb-transfer-{}-{:?}-{is_diskless}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut runtime = ServerWorkerState::new(1).unwrap();
+        runtime.ctx.config_mut().persistence.dir = directory.to_string_lossy().into_owned();
+        runtime.ctx.config_mut().replication.repl_diskless_load = "disabled".to_string();
+        runtime
+            .ctx
+            .db_mut(0)
+            .unwrap()
+            .set(b"old".to_vec(), Robj::string("value"));
+        let mut connection = Connection::new_fake();
+        connection.set_token_for_test(Token(41));
+        let connection_token = runtime.connection_registry.insert(connection);
+        let mut link = ReplicaLink::new(
+            ConnectionId(41),
+            MasterInfo {
+                host: "127.0.0.1".to_string(),
+                port: 6379,
+            },
+        );
+        link.set_dual_channel_enabled(false);
+        link.connected(None, None);
+        link.on_bytes(b"+PONG\r\n+OK\r\n+OK\r\n", 6380).unwrap();
+
+        let mut rdb = b"VALKEY080\x00".to_vec();
+        crate::foundation::io::persistence::save_string(&mut rdb, b"new");
+        crate::foundation::io::persistence::save_string(&mut rdb, b"value");
+        rdb.push(0);
+        crate::foundation::io::persistence::save_string(&mut rdb, b"tail");
+        crate::foundation::io::persistence::save_string(&mut rdb, &[b'x'; 256]);
+        rdb.push(0xff);
+        rdb.extend_from_slice(&[0; 8]);
+        let marker = "0123456789abcdef0123456789abcdef01234567";
+        let mut frame = format!("+FULLRESYNC {marker} 0\r\n").into_bytes();
+        if is_diskless {
+            frame.extend_from_slice(format!("$EOF:{marker}\r\n").as_bytes());
+        } else {
+            frame.extend_from_slice(format!("${}\r\n", rdb.len()).as_bytes());
+        }
+        frame.extend_from_slice(&rdb[..rdb.len() - 9]);
+        let context = ClassicChunkContext {
+            token_value: 41,
+            connection_token,
+            listening_port: 6380,
+            replica_announce_ip: "",
+        };
+
+        let mut received = runtime
+            .process_classic_rdb_chunk(link, &context, &frame)
+            .unwrap();
+
+        assert!(
+            !runtime.ctx.is_loading(),
+            "disk-backed transfer must keep the old dataset readable until framing completes"
+        );
+        assert!(!runtime.ctx.replication().async_loading);
+        assert!(runtime.ctx.db(0).unwrap().get_no_expire(b"old").is_some());
+        assert!(runtime.ctx.db(0).unwrap().get_no_expire(b"new").is_none());
+        assert_eq!(
+            received.link.rdb_receive_mut().unwrap().loaded(),
+            0,
+            "C receives the complete RDB before decoding a disk-backed transfer"
+        );
+
+        let mut terminal = rdb[rdb.len() - 9..].to_vec();
+        if is_diskless {
+            terminal.extend_from_slice(marker.as_bytes());
+        }
+        let completed = runtime
+            .process_classic_rdb_chunk(received.link, &context, &terminal)
+            .unwrap();
+
+        assert!(!runtime.ctx.is_loading());
+        assert!(!completed.link.has_pending_rdb_receive());
+        assert!(completed.link.can_ack_primary());
+        assert!(runtime.ctx.db(0).unwrap().get_no_expire(b"old").is_none());
+        assert_eq!(
+            runtime
+                .ctx
+                .db(0)
+                .unwrap()
+                .get_no_expire(b"new")
+                .unwrap()
+                .as_bytes(),
+            b"value"
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn disk_backed_length_transfer_keeps_old_dataset_readable() {
+        assert_disk_backed_transfer_preserves_reads(false);
+    }
+
+    #[test]
+    fn disk_backed_eof_transfer_keeps_old_dataset_readable() {
+        assert_disk_backed_transfer_preserves_reads(true);
+    }
+
+    #[test]
+    fn disk_backed_dual_transfer_waits_for_its_own_framing() {
+        let mut runtime = ServerWorkerState::new(1).unwrap();
+        runtime
+            .ctx
+            .db_mut(0)
+            .unwrap()
+            .set(b"old".to_vec(), Robj::string("value"));
+        let main = ConnectionId(41);
+        let mut link = ReplicaLink::new(
+            main,
+            MasterInfo {
+                host: "127.0.0.1".to_string(),
+                port: 6379,
+            },
+        );
+        link.pin_rdb_load_mode(RdbLoadMode::DiskBacked);
+        link.transition_rdb_channel_state(ReplicaRdbChannelState::Connecting)
+            .unwrap();
+        link.transition_rdb_channel_state(ReplicaRdbChannelState::Handshake)
+            .unwrap();
+        let mut frame = b"+OK\r\n".to_vec();
+        frame.extend_from_slice(
+            &crate::engine::distributed::replication::protocol::encode_end_offset(
+                offset(50),
+                "0123456789abcdef0123456789abcdef01234567",
+                0,
+                42,
+            ),
+        );
+        frame.extend_from_slice(b"$20\r\nVALKEY080");
+        link.on_rdb_bytes(&frame).unwrap();
+
+        runtime.apply_streaming_loading_gate(&link);
+        runtime.drive_streaming_decode(42, 0, &mut link).unwrap();
+
+        assert!(!runtime.ctx.is_loading());
+        assert!(link.rdb_framing_is_pending());
+        assert!(runtime.ctx.db(0).unwrap().get_no_expire(b"old").is_some());
+        assert_eq!(link.rdb_receive_mut().unwrap().loaded(), 0);
+
+        link.on_rdb_bytes(&[0; 11]).unwrap();
+        assert!(link.rdb_framing_is_complete());
+        runtime.apply_streaming_loading_gate(&link);
+
+        assert!(runtime.ctx.is_loading());
+        assert!(!runtime.ctx.replication().async_loading);
     }
 
     #[test]

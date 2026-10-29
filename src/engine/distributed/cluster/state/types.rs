@@ -12,6 +12,7 @@ use crate::engine::distributed::cluster::NodeId;
 use std::collections::{BTreeSet, HashMap};
 
 use super::debug::{ClusterActiveOperations, ClusterDebugSnapshot, ClusterPendingWork};
+use super::snapshot::ClusterHealth;
 
 /// Cluster state constants.
 pub const CLUSTER_SLOTS: usize = 16384;
@@ -628,7 +629,6 @@ impl ClusterState {
         };
         if !requester_node.is_replica()
             || requester_node.replicaof != self.myself.replicaof
-            || requester_node.replica_priority == 0
             || requester_node
                 .has_flag(crate::engine::distributed::cluster::node::CLUSTER_NODE_NOFAILOVER)
         {
@@ -641,10 +641,12 @@ impl ClusterState {
         };
         let requester_rank = super::failover::ReplicaRankKey {
             replication_offset: requester_node.repl_offset,
+            cluster_replica_priority: requester_node.cluster_replica_priority,
             node_id: requester.clone(),
         };
         let local_rank = super::failover::ReplicaRankKey {
             replication_offset: self.myself.repl_offset,
+            cluster_replica_priority: self.myself.cluster_replica_priority,
             node_id: local_id,
         };
         if requester_rank >= local_rank {
@@ -835,6 +837,7 @@ impl ClusterState {
         let previous_nodes = self.nodes.keys().cloned().collect::<Vec<_>>();
         let next_generation = self.topology_generation().wrapping_add(1);
         let mut new_self = Self::new(ip, port, cport);
+        new_self.myself.cluster_replica_priority = self.myself.cluster_replica_priority;
         new_self.gossip_percentage = self.gossip_percentage;
         new_self.bus_stats.link_memory = self.bus_stats.link_memory;
         new_self.topology_generation = next_generation;
@@ -1179,10 +1182,11 @@ impl ClusterState {
         self.projection().debug_snapshot()
     }
 
-    pub(crate) fn build_debug_snapshot(
-        &self,
-        topology: &super::snapshot::ClusterTopologySnapshot,
-    ) -> ClusterDebugSnapshot {
+    pub(crate) fn build_debug_snapshot(&self) -> ClusterDebugSnapshot {
+        use crate::engine::distributed::cluster::node::{
+            CLUSTER_NODE_FAIL, CLUSTER_NODE_HANDSHAKE, CLUSTER_NODE_NOADDR,
+        };
+
         let mut links = self.link_views.values().cloned().collect::<Vec<_>>();
         links.sort_unstable_by(|left, right| {
             left.node_id
@@ -1190,17 +1194,42 @@ impl ClusterState {
                 .cmp(right.node_id.as_str())
                 .then(left.direction.cmp(&right.direction))
         });
+        let nodes = std::iter::once(&self.myself)
+            .chain(self.nodes.values().filter(|node| !node.is_myself()));
+        // Resolve the same owners as management topology without allocating
+        // node IDs, bitmaps, or shard views for a diagnostic count.
+        let mut previous_owner = None;
+        let mut has_reusable_owner = false;
+        let assigned_slot_count = (0..CLUSTER_SLOTS)
+            .filter(|&slot| {
+                let owner = &self.slot_ownership.owners[slot];
+                if previous_owner != Some(owner) || !has_reusable_owner {
+                    previous_owner = Some(owner);
+                    // A healthy canonical binding is assigned regardless of
+                    // withdrawal. Reuse that fact within a contiguous range;
+                    // failed bindings still need slot-specific resolution.
+                    has_reusable_owner = self.canonical_slot_owner_ref(slot).is_some_and(|node| {
+                        !node.has_flag(CLUSTER_NODE_FAIL)
+                            && (node.is_myself()
+                                || !node.has_flag(CLUSTER_NODE_HANDSHAKE | CLUSTER_NODE_NOADDR))
+                    });
+                }
+                has_reusable_owner
+                    || self.slot_owner_ref(slot).is_some()
+                    || (!self.require_full_coverage && self.declared_node_by_slot(slot).is_some())
+            })
+            .count();
         ClusterDebugSnapshot {
-            topology_generation: topology.generation,
-            health: topology.health,
+            topology_generation: self.topology_generation,
+            health: if self.state == CLUSTER_OK {
+                ClusterHealth::Ok
+            } else {
+                ClusterHealth::Fail
+            },
             current_epoch: self.current_epoch,
-            node_count: topology.nodes.len(),
-            primary_count: topology
-                .nodes
-                .iter()
-                .filter(|node| node.role == super::snapshot::ClusterNodeRole::Primary)
-                .count(),
-            assigned_slot_count: topology.slot_owners.iter().flatten().count(),
+            node_count: nodes.clone().count(),
+            primary_count: nodes.filter(|node| !node.is_replica()).count(),
+            assigned_slot_count,
             link_count: links.len(),
             links,
             pending: ClusterPendingWork {

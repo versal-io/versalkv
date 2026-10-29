@@ -53,6 +53,7 @@ pub(super) fn debug_help() -> Value {
         "FORCE-FREE-PRIMARY-ASYNC <0|1>",
         "PROTECT-CLIENT <id>",
         "CLUSTERLINK KILL <to|from|all> <node-id>",
+        "CLUSTER-REPLICA-PRIORITY <node-id>",
     ];
     Value::Array(help.iter().map(|line| Value::bulk(*line)).collect())
 }

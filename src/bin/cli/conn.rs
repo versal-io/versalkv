@@ -216,7 +216,7 @@ impl Connection {
         let data = serialize_resp_command(args);
         self.stream
             .write_all(&data)
-            .map_err(|e| format!("Write error: {}", e))?;
+            .map_err(|error| connection_io_error(error, "Write error"))?;
         self.read_response()
     }
 
@@ -251,7 +251,7 @@ impl Connection {
         let data = serialize_resp_command(args);
         self.stream
             .write_all(&data)
-            .map_err(|e| format!("Write error: {}", e))
+            .map_err(|error| connection_io_error(error, "Write error"))
     }
 
     /// Copy the RDB bulk transfer following SYNC/PSYNC to `writer`.
@@ -295,7 +295,7 @@ impl Connection {
             let count = remaining.min(buf.len());
             self.stream
                 .read_exact(&mut buf[..count])
-                .map_err(|e| format!("Read RDB error: {}", e))?;
+                .map_err(|error| connection_io_error(error, "Read RDB error"))?;
             writer
                 .write_all(&buf[..count])
                 .map_err(|e| format!("Write RDB error: {}", e))?;
@@ -334,7 +334,7 @@ impl Connection {
             let count = self
                 .stream
                 .read(&mut buf)
-                .map_err(|e| format!("Read RDB error: {}", e))?;
+                .map_err(|error| connection_io_error(error, "Read RDB error"))?;
             if count == 0 {
                 return Err("Connection closed before RDB EOF marker".to_string());
             }
@@ -369,7 +369,7 @@ impl Connection {
             let n = self
                 .stream
                 .read(&mut self.buf)
-                .map_err(|e| format!("Read error: {}", e))?;
+                .map_err(|error| connection_io_error(error, "Read error"))?;
             if n == 0 {
                 return Err("Connection closed by server".to_string());
             }
@@ -387,11 +387,22 @@ impl Connection {
     }
 }
 
+fn connection_io_error(error: io::Error, operation: &str) -> String {
+    match error.kind() {
+        io::ErrorKind::BrokenPipe
+        | io::ErrorKind::ConnectionReset
+        | io::ErrorKind::ConnectionAborted
+        | io::ErrorKind::UnexpectedEof
+        | io::ErrorKind::NotConnected => "Connection closed by server".to_string(),
+        _ => format!("{}: {}", operation, error),
+    }
+}
+
 fn replication_header_read_error(error: io::Error) -> String {
     if error.kind() == io::ErrorKind::UnexpectedEof {
         "Connection closed before replication header".to_string()
     } else {
-        format!("Read replication header error: {}", error)
+        connection_io_error(error, "Read replication header error")
     }
 }
 
@@ -412,9 +423,151 @@ pub fn serialize_resp_command(args: &[&[u8]]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Connection, ReplicationRdbTransfer, StreamType};
-    use std::io::Write;
-    use std::net::TcpListener;
+    use super::{connection_io_error, Connection, ReplicationRdbTransfer, StreamType};
+    use std::io::{self, Write};
+    use std::net::{Shutdown, TcpListener, TcpStream};
+    use std::time::Duration;
+
+    fn tcp_pair() -> (Connection, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let connection = Connection::connect_with_defaults("127.0.0.1", port).unwrap();
+        let server = listener.accept().unwrap().0;
+        (connection, server)
+    }
+
+    #[test]
+    fn connection_io_errors_preserve_nonclosure_diagnostics() {
+        for kind in [
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::UnexpectedEof,
+            io::ErrorKind::NotConnected,
+        ] {
+            assert_eq!(
+                connection_io_error(io::Error::new(kind, "transport failed"), "Read error"),
+                "Connection closed by server",
+                "{kind:?}"
+            );
+        }
+        for kind in [
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::WouldBlock,
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::Other,
+        ] {
+            assert_eq!(
+                connection_io_error(io::Error::new(kind, "transport failed"), "Read error"),
+                "Read error: transport failed",
+                "{kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn command_writes_report_connection_closed() {
+        for has_reply in [true, false] {
+            let (mut connection, _server) = tcp_pair();
+            let StreamType::Tcp(stream) = &connection.stream else {
+                panic!("expected TCP connection");
+            };
+            stream.shutdown(Shutdown::Write).unwrap();
+            let error = if has_reply {
+                connection.send_command(&[b"PING"]).unwrap_err()
+            } else {
+                connection
+                    .send_command_without_reply(&[b"PSYNC", b"?", b"-1"])
+                    .unwrap_err()
+            };
+            assert_eq!(
+                error, "Connection closed by server",
+                "has_reply={has_reply}"
+            );
+        }
+    }
+
+    #[test]
+    fn connection_reads_report_peer_reset() {
+        for is_replication in [false, true] {
+            let (mut connection, server) = tcp_pair();
+            socket2::SockRef::from(&server)
+                .set_linger(Some(Duration::ZERO))
+                .unwrap();
+            drop(server);
+            let error = if is_replication {
+                connection
+                    .read_replication_rdb(&mut Vec::new())
+                    .unwrap_err()
+            } else {
+                connection.read_response().unwrap_err()
+            };
+            assert_eq!(
+                error, "Connection closed by server",
+                "is_replication={is_replication}"
+            );
+        }
+    }
+
+    #[test]
+    fn replication_rdb_reports_truncated_payloads() {
+        for (payload, expected) in [
+            (&b"$10\r\nRDB"[..], "Connection closed by server"),
+            (
+                &b"$EOF:0123456789012345678901234567890123456789\r\nRDB"[..],
+                "Connection closed before RDB EOF marker",
+            ),
+        ] {
+            let (mut connection, mut server) = tcp_pair();
+            server.write_all(payload).unwrap();
+            drop(server);
+            assert_eq!(
+                connection
+                    .read_replication_rdb(&mut Vec::new())
+                    .unwrap_err(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn replication_rdb_preserves_protocol_and_output_errors() {
+        struct FailingWriter;
+
+        impl Write for FailingWriter {
+            fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "output closed"))
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (mut connection, mut server) = tcp_pair();
+        server.write_all(b"invalid\r\n").unwrap();
+        assert_eq!(
+            connection
+                .read_replication_rdb(&mut Vec::new())
+                .unwrap_err(),
+            "Unexpected replication reply: invalid"
+        );
+
+        for payload in [
+            &b"$3\r\nRDB"[..],
+            &b"$EOF:0123456789012345678901234567890123456789\r\n\
+RDB0123456789012345678901234567890123456789"[..],
+        ] {
+            let (mut connection, mut server) = tcp_pair();
+            server.write_all(payload).unwrap();
+            assert_eq!(
+                connection
+                    .read_replication_rdb(&mut FailingWriter)
+                    .unwrap_err(),
+                "Write RDB error: output closed"
+            );
+        }
+    }
 
     #[test]
     fn tcp_connections_disable_nagle() {

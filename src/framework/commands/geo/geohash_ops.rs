@@ -1,6 +1,5 @@
 
-use crate::foundation::io::store::structure::hashtable::HashTable;
-use bytes::Bytes;
+use crate::foundation::io::store::Robj;
 
 use super::{
     GeoHashBits, GeoHashRadius, GeoPoint, GeoShape, GEO_LAT_MAX, GEO_LAT_MIN,
@@ -248,7 +247,7 @@ pub(super) fn calculate_areas_by_shape(shape: &GeoShape) -> GeoHashRadius {
     GeoHashRadius { hash, neighbors }
 }
 
-pub fn geo_search(zset: &HashTable<f64>, shape: &GeoShape, limit: usize) -> Vec<GeoPoint> {
+pub fn geo_search(zset: &Robj, shape: &GeoShape, limit: usize) -> Vec<GeoPoint> {
     let radius = calculate_areas_by_shape(shape);
 
     let boxes: [GeoHashBits; 9] = [
@@ -262,13 +261,6 @@ pub fn geo_search(zset: &HashTable<f64>, shape: &GeoShape, limit: usize) -> Vec<
         radius.neighbors.south_east,
         radius.neighbors.south_west,
     ];
-
-    let mut entries: Vec<(Bytes, f64)> = zset.iter().map(|(k, &s)| (k.clone(), s)).collect();
-    entries.sort_by(|a, b| {
-        a.1.partial_cmp(&b.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.0.cmp(&b.0))
-    });
 
     let mut results: Vec<GeoPoint> = Vec::new();
 
@@ -290,22 +282,18 @@ pub fn geo_search(zset: &HashTable<f64>, shape: &GeoShape, limit: usize) -> Vec<
             geohash_align52_bits(&max_hash) as f64
         };
 
-        for (member, score) in &entries {
-            if *score < min_score {
-                continue;
-            }
-            if *score >= max_score {
-                break;
-            }
-            let bits = *score as u64;
+        for (member, score) in zset.zset_range_by_score(
+            (min_score, true), (max_score, false), 0, -1, false,
+        ) {
+            let bits = score as u64;
             let Some((lon, lat)) = geohash_decode(bits) else {
                 continue;
             };
             if let Some(dist) = point_within_shape(shape, lon, lat) {
                 results.push(GeoPoint {
-                    member: member.clone(),
+                    member,
                     dist,
-                    score: *score,
+                    score,
                     lon,
                     lat,
                 });

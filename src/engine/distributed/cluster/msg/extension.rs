@@ -16,6 +16,7 @@ pub enum ClusterExtension {
     ClientPort(u16),
     ClientTlsPort(u16),
     AvailabilityZone(String),
+    ReplicaPriority(u32),
     Unknown { kind: u16, payload: Vec<u8> },
 }
 
@@ -56,6 +57,7 @@ impl ClusterExtension {
             Self::ClientPort(port) => (6, port.to_be_bytes().to_vec()),
             Self::ClientTlsPort(port) => (7, port.to_be_bytes().to_vec()),
             Self::AvailabilityZone(value) => (8, nul_terminated(value)),
+            Self::ReplicaPriority(priority) => (9, priority.to_be_bytes().to_vec()),
             Self::Unknown { kind, payload } => (*kind, payload.clone()),
         };
         Ok(value)
@@ -147,6 +149,10 @@ fn decode_extension(kind: u16, payload: &[u8]) -> Result<ClusterExtension, Clust
             ClusterExtension::ClientTlsPort(read_u16(payload, 0)?)
         }
         8 => ClusterExtension::AvailabilityZone(decode_c_string(payload)?),
+        9 => {
+            require_payload(payload, 8, "replica-priority")?;
+            ClusterExtension::ReplicaPriority(read_u32(payload, 0)?)
+        }
         _ => ClusterExtension::Unknown {
             kind,
             payload: payload.to_vec(),
@@ -216,6 +222,11 @@ pub fn extensions_for_node(node: &ClusterNode) -> Vec<ClusterExtension> {
     }
     if let Ok(shard_id) = NodeId::parse(node.shard_id.as_bytes()) {
         extensions.push(ClusterExtension::ShardId(shard_id));
+    }
+    if node.cluster_replica_priority != 0 {
+        extensions.push(ClusterExtension::ReplicaPriority(
+            node.cluster_replica_priority,
+        ));
     }
     extensions
 }

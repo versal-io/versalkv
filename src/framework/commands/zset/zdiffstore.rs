@@ -34,6 +34,7 @@ pub fn zdiffstore(
     if 2 + numkeys < args.args.len() {
         return CommandOutcome::reply(CommandError::syntax_error());
     }
+    let (max_entries, max_value_size) = runtime.zset_encoding_limits();
     let db_idx = runtime.selected_db();
     let db = match runtime.db_mut() {
         Some(d) => d,
@@ -93,9 +94,10 @@ pub fn zdiffstore(
     if result.is_empty() {
         db.del(dest);
     } else {
-        use crate::foundation::io::store::structure::zset::ZSetSl;
-        let zset = ZSetSl::from_dict(result);
-        db.set(dest.to_vec(), Robj::ZSetSkiplist(zset));
+        db.set(
+            dest.to_vec(),
+            Robj::zset_from_dict_with_limits(result, max_entries, max_value_size),
+        );
     }
     changed(Value::integer(count), db_idx, dest)
 }

@@ -112,6 +112,10 @@ pub fn debug_cmd(conn: &mut dyn CommandConn, args: &CommandArgs, ctx: &mut Serve
             Some(state) => debug_cluster_link(args, state),
             None => Value::error("ERR Debug option only available for cluster mode enabled setup!"),
         },
+        "cluster-replica-priority" => match ctx.cluster_state().as_deref() {
+            Some(state) => debug_cluster_replica_priority(args, state),
+            None => Value::error("ERR Debug option only available for cluster mode enabled setup!"),
+        },
         "slotmigration" => match ctx.cluster_state_mut().as_deref_mut() {
             Some(state) => debug_slot_migration(args, state),
             None => Value::error("ERR This instance has cluster support disabled"),
@@ -257,6 +261,9 @@ pub(crate) fn prepare_debug_task(
     let mut policy = crate::foundation::io::persistence::RdbDecodePolicy::persisted(
         true,
         ctx.config().persistence.key_load_delay,
+    ).with_zset_limits(
+        ctx.config().encoding.zset_max_ziplist_entries as usize,
+        ctx.config().encoding.zset_max_ziplist_value as usize,
     );
     policy.allow_duplicate_keys = should_merge;
     let task = crate::framework::host_tasks::RdbLoadTask::new(
@@ -462,6 +469,25 @@ fn debug_slot_migration(
         return CommandError::syntax_error();
     }
     Value::ok()
+}
+
+fn debug_cluster_replica_priority(
+    args: &CommandArgs,
+    state: &crate::engine::distributed::cluster::ClusterState,
+) -> Value {
+    if args.args.len() != 2 {
+        return CommandError::syntax_error();
+    }
+    let node_id = String::from_utf8_lossy(&args.args[1]);
+    let node = if node_id == state.myself.name {
+        Some(&state.myself)
+    } else {
+        state.nodes.get(node_id.as_ref())
+    };
+    match node {
+        Some(node) => Value::Integer(i64::from(node.cluster_replica_priority)),
+        None => Value::error(format!("ERR Unknown node {node_id}")),
+    }
 }
 
 fn debug_cluster_link(

@@ -212,7 +212,7 @@ fn zset_listpack_limits_apply_to_runtime_zadd_encoding() {
     );
     assert!(client
         .command_str(&[b"OBJECT", b"ENCODING", b"zset"])
-        .contains("skiplist"));
+        .contains("btree"));
 }
 
 #[test]

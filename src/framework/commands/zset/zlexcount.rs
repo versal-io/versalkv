@@ -33,7 +33,6 @@ fn zlexcount_reply(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> Valu
         Err(_) => return CommandError::wrong_type(),
     };
     Value::integer(
-        zset.zset_range_by_lex(&min_val, min_inc, &max_val, max_inc, false)
-            .len() as i64,
+        zset.zset_count_by_lex(&min_val, min_inc, &max_val, max_inc) as i64,
     )
 }

@@ -1,5 +1,8 @@
-use std::io::Write;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Command, Stdio};
+use std::sync::mpsc::{self, Receiver};
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 use crate::common::TestServer;
 
@@ -867,59 +870,124 @@ fn interactive_pubsub_get_pubsub() {
 // ============================================================================
 // ============================================================================
 
+fn capture_cli_lines(reader: impl Read + Send + 'static) -> (Receiver<String>, JoinHandle<String>) {
+    let (sender, receiver) = mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let mut captured = String::new();
+        for line in BufReader::new(reader).lines() {
+            let line = line.expect("read CLI output");
+            captured.push_str(&line);
+            captured.push('\n');
+            let _ = sender.send(line);
+        }
+        captured
+    });
+    (receiver, handle)
+}
+
 #[test]
 fn selected_db_survives_connection_drops() {
     let server = TestServer::start_default();
     let port = server.port;
 
-    let mut child = Command::new(binary_path("versal-cli"))
-        .arg("-h")
-        .arg("127.0.0.1")
-        .arg("-p")
-        .arg(port.to_string())
-        .arg("-n")
-        .arg("9")
-        .env("FAKETTY", "1")
-        .env("TERM", "dumb")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn versal-cli");
+    for initial_db in ["0", "9"] {
+        let mut child = Command::new(binary_path("versal-cli"))
+            .arg("-h")
+            .arg("127.0.0.1")
+            .arg("-p")
+            .arg(port.to_string())
+            .arg("-n")
+            .arg(initial_db)
+            .env("FAKETTY", "1")
+            .env("TERM", "dumb")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn versal-cli");
 
-    let stdin = child.stdin.as_mut().unwrap();
+        let mut stdin = child.stdin.take().expect("CLI stdin");
+        let (stdout_lines, stdout_reader) =
+            capture_cli_lines(child.stdout.take().expect("CLI stdout"));
+        let (stderr_lines, stderr_reader) =
+            capture_cli_lines(child.stderr.take().expect("CLI stderr"));
+        let read_stdout = || {
+            stdout_lines
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "CLI stdout was not available: {error}; stderr={:?}",
+                        stderr_lines.try_iter().collect::<Vec<_>>()
+                    )
+                })
+        };
+        let read_client_id = || {
+            let line = read_stdout();
+            line.strip_prefix("(integer) ")
+                .expect("CLI client ID response")
+                .parse::<u64>()
+                .expect("numeric CLI client ID")
+        };
 
-    // Select DB 9
-    writeln!(stdin, "select 9").ok();
-    // Kill all normal clients to disconnect the CLI
-    let mut killer = server.connect();
-    killer.command_str(&[b"CLIENT", b"KILL", b"TYPE", b"normal"]);
-    std::thread::sleep(std::time::Duration::from_millis(100));
+        // Finish both the initial handshake and SELECT before closing the CLI.
+        writeln!(stdin, "select 9").expect("send SELECT");
+        assert_eq!(read_stdout(), "OK");
+        writeln!(stdin, "client id").expect("send CLIENT ID");
+        let original_id = read_client_id();
 
-    // Trigger reconnect
-    writeln!(stdin, "ping").ok();
-    std::thread::sleep(std::time::Duration::from_millis(100));
+        let mut killer = server.connect();
+        assert_eq!(
+            killer.command(&[
+                b"CLIENT",
+                b"KILL",
+                b"ID",
+                original_id.to_string().as_bytes()
+            ]),
+            b":1\r\n",
+            "the test must close the established CLI connection"
+        );
+        writeln!(stdin, "ping").expect("trigger CLI reconnect");
+        assert_eq!(
+            stderr_lines
+                .recv_timeout(Duration::from_secs(10))
+                .expect("CLI reconnect confirmation"),
+            "Reconnected to server"
+        );
 
-    // Set a key and verify it's in DB 9
-    writeln!(stdin, "set survived-key survived-val").ok();
-    std::thread::sleep(std::time::Duration::from_millis(100));
-    writeln!(stdin, "quit").ok();
+        let key = format!("survived-key-{initial_db}");
+        let value = format!("survived-val-{initial_db}");
+        writeln!(stdin, "set {key} {value}").expect("send SET after reconnect");
+        assert_eq!(read_stdout(), "OK");
+        writeln!(stdin, "client id").expect("read reconnected client ID");
+        assert_ne!(
+            read_client_id(),
+            original_id,
+            "the CLI must establish a new connection"
+        );
+        writeln!(stdin, "client info").expect("read reconnected client database");
+        let client_info = read_stdout();
+        assert!(
+            client_info.contains(" db=9 "),
+            "the reconnected CLI must still select DB 9: {client_info}"
+        );
+        writeln!(stdin, "quit").expect("stop CLI");
+        drop(stdin);
 
-    let output = child.wait_with_output().expect("wait versal-cli");
-    let stderr = String::from_utf8_lossy(&output.stderr);
+        let output = child.wait_with_output().expect("wait versal-cli");
+        let stdout = stdout_reader.join().expect("join CLI stdout reader");
+        let stderr = stderr_reader.join().expect("join CLI stderr reader");
+        assert!(
+            output.status.success(),
+            "versal-cli failed: stderr={stderr}; stdout={stdout}"
+        );
 
-    // Check that the CLI ran successfully
-    assert!(
-        output.status.success(),
-        "versal-cli failed: stderr={stderr}"
-    );
-
-    // Check the key was set in DB 9
-    let mut check_client = server.connect();
-    check_client.command_str(&[b"SELECT", b"9"]);
-    let val = check_client.command_str(&[b"GET", b"survived-key"]);
-    assert!(
-        val.contains("survived-val"),
-        "key should be in DB 9 after reconnect: got {val}"
-    );
+        let mut check_client = server.connect();
+        assert_eq!(check_client.command(&[b"SELECT", b"9"]), b"+OK\r\n");
+        assert_eq!(
+            check_client.command(&[b"GET", key.as_bytes()]),
+            format!("${}\r\n{value}\r\n", value.len()).as_bytes()
+        );
+        assert_eq!(check_client.command(&[b"SELECT", b"0"]), b"+OK\r\n");
+        assert_eq!(check_client.command(&[b"GET", key.as_bytes()]), b"$-1\r\n");
+    }
 }

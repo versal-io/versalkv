@@ -90,12 +90,12 @@ fn zscan_reply(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> Value {
         let budget_threshold = count * 10;
         let target = if noscores { count } else { count * 2 };
 
-        if encoding == Encoding::Skiplist
+        if encoding == Encoding::Btree
             && zset_len > budget_threshold
             && matches!(zref, Robj::ZSetSkiplist(_))
         {
             let Robj::ZSetSkiplist(zref) = zref else {
-                unreachable!("skiplist encoding must have a skiplist payload");
+                unreachable!("btree encoding must have an ordered zset payload");
             };
             let mut out: Vec<Value> = Vec::new();
             let mut cur = cursor;

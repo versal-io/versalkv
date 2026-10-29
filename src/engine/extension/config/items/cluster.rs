@@ -149,6 +149,26 @@ pub(crate) fn register_cluster_configs(reg: &mut ConfigRegistry) {
         },
     });
     reg.register(&ConfigSpec {
+        name: "cluster-replica-priority",
+        type_: ConfigType::Numeric,
+        enum_values: &[],
+        numeric_min: 0,
+        numeric_max: i32::MAX as i64,
+        flags: &[],
+        alias: None,
+        get: |rcfg| ConfigValue::Numeric(i64::from(rcfg.server.cluster_replica_priority)),
+        set: |rcfg, val| {
+            let value = val
+                .as_i64()
+                .ok_or("cluster-replica-priority must be numeric")?;
+            if !(0..=i64::from(i32::MAX)).contains(&value) {
+                return Err(format!("argument must be between 0 and {}", i32::MAX));
+            }
+            rcfg.server.cluster_replica_priority = value as u32;
+            Ok(())
+        },
+    });
+    reg.register(&ConfigSpec {
         name: "cluster-require-full-coverage",
         type_: ConfigType::Bool,
         enum_values: &[],

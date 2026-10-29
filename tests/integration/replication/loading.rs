@@ -4,6 +4,103 @@ use crate::replication::psync2::extract_field;
 use std::time::Duration;
 use versal::foundation::io::sys::process::{send_signal, ProcessSignal};
 
+fn assert_disk_backed_load_services_clients(is_dual_channel: bool) {
+    let master = TestServer::start(&["--save", ""]);
+    let replica = TestServer::start(&[
+        "--save",
+        "",
+        "--repl-diskless-load",
+        "disabled",
+        "--logfile",
+        "server.log",
+    ]);
+    let mut mc = master.connect();
+    let mut rc = replica.connect();
+    let dual_enabled: &[u8] = if is_dual_channel { b"yes" } else { b"no" };
+    for client in [&mut mc, &mut rc] {
+        assert_eq!(
+            client.command(&[
+                b"CONFIG",
+                b"SET",
+                b"dual-channel-replication-enabled",
+                dual_enabled,
+            ]),
+            b"+OK\r\n"
+        );
+    }
+    for (name, value) in [
+        (b"repl-diskless-sync".as_slice(), b"yes".as_slice()),
+        (b"repl-diskless-sync-delay", b"0"),
+        (b"rdbcompression", b"no"),
+    ] {
+        assert_eq!(mc.command(&[b"CONFIG", b"SET", name, value]), b"+OK\r\n");
+    }
+    assert_eq!(
+        mc.command(&[b"DEBUG", b"POPULATE", b"512", b"paced", b"1024"]),
+        b"+OK\r\n"
+    );
+    for (name, value) in [
+        (b"key-load-delay".as_slice(), b"4000".as_slice()),
+        (b"loading-process-events-interval-bytes", b"1024"),
+    ] {
+        assert_eq!(rc.command(&[b"CONFIG", b"SET", name, value]), b"+OK\r\n");
+    }
+    let port = master.port.to_string();
+    assert_eq!(
+        rc.command(&[b"REPLICAOF", b"127.0.0.1", port.as_bytes()]),
+        b"+OK\r\n"
+    );
+    let log_path = replica.data_dir().join("server.log");
+    assert!(
+        wait_until(
+            || std::fs::read_to_string(&log_path)
+                .is_ok_and(|log| log.contains("Loading RDB produced by")),
+            Duration::from_secs(10),
+        ),
+        "the replica did not begin decoding the completed transfer"
+    );
+
+    // The log is emitted by the decoder before applying any keys. INFO must
+    // run inside the paced load, rather than wait for the entire RDB to commit.
+    let info = rc.command_str(&[b"INFO", b"persistence"]);
+    assert_eq!(
+        extract_field(&info, "loading"),
+        "1",
+        "INFO was not serviced while the disk-backed RDB was loading"
+    );
+    assert_eq!(extract_field(&info, "async_loading"), "0");
+    assert!(
+        rc.command(&[b"GET", b"paced:0"]).starts_with(b"-LOADING"),
+        "ordinary reads must be rejected during the load"
+    );
+    assert_eq!(
+        rc.command(&[b"CONFIG", b"SET", b"key-load-delay", b"0"]),
+        b"+OK\r\n",
+        "loading must continue servicing configuration commands"
+    );
+    assert!(
+        wait_until(
+            || replica
+                .connect()
+                .command_str(&[b"INFO", b"replication"])
+                .contains("master_link_status:up"),
+            Duration::from_secs(15),
+        ),
+        "the paced full sync did not finish"
+    );
+    assert_eq!(rc.command(&[b"DBSIZE"]), b":512\r\n");
+}
+
+#[test]
+fn disk_backed_classic_load_services_clients() {
+    assert_disk_backed_load_services_clients(false);
+}
+
+#[test]
+fn disk_backed_dual_load_services_clients() {
+    assert_disk_backed_load_services_clients(true);
+}
+
 //
 #[test]
 fn replica_enters_blocking_loading_on_different_replid() {

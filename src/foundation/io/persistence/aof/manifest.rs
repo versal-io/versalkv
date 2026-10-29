@@ -247,18 +247,13 @@ fn read_or_upgrade_legacy(
                 return Ok(None);
             }
             std::fs::create_dir_all(app_dir)?;
-            std::fs::rename(&old_path, app_dir.join(filename))?;
-            let incr_name = format!("{}.1.incr.aof", filename);
-            OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(app_dir.join(&incr_name))?;
-            let content = format!(
-                "file {} seq 1 type b\nfile {} seq 1 type i\n",
-                format_manifest_token(filename),
-                format_manifest_token(&incr_name)
-            );
+            // The legacy file must remain the final replay input until load
+            // succeeds. Startup creates the new increment after recovery.
+            let content = format!("file {} seq 1 type b\n", format_manifest_token(filename));
             std::fs::write(manifest_path, &content)?;
+            // Persist first so an interrupted move can be resumed from the
+            // base-only manifest by migrate_interrupted_legacy.
+            std::fs::rename(&old_path, app_dir.join(filename))?;
             Ok(Some(content))
         }
         Err(error) => Err(error),

@@ -109,6 +109,7 @@ impl ClusterState {
         state.myself = myself;
         state.nodes = nodes;
         state.restore_open_slot_maps(migrating_slots_to, importing_slots_from);
+        restore_referenced_primaries(&mut state);
         let maximum_node_epoch = std::iter::once(state.myself.config_epoch)
             .chain(state.nodes.values().map(|node| node.config_epoch))
             .max()
@@ -469,6 +470,26 @@ fn parse_slot_token(
     Ok(())
 }
 
+fn restore_referenced_primaries(state: &mut ClusterState) {
+    let primary_ids = std::iter::once(&state.myself)
+        .chain(state.nodes.values())
+        .filter(|node| !node.replicaof.is_empty())
+        .map(|node| node.replicaof.clone())
+        .collect::<Vec<_>>();
+    for primary_id in primary_ids {
+        if primary_id == state.myself.name {
+            continue;
+        }
+        state.nodes.entry(primary_id.clone()).or_insert_with(|| {
+            // C clusterLoadConfig preserves references to missing nodes with
+            // no role flags until a heartbeat supplies their actual identity.
+            let mut node = ClusterNode::new(primary_id, String::new(), 0, 0, false);
+            node.flags = 0;
+            node
+        });
+    }
+}
+
 fn repair_replica_shard_ids(state: &mut ClusterState) {
     let mut primary_shards = std::collections::HashMap::new();
     primary_shards.insert(state.myself.name.clone(), state.myself.shard_id.clone());
@@ -603,6 +624,49 @@ mod tests {
         assert_eq!(state.myself.numslots, 16384);
         assert_eq!(state.current_epoch, 13);
         assert_eq!(state.last_vote_epoch, 9);
+    }
+
+    #[test]
+    fn parser_preserves_missing_primary_referenced_by_a_replica() {
+        let local_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let primary_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let replica_id = "cccccccccccccccccccccccccccccccccccccccc";
+        for is_local_replica in [false, true] {
+            let local_role = if is_local_replica {
+                format!("myself,slave {primary_id}")
+            } else {
+                "myself,master -".to_string()
+            };
+            let content = format!(
+                "{local_id} 127.0.0.1:7000@17000 {local_role} 0 0 1 connected\n\
+                 {replica_id} 127.0.0.1:7002@17002 slave {primary_id} 0 0 2 connected\n\
+                 vars currentEpoch 2 lastVoteEpoch 0\n"
+            );
+
+            let state = parse_cluster_config(&content, "127.0.0.1", 7000, 17000).unwrap();
+            let primary = state
+                .nodes
+                .get(primary_id)
+                .expect("a replica reference must preserve its missing primary");
+            assert!(!primary.is_primary());
+            assert!(!primary.is_replica());
+            assert!(!primary.is_myself());
+            assert!(primary.ip().is_empty());
+            assert_eq!(primary.port(), 0);
+            assert_eq!(primary.cport(), 0);
+            assert_eq!(primary.numslots, 0);
+            assert_eq!(state.nodes.len(), 2);
+            assert_eq!(state.nodes[replica_id].replicaof, primary_id);
+            if is_local_replica {
+                assert_eq!(state.myself.replicaof, primary_id);
+            }
+
+            let rendered = render_cluster_config(&state);
+            let restored = parse_cluster_config(&rendered, "127.0.0.1", 7000, 17000).unwrap();
+            assert!(restored.nodes.contains_key(primary_id));
+            assert!(!restored.nodes[primary_id].is_primary());
+            assert!(!restored.nodes[primary_id].is_replica());
+        }
     }
 
     #[test]

@@ -328,7 +328,7 @@ fn resolve_search_shape(
             Some(d) => d,
             None => return Err(CommandError::db_index_out_of_range()),
         };
-        let score = match db.get_zset(&args.args[invocation.key_idx]) {
+        let score = match db.get_zset_object(&args.args[invocation.key_idx]) {
             Ok(None) => {
                 if let Some(dkey) = &invocation.dest_key {
                     db.del(dkey);
@@ -336,8 +336,8 @@ fn resolve_search_shape(
                 }
                 return Err(Value::Array(Vec::new()));
             }
-            Ok(Some(m)) => match m.dict().get(&args.args[offset]) {
-                Some(&s) => s,
+            Ok(Some(m)) => match m.zset_score(&args.args[offset]) {
+                Some(s) => s,
                 None => {
                     let member = String::from_utf8_lossy(&args.args[offset]);
                     return Err(Value::error(format!("ERR member {} does not exist", member)));
@@ -359,12 +359,13 @@ fn execute_geosearch(
     invocation: &GeoSearchInvocation,
     shape: &GeoShape,
 ) -> Value {
+    let limits = runtime.zset_encoding_limits();
     let db = match runtime.db_mut_at(invocation.db_index) {
         Some(d) => d,
         None => return CommandError::db_index_out_of_range(),
     };
     let key = &args.args[invocation.key_idx];
-    let map = match db.get_zset(key) {
+    let map = match db.get_zset_object(key) {
         Ok(None) => {
             if let Some(dkey) = &invocation.dest_key {
                 db.del(dkey);
@@ -375,9 +376,9 @@ fn execute_geosearch(
         Ok(Some(m)) => m,
         Err(_) => return CommandError::wrong_type(),
     };
-    let results = search_and_process(map.dict(), shape, &request.opts, request.conversion());
+    let results = search_and_process(map, shape, &request.opts, request.conversion());
     if let Some(dest_key) = &invocation.dest_key {
-        return store_geosearch_results(db, dest_key, &results, request.storedist);
+        return store_geosearch_results(db, dest_key, &results, request.storedist, limits);
     }
     format_search_results(&results, &request.opts)
 }
@@ -406,9 +407,9 @@ fn store_geosearch_results(
     dest_key: &[u8],
     results: &[GeoPoint],
     storedist: bool,
+    limits: (usize, usize),
 ) -> Value {
     use crate::foundation::io::store::structure::hashtable::HashTable;
-    use crate::foundation::io::store::structure::zset::ZSetSl;
     use crate::foundation::io::store::Robj;
     let mut values = HashTable::new();
     for point in results {
@@ -418,7 +419,7 @@ fn store_geosearch_results(
     if values.is_empty() {
         db.del(dest_key);
     } else {
-        db.set(dest_key.to_vec(), Robj::ZSetSkiplist(ZSetSl::from_dict(values)));
+        db.set(dest_key.to_vec(), Robj::zset_from_dict_with_limits(values, limits.0, limits.1));
     }
     Value::integer(results.len() as i64)
 }

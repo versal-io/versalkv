@@ -21,6 +21,8 @@ pub struct RdbDecodePolicy {
     pub allow_duplicate_keys: bool,
     pub expired_keys: ExpiredKeyPolicy,
     pub key_load_delay_us: i64,
+    pub zset_max_listpack_entries: usize,
+    pub zset_max_listpack_value: usize,
 }
 
 impl RdbDecodePolicy {
@@ -30,6 +32,8 @@ impl RdbDecodePolicy {
             allow_duplicate_keys: false,
             expired_keys: ExpiredKeyPolicy::Retain,
             key_load_delay_us,
+            zset_max_listpack_entries: 128,
+            zset_max_listpack_value: 64,
         }
     }
 
@@ -39,7 +43,15 @@ impl RdbDecodePolicy {
             allow_duplicate_keys: false,
             expired_keys: ExpiredKeyPolicy::Skip,
             key_load_delay_us,
+            zset_max_listpack_entries: 128,
+            zset_max_listpack_value: 64,
         }
+    }
+
+    pub fn with_zset_limits(mut self, max_entries: usize, max_value_size: usize) -> Self {
+        self.zset_max_listpack_entries = max_entries;
+        self.zset_max_listpack_value = max_value_size;
+        self
     }
 }
 
@@ -148,6 +160,18 @@ impl RdbDecoder {
         self.buf.extend_from_slice(bytes);
     }
 
+    pub fn set_zset_limits(&mut self, max_entries: usize, max_value_size: usize) {
+        self.policy = self.policy.with_zset_limits(max_entries, max_value_size);
+    }
+
+    pub fn set_key_load_delay(&mut self, key_load_delay_us: i64) {
+        self.policy.key_load_delay_us = key_load_delay_us;
+    }
+
+    pub fn consumed_bytes(&self) -> usize {
+        self.discarded_prefix.saturating_add(self.cursor)
+    }
+
     pub fn loaded(&self) -> usize {
         self.loaded
     }
@@ -227,7 +251,7 @@ impl RdbDecoder {
             );
         RdbDecodedMetadata {
             loaded: self.loaded,
-            consumed: self.discarded_prefix.saturating_add(self.cursor),
+            consumed: self.consumed_bytes(),
             expired: self.expired,
             empty_keys: self.empty_keys,
             function_codes: self.function_codes.clone(),
@@ -307,7 +331,11 @@ impl RdbDecoder {
                 key: Bytes::copy_from_slice(&key),
                 fields: loaded.skipped_expired_hash_fields,
             });
-        let val = loaded.object;
+        let mut val = loaded.object;
+        val.zset_convert_with_limits(
+            self.policy.zset_max_listpack_entries,
+            self.policy.zset_max_listpack_value,
+        );
         let hfe = loaded.hash_field_expires;
         let expire = self.expire_ms.take();
 
@@ -505,7 +533,7 @@ impl RdbDecoder {
         dbs: &mut DbSet,
         key_load_delay_us: i64,
     ) -> Result<StreamStep, LoadError> {
-        self.policy.key_load_delay_us = key_load_delay_us;
+        self.set_key_load_delay(key_load_delay_us);
         loop {
             match self.step(dbs)? {
                 RdbStep::NeedInput => return Ok(StreamStep::NeedMore),

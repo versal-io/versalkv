@@ -61,6 +61,7 @@ fn replication_stream_dispatch_restores_main_link_before_opening_dual_rdb_channe
 fn rdb_channel_yields_after_one_io_buffer_and_resumes_on_level_readiness() {
     let mut backend = ServerWorkerState::new(1).unwrap();
     crate::framework::commands::register_all(&mut backend.registry);
+    backend.ctx.config_mut().replication.repl_diskless_load = "flush-before-load".to_string();
     let (main_token, _main_slab, rdb_token, _rdb_slab, mut primary_stream) =
         setup_live_dual_rdb_receiver(&mut backend);
     let (mut ordinary_peer, ordinary_token) = setup_live_ordinary_connection(&mut backend);

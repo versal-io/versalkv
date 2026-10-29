@@ -73,6 +73,7 @@ pub fn restore(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> CommandO
     let lazyfree_server_del = runtime.should_use_lazyfree_server_del();
     let now_ms = runtime.now_ms();
     let db_idx = runtime.selected_db();
+    let (max_entries, max_value_size) = runtime.zset_encoding_limits();
 
     let db = match runtime.db_mut() {
         Some(d) => d,
@@ -105,7 +106,7 @@ pub fn restore(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> CommandO
     let body = &payload[..payload.len() - 10];
     let mut pos = 0usize;
     let type_byte = body.first().copied();
-    let (obj, hash_field_expires) =
+    let (mut obj, hash_field_expires) =
         match persistence::load_typed_object_with_hash_field_expires_detailed(body, &mut pos, None)
         {
             Ok(loaded) if pos == body.len() => loaded,
@@ -126,6 +127,7 @@ pub fn restore(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> CommandO
         log_restore_integrity_failure(type_byte);
         return CommandOutcome::reply(Value::error("ERR Bad data format"));
     }
+    obj.zset_convert_with_limits(max_entries, max_value_size);
 
     if replace {
         db.del(key);

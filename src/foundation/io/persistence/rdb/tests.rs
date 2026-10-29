@@ -516,8 +516,9 @@ fn load_rdb_rebuilds_all_types() {
     ));
     assert!(matches!(
         db.get_no_expire(b"z").unwrap(),
-        Robj::ZSetSkiplist(_)
+        Robj::ZSetListpack(_)
     ));
+    assert_eq!(db.get_no_expire(b"z").unwrap().zset_score(b"m"), Some(1.5));
 }
 
 #[test]

@@ -258,6 +258,16 @@ pub(crate) fn validate_config_file_directives(contents: &str) -> Result<(), Stri
             parse_replicaof_config(raw_value.unwrap_or_default().trim())?;
             continue;
         }
+        if key == "cluster-replica-priority" {
+            let value = decode_config_value(raw_value.unwrap_or_default().trim());
+            if !value
+                .parse::<u32>()
+                .is_ok_and(|number| number <= i32::MAX as u32)
+            {
+                return Err(format!("invalid value for {key}"));
+            }
+            continue;
+        }
         let Some(raw_value) = raw_value else { continue };
         let value = decode_config_value(raw_value.trim());
         let valid = match key.as_str() {

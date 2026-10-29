@@ -385,7 +385,10 @@ impl Server {
         let mut task = crate::framework::host_tasks::RdbLoadTask::new(
             bytes,
             dataset,
-            startup_rdb_decode_policy(strict, key_load_delay_us, role),
+            startup_rdb_decode_policy(strict, key_load_delay_us, role).with_zset_limits(
+                backend.ctx.config().encoding.zset_max_ziplist_entries as usize,
+                backend.ctx.config().encoding.zset_max_ziplist_value as usize,
+            ),
             crate::framework::host_tasks::DatasetVisibility::Visible,
             backend
                 .ctx

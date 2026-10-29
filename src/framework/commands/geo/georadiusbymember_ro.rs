@@ -1,6 +1,6 @@
 use super::geohash_util::*;
 use super::georadius::georadius_generic;
-use super::georadiusbymember::{get_member_center, MemberCenterResult};
+use super::georadiusbymember::{get_member_center, handle_not_found, MemberCenterResult};
 use crate::engine::core::{CommandOutcome, Value};
 use crate::framework::commands::command_runtime::CommandRuntime;
 use crate::framework::{CommandArgs, CommandError};
@@ -33,7 +33,7 @@ fn georadiusbymember_ro_reply(runtime: &mut dyn CommandRuntime, args: &CommandAr
             4,
             false,
         ),
-        Ok(MemberCenterResult::NotFound) => Value::Array(Vec::new()),
+        Ok(MemberCenterResult::NotFound) => handle_not_found(args, runtime, 4, false),
         Ok(MemberCenterResult::MemberMissing) => {
             let member_str = String::from_utf8_lossy(&args.args[1]);
             Value::error(format!("ERR member {} does not exist", member_str))

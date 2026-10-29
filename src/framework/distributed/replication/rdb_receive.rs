@@ -1,14 +1,14 @@
 //! Streaming full-sync RDB receive state, owned by `ReplicaLink` for the
 //! duration of an RDB phase. `ReplicaLink` framing forwards RDB-body bytes here
 //! (never the diskless EOF marker); the backend supplies the target `DbSet` and
-//! drives the paced decode. The whole body is no longer buffered — only the
-//! `aof_use_rdb_preamble && !diskless` case retains `raw`, because installing
-//! the sync RDB as the AOF base intrinsically needs the full bytes.
+//! drives the paced decode. Disk-backed loads retain the whole body until the
+//! transfer completes before decoding, matching C's file download/load split.
+//! `raw` is retained for disk-backed persistence and non-diskless transfers.
 //! Ownership seam: the decoder needs a `DbSet` (owned by `ServerContext`, not
 //! the link), so the actual `drive`/commit happens in the backend receive path
 //! (`runtime/distributed/replication/rdb_recv_path.rs`); the link only `feed`s bytes.
 
-use crate::foundation::io::persistence::{LoadError, RdbStreamDecoder, StreamStep};
+use crate::foundation::io::persistence::{LoadError, RdbStep, RdbStreamDecoder, StreamStep};
 use crate::foundation::io::store::kv_engine::DbSet;
 use crate::framework::distributed::replication::RdbLoadMode;
 
@@ -46,6 +46,7 @@ pub struct RdbReceive {
     load_mode: RdbLoadMode,
     target: RdbTarget,
     received_payload: bool,
+    transfer_started: bool,
     payload_bytes: u64,
 }
 
@@ -64,6 +65,7 @@ impl RdbReceive {
             load_mode,
             target: RdbTarget::Uninit,
             received_payload: false,
+            transfer_started: false,
             payload_bytes: 0,
         }
     }
@@ -90,10 +92,21 @@ impl RdbReceive {
         !matches!(self.target, RdbTarget::Direct)
     }
 
-    /// A full-sync header alone only enters transfer state. C starts blocking
-    /// loading after the first RDB payload bytes arrive, not at framing time.
+    /// A full-sync header alone only enters transfer state. Socket loading
+    /// starts with the first payload; disk-backed loading waits for the complete
+    /// transfer. The backend selects the loading gate from the pinned load mode.
     pub fn has_received_payload(&self) -> bool {
         self.received_payload
+    }
+
+    /// Report the first payload transition once, independently of whether the
+    /// backend has begun decoding or installed a target database.
+    pub fn mark_transfer_started(&mut self) -> bool {
+        if !self.received_payload || self.transfer_started {
+            return false;
+        }
+        self.transfer_started = true;
+        true
     }
 
     pub fn set_swap(&mut self, temp: DbSet) {
@@ -102,6 +115,28 @@ impl RdbReceive {
 
     pub fn set_direct(&mut self) {
         self.target = RdbTarget::Direct;
+    }
+
+    pub fn set_zset_limits(&mut self, max_entries: usize, max_value_size: usize) {
+        self.decoder.set_zset_limits(max_entries, max_value_size);
+    }
+
+    /// Decode one record so the backend can service events between records.
+    pub fn step(
+        &mut self,
+        serving: &mut DbSet,
+        key_load_delay_us: i64,
+    ) -> Result<RdbStep, LoadError> {
+        self.decoder.set_key_load_delay(key_load_delay_us);
+        match &mut self.target {
+            RdbTarget::Swap(temp) => self.decoder.step(temp),
+            RdbTarget::Direct => self.decoder.step(serving),
+            RdbTarget::Uninit => Ok(RdbStep::NeedInput),
+        }
+    }
+
+    pub fn consumed_bytes(&self) -> usize {
+        self.decoder.consumed_bytes()
     }
 
     /// Decode as many complete records as the buffer allows into the configured

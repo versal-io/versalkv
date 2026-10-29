@@ -112,6 +112,7 @@ struct SenderExtensions<'a> {
     client_port: u16,
     client_tls_port: u16,
     shard_id: Option<String>,
+    cluster_replica_priority: u32,
 }
 
 impl<'a> SenderExtensions<'a> {
@@ -149,6 +150,14 @@ impl<'a> SenderExtensions<'a> {
                 ClusterExtension::ShardId(node_id) => Some(node_id.to_string()),
                 _ => None,
             }),
+            cluster_replica_priority: extensions
+                .iter()
+                .rev()
+                .find_map(|item| match item {
+                    ClusterExtension::ReplicaPriority(priority) => Some(*priority),
+                    _ => None,
+                })
+                .unwrap_or_default(),
         }
     }
 }
@@ -953,7 +962,22 @@ impl ClusterBusManager {
     }
 
     fn apply_sender_extensions(state: &mut ClusterState, msg: &ClusterMsg) {
+        if !matches!(
+            msg.msg_type,
+            msg::ClusterMsgType::Ping | msg::ClusterMsgType::Pong | msg::ClusterMsgType::Meet
+        ) {
+            return;
+        }
         if !msg.has_message_flag(ClusterMessageFlags::EXT_DATA) {
+            if let Some(mut node) = state
+                .nodes
+                .get(&msg.sender_id)
+                .filter(|node| node.cluster_replica_priority != 0)
+                .cloned()
+            {
+                node.cluster_replica_priority = 0;
+                state.commit_sender_extension_observation(node);
+            }
             return;
         }
         let extensions = SenderExtensions::parse(&msg.extensions);
@@ -994,6 +1018,7 @@ impl ClusterBusManager {
             if let Some(shard_id) = extensions.shard_id {
                 node.shard_id = shard_id;
             }
+            node.cluster_replica_priority = extensions.cluster_replica_priority;
             let changed = node.flags != previous_flags
                 || node.endpoints != previous_endpoints
                 || node.shard_id != previous_shard_id;

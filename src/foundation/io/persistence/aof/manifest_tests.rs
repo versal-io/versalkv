@@ -80,7 +80,7 @@ fn upgrades_legacy_aof_and_supports_quoted_filenames() {
     let paths =
         resolve_aof_read_paths_checked(dir.to_str().unwrap(), filename, "appendonlydir").unwrap();
 
-    assert_eq!(paths.len(), 2);
+    assert_eq!(paths.len(), 1);
     assert_eq!(std::fs::read(&paths[0]).unwrap(), b"*1\r\n$4\r\nPING\r\n");
     let manifest = std::fs::read_to_string(
         dir.join("appendonlydir")
@@ -89,6 +89,12 @@ fn upgrades_legacy_aof_and_supports_quoted_filenames() {
     .unwrap();
     assert!(manifest.contains("\\n"));
     assert!(!dir.join(filename).exists());
+    assert!(!manifest.contains("type i"));
+    ensure_aof_increment(dir.to_str().unwrap(), filename, "appendonlydir").unwrap();
+    let paths =
+        resolve_aof_read_paths_checked(dir.to_str().unwrap(), filename, "appendonlydir").unwrap();
+    assert_eq!(paths.len(), 2);
+    assert_eq!(std::fs::read(&paths[1]).unwrap(), b"");
     assert_eq!(
         next_rewrite_sequences(
             &dir.join("appendonlydir")

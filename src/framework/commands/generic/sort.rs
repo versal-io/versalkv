@@ -83,7 +83,7 @@ fn sort_generic(
         return CommandOutcome::reply(CommandError::syntax_error());
     }
 
-    let elements = match db.get(key) {
+    let elements = match db.get_mut(key) {
         None => {
             if let Some(store_key) = &opts.store_key {
                 db.del(store_key);
@@ -92,7 +92,10 @@ fn sort_generic(
                 return CommandOutcome::reply(Value::Array(Vec::new()));
             }
         }
-        Some(obj) => extract_elements(obj),
+        Some(obj) => {
+            obj.zset_upgrade_to_tree();
+            extract_elements(obj)
+        }
     };
 
     let entries = match build_entries(db, &elements, &opts) {

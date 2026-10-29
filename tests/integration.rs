@@ -27,6 +27,15 @@ mod admin;
 #[path = "integration/config_compat.rs"]
 mod config_compat;
 
+#[path = "integration/valkey_581.rs"]
+mod valkey_581;
+
+#[path = "integration/zset_encoding_581.rs"]
+mod zset_encoding_581;
+
+#[path = "integration/cluster_priority_581.rs"]
+mod cluster_priority_581;
+
 #[path = "integration/cluster.rs"]
 mod cluster;
 

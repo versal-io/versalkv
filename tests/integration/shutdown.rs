@@ -176,12 +176,40 @@ fn sigterm_persists_runtime_acl_users_for_restart() {
         .starts_with("+OK"));
 }
 
+fn wait_for_shutdown_condition(
+    server: &mut TestServer,
+    phase: &str,
+    is_ready: impl Fn(&TestServer) -> bool,
+) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !is_ready(server) {
+        let status = server.wait_status(Duration::from_millis(1));
+        assert!(
+            status.is_none(),
+            "{phase} was not reached before server exit: {status:?}\n{}",
+            server.server_log()
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {phase}\n{}",
+            server.server_log()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 #[test]
 fn double_sigint_forces_exit_and_cleans_temp() {
     let mut srv = TestServer::start(&["--save", ""]);
     let workdir: PathBuf = srv.data_dir().to_path_buf();
     {
         let mut c = srv.connect();
+        // Keep automatic saves disabled, but make the first interrupt enter a
+        // slow final save so the second signal cannot race a clean exit.
+        assert_eq!(
+            c.command(&[b"CONFIG", b"SET", b"shutdown-on-sigint", b"save"]),
+            b"+OK\r\n"
+        );
         assert!(c
             .command_str(&[b"CONFIG", b"SET", b"rdb-key-save-delay", b"5000000"])
             .starts_with("+OK"));
@@ -195,11 +223,26 @@ fn double_sigint_forces_exit_and_cleans_temp() {
             reply
         );
     }
-    std::thread::sleep(Duration::from_millis(200));
+    wait_for_shutdown_condition(&mut srv, "background RDB temporary file", |_| {
+        std::fs::read_dir(&workdir)
+            .expect("read test data directory")
+            .flatten()
+            .any(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                name.starts_with("temp-") && name.ends_with(".rdb")
+            })
+    });
 
     let pid = srv.pid();
+    let final_temp = workdir.join(format!("temp-{pid}.rdb"));
     send_signal(pid as i32, ProcessSignal::Interrupt).expect("send first interrupt");
-    std::thread::sleep(Duration::from_millis(5));
+    wait_for_shutdown_condition(&mut srv, "final synchronous RDB save", |server| {
+        final_temp.exists()
+            && server
+                .server_log()
+                .contains("Saving the final RDB snapshot before exiting.")
+    });
     send_signal(pid as i32, ProcessSignal::Interrupt).expect("send second interrupt");
     let status = srv.wait_exit(Duration::from_secs(10));
     assert_eq!(status, Some(1), "expected exit(1) after 2 SIGINTs");

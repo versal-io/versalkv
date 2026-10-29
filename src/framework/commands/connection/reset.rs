@@ -17,5 +17,6 @@ pub fn reset(conn: &mut dyn CommandConn, _args: &CommandArgs, ctx: &mut ServerCo
     conn.set_username("default".to_string());
     conn.set_resp_version(2);
     conn.set_blocked(None);
+    conn.set_import_source(false);
     Value::SimpleString(Bytes::from_static(b"RESET"))
 }

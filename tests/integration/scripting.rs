@@ -936,9 +936,12 @@ fn exec_after_aof_rewrite_sequences_from_the_aof_cursor() {
         client.command(&[b"SET", b"rewrite-prime", b"1"]),
         b"+OK\r\n"
     );
-    assert!(client
-        .command(&[b"BGREWRITEAOF"])
-        .starts_with(b"+Background"));
+    let rewrite_reply = client.command(&[b"BGREWRITEAOF"]);
+    assert!(
+        rewrite_reply.starts_with(b"+Background"),
+        "unexpected BGREWRITEAOF reply: {rewrite_reply:?}\npersistence: {}",
+        client.command_str(&[b"INFO", b"persistence"])
+    );
     wait_for_aof_rewrite(&mut client);
 
     assert_eq!(client.command(&[b"MULTI"]), b"+OK\r\n");
