@@ -74,6 +74,7 @@ pub(super) fn config_set_persistence(
                     return Err("rdb-key-save-delay out of range".to_string());
                 }
                 ctx.config_mut().persistence.rdb_key_save_delay = n;
+                ctx.persistence().set_forkless_key_delay(n);
                 if n == 0 {
                     if let Some(pid) = ctx.persistence().rdb_child_pid() {
                         let _ = crate::foundation::io::sys::process::send_signal(

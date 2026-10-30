@@ -790,7 +790,11 @@ impl ServerWorkerState {
 
     fn rearm_drained_writable(&mut self, token: Token, keep_master_paused: bool) -> bool {
         let interest = if keep_master_paused {
-            Interest::Writable
+            if self.ctx.persistence().forkless_capture_in_progress() {
+                Interest::None
+            } else {
+                Interest::Writable
+            }
         } else {
             Interest::Readable
         };
@@ -831,9 +835,16 @@ impl ServerWorkerState {
                 self.remove_connection(token.0);
             }
             WriteOutcome::BudgetExhausted | WriteOutcome::Backpressured => {
-                self.transport
-                    .set_interest(token, Interest::ReadWritable)
-                    .ok();
+                let interest = if self.replication_runtime.replica_main_read_paused() {
+                    if self.ctx.persistence().forkless_capture_in_progress() {
+                        Interest::None
+                    } else {
+                        Interest::Writable
+                    }
+                } else {
+                    Interest::ReadWritable
+                };
+                self.transport.set_interest(token, interest).ok();
             }
             WriteOutcome::Complete => {}
         }
@@ -886,6 +897,24 @@ impl ServerWorkerState {
     }
 
     pub(crate) fn reap_bgsave_child(&mut self) {
+        if let Some(outcome) = self
+            .ctx
+            .poll_forkless_save(crate::foundation::io::sys::time::mstime() / 1_000)
+        {
+            use crate::foundation::io::persistence::snapshot::background::RdbSaveOutcome;
+            match outcome {
+                RdbSaveOutcome::Saved => {
+                    crate::server_log!(notice, "Forkless background saving completed")
+                }
+                RdbSaveOutcome::Cancelled => {
+                    crate::server_log!(notice, "Forkless background saving cancelled")
+                }
+                RdbSaveOutcome::Failed(error) => {
+                    crate::server_log!(warning, "Forkless background saving failed: {}", error)
+                }
+            }
+            self.release_forkless_clients();
+        }
         let Some(pid) = self.ctx.persistence().rdb_child_pid() else {
             return;
         };
@@ -923,6 +952,18 @@ impl ServerWorkerState {
             },
             pid
         );
+    }
+
+    pub(crate) fn release_forkless_clients(&mut self) {
+        let tokens: Vec<_> = self.ctx.forkless_clients_mut().drain(..).collect();
+        let mut dirty = Vec::new();
+        for token in tokens {
+            self.ctx.paused_clients_mut().insert(token);
+            dirty.extend(self.wakeup_blocked_client(token, None, None));
+        }
+        if !dirty.is_empty() {
+            self.wakeup_blocked_on_keys(&dirty, None, None);
+        }
     }
 
     pub(crate) fn check_auto_bgsave(&mut self) {

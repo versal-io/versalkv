@@ -112,8 +112,6 @@ pub struct ModuleOptions {
 }
 
 impl ModuleOptions {
-    // Tests read the owning module's state; production currently only stores flags.
-    #[cfg(test)]
     pub fn get(&self) -> c_int {
         self.value.load(std::sync::atomic::Ordering::Relaxed)
     }

@@ -118,8 +118,7 @@ fn memory_stats(ctx: &ServerContext) -> Value {
     let tracker = crate::foundation::memory::metrics::memory_stats::get_tracker();
     let normal_clients = ctx.normal_client_memory();
     let aof_buffer = ctx.aof().buffer_allocation_bytes();
-    let lua_caches = tracker
-        .get(crate::foundation::memory::metrics::memory_stats::MemoryCategory::ScriptsCaches);
+    let lua_caches = ctx.script().script_cache.memory_usage();
     let replica_repl_buffer = if ctx.replication().is_replica() {
         ctx.replication().replica_output_buffer_bytes
     } else {

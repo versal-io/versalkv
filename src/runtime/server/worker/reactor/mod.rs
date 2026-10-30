@@ -182,6 +182,7 @@ pub(crate) enum TimerEvent {
     ServerCron,
     ModuleTimer,
     EvictionContinuation,
+    ReplicationThrottle,
     // Reserved for the timer migrations that follow the continuation cutover.
     // TODO(dead_code): remove these local allows when their owners use TimeEventRegistry.
     #[allow(dead_code)]
@@ -527,6 +528,7 @@ impl super::ServerWorkerState {
             // honored below.
             if self.ctx.is_shutdown_requested() {
                 self.perform_shutdown_handoff_if_needed();
+                self.save_cluster_config_before_exit();
                 crate::server_log!(notice, "Shutdown requested, exiting event loop");
                 self.cancel_disk_sync_batch();
                 self.abort_direct_dual_rdb_child_for_shutdown();
@@ -540,6 +542,7 @@ impl super::ServerWorkerState {
             return false;
         }
         self.perform_shutdown_handoff_if_needed();
+        self.save_cluster_config_before_exit();
         crate::server_log!(notice, "Shutdown requested, exiting event loop");
         self.cancel_disk_sync_batch();
         self.abort_direct_dual_rdb_child_for_shutdown();

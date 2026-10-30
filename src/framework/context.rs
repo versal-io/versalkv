@@ -18,6 +18,7 @@ use crate::framework::observability::slowlog::SlowLog;
 mod control;
 mod data;
 mod distributed;
+mod hotkeys;
 mod lifecycle;
 mod memory;
 mod persistence;
@@ -50,6 +51,7 @@ pub struct ServerContext {
     mem_stats: &'static MemoryCategoryTracker,
     slowlog: SlowLog,
     commandlog: CommandLog,
+    hotkeys: std::rc::Rc<crate::engine::extension::hotkeys::Hotkeys>,
     slot_metrics: SlotMetrics,
     migrate_sockets: MigrateSocketCache,
     script: ScriptExecutionState,
@@ -68,8 +70,11 @@ pub struct ServerContext {
     // commands in postponement order so an earlier blocking pop is registered
     // before a later push makes the key ready.
     paused_clients: indexmap::IndexSet<Token>,
+    forkless_clients: indexmap::IndexSet<Token>,
+    throttled_clients: indexmap::IndexSet<Token>,
     pending_unpause: bool,
     needs_eviction: bool,
+    suppress_eviction_until_write: bool,
     slot_export_output_memory: usize,
     pending_acl_client_kills: Vec<String>,
     pending_acl_tokens_to_kill: Vec<Token>,

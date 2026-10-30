@@ -344,6 +344,15 @@ fn emit_eventloop_and_acl_stats(s: &mut String, ctx: &ServerContext) {
 pub(super) fn gen_debug_section(ctx: &ServerContext) -> String {
     let mut s = String::new();
     s.push_str("# Debug\r\n");
+    let forkless = ctx.persistence().forkless_progress();
+    emit_line(&mut s, "forkless_current_item_ms", forkless.map_or(-1, |p| p.current_item_ms));
+    emit_line(&mut s, "forkless_current_queue_length", forkless.map_or(0, |p| p.queue_length));
+    emit_line(&mut s, "forkless_queue_length_target", forkless.map_or(0, |p| p.queue_length_target));
+    emit_line(&mut s, "forkless_dbentries_queued", forkless.map_or(0, |p| p.enqueued));
+    emit_line(&mut s, "forkless_dbentries_processed", forkless.map_or(0, |p| p.processed));
+    emit_line(&mut s, "repl_throttle_more_events", ctx.replication().throttle.more_events);
+    emit_line(&mut s, "repl_throttle_less_events", ctx.replication().throttle.less_events);
+    emit_line(&mut s, "repl_throttle_current_clients", ctx.throttled_clients().len());
     emit_line(
         &mut s,
         "eventloop_duration_aof_sum",

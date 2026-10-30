@@ -14,6 +14,8 @@ use bytes::Bytes;
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
+use std::ops::{Deref, DerefMut};
+use std::sync::Arc;
 
 use super::{now_ms, EvictionCandidate, EvictionPolicy};
 type SlotRouter = fn(&[u8]) -> usize;
@@ -45,6 +47,7 @@ pub struct Db {
     lfu_log_factor: u32,
     lfu_decay_time: u16,
     slot_router: SlotRouter,
+    pub(super) db_id: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -103,16 +106,107 @@ impl KeyMeta {
     }
 }
 
+#[derive(Debug)]
+pub(crate) enum SnapshotValue {
+    Owned(Robj),
+    Shared(Arc<Robj>),
+}
+
+impl SnapshotValue {
+    pub(crate) fn as_ref(&self) -> &Robj {
+        match self {
+            Self::Owned(value) => value,
+            Self::Shared(value) => value,
+        }
+    }
+
+    pub(crate) fn is_shared(&self) -> bool {
+        matches!(self, Self::Shared(_))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn collection_storage_ptr(&self) -> *const () {
+        match self {
+            Self::Owned(value) => collection_storage_ptr(value),
+            Self::Shared(value) => collection_storage_ptr(value),
+        }
+    }
+}
+
+#[cfg(test)]
+fn collection_storage_ptr(value: &Robj) -> *const () {
+    match value {
+        Robj::ListQuicklist(list) => list.as_slices().0.as_ptr().cast(),
+        _ => std::ptr::null(),
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(super) enum ValueSlot {
+    Owned(Robj),
+    Shared(Arc<Robj>),
+}
+
+impl Deref for ValueSlot {
+    type Target = Robj;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Owned(value) => value,
+            Self::Shared(value) => value,
+        }
+    }
+}
+
+impl DerefMut for ValueSlot {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            Self::Owned(value) => value,
+            Self::Shared(value) => Arc::make_mut(value),
+        }
+    }
+}
+
+impl ValueSlot {
+    fn snapshot(&mut self, large_value_threshold: usize) -> SnapshotValue {
+        if self.estimated_size() <= large_value_threshold {
+            return SnapshotValue::Owned((**self).clone());
+        }
+        if let Self::Owned(value) = self {
+            let owned = std::mem::replace(value, Robj::string_raw(Bytes::new()));
+            *self = Self::Shared(Arc::new(owned));
+        }
+        let Self::Shared(value) = self else {
+            unreachable!("large snapshot value must be shared");
+        };
+        SnapshotValue::Shared(Arc::clone(value))
+    }
+
+    fn into_owned(self) -> Robj {
+        match self {
+            Self::Owned(value) => value,
+            Self::Shared(value) => Arc::unwrap_or_clone(value),
+        }
+    }
+
+    fn into_deferred_flush_value(self) -> Option<Robj> {
+        match self {
+            Self::Owned(value) => Some(value),
+            Self::Shared(value) => Arc::into_inner(value),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct DbValue {
-    pub(super) value: Robj,
+    pub(super) value: ValueSlot,
     pub(super) key_meta: KeyMeta,
 }
 
 impl DbValue {
     fn new(value: Robj, use_lfu: bool) -> Self {
         Self {
-            value,
+            value: ValueSlot::Owned(value),
             key_meta: if use_lfu {
                 KeyMeta::lfu_now(5)
             } else {
@@ -187,6 +281,7 @@ impl Db {
             lfu_decay_time: 1,
             lazy_expired_hash_fields: 0,
             slot_router,
+            db_id: 0,
         }
     }
 
@@ -239,28 +334,69 @@ impl Db {
     }
 
     pub fn get_at(&mut self, key: &[u8], now_ms: u64) -> Option<&Robj> {
+        crate::foundation::memory::key_access::record_lookup(self.db_id, key);
         if self.is_expired_at(key, now_ms) {
             if !self.no_lazy_expire && !self.pause_skip_expire && self.should_expire_locally(key) {
                 self.expired_deletions.push(key.to_vec());
+                let _suppression =
+                    crate::foundation::memory::key_access::KeyAccessSuppression::enter();
                 self.del(key);
             }
             return None;
         }
         let slot = self.key_slot(key);
-        self.data.get_in_slot(slot, key).map(|entry| &entry.value)
+        self.data.get_in_slot(slot, key).map(|entry| &*entry.value)
     }
 
     pub fn get_no_expire(&self, key: &[u8]) -> Option<&Robj> {
+        crate::foundation::memory::key_access::record_lookup(self.db_id, key);
         if self.is_expired(key) {
             return None;
         }
         let slot = self.key_slot(key);
-        self.data.get_in_slot(slot, key).map(|entry| &entry.value)
+        self.data.get_in_slot(slot, key).map(|entry| &*entry.value)
     }
 
     pub fn get_allow_expired(&self, key: &[u8]) -> Option<&Robj> {
+        crate::foundation::memory::key_access::record_lookup(self.db_id, key);
         let slot = self.key_slot(key);
-        self.data.get_in_slot(slot, key).map(|entry| &entry.value)
+        self.data.get_in_slot(slot, key).map(|entry| &*entry.value)
+    }
+
+    /// Promote one large value at the handoff boundary. Ordinary values stay
+    /// owned by the event-loop store and are copied only into the work item.
+    pub(crate) fn snapshot_value_for_background(
+        &mut self,
+        key: &[u8],
+        large_value_threshold: usize,
+    ) -> Option<SnapshotValue> {
+        let slot = self.key_slot(key);
+        self.data
+            .get_mut_in_slot(slot, key)
+            .map(|entry| entry.value.snapshot(large_value_threshold))
+    }
+
+    pub(crate) fn release_background_snapshot(&mut self, key: &[u8]) -> bool {
+        let slot = self.key_slot(key);
+        let Some(entry) = self.data.get_mut_in_slot(slot, key) else {
+            return true;
+        };
+        let ValueSlot::Shared(shared) = &entry.value else {
+            return true;
+        };
+        if Arc::strong_count(shared) != 1 {
+            return false;
+        }
+        let ValueSlot::Shared(shared) = std::mem::replace(
+            &mut entry.value,
+            ValueSlot::Owned(Robj::string_raw(Bytes::new())),
+        ) else {
+            unreachable!("snapshot value was checked as shared");
+        };
+        entry.value = ValueSlot::Owned(
+            Arc::into_inner(shared).expect("sole snapshot owner must unwrap without cloning"),
+        );
+        true
     }
 
     pub fn expire_of(&self, key: &[u8]) -> Option<u64> {
@@ -273,9 +409,12 @@ impl Db {
     }
 
     pub fn get_mut_at(&mut self, key: &[u8], now_ms: u64) -> Option<&mut Robj> {
+        crate::foundation::memory::key_access::record_lookup(self.db_id, key);
         if self.is_expired_at(key, now_ms) {
             if !self.no_lazy_expire && !self.pause_skip_expire && self.should_expire_locally(key) {
                 self.expired_deletions.push(key.to_vec());
+                let _suppression =
+                    crate::foundation::memory::key_access::KeyAccessSuppression::enter();
                 self.del(key);
             }
             return None;
@@ -283,7 +422,7 @@ impl Db {
         let slot = self.key_slot(key);
         self.data
             .get_mut_in_slot(slot, key)
-            .map(|entry| &mut entry.value)
+            .map(|entry| &mut *entry.value)
     }
 
     fn upgrade_compact_encoding_for_command(&mut self, key: &[u8]) {
@@ -291,7 +430,7 @@ impl Db {
         let Some(entry) = self.data.get_mut_in_slot(slot, key) else {
             return;
         };
-        let obj = &mut entry.value;
+        let obj = &mut *entry.value;
         let replacement = match obj {
             Robj::ListListpack(list) => Some(Robj::ListQuicklist(ListValue::from_vecdeque(
                 list.all_elements().into_iter().map(Bytes::from).collect(),
@@ -437,7 +576,7 @@ impl Db {
 
     pub fn get_string_allow_expired(&self, key: &[u8]) -> Result<Option<&[u8]>, ()> {
         let slot = self.key_slot(key);
-        match self.data.get_in_slot(slot, key).map(|entry| &entry.value) {
+        match self.data.get_in_slot(slot, key).map(|entry| &*entry.value) {
             Some(Robj::StrInt(s)) => Ok(Some(s.as_bytes())),
             Some(Robj::StrEmbstr(s)) => Ok(Some(s.as_bytes())),
             Some(Robj::StrRaw(s)) => Ok(Some(s.as_bytes())),
@@ -536,12 +675,12 @@ impl Db {
                 StoredKey::from(key),
                 DbValue::new(Robj::ListQuicklist(ListValue::new()), use_lfu),
             );
-            return Ok(match &mut data.get_mut_in_slot(slot, key).unwrap().value {
+            return Ok(match &mut *data.get_mut_in_slot(slot, key).unwrap().value {
                 Robj::ListQuicklist(v) => v,
                 _ => unreachable!(),
             });
         }
-        match &mut data.get_mut_in_slot(slot, key).unwrap().value {
+        match &mut *data.get_mut_in_slot(slot, key).unwrap().value {
             Robj::ListQuicklist(v) => Ok(v),
             _ => Err(()),
         }
@@ -562,12 +701,12 @@ impl Db {
                 StoredKey::from(key),
                 DbValue::new(Robj::ZSetSkiplist(ZSetSl::new()), use_lfu),
             );
-            return Ok(match &mut data.get_mut_in_slot(slot, key).unwrap().value {
+            return Ok(match &mut *data.get_mut_in_slot(slot, key).unwrap().value {
                 Robj::ZSetSkiplist(v) => v,
                 _ => unreachable!(),
             });
         }
-        match &mut data.get_mut_in_slot(slot, key).unwrap().value {
+        match &mut *data.get_mut_in_slot(slot, key).unwrap().value {
             Robj::ZSetSkiplist(v) => Ok(v),
             _ => Err(()),
         }
@@ -588,12 +727,12 @@ impl Db {
                 StoredKey::from(key),
                 DbValue::new(Robj::HashHashtable(HashHt::new()), use_lfu),
             );
-            return Ok(match &mut data.get_mut_in_slot(slot, key).unwrap().value {
+            return Ok(match &mut *data.get_mut_in_slot(slot, key).unwrap().value {
                 Robj::HashHashtable(v) => v,
                 _ => unreachable!(),
             });
         }
-        match &mut data.get_mut_in_slot(slot, key).unwrap().value {
+        match &mut *data.get_mut_in_slot(slot, key).unwrap().value {
             Robj::HashHashtable(v) => Ok(v),
             _ => Err(()),
         }
@@ -627,6 +766,7 @@ impl Db {
             .get_mut_in_slot(slot, key)
             .expect("hash object was inserted before mutation")
             .value;
+        let object = &mut **object;
         match object {
             Robj::HashHashtable(hash) => Ok(hash
                 .data
@@ -688,6 +828,7 @@ impl Db {
             .get_mut_in_slot(slot, key)
             .expect("zset object was inserted before mutation")
             .value;
+        let object = &mut **object;
         match object {
             Robj::ZSetSkiplist(zset) => ZSetOps::add(zset, member, score).map_err(|_| ()),
             Robj::ZSetListpack(zset) => {
@@ -737,12 +878,12 @@ impl Db {
                 StoredKey::from(key),
                 DbValue::new(Robj::SetHashtable(ValkeySet::new()), use_lfu),
             );
-            return Ok(match &mut data.get_mut_in_slot(slot, key).unwrap().value {
+            return Ok(match &mut *data.get_mut_in_slot(slot, key).unwrap().value {
                 Robj::SetHashtable(v) => v,
                 _ => unreachable!(),
             });
         }
-        match &mut data.get_mut_in_slot(slot, key).unwrap().value {
+        match &mut *data.get_mut_in_slot(slot, key).unwrap().value {
             Robj::SetHashtable(v) => Ok(v),
             _ => Err(()),
         }
@@ -763,12 +904,12 @@ impl Db {
                 StoredKey::from(key),
                 DbValue::new(Robj::StreamListpack(Box::default()), use_lfu),
             );
-            return Ok(match &mut data.get_mut_in_slot(slot, key).unwrap().value {
+            return Ok(match &mut *data.get_mut_in_slot(slot, key).unwrap().value {
                 Robj::StreamListpack(v) => v,
                 _ => unreachable!(),
             });
         }
-        match &mut data.get_mut_in_slot(slot, key).unwrap().value {
+        match &mut *data.get_mut_in_slot(slot, key).unwrap().value {
             Robj::StreamListpack(v) => Ok(v),
             _ => Err(()),
         }
@@ -860,9 +1001,12 @@ impl Db {
     }
 
     pub fn exists_at(&mut self, key: &[u8], now_ms: u64) -> bool {
+        crate::foundation::memory::key_access::record_lookup(self.db_id, key);
         if self.is_expired_at(key, now_ms) {
             if !self.no_lazy_expire && !self.pause_skip_expire && self.should_expire_locally(key) {
                 self.expired_deletions.push(key.to_vec());
+                let _suppression =
+                    crate::foundation::memory::key_access::KeyAccessSuppression::enter();
                 self.del(key);
             }
             return false;
@@ -872,6 +1016,7 @@ impl Db {
     }
 
     pub fn exists_no_expire(&self, key: &[u8]) -> bool {
+        crate::foundation::memory::key_access::record_lookup(self.db_id, key);
         if self.is_expired(key) {
             return false;
         }
@@ -884,6 +1029,20 @@ impl Db {
             .keys()
             .map(|key| key.as_bytes().to_vec())
             .collect()
+    }
+
+    /// Return one dictionary scan bucket. Callers can retain the cursor and
+    /// process one bounded bucket per event-loop turn.
+    pub(crate) fn snapshot_scan_bucket(&self, cursor: u64) -> (u64, Vec<Vec<u8>>) {
+        let mut keys = Vec::new();
+        let next = self.data.scan(cursor, |key, _| {
+            keys.push(key.as_bytes().to_vec());
+        });
+        (next, keys)
+    }
+
+    pub(crate) fn hash_field_expires_for(&self, key: &[u8]) -> Option<&HashMap<Vec<u8>, u64>> {
+        self.hash_field_expires.get(key)
     }
 
     pub fn random_eviction_key(&self) -> Option<Vec<u8>> {
@@ -991,10 +1150,10 @@ impl Db {
             .data
             .drain()
             .into_iter()
-            .map(|(key, val)| {
+            .filter_map(|(key, val)| {
                 let key_total = key.len() + val.value.estimated_size();
                 memory_stats::track_sub(MemoryCategory::Dataset, key_total);
-                val.value
+                val.value.into_deferred_flush_value()
             })
             .collect();
         for _key in self.expires.keys() {}
@@ -1024,6 +1183,7 @@ impl Db {
         self.module_values.remove(key);
         let removed = self.data.remove_in_slot(slot, key);
         if let Some(val) = removed {
+            crate::foundation::memory::key_access::record_delete(self.db_id, key);
             let key_total = key.len() + val.value.estimated_size();
             memory_stats::track_sub(MemoryCategory::Dataset, key_total);
             true
@@ -1101,7 +1261,11 @@ impl Db {
     }
 
     pub fn touch_access_time(&mut self, key: &[u8]) -> bool {
-        if !self.exists(key) {
+        let exists = {
+            let _suppression = crate::foundation::memory::key_access::KeyAccessSuppression::enter();
+            self.exists(key)
+        };
+        if !exists {
             return false;
         }
         if let Some(entry) = self.data.get_mut_in_slot(self.key_slot(key), key) {
@@ -1202,10 +1366,12 @@ impl Db {
         let slot = self.key_slot(key);
         if self.is_expired(key) && !self.no_lazy_expire && !self.pause_skip_expire {
             self.expired_deletions.push(key.to_vec());
+            let _suppression = crate::foundation::memory::key_access::KeyAccessSuppression::enter();
             self.del(key);
             return None;
         }
         let val = self.data.remove_in_slot(slot, key)?;
+        crate::foundation::memory::key_access::record_delete(self.db_id, key);
         let expire = self.expires.remove_in_slot(slot, key);
         self.replica_local_expire_keys.remove(key);
         let hfe = self.take_hash_field_expires(key);
@@ -1213,7 +1379,7 @@ impl Db {
         self.module_values.remove(key);
         let key_total = key.len() + val.value.estimated_size();
         memory_stats::track_sub(MemoryCategory::Dataset, key_total);
-        Some((val.value, expire, hfe))
+        Some((val.value.into_owned(), expire, hfe))
     }
 
     pub fn clone_entry(&self, key: &[u8]) -> Option<(Robj, Option<u64>, HashMap<Vec<u8>, u64>)> {
@@ -1228,7 +1394,7 @@ impl Db {
         key: &[u8],
     ) -> Option<(Robj, Option<u64>, HashMap<Vec<u8>, u64>)> {
         let slot = self.key_slot(key);
-        let val = self.data.get_in_slot(slot, key)?.value.clone();
+        let val = (*self.data.get_in_slot(slot, key)?.value).clone();
         let expire = self.expires.get_in_slot(slot, key).copied();
         let hfe = self
             .hash_field_expires
@@ -1249,7 +1415,7 @@ impl Db {
         let Some(entry) = self.data.get_mut_in_slot(slot, key) else {
             return false;
         };
-        entry.value = entry.value.relocated_clone();
+        entry.value = ValueSlot::Owned(entry.value.relocated_clone());
         true
     }
 

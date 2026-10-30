@@ -28,12 +28,14 @@ impl DbSet {
     ) -> Self {
         let resize_budget = ResizeBudget::new(None);
         let mut dbs = Vec::with_capacity(num_dbs as usize);
-        for _ in 0..num_dbs {
-            dbs.push(Db::new_with_slot_router_and_resize_budget(
+        for db_id in 0..num_dbs {
+            let mut db = Db::new_with_slot_router_and_resize_budget(
                 slot_bits,
                 slot_router,
                 resize_budget.clone(),
-            ));
+            );
+            db.db_id = db_id;
+            dbs.push(db);
         }
         Self { dbs, resize_budget }
     }
@@ -64,6 +66,10 @@ impl DbSet {
 
     pub fn iter_dbs(&self) -> impl Iterator<Item = (usize, &Db)> {
         self.dbs.iter().enumerate()
+    }
+
+    pub(crate) fn iter_dbs_mut(&mut self) -> impl Iterator<Item = (usize, &mut Db)> {
+        self.dbs.iter_mut().enumerate()
     }
 
     pub fn set_lfu_mode(&mut self, use_lfu: bool) {
@@ -151,6 +157,8 @@ impl DbSet {
             return;
         }
         self.dbs.swap(idx1 as usize, idx2 as usize);
+        self.dbs[idx1 as usize].db_id = idx1;
+        self.dbs[idx2 as usize].db_id = idx2;
     }
 
     pub fn flush_all(&mut self) {

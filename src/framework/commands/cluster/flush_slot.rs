@@ -26,7 +26,7 @@ pub(super) fn cluster_flushslot(
         return CommandError::syntax_error();
     }
 
-    let deleted = ctx.dbs_mut().take_slot(slot);
+    let deleted = ctx.take_slot_entries(slot);
     for entry in &deleted {
         conn.record_dirty_key((entry.db_id, Bytes::copy_from_slice(&entry.key)));
     }

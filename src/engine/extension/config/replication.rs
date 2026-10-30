@@ -20,6 +20,7 @@ pub struct ReplicationConfig {
     /// C `replica-lazy-flush`, enabled by default for full-sync replacement.
     pub replica_lazy_flush: bool,
     pub repl_disable_tcp_nodelay: bool,
+    pub repl_throttling_enabled: bool,
     /// C `repl-mptcp`, immutable because an existing upstream socket cannot
     /// change protocol in place.
     pub repl_mptcp: bool,
@@ -62,6 +63,7 @@ impl ReplicationConfig {
             replica_ignore_disk_write_errors: false,
             replica_lazy_flush: true,
             repl_disable_tcp_nodelay: false,
+            repl_throttling_enabled: false,
             repl_mptcp: false,
             repl_diskless_load: "disabled".to_string(),
             repl_diskless_sync_delay: 5,

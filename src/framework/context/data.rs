@@ -19,6 +19,7 @@ impl ServerContext {
 
     // ── Db semantic methods ──
     pub fn flush_all_dbs(&mut self) {
+        self.persistence().cancel_forkless_save();
         self.db.dbs.flush_all();
         self.reset_repl_seldb();
     }
@@ -26,6 +27,7 @@ impl ServerContext {
     /// owner. Used only by full-sync replacement paths that have already made
     /// the serving dataset unavailable.
     pub fn drain_all_db_values_for_lazyfree(&mut self) -> Vec<crate::foundation::io::store::Robj> {
+        self.persistence().cancel_forkless_save();
         let values = self.db.dbs.drain_all_values_for_lazyfree();
         self.reset_repl_seldb();
         values

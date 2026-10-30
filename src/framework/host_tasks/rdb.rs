@@ -86,6 +86,7 @@ impl DebugRdbTask {
                     return debug_rdb_error(&LoadError::Corrupt);
                 }
                 *ctx.dbs_mut() = loaded_dataset;
+                ctx.set_suppress_eviction_until_write(true);
                 Value::ok()
             }
             Err(RdbTaskError::Load(error)) => {

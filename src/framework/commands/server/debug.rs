@@ -116,6 +116,29 @@ pub fn debug_cmd(conn: &mut dyn CommandConn, args: &CommandArgs, ctx: &mut Serve
             Some(state) => debug_cluster_replica_priority(args, state),
             None => Value::error("ERR Debug option only available for cluster mode enabled setup!"),
         },
+        "cluster-failover-delay" | "cluster-failover-epoch" => {
+            if args.args.len() != 2 { return CommandError::syntax_error(); }
+            let value = match std::str::from_utf8(&args.args[1]).ok().and_then(|s| s.parse::<i64>().ok()) {
+                Some(value) => value,
+                None => return Value::error("ERR value is not an integer or out of range"),
+            };
+            let is_delay = sub == "cluster-failover-delay";
+            if is_delay && i32::try_from(value).is_err() {
+                return Value::error("ERR value is out of range");
+            }
+            if value < -1 {
+                return Value::error(if is_delay {
+                    "ERR delay-ms must be -1 (default) or a non-negative value in ms"
+                } else { "ERR epoch must be -1 (default) or a non-negative value" });
+            }
+            let Some(state) = ctx.cluster_state_mut().as_deref_mut() else {
+                return Value::error("ERR This instance has cluster support disabled");
+            };
+            let override_value = u64::try_from(value).ok();
+            if is_delay { state.automatic_failover.set_debug_delay_ms(override_value); }
+            else { state.automatic_failover.set_debug_epoch(override_value); }
+            Value::ok()
+        }
         "slotmigration" => match ctx.cluster_state_mut().as_deref_mut() {
             Some(state) => debug_slot_migration(args, state),
             None => Value::error("ERR This instance has cluster support disabled"),
@@ -218,6 +241,12 @@ pub(crate) fn prepare_debug_task(
         }
         return prepare_debug_loadaof(ctx);
     }
+    if args.args[0].eq_ignore_ascii_case(b"bio-drain") {
+        if args.args.len() != 2 || !args.args[1].eq_ignore_ascii_case(b"BIO_CLUSTER_SAVE") {
+            return Err(CommandError::syntax_error());
+        }
+        return Ok(crate::framework::host_tasks::PreparedHostTask::DrainClusterConfig);
+    }
     if !args.args[0].eq_ignore_ascii_case(b"reload") {
         return Err(debug_cmd(conn, args, ctx));
     }
@@ -250,6 +279,9 @@ pub(crate) fn prepare_debug_task(
         .join(&ctx.config().persistence.dbfilename);
     let bytes = std::fs::read(&path)
         .map_err(|error| Value::error(format!("ERR Error reading RDB file: {}", error)))?;
+    if should_flush {
+        ctx.persistence().cancel_forkless_save();
+    }
     let placeholder = ctx.dbs().empty_like();
     let existing = std::mem::replace(ctx.dbs_mut(), placeholder);
     let (dataset, rollback_dataset) = if should_flush {

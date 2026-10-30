@@ -32,7 +32,9 @@ pub fn client_info(conn: &mut dyn CommandConn, ctx: &mut ServerContext) -> Value
     if conn.readonly() {
         flags.push('r');
     }
-    if conn.blocked().is_some() {
+    if conn.blocked().is_some_and(|blocked| matches!(blocked.cmd, crate::engine::command::context::BlockedCmd::Throttled)) {
+        flags.push('h');
+    } else if conn.blocked().is_some() {
         flags.push('b');
     }
     if conn.no_touch() {

@@ -1,7 +1,7 @@
 use crate::framework::capabilities::connection::Connection;
 
 /// Valid client flag characters for CLIENT LIST/KILL flag filters.
-const VALID_FLAG_CHARS: &[u8] = b"NOSMbrmIdutTxekKLXpBPcRUWqmnvCDAHsijJFVfgGYwyE";
+const VALID_FLAG_CHARS: &[u8] = b"NOSMbrmIdutTxekKLXpBPcRUWqmnvCDAHsijJFVfgGYwyEh";
 
 pub(crate) fn is_valid_flag(flag: &str) -> bool {
     flag.as_bytes()
@@ -40,7 +40,14 @@ pub(crate) fn flag_char_for_conn(
     if conn.readonly {
         flags.push('r');
     }
-    if conn.blocked.is_some() {
+    if conn.blocked.as_ref().is_some_and(|blocked| {
+        matches!(
+            blocked.cmd,
+            crate::framework::capabilities::connection::BlockedCmd::Throttled
+        )
+    }) {
+        flags.push('h');
+    } else if conn.blocked.is_some() {
         flags.push('b');
     }
     if conn.is_async_close_pending {

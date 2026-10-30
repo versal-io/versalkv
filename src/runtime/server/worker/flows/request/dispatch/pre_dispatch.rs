@@ -435,6 +435,61 @@ impl ServerWorkerState {
         None
     }
 
+    pub(super) fn stage_forkless_key_barrier(
+        &self,
+        facts: &CommandClientFacts,
+        meta: &CmdPreconditions,
+        args: &CommandArgs,
+        call_flags: CmdCallFlags,
+    ) -> Option<DispatchOutcome> {
+        let is_safe_slot_migration_control = facts.migration_control
+            && crate::runtime::server::worker::distributed::migration::is_syncslots_ack(args);
+        if is_safe_slot_migration_control {
+            return None;
+        }
+        let is_snapshot_mutating_migration_control = facts.migration_control
+            && crate::runtime::server::worker::distributed::migration::is_syncslots_command(args);
+        if is_snapshot_mutating_migration_control
+            && self.ctx.persistence().forkless_save_in_progress()
+        {
+            return Some(DispatchOutcome {
+                action: DispatchAction::Postpone(PostponeReason::ForklessKey),
+                call_flags,
+                reject_reply: None,
+            });
+        }
+        if !call_flags.is_write {
+            return None;
+        }
+        let keys = super::ServerWorkerState::cluster_redirect_keys(meta, args);
+        let is_capture_control = args.name.eq_ignore_ascii_case(b"bgsave")
+            || args.name.eq_ignore_ascii_case(b"save")
+            || args.name.eq_ignore_ascii_case(b"flushdb")
+            || args.name.eq_ignore_ascii_case(b"flushall")
+            || args.name.eq_ignore_ascii_case(b"shutdown");
+        if !is_capture_control && self.ctx.persistence().forkless_capture_in_progress() {
+            return Some(DispatchOutcome {
+                action: DispatchAction::Postpone(PostponeReason::ForklessKey),
+                call_flags,
+                reject_reply: None,
+            });
+        }
+        if facts.transaction {
+            return None;
+        }
+        keys.into_iter()
+            .any(|key| {
+                self.ctx
+                    .persistence()
+                    .forkless_key_blocked(facts.selected_db, &key)
+            })
+            .then_some(DispatchOutcome {
+                action: DispatchAction::Postpone(PostponeReason::ForklessKey),
+                call_flags,
+                reject_reply: None,
+            })
+    }
+
     pub(super) fn stage_slot_migration_pause(
         &self,
         facts: &CommandClientFacts,

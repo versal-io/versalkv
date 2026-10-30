@@ -46,6 +46,15 @@ impl ServerContext {
     pub(crate) fn paused_clients_mut(&mut self) -> &mut indexmap::IndexSet<Token> {
         &mut self.paused_clients
     }
+    pub(crate) fn forkless_clients_mut(&mut self) -> &mut indexmap::IndexSet<Token> {
+        &mut self.forkless_clients
+    }
+    pub fn throttled_clients(&self) -> &indexmap::IndexSet<Token> {
+        &self.throttled_clients
+    }
+    pub(crate) fn throttled_clients_mut(&mut self) -> &mut indexmap::IndexSet<Token> {
+        &mut self.throttled_clients
+    }
     pub fn pending_unpause(&self) -> bool {
         self.pending_unpause
     }
@@ -58,6 +67,12 @@ impl ServerContext {
 
     pub(crate) fn needs_eviction(&self) -> bool {
         self.needs_eviction
+    }
+    pub(crate) fn suppress_eviction_until_write(&self) -> bool {
+        self.suppress_eviction_until_write
+    }
+    pub(crate) fn set_suppress_eviction_until_write(&mut self, val: bool) {
+        self.suppress_eviction_until_write = val;
     }
     pub(crate) fn pending_acl_client_kills_mut(&mut self) -> &mut Vec<String> {
         &mut self.pending_acl_client_kills

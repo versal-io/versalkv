@@ -25,6 +25,7 @@ pub enum ClusterMsgType {
     MfStart = 8,
     Module = 9,
     PublishShard = 10,
+    FailoverAuthNack = 11,
 }
 
 impl ClusterMsgType {
@@ -41,6 +42,7 @@ impl ClusterMsgType {
             8 => Self::MfStart,
             9 => Self::Module,
             10 => Self::PublishShard,
+            11 => Self::FailoverAuthNack,
             _ => return None,
         })
     }
@@ -160,7 +162,8 @@ impl ClusterBusMessage {
                 tls_port: sender.endpoints.tls_port(),
                 bus_port: sender.cport(),
                 flags: sender.flags
-                    | crate::engine::distributed::cluster::node::CLUSTER_NODE_EXTENSIONS_SUPPORTED,
+                    | crate::engine::distributed::cluster::node::CLUSTER_NODE_EXTENSIONS_SUPPORTED
+                    | crate::engine::distributed::cluster::node::CLUSTER_NODE_FAILOVER_AUTH_NACK_SUPPORTED,
                 replicaof: sender.replicaof.clone(),
                 sender_ip: sender.ip().to_string(),
                 myslots,

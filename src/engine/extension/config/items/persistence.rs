@@ -3,6 +3,50 @@ use crate::engine::extension::config::spec_registry::ConfigRegistry;
 
 pub(crate) fn register_persistence_configs(reg: &mut ConfigRegistry) {
     reg.register(&ConfigSpec {
+        name: "forkless-infrastructure-enabled",
+        type_: ConfigType::Bool,
+        enum_values: &[],
+        numeric_min: 0,
+        numeric_max: 0,
+        flags: &["immutable"],
+        alias: None,
+        get: |config| ConfigValue::Bool(config.persistence.forkless_infrastructure_enabled),
+        set: |config, value| {
+            let ConfigValue::Bool(value) = value else {
+                return Err("forkless-infrastructure-enabled must be a boolean".to_string());
+            };
+            config.persistence.forkless_infrastructure_enabled = *value;
+            Ok(())
+        },
+    });
+    reg.register(&ConfigSpec {
+        name: "bgsave-default-method",
+        type_: ConfigType::Enum,
+        enum_values: &["fork", "forkless"],
+        numeric_min: 0,
+        numeric_max: 0,
+        flags: &[],
+        alias: None,
+        get: |config| {
+            ConfigValue::String(
+                config
+                    .persistence
+                    .bgsave_default_method
+                    .as_str()
+                    .to_string(),
+            )
+        },
+        set: |config, value| {
+            let ConfigValue::String(value) = value else {
+                return Err("bgsave-default-method must be an enum".to_string());
+            };
+            config.persistence.bgsave_default_method =
+                crate::engine::extension::config::persistence::BgsaveMethod::parse(value)
+                    .ok_or_else(|| "Invalid background save method".to_string())?;
+            Ok(())
+        },
+    });
+    reg.register(&ConfigSpec {
         name: "dir",
         type_: ConfigType::String,
         enum_values: &[],

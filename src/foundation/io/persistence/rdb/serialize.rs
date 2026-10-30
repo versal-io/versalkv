@@ -132,11 +132,15 @@ pub fn serialize_all_with_functions_and_replication_with_options(
 ) -> Vec<u8> {
     // Pre-reserve capacity to avoid repeated Vec growth reallocations during
     // small-field encoding: magic(9) + aux(~256) + per-key ~64B avg estimate.
-    let total_keys: u64 = std::iter::once(dbs)
-        .chain(additional_datasets.iter().copied())
-        .flat_map(|dataset| (0..dataset.num_dbs() as u32).filter_map(|i| dataset.get(i)))
-        .map(|db| db.dbsize() as u64)
-        .sum();
+    let total_keys: u64 = if include_keys {
+        std::iter::once(dbs)
+            .chain(additional_datasets.iter().copied())
+            .flat_map(|dataset| (0..dataset.num_dbs() as u32).filter_map(|i| dataset.get(i)))
+            .map(|db| db.dbsize() as u64)
+            .sum()
+    } else {
+        0
+    };
     let estimate = 9 + 256 + total_keys.saturating_mul(64);
     let mut out = Vec::with_capacity(estimate as usize);
 
@@ -439,7 +443,7 @@ fn save_aux_str(out: &mut Vec<u8>, key: &[u8], val: &[u8], compression: bool) {
     save_raw_string(out, val, compression);
 }
 
-fn save_key_value(
+pub(crate) fn save_key_value(
     out: &mut Vec<u8>,
     key: &[u8],
     val: &Robj,
@@ -459,4 +463,37 @@ fn save_key_value(
         hash_field_expires,
         &mut writer,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+
+    #[test]
+    fn metadata_only_serialization_does_not_reserve_per_key_capacity() {
+        let mut dbs = DbSet::new(1);
+        for index in 0..20_000 {
+            dbs.get_mut(0).unwrap().set(
+                format!("key-{index}").into_bytes(),
+                Robj::string_raw(Bytes::from_static(b"value")),
+            );
+        }
+
+        let header = serialize_all_with_functions_and_replication_with_options(
+            &dbs,
+            0,
+            &[],
+            false,
+            None,
+            &[],
+            RdbSerializeOptions::default(),
+        );
+
+        assert!(
+            header.capacity() <= 4_096,
+            "metadata-only serialization reserved {} bytes",
+            header.capacity()
+        );
+    }
 }

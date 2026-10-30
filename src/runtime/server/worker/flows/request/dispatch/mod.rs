@@ -30,9 +30,14 @@ pub(crate) use types::{
 };
 
 use super::super::ServerWorkerState;
-use crate::engine::command::{CommandArgs, CMD_WRITE};
+use crate::engine::command::{CommandArgs, CMD_MAY_REPLICATE, CMD_WRITE};
 use crate::foundation::io::protocol::Value;
 use crate::framework::context::ServerContext;
+
+pub(crate) fn command_may_mutate_dataset(name: &str, flags: u64) -> bool {
+    (flags & CMD_WRITE) != 0
+        || ((flags & CMD_MAY_REPLICATE) != 0 && matches!(name, "eval" | "evalsha" | "fcall"))
+}
 
 impl ServerWorkerState {
     pub(crate) fn pre_dispatch_exec(
@@ -51,7 +56,7 @@ impl ServerWorkerState {
             self.connection_registry[facts.token].asking = false;
         }
         let call_flags = CmdCallFlags {
-            is_write: (meta.flags & CMD_WRITE) != 0,
+            is_write: command_may_mutate_dataset(meta.name.as_str(), meta.flags),
             client_asking,
         };
         let request = PreflightRequest {
@@ -72,11 +77,40 @@ impl ServerWorkerState {
         if let Some(outcome) = outcome {
             return outcome;
         }
+        if self.should_throttle_command(request.facts.token, meta.flags) {
+            return DispatchOutcome {
+                action: DispatchAction::Postpone(PostponeReason::ReplicationThrottle),
+                call_flags,
+                reject_reply: None,
+            };
+        }
         DispatchOutcome {
             action: DispatchAction::Execute,
             call_flags,
             reject_reply: None,
         }
+    }
+
+    pub(crate) fn should_throttle_command(
+        &mut self,
+        token: crate::framework::capabilities::io::Token,
+        flags: u64,
+    ) -> bool {
+        if !self.ctx.config().replication.repl_throttling_enabled
+            || self.ctx.replication().is_replica()
+            || !self.ctx.replication().throttle.is_active()
+            || self.connection_registry[token].throttle_checked
+        {
+            return false;
+        }
+        self.connection_registry[token].throttle_checked = true;
+        let has_queued_clients = !self.ctx.throttled_clients().is_empty();
+        flags & (CMD_WRITE | CMD_MAY_REPLICATE) != 0
+            && self
+                .ctx
+                .replication_mut()
+                .throttle
+                .should_postpone(has_queued_clients)
     }
 
     fn preflight_protocol(&self, request: &PreflightRequest<'_>) -> Option<DispatchOutcome> {
@@ -176,12 +210,20 @@ impl ServerWorkerState {
         &mut self,
         request: &PreflightRequest<'_>,
     ) -> Option<DispatchOutcome> {
-        self.stage_client_pause(
+        self.stage_forkless_key_barrier(
             &request.facts,
             request.meta,
             request.args,
             request.call_flags,
         )
+        .or_else(|| {
+            self.stage_client_pause(
+                &request.facts,
+                request.meta,
+                request.args,
+                request.call_flags,
+            )
+        })
         .or_else(|| {
             self.stage_bgsave_error(
                 &request.facts,

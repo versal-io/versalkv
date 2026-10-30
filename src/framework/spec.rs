@@ -42,6 +42,7 @@ impl CommandExecutor {
         args: &CommandArgs,
         ctx: &mut ServerContext,
     ) -> Value {
+        let _scope = ctx.hotkeys_command_scope(args);
         match self {
             Self::Immediate(handler) => handler(conn, args, ctx),
             Self::Runtime(handler) => {

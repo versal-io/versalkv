@@ -174,6 +174,106 @@ fn diskless_child_pipes_same_bytes_as_in_process_serialize() {
 }
 
 #[test]
+fn forkless_save_releases_large_key_barrier_after_serialization() {
+    use crate::engine::extension::config::persistence::BgsaveMethod;
+    use crate::foundation::io::store::structure::list::ListValue;
+    use crate::foundation::io::store::Robj;
+    use crate::framework::context::ServerContext;
+    use std::collections::VecDeque;
+    use std::time::{Duration, Instant};
+
+    let mut ctx = ServerContext::new(1);
+    ctx.dbs_mut().get_mut(0).unwrap().set(
+        b"large".to_vec(),
+        Robj::ListQuicklist(ListValue::from_vecdeque(VecDeque::from(vec![
+            Bytes::from(vec![b'x'; 128]);
+            1_024
+        ]))),
+    );
+    let dir = std::env::temp_dir().join(format!(
+        "versal-forkless-release-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    ctx.config_mut().persistence.dir = dir.to_string_lossy().into_owned();
+    ctx.config_mut().persistence.dbfilename = "dump.rdb".to_string();
+    ctx.config_mut().persistence.bgsave_default_method = BgsaveMethod::Forkless;
+
+    super::start_bgsave(&mut ctx).unwrap();
+    assert!(ctx.persistence().forkless_key_blocked(0, b"large"));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while ctx
+        .persistence()
+        .forkless_progress()
+        .is_some_and(|progress| progress.processed == 0)
+        && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(
+        ctx.persistence()
+            .forkless_progress()
+            .map(|progress| progress.processed),
+        Some(1)
+    );
+
+    let _ = ctx.drive_forkless_feed();
+    assert!(
+        !ctx.persistence().forkless_key_blocked(0, b"large"),
+        "the key barrier must be released once the background worker drops its shared value"
+    );
+
+    ctx.abort_forkless_save(crate::foundation::io::sys::time::mstime() / 1_000);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn forkless_capture_prevents_lazy_expiration_from_deleting_unscanned_keys() {
+    use crate::engine::extension::config::persistence::BgsaveMethod;
+    use crate::foundation::io::store::Robj;
+    use crate::framework::context::ServerContext;
+    use std::time::Duration;
+
+    let mut ctx = ServerContext::new(1);
+    let expire_at = crate::foundation::io::sys::time::mstime().saturating_add(100) as u64;
+    for index in 0..256 {
+        ctx.db_mut(0).unwrap().load_entry(
+            format!("expiring-{index}").into_bytes(),
+            Robj::string_raw(Bytes::from_static(b"value")),
+            Some(expire_at),
+        );
+    }
+    let dir = std::env::temp_dir().join(format!(
+        "versal-forkless-lazy-expire-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    ctx.config_mut().persistence.dir = dir.to_string_lossy().into_owned();
+    ctx.config_mut().persistence.dbfilename = "dump.rdb".to_string();
+    ctx.config_mut().persistence.bgsave_default_method = BgsaveMethod::Forkless;
+    ctx.config_mut().persistence.rdb_key_save_delay = 10_000_000;
+    super::start_bgsave(&mut ctx).unwrap();
+    assert!(ctx.persistence().forkless_capture_in_progress());
+    std::thread::sleep(Duration::from_millis(150));
+
+    assert!(ctx.db_mut(0).unwrap().get(b"expiring-255").is_none());
+    assert!(
+        ctx.db(0)
+            .unwrap()
+            .get_allow_expired(b"expiring-255")
+            .is_some(),
+        "lazy expiration must not physically remove keys during capture"
+    );
+
+    ctx.abort_forkless_save(crate::foundation::io::sys::time::mstime() / 1_000);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn diskless_child_waits_for_parent_release_after_data_eof() {
     use crate::foundation::io::sys::process::{wait_nonblocking, WaitOutcome};
     use crate::framework::context::ServerContext;

@@ -131,8 +131,29 @@ impl ServerWorkerState {
         link: &mut ReplicaLink,
         events: Vec<ReplicaEvent>,
     ) -> Result<(), ()> {
+        if !events.is_empty() && self.ctx.persistence().forkless_capture_in_progress() {
+            return self.defer_replica_events(connection_token, link, events);
+        }
         for event in events {
             self.apply_replica_event(connection_token, link, event, true)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn defer_replica_events(
+        &mut self,
+        connection_token: usize,
+        link: &mut ReplicaLink,
+        events: Vec<ReplicaEvent>,
+    ) -> Result<(), ()> {
+        let should_pause_reads =
+            !events.is_empty() && self.ctx.persistence().forkless_capture_in_progress();
+        link.defer_events(events);
+        if should_pause_reads {
+            self.pause_replica_main_reads_with_interest(
+                connection_token,
+                crate::foundation::io::transport::Interest::None,
+            )?;
         }
         Ok(())
     }
@@ -282,7 +303,17 @@ impl ServerWorkerState {
     }
 
     fn pause_replica_main_reads(&mut self, connection_token: usize) -> Result<bool, ()> {
-        use crate::foundation::io::transport::Interest;
+        self.pause_replica_main_reads_with_interest(
+            connection_token,
+            crate::foundation::io::transport::Interest::Writable,
+        )
+    }
+
+    fn pause_replica_main_reads_with_interest(
+        &mut self,
+        connection_token: usize,
+        interest: crate::foundation::io::transport::Interest,
+    ) -> Result<bool, ()> {
         if self.replication_runtime.replica_main_read_paused() {
             return Ok(false);
         }
@@ -291,7 +322,7 @@ impl ServerWorkerState {
             .get(crate::framework::capabilities::io::Token(connection_token))
             .map(|c| c.token())
             .ok_or(())?;
-        if let Err(error) = self.transport.set_interest(main_token, Interest::Writable) {
+        if let Err(error) = self.transport.set_interest(main_token, interest) {
             crate::server_log!(
                 warning,
                 "Failed to pause replica main reads: token={} error={}",
@@ -304,7 +335,7 @@ impl ServerWorkerState {
         Ok(true)
     }
 
-    fn resume_replica_main_reads(&mut self, connection_token: usize) -> Result<(), ()> {
+    pub(super) fn resume_replica_main_reads(&mut self, connection_token: usize) -> Result<(), ()> {
         use crate::foundation::io::transport::Interest;
         if !self.replication_runtime.replica_main_read_paused() {
             return Ok(());
@@ -327,10 +358,7 @@ impl ServerWorkerState {
             return Err(());
         }
         self.replication_runtime.set_replica_main_read_paused(false);
-        crate::server_log!(
-            notice,
-            "dual handoff complete, resumed main socket readable"
-        );
+        crate::server_log!(notice, "resumed replica main socket readable");
         Ok(())
     }
 
@@ -733,9 +761,10 @@ impl ServerWorkerState {
             return Ok(());
         };
         let mut read_data = Vec::new();
-        let close = crate::foundation::io::sys::os::drain_nonblocking(
+        let close = crate::foundation::io::sys::os::drain_nonblocking_bounded(
             &mut self.io_buf,
             &mut read_data,
+            crate::runtime::server::worker::NORMAL_CLIENT_READ_BUDGET,
             |buf| stream.read(buf),
         )
         .unwrap_or(true);
@@ -1248,6 +1277,7 @@ impl ServerWorkerState {
         args: &CommandArgs,
         relay_stream: bool,
     ) -> Result<Option<ReplicationCommandOutcome>, ()> {
+        let _suppression = crate::foundation::memory::key_access::KeyAccessSuppression::enter();
         let cleanup_command =
             args.name.eq_ignore_ascii_case(b"DEL") || args.name.eq_ignore_ascii_case(b"UNLINK");
         let replica_local_expire_only = !cleanup_command

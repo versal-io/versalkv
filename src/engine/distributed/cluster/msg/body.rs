@@ -76,6 +76,7 @@ pub enum ClusterBusBody {
     Publish(ClusterPublish),
     Update(SlotOwnershipUpdate),
     Module(ClusterModuleMessage),
+    FailoverAuthNack { reason: u8 },
     Empty,
 }
 
@@ -98,6 +99,10 @@ pub(super) fn encode_body(
         }
         (ClusterMsgType::Fail, ClusterBusBody::Fail { node_id }) => {
             output.extend_from_slice(node_id.as_str().as_bytes());
+            Ok(0)
+        }
+        (ClusterMsgType::FailoverAuthNack, ClusterBusBody::FailoverAuthNack { reason }) => {
+            output.push(*reason);
             Ok(0)
         }
         (
@@ -173,6 +178,15 @@ pub(super) fn decode_body(
             let node_id = NodeId::parse(&packet[start..end])
                 .map_err(|error| ClusterProtocolError::InvalidNodeId(error.to_string()))?;
             Ok((ClusterBusBody::Fail { node_id }, end))
+        }
+        ClusterMsgType::FailoverAuthNack => {
+            require_exact(packet, start + 1, "FAILOVER_AUTH_NACK body")?;
+            Ok((
+                ClusterBusBody::FailoverAuthNack {
+                    reason: packet[start],
+                },
+                start + 1,
+            ))
         }
         ClusterMsgType::Publish | ClusterMsgType::PublishShard => {
             require_len(packet, start + PUBLISH_PREFIX_LEN, "PUBLISH body")?;

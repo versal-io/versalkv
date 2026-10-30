@@ -7,6 +7,7 @@ mod module_values;
 pub mod scan;
 
 pub use crate::foundation::io::store::Robj;
+pub(crate) use db::SnapshotValue;
 pub use db::{Db, KeyMeta};
 pub use dbset::{DbSet, SlotEntry};
 pub use eviction::{EvictionCandidate, EvictionPolicy};

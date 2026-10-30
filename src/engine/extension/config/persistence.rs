@@ -9,6 +9,32 @@ pub struct SaveParam {
 
 pub const BGSAVE_RETRY_DELAY_SEC: i64 = 60;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BgsaveMethod {
+    #[default]
+    Fork,
+    Forkless,
+}
+
+impl BgsaveMethod {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fork => "fork",
+            Self::Forkless => "forkless",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        if value.eq_ignore_ascii_case("fork") {
+            Some(Self::Fork)
+        } else if value.eq_ignore_ascii_case("forkless") {
+            Some(Self::Forkless)
+        } else {
+            None
+        }
+    }
+}
+
 pub fn validate_aof_basename(value: &str, setting: &str) -> Result<(), String> {
     if value.is_empty() {
         return Err(format!("{setting} can't be empty"));
@@ -45,6 +71,8 @@ pub fn default_saveparams() -> Vec<SaveParam> {
 pub struct PersistenceConfig {
     pub dir: String,
     pub dbfilename: String,
+    pub forkless_infrastructure_enabled: bool,
+    pub bgsave_default_method: BgsaveMethod,
     pub rdb_version_check_relaxed: bool,
     pub rdbcompression: RdbCompression,
     pub rdbchecksum: bool,
@@ -76,6 +104,8 @@ impl PersistenceConfig {
         Self {
             dir: "./".to_string(),
             dbfilename: "dump.rdb".to_string(),
+            forkless_infrastructure_enabled: false,
+            bgsave_default_method: BgsaveMethod::Fork,
             rdb_version_check_relaxed: false,
             rdbcompression: RdbCompression::Yes,
             rdbchecksum: true,
@@ -99,6 +129,18 @@ impl PersistenceConfig {
             key_load_delay: 0,
             loading_process_events_interval_bytes: 2 * 1024 * 1024,
         }
+    }
+
+    pub fn validate_bgsave_method(&self) -> Result<(), String> {
+        if self.bgsave_default_method == BgsaveMethod::Forkless
+            && !self.forkless_infrastructure_enabled
+        {
+            return Err(
+                "'bgsave-default-method forkless' can only be selected when the server was started with 'forkless-infrastructure-enabled yes'"
+                    .to_string(),
+            );
+        }
+        Ok(())
     }
 }
 

@@ -400,6 +400,12 @@ impl<T: TransportRuntime> RuntimeTransport<T> {
         self.registry.transport_id(token).is_some()
     }
 
+    pub(crate) fn is_connection_ready(&self, token: Token) -> bool {
+        self.registry
+            .transport_id(token)
+            .is_some_and(|id| self.inner.is_connection_ready(id))
+    }
+
     pub(crate) fn has_pending_data(&self) -> bool {
         #[cfg(test)]
         if !self.test_pending_data_events.is_empty() {

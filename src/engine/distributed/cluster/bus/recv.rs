@@ -443,7 +443,8 @@ impl ClusterBusManager {
                 };
                 let stale_slot_claim =
                     facts.maximum_claimed_slot_epoch > facts.request_config_epoch;
-                if stale_slot_claim {
+                let rejection = state.automatic_failover.vote_rejection_reason(&facts);
+                if rejection == Some(7) {
                     crate::server_log!(
                         warning,
                         "Failover auth denied to {}: slot epoch {} > reqConfigEpoch {}",
@@ -479,8 +480,13 @@ impl ClusterBusManager {
                         facts.persisted_last_vote_epoch,
                     );
                 }
-                self.execute_failover_actions(state, actions, now, Some(token_value));
-                if stale_slot_claim {
+                let reply_token = self.connections.iter().find_map(|(token, connection)| {
+                    (connection.is_outgoing
+                        && connection.connected
+                        && connection.node_name == msg.sender_id)
+                        .then_some(*token)
+                });
+                if rejection == Some(7) {
                     let claimed_slots = bytes_to_slots(&msg.myslots);
                     let owner = (0..claimed_slots.len())
                         .filter(|slot| claimed_slots[*slot])
@@ -495,11 +501,92 @@ impl ClusterBusManager {
                             owner.name,
                         );
                         let update = self.build_update_for_node(state, &owner);
-                        if let Some(connection) = self.connections.get_mut(&token_value) {
+                        if let Some(connection) = self
+                            .connections
+                            .get_mut(&reply_token.unwrap_or(token_value))
+                        {
                             connection.write_buf.extend_from_slice(&update);
                             state.record_bus_message_sent(ClusterMsgType::Update);
                         }
                     }
+                }
+                // Use the same outgoing stream for UPDATE followed by NACK.
+                // TCP ordering lets the candidate retry with refreshed slots.
+                if let (Some(reason), Some(reply_token)) = (rejection, reply_token) {
+                    if state.nodes.get(&msg.sender_id).is_some_and(|node| node.has_flag(
+                        crate::engine::distributed::cluster::node::CLUSTER_NODE_FAILOVER_AUTH_NACK_SUPPORTED
+                    )) {
+                        let nack = crate::engine::distributed::cluster::msg::ClusterBusMessage::from_node(
+                            ClusterMsgType::FailoverAuthNack, &state.myself, state.current_epoch,
+                            ClusterBusBody::FailoverAuthNack { reason },
+                        ).encode().expect("local cluster wire metadata must be valid");
+                        if let Some(connection) = self.connections.get_mut(&reply_token) {
+                            connection.write_buf.extend_from_slice(&nack);
+                            state.record_bus_message_sent(ClusterMsgType::FailoverAuthNack);
+                        }
+                    }
+                }
+                self.execute_failover_actions(state, actions, now, Some(token_value));
+            }
+            ClusterMsgType::FailoverAuthNack => {
+                use crate::engine::distributed::cluster::node::CLUSTER_NODE_FAIL;
+                let Some(voter) = state.nodes.get(&msg.sender_id) else {
+                    return;
+                };
+                if !ClusterState::is_voting_primary(voter) || voter.has_flag(CLUSTER_NODE_FAIL) {
+                    return;
+                }
+                let ClusterBusBody::FailoverAuthNack { reason } = &msg.body else {
+                    return;
+                };
+                let Ok(voter_id) =
+                    crate::engine::distributed::cluster::NodeId::parse(msg.sender_id.as_bytes())
+                else {
+                    return;
+                };
+                let voting_primaries = state.primary_count();
+                let dead_voters = std::iter::once(&state.myself)
+                    .chain(state.nodes.values())
+                    .filter(|node| {
+                        ClusterState::is_voting_primary(node) && node.has_flag(CLUSTER_NODE_FAIL)
+                    })
+                    .count();
+                let election_epoch = state.automatic_failover.election_epoch();
+                let Some(cannot_win) = state.automatic_failover.on_vote_nack(
+                    voter_id,
+                    msg.current_epoch,
+                    voting_primaries,
+                    dead_voters,
+                ) else {
+                    return;
+                };
+                let nack_count = state.automatic_failover.rejected_voter_count();
+                let quorum = voting_primaries / 2 + 1;
+                let reason = match reason {
+                    1 => "not-safe",
+                    2 => "req-epoch-old",
+                    3 => "already-voted",
+                    4 => "req-is-primary",
+                    5 => "no-primary",
+                    6 => "primary-up",
+                    7 => "stale-config",
+                    _ => "unknown",
+                };
+                crate::server_log!(
+                    notice,
+                    "Failover auth NACK [{}] from {} for epoch {} (NACKs {}, quorum {})",
+                    reason,
+                    msg.sender_id,
+                    election_epoch,
+                    nack_count,
+                    quorum,
+                );
+                if cannot_win {
+                    crate::server_log!(
+                        notice,
+                        "Failover election for epoch {} cannot reach quorum {} (NACKs {}, dead voters {}). Resetting the election since we cannot win an election without quorum.",
+                        election_epoch, quorum, nack_count, dead_voters,
+                    );
                 }
             }
             ClusterMsgType::FailoverAuthAck => {
@@ -1060,9 +1147,6 @@ impl ClusterBusManager {
             }
             topology_changed = node.flags != previous_flags;
             state.commit_direct_sender_observation(node);
-        }
-        if state.myself.is_replica() && state.myself.replicaof == msg.sender_id {
-            state.clear_local_primary_failure_view();
         }
         if topology_changed {
             state.mark_topology_changed();

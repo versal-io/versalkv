@@ -35,6 +35,12 @@ enum RdbChannelReadMode {
     DrainAfterHup,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReplicationStreamReadMode {
+    Fair,
+    DrainAfterHup,
+}
+
 enum BoundedRdbRead {
     Data(Vec<u8>),
     WouldBlock,
@@ -384,8 +390,7 @@ impl ServerWorkerState {
             if events.is_empty() && link.is_dual_rdb_mode_active() {
                 self.buffer_replica_events_into_pending(connection_token, link, events)
             } else {
-                link.defer_events(events);
-                Ok(())
+                self.defer_replica_events(connection_token, link, events)
             }
         } else if link.is_dual_rdb_mode_active() {
             self.buffer_replica_events_into_pending(connection_token, link, events)
@@ -791,6 +796,31 @@ impl ServerWorkerState {
     /// Only reached once the RDB phase has committed, so it never sees a
     /// half-loaded RDB; the bounded path above owns the handshake + RDB body.
     pub(crate) fn recv_replication_stream(&mut self, token_value: usize, connection_token: usize) {
+        self.recv_replication_stream_with_mode(
+            token_value,
+            connection_token,
+            ReplicationStreamReadMode::Fair,
+        );
+    }
+
+    pub(crate) fn recv_replication_stream_after_hup(
+        &mut self,
+        token_value: usize,
+        connection_token: usize,
+    ) {
+        self.recv_replication_stream_with_mode(
+            token_value,
+            connection_token,
+            ReplicationStreamReadMode::DrainAfterHup,
+        );
+    }
+
+    fn recv_replication_stream_with_mode(
+        &mut self,
+        token_value: usize,
+        connection_token: usize,
+        mode: ReplicationStreamReadMode,
+    ) {
         let mut read_data = Vec::new();
         let close = {
             let Some(conn) = self
@@ -803,11 +833,23 @@ impl ServerWorkerState {
                 Some(s) => s,
                 None => return,
             };
-            crate::foundation::io::sys::os::drain_nonblocking(
-                &mut self.io_buf,
-                &mut read_data,
-                |buf| stream.read(buf),
-            )
+            match mode {
+                ReplicationStreamReadMode::Fair => {
+                    crate::foundation::io::sys::os::drain_nonblocking_bounded(
+                        &mut self.io_buf,
+                        &mut read_data,
+                        crate::runtime::server::worker::NORMAL_CLIENT_READ_BUDGET,
+                        |buf| stream.read(buf),
+                    )
+                }
+                ReplicationStreamReadMode::DrainAfterHup => {
+                    crate::foundation::io::sys::os::drain_nonblocking(
+                        &mut self.io_buf,
+                        &mut read_data,
+                        |buf| stream.read(buf),
+                    )
+                }
+            }
             .unwrap_or(true)
         };
         if close && read_data.is_empty() {
@@ -879,8 +921,7 @@ impl ServerWorkerState {
             if events.is_empty() && link.is_dual_rdb_mode_active() {
                 self.buffer_replica_events_into_pending(connection_token, &mut link, events)
             } else {
-                link.defer_events(events);
-                Ok(())
+                self.defer_replica_events(connection_token, &mut link, events)
             }
         } else if link.is_dual_rdb_mode_active() {
             self.buffer_replica_events_into_pending(connection_token, &mut link, events)
@@ -1092,9 +1133,10 @@ impl ServerWorkerState {
             return Err(());
         };
         let mut stream = self.transport.stream(conn.token()).ok_or(())?;
-        let close = crate::foundation::io::sys::os::drain_nonblocking(
+        let close = crate::foundation::io::sys::os::drain_nonblocking_bounded(
             &mut self.io_buf,
             &mut read_data,
+            crate::runtime::server::worker::NORMAL_CLIENT_READ_BUDGET,
             |buf| stream.read(buf),
         )
         .unwrap_or(true);

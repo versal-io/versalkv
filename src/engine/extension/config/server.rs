@@ -122,6 +122,9 @@ pub struct ServerConfig {
     pub tcp_keepalive: u64,
     /// C `prefetch-batch-max-size`: zero disables pipeline key warming.
     pub prefetch_batch_max_size: usize,
+    pub hotkeys_sampling_percentage: u8,
+    pub hotkeys_top_k: usize,
+    pub hotkeys_window_seconds: u64,
     pub availability_zone: String,
     pub config_file: Option<String>,
     /// Optional pidfile path; an empty value disables pidfile creation.
@@ -304,6 +307,9 @@ impl ServerConfig {
             proto_max_bulk_len: 512 * 1024 * 1024,
             tcp_keepalive: 300,
             prefetch_batch_max_size: 16,
+            hotkeys_sampling_percentage: 1,
+            hotkeys_top_k: 0,
+            hotkeys_window_seconds: 1,
             availability_zone: String::new(),
             config_file: None,
             pidfile: String::new(),

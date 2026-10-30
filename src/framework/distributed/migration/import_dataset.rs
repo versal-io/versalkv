@@ -100,7 +100,7 @@ impl ImportDataset {
         let mut moved = 0;
         for range in ranges.iter() {
             for slot in range.start..=range.end {
-                let entries = self.context.dbs_mut().take_slot(slot as usize);
+                let entries = self.context.take_slot_entries(slot as usize);
                 moved += entries.len();
                 serving.restore_slot_entries(entries);
             }

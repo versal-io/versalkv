@@ -67,20 +67,22 @@ impl ScriptCache {
         let memory_bytes = body.len() + sha1.len();
 
         if let Some(existing) = self.scripts.get_mut(&sha1) {
+            self.total_memory = self
+                .total_memory
+                .saturating_sub(existing.memory_bytes)
+                .saturating_add(memory_bytes);
             existing.body = body;
-            if existing.evictable != evictable {
-                if existing.evictable {
-                    self.evictable_count -= 1;
-                } else if evictable {
-                    self.evictable_count += 1;
-                }
-                existing.evictable = evictable;
+            if existing.evictable && !evictable {
+                self.evictable_count -= 1;
+                existing.evictable = false;
             }
             existing.memory_bytes = memory_bytes;
             if let Some(pos) = self.lru_order.iter().position(|x| x == &sha1) {
                 self.lru_order.remove(pos);
             }
-            self.lru_order.push(sha1);
+            if existing.evictable {
+                self.lru_order.push(sha1);
+            }
             return;
         }
 
@@ -94,9 +96,9 @@ impl ScriptCache {
                 evictable,
             },
         );
-        self.lru_order.push(sha1);
         self.total_memory += memory_bytes;
         if evictable {
+            self.lru_order.push(sha1);
             self.evictable_count += 1;
         }
     }
@@ -114,6 +116,15 @@ impl ScriptCache {
 
     pub fn len(&self) -> usize {
         self.scripts.len()
+    }
+
+    pub fn memory_usage(&self) -> usize {
+        // Valkey accounts for the separate LRU SHA allocation, its string
+        // header, and the three pointers in each LRU list node.
+        let lru_entry_bytes = 40 + 4 * std::mem::size_of::<usize>();
+        self.total_memory
+            + self.scripts.len() * std::mem::size_of::<CachedScript>()
+            + self.evictable_count * lru_entry_bytes
     }
 
     pub fn evicted_scripts(&self) -> usize {

@@ -12,7 +12,11 @@ pub(crate) fn persist_cluster_config(path: &Path, content: &str) -> io::Result<(
     persist_cluster_config_with_fsync(path, content, true)
 }
 
-fn persist_cluster_config_with_fsync(path: &Path, content: &str, do_fsync: bool) -> io::Result<()> {
+pub(super) fn persist_cluster_config_with_fsync(
+    path: &Path,
+    content: &str,
+    do_fsync: bool,
+) -> io::Result<()> {
     let temp_path = cluster_config_temp_path(path)?;
     let result = persist_cluster_config_inner(path, &temp_path, content, do_fsync);
     if result.is_err() {
@@ -98,7 +102,8 @@ impl ServerWorkerState {
     }
 
     pub(crate) fn save_cluster_config_now(&mut self) -> io::Result<()> {
-        let path = self.cluster_config.path.as_deref().ok_or_else(|| {
+        self.drain_cluster_config_saves()?;
+        let path = self.cluster_config.path.clone().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
                 "cluster config path is not configured",
@@ -108,14 +113,24 @@ impl ServerWorkerState {
             io::Error::new(io::ErrorKind::NotFound, "cluster state is not initialized")
         })?;
         let content = crate::engine::distributed::cluster::config::render_cluster_config(state);
-        persist_cluster_config(path, &content)?;
+        let result = persist_cluster_config(&path, &content);
         if let Some(state) = self.ctx.cluster_state_mut().as_deref_mut() {
             state.take_config_save_request();
+            state.take_config_fsync_request();
+            state.config_save_succeeded = result.is_ok();
+            if result.is_ok() {
+                state.config_last_save_time_sec =
+                    crate::foundation::io::sys::time::mstime() / 1_000;
+            }
         }
-        Ok(())
+        if let Err(error) = &result {
+            crate::server_log!(warning, "{}", error);
+        }
+        result
     }
 
     pub(crate) fn persist_cluster_config_if_changed(&mut self, state: &mut ClusterState) {
+        self.apply_cluster_config_completions(state);
         if !state.take_config_save_request() {
             return;
         }
@@ -124,7 +139,7 @@ impl ServerWorkerState {
         // cron tick turns a large cluster into an O(nodes * slots) idle path.
         let content = crate::engine::distributed::cluster::config::render_cluster_config(state);
         let do_fsync = state.take_config_fsync_request();
-        let Some(path) = self.cluster_config.path.as_deref() else {
+        let Some(path) = self.cluster_config.path.clone() else {
             if do_fsync {
                 state.request_config_fsync();
             } else {
@@ -132,34 +147,119 @@ impl ServerWorkerState {
             }
             return;
         };
-        match persist_cluster_config_with_fsync(path, &content, do_fsync) {
-            Ok(()) => {}
-            Err(error) => {
-                if do_fsync {
-                    state.request_config_fsync();
-                } else {
-                    state.request_config_save();
-                }
+        if self.ctx.config().server.cluster_config_save_behavior == "sync" {
+            let barrier = self
+                .cluster_config
+                .writer
+                .as_ref()
+                .map_or(Ok(()), |writer| writer.drain());
+            self.apply_cluster_config_completions(state);
+            let result =
+                barrier.and_then(|()| persist_cluster_config_with_fsync(&path, &content, do_fsync));
+            self.record_cluster_config_completion(
+                state,
+                &result,
+                false,
+                crate::foundation::io::sys::time::mstime() / 1_000,
+            );
+            if result.is_err() {
+                crate::server_log!(warning, "Fatal: can't update cluster config file.");
+                std::process::exit(1);
+            }
+            return;
+        }
+        let result = (|| {
+            if self.cluster_config.writer.is_none() {
+                self.cluster_config.writer = Some(super::ClusterConfigWriter::new()?);
+            }
+            self.cluster_config
+                .writer
+                .as_ref()
+                .expect("save worker was initialized")
+                .submit(path, content, do_fsync)
+        })();
+        if result.is_err() {
+            self.cluster_config.writer.take();
+            self.record_cluster_config_completion(
+                state,
+                &result,
+                true,
+                crate::foundation::io::sys::time::mstime() / 1_000,
+            );
+        }
+    }
+
+    fn record_cluster_config_completion(
+        &mut self,
+        state: &mut ClusterState,
+        result: &io::Result<()>,
+        is_best_effort: bool,
+        finished_at_sec: i64,
+    ) {
+        state.config_save_succeeded = result.is_ok();
+        if let Err(error) = result {
+            crate::server_log!(warning, "{}", error);
+            let now = finished_at_sec.saturating_mul(1_000);
+            if is_best_effort
+                && now.saturating_sub(self.cluster_config.last_best_effort_warning_ms)
+                    >= BEST_EFFORT_WARNING_INTERVAL_MS
+            {
+                crate::server_log!(warning, "Cluster config updated even though writing the cluster config file to disk failed.");
+                self.cluster_config.last_best_effort_warning_ms = now;
+            }
+        } else {
+            state.config_last_save_time_sec = finished_at_sec;
+            self.cluster_config.last_best_effort_warning_ms = 0;
+        }
+    }
+
+    fn apply_cluster_config_completions(&mut self, state: &mut ClusterState) {
+        let completions = self
+            .cluster_config
+            .writer
+            .as_ref()
+            .map(|writer| writer.take_completions())
+            .unwrap_or_default();
+        for completed in completions {
+            self.record_cluster_config_completion(
+                state,
+                &completed.result,
+                true,
+                completed.finished_at_sec,
+            );
+        }
+    }
+
+    pub(crate) fn poll_cluster_config_saves(&mut self) {
+        let mut state = self.ctx.cluster_state_mut().take();
+        if let Some(state) = state.as_deref_mut() {
+            self.apply_cluster_config_completions(state);
+        }
+        *self.ctx.cluster_state_mut() = state;
+    }
+
+    pub(crate) fn drain_cluster_config_saves(&mut self) -> io::Result<()> {
+        let result = self
+            .cluster_config
+            .writer
+            .as_ref()
+            .map_or(Ok(()), |writer| writer.drain());
+        self.poll_cluster_config_saves();
+        result
+    }
+
+    pub(crate) fn save_cluster_config_before_exit(&mut self) {
+        if self.cluster_config.path.is_some() && self.ctx.cluster_state().is_some() {
+            crate::server_log!(
+                notice,
+                "Saving the cluster configuration file before exiting."
+            );
+            if let Err(error) = self.save_cluster_config_now() {
                 crate::server_log!(
                     warning,
-                    "Could not persist cluster config file {}: {}",
-                    path.display(),
+                    "Could not save cluster configuration before exiting: {}",
                     error
                 );
-                if self.ctx.config().server.cluster_config_save_behavior == "sync" {
-                    crate::server_log!(warning, "Fatal: can't update cluster config file.");
-                    std::process::exit(1);
-                }
-                let now = crate::foundation::io::sys::time::mstime();
-                if now.saturating_sub(self.cluster_config.last_best_effort_warning_ms)
-                    >= BEST_EFFORT_WARNING_INTERVAL_MS
-                {
-                    crate::server_log!(
-                        warning,
-                        "Cluster config updated even though writing the cluster config file to disk failed."
-                    );
-                    self.cluster_config.last_best_effort_warning_ms = now;
-                }
             }
         }
     }
@@ -245,6 +345,40 @@ mod tests {
             Some(Value::SimpleString(Bytes::from_static(b"BUMPED 7")))
         );
         assert!(path.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn background_configs_cannot_overwrite_a_later_synchronous_save() {
+        let dir = test_dir("ordered-background");
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("nodes.conf");
+        let mut runtime = ServerWorkerState::new(1).unwrap();
+        runtime.cluster_config.path = Some(path.clone());
+        runtime.ctx.config_mut().server.cluster_config_save_behavior = "best-effort".into();
+        let mut state = ClusterState::new("127.0.0.1", 6379, 16_379);
+        for epoch in 1..=100 {
+            state.current_epoch = epoch;
+            state.request_config_save();
+            runtime.persist_cluster_config_if_changed(&mut state);
+        }
+        state.current_epoch = 101;
+        *runtime.ctx.cluster_state_mut() = Some(Box::new(state));
+        runtime.save_cluster_config_now().unwrap();
+        runtime.drain_cluster_config_saves().unwrap();
+
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("vars currentEpoch 101 "));
+        assert!(
+            runtime
+                .ctx
+                .cluster_state()
+                .as_ref()
+                .unwrap()
+                .config_save_succeeded
+        );
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

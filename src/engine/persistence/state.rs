@@ -1,4 +1,12 @@
+use crate::engine::extension::config::persistence::BgsaveMethod;
 use crate::foundation::io::persistence::journal::AofJournal;
+use crate::foundation::io::persistence::rdb::frozen::{ForklessFeed, ForklessItemId};
+use crate::foundation::io::persistence::snapshot::background::{
+    BackgroundRdbSave, RdbSaveOutcome, RdbSaveProgress,
+};
+use crate::foundation::io::store::kv_engine::DbSet;
+use std::collections::HashSet;
+use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OperationStatus {
@@ -41,6 +49,11 @@ pub struct RdbState {
     pub last_save_time_sec: i64,
     pub last_bgsave_status: OperationStatus,
     pub last_bgsave_try_sec: i64,
+    pub saves: u64,
+    pub current_bgsave_type: Option<BgsaveMethod>,
+    pub last_bgsave_type: Option<BgsaveMethod>,
+    pub last_bgsave_duration_sec: i64,
+    started: Option<Instant>,
     pub last_load_keys_loaded: usize,
     pub last_load_keys_expired: usize,
     pub last_cow_size: usize,
@@ -134,7 +147,11 @@ pub struct PersistenceState {
     rdb: RdbState,
     aof: AofState,
     child: Option<PersistenceChild>,
-    bgsave_scheduled: bool,
+    forkless: Option<(BackgroundRdbSave, i64)>,
+    forkless_feed: Option<ForklessFeed>,
+    forkless_keys: HashSet<ForklessItemId>,
+    forkless_captured_keys: HashSet<ForklessItemId>,
+    bgsave_scheduled: Option<BgsaveMethod>,
     aof_rewrite_scheduled: bool,
 }
 
@@ -153,6 +170,11 @@ impl PersistenceState {
                 last_save_time_sec: 0,
                 last_bgsave_status: OperationStatus::Ok,
                 last_bgsave_try_sec: 0,
+                saves: 0,
+                current_bgsave_type: None,
+                last_bgsave_type: None,
+                last_bgsave_duration_sec: -1,
+                started: None,
                 last_load_keys_loaded: 0,
                 last_load_keys_expired: 0,
                 last_cow_size: 0,
@@ -184,7 +206,11 @@ impl PersistenceState {
                 },
             },
             child: None,
-            bgsave_scheduled: false,
+            forkless: None,
+            forkless_feed: None,
+            forkless_keys: HashSet::new(),
+            forkless_captured_keys: HashSet::new(),
+            bgsave_scheduled: None,
             aof_rewrite_scheduled: false,
         }
     }
@@ -215,6 +241,7 @@ impl PersistenceState {
 
     pub fn record_rdb_save(&mut self, now_sec: i64) {
         self.dirty = 0;
+        self.rdb.saves = self.rdb.saves.saturating_add(1);
         self.rdb.last_save_time_sec = now_sec;
         self.rdb.last_bgsave_status = OperationStatus::Ok;
     }
@@ -276,15 +303,208 @@ impl PersistenceState {
     }
 
     pub fn has_active_child(&self) -> bool {
-        self.child.is_some()
+        self.child.is_some() || self.forkless.is_some()
+    }
+
+    pub fn forkless_save_in_progress(&self) -> bool {
+        self.forkless.is_some()
+    }
+
+    pub fn forkless_capture_in_progress(&self) -> bool {
+        self.forkless_feed.is_some()
+    }
+
+    pub fn forkless_progress(&self) -> Option<RdbSaveProgress> {
+        self.forkless
+            .as_ref()
+            .map(|(task, _)| task.control().progress())
+    }
+
+    pub fn current_bgsave_duration_sec(&self) -> i64 {
+        self.rdb
+            .started
+            .map_or(-1, |started| started.elapsed().as_secs() as i64)
+    }
+
+    fn begin_save_metrics(&mut self, method: BgsaveMethod, now_sec: i64) {
+        self.rdb.saves = self.rdb.saves.saturating_add(1);
+        self.rdb.current_bgsave_type = Some(method);
+        self.rdb.last_bgsave_try_sec = now_sec;
+        self.rdb.started = Some(Instant::now());
+    }
+
+    fn begin_transfer_metrics(&mut self) {
+        self.rdb.current_bgsave_type = Some(BgsaveMethod::Fork);
+        self.rdb.started = Some(Instant::now());
+    }
+
+    fn clear_save_metrics(&mut self) {
+        self.rdb.last_bgsave_duration_sec = self.current_bgsave_duration_sec();
+        self.rdb.started = None;
+        self.rdb.current_bgsave_type = None;
+        self.rdb.current_cow_size = 0;
+        self.rdb.current_save_keys_processed = 0;
+        self.rdb.current_save_keys_total = 0;
+        self.rdb.current_fork_perc = 0.0;
+    }
+
+    pub fn begin_forkless_save(
+        &mut self,
+        task: BackgroundRdbSave,
+        now_sec: i64,
+        forkless_keys: Vec<(u32, Vec<u8>)>,
+        feed: Option<ForklessFeed>,
+    ) -> Result<(), StateError> {
+        if self.has_active_child() {
+            return Err(StateError::ChildAlreadyRunning);
+        }
+        self.begin_rdb_metrics(task.control().progress().total_keys);
+        self.begin_save_metrics(BgsaveMethod::Forkless, now_sec);
+        self.forkless_keys = forkless_keys
+            .into_iter()
+            .map(|(db_id, key)| ForklessItemId {
+                dataset_id: None,
+                db_id,
+                key,
+            })
+            .collect();
+        self.forkless_captured_keys.clear();
+        self.forkless_feed = feed;
+        self.forkless = Some((task, self.dirty));
+        Ok(())
+    }
+
+    pub fn drive_forkless_feed(
+        &mut self,
+        primary: &mut DbSet,
+        additional_datasets: &mut [(Vec<u8>, &mut DbSet)],
+    ) -> bool {
+        let completed = self
+            .forkless
+            .as_ref()
+            .map(|(task, _)| task.take_completed_items())
+            .unwrap_or_default();
+        let mut released_any = false;
+        for item in completed {
+            if release_forkless_item(primary, additional_datasets, &item) {
+                released_any |= self.forkless_keys.remove(&item);
+            }
+        }
+        if let Some(feed) = self.forkless_feed.as_mut() {
+            feed.drive(primary, additional_datasets, 128);
+            self.forkless_keys.extend(feed.take_shared_keys());
+            self.forkless_captured_keys
+                .extend(feed.take_captured_keys());
+            if feed.is_finished() {
+                self.forkless_feed = None;
+            }
+        }
+        released_any
+    }
+
+    pub fn forkless_key_blocked(&self, db_id: u32, key: &[u8]) -> bool {
+        self.forkless_keys.contains(&ForklessItemId {
+            dataset_id: None,
+            db_id,
+            key: key.to_vec(),
+        })
+    }
+
+    pub fn forkless_key_captured(&self, db_id: u32, key: &[u8]) -> bool {
+        self.forkless_captured_keys.contains(&ForklessItemId {
+            dataset_id: None,
+            db_id,
+            key: key.to_vec(),
+        })
+    }
+
+    pub fn set_forkless_key_delay(&self, delay_us: i64) {
+        if let Some((task, _)) = &self.forkless {
+            task.control().set_key_delay(delay_us);
+        }
+    }
+
+    pub fn cancel_forkless_save(&self) {
+        if let Some((task, _)) = &self.forkless {
+            task.control().cancel();
+        }
+    }
+
+    pub fn poll_forkless_save(
+        &mut self,
+        now_sec: i64,
+        primary: &mut DbSet,
+        additional_datasets: &mut [(Vec<u8>, &mut DbSet)],
+    ) -> Option<RdbSaveOutcome> {
+        if !self
+            .forkless
+            .as_ref()
+            .is_some_and(|(task, _)| task.is_finished())
+        {
+            return None;
+        }
+        self.finish_forkless_save(now_sec, primary, additional_datasets)
+    }
+
+    /// Shutdown joins only after cancellation, before a final synchronous save.
+    pub fn abort_forkless_save(
+        &mut self,
+        now_sec: i64,
+        primary: &mut DbSet,
+        additional_datasets: &mut [(Vec<u8>, &mut DbSet)],
+    ) {
+        self.cancel_forkless_save();
+        let _ = self.finish_forkless_save(now_sec, primary, additional_datasets);
+    }
+
+    fn finish_forkless_save(
+        &mut self,
+        now_sec: i64,
+        primary: &mut DbSet,
+        additional_datasets: &mut [(Vec<u8>, &mut DbSet)],
+    ) -> Option<RdbSaveOutcome> {
+        let (mut task, dirty_at_start) = self.forkless.take()?;
+        self.forkless_feed = None;
+        self.forkless_captured_keys.clear();
+        let outcome = task.finish();
+        for item in self.forkless_keys.drain() {
+            let released = release_forkless_item(primary, additional_datasets, &item);
+            debug_assert!(
+                released,
+                "background save completion must release every shared value"
+            );
+        }
+        match &outcome {
+            RdbSaveOutcome::Saved => {
+                self.rdb.last_bgsave_status = OperationStatus::Ok;
+                self.rdb.last_save_time_sec = now_sec;
+                self.dirty = self.dirty.saturating_sub(dirty_at_start);
+                self.rdb.last_bgsave_type = Some(BgsaveMethod::Forkless);
+            }
+            RdbSaveOutcome::Failed(_) => {
+                self.rdb.last_bgsave_status = OperationStatus::Err;
+                self.rdb.last_bgsave_type = Some(BgsaveMethod::Forkless);
+            }
+            RdbSaveOutcome::Cancelled => {}
+        }
+        self.clear_save_metrics();
+        Some(outcome)
     }
 
     pub fn bgsave_scheduled(&self) -> bool {
-        self.bgsave_scheduled
+        self.bgsave_scheduled.is_some()
     }
 
     pub fn set_bgsave_scheduled(&mut self, scheduled: bool) {
-        self.bgsave_scheduled = scheduled;
+        self.bgsave_scheduled = scheduled.then_some(BgsaveMethod::Fork);
+    }
+
+    pub fn schedule_bgsave(&mut self, method: BgsaveMethod) {
+        self.bgsave_scheduled = Some(method);
+    }
+
+    pub fn scheduled_bgsave_method(&self) -> Option<BgsaveMethod> {
+        self.bgsave_scheduled
     }
 
     pub fn aof_rewrite_scheduled(&self) -> bool {
@@ -328,13 +548,14 @@ impl PersistenceState {
     /// disk-based full-sync) runs. Drives INFO `rdb_bgsave_in_progress`; C sets
     /// that flag for disk BGSAVE and both full-sync transfer flavors.
     pub fn rdb_bgsave_in_progress(&self) -> bool {
-        matches!(
-            self.child,
-            Some(PersistenceChild::Rdb { .. })
-                | Some(PersistenceChild::DisklessSync { .. })
-                | Some(PersistenceChild::DiskSync { .. })
-                | Some(PersistenceChild::SlotMigration { .. })
-        )
+        self.forkless.is_some()
+            || matches!(
+                self.child,
+                Some(PersistenceChild::Rdb { .. })
+                    | Some(PersistenceChild::DisklessSync { .. })
+                    | Some(PersistenceChild::DiskSync { .. })
+                    | Some(PersistenceChild::SlotMigration { .. })
+            )
     }
 
     pub fn aof_rewrite_child_pid(&self) -> Option<i32> {
@@ -390,10 +611,10 @@ impl PersistenceState {
     }
 
     pub fn begin_rdb_child(&mut self, pid: i32, now_sec: i64) -> Result<(), StateError> {
-        if self.child.is_some() {
+        if self.has_active_child() {
             return Err(StateError::ChildAlreadyRunning);
         }
-        self.rdb.last_bgsave_try_sec = now_sec;
+        self.begin_save_metrics(BgsaveMethod::Fork, now_sec);
         self.child = Some(PersistenceChild::Rdb {
             pid,
             dirty_at_fork: self.dirty,
@@ -418,18 +639,17 @@ impl PersistenceState {
             OperationStatus::Err
         };
         self.rdb.last_cow_size = self.rdb.current_cow_size;
-        self.rdb.current_cow_size = 0;
-        self.rdb.current_save_keys_processed = 0;
-        self.rdb.current_save_keys_total = 0;
-        self.rdb.current_fork_perc = 0.0;
+        self.rdb.last_bgsave_type = Some(BgsaveMethod::Fork);
+        self.clear_save_metrics();
         crate::foundation::io::sys::signal::set_rdb_child_pid(-1);
         Ok(())
     }
 
     pub fn begin_diskless_child(&mut self, pid: i32) -> Result<(), StateError> {
-        if self.child.is_some() {
+        if self.has_active_child() {
             return Err(StateError::ChildAlreadyRunning);
         }
+        self.begin_transfer_metrics();
         self.child = Some(PersistenceChild::DisklessSync { pid });
         Ok(())
     }
@@ -439,13 +659,15 @@ impl PersistenceState {
     pub fn complete_diskless_child(&mut self) {
         if matches!(self.child, Some(PersistenceChild::DisklessSync { .. })) {
             self.child = None;
+            self.clear_save_metrics();
         }
     }
 
     pub fn begin_disk_sync_child(&mut self, pid: i32) -> Result<(), StateError> {
-        if self.child.is_some() {
+        if self.has_active_child() {
             return Err(StateError::ChildAlreadyRunning);
         }
+        self.begin_transfer_metrics();
         self.child = Some(PersistenceChild::DiskSync { pid });
         Ok(())
     }
@@ -455,11 +677,12 @@ impl PersistenceState {
     pub fn complete_disk_sync_child(&mut self) {
         if matches!(self.child, Some(PersistenceChild::DiskSync { .. })) {
             self.child = None;
+            self.clear_save_metrics();
         }
     }
 
     pub fn begin_slot_migration_child(&mut self, pid: i32) -> Result<(), StateError> {
-        if self.child.is_some() {
+        if self.has_active_child() {
             return Err(StateError::ChildAlreadyRunning);
         }
         self.child = Some(PersistenceChild::SlotMigration { pid });
@@ -473,7 +696,7 @@ impl PersistenceState {
     }
 
     pub fn begin_aof_rewrite_child(&mut self, pid: i32, started_ms: i64) -> Result<(), StateError> {
-        if self.child.is_some() {
+        if self.has_active_child() {
             return Err(StateError::ChildAlreadyRunning);
         }
         self.child = Some(PersistenceChild::AofRewrite { pid, started_ms });
@@ -532,22 +755,39 @@ impl PersistenceState {
         let child = self.child.take();
         match child {
             Some(PersistenceChild::Rdb { .. }) => {
+                self.clear_save_metrics();
                 crate::foundation::io::sys::signal::set_rdb_child_pid(-1);
             }
             Some(PersistenceChild::AofRewrite { .. }) => {
                 self.aof.rewrite.buffer.clear();
                 crate::foundation::io::sys::signal::set_aof_child_pid(-1);
             }
-            // Diskless full-sync owns no signal PID slot or rewrite buffer, so
-            // dropping the child is all that is needed to release ownership.
-            Some(PersistenceChild::DisklessSync { .. }) => {}
-            // Disk-based full-sync likewise owns no signal PID slot or buffer.
-            Some(PersistenceChild::DiskSync { .. }) => {}
+            // Replication transfers clear timing and progress without changing
+            // persistence status, dirty accounting, or process signal slots.
+            Some(PersistenceChild::DisklessSync { .. })
+            | Some(PersistenceChild::DiskSync { .. }) => self.clear_save_metrics(),
             Some(PersistenceChild::SlotMigration { .. }) => {}
             None => {}
         }
         child
     }
+}
+
+fn release_forkless_item(
+    primary: &mut DbSet,
+    additional_datasets: &mut [(Vec<u8>, &mut DbSet)],
+    item: &ForklessItemId,
+) -> bool {
+    if item.dataset_id.is_none() {
+        return primary
+            .get_mut(item.db_id)
+            .is_none_or(|db| db.release_background_snapshot(&item.key));
+    }
+    additional_datasets
+        .iter_mut()
+        .find(|(id, _)| Some(id.as_slice()) == item.dataset_id.as_deref())
+        .and_then(|(_, dataset)| dataset.get_mut(item.db_id))
+        .is_none_or(|db| db.release_background_snapshot(&item.key))
 }
 
 impl OperationStatus {
@@ -568,6 +808,81 @@ impl Default for PersistenceState {
 #[cfg(test)]
 mod tests {
     use super::{OperationStatus, PersistenceChild, PersistenceState, StateError};
+
+    #[test]
+    fn replication_transfer_registers_timing_without_persistence_accounting() {
+        for is_diskless in [true, false] {
+            let mut state = PersistenceState::new();
+            state.add_dirty(13);
+            state.rdb.saves = 10;
+            state.rdb.last_bgsave_try_sec = 41;
+            if is_diskless {
+                state.begin_diskless_child(101).unwrap();
+            } else {
+                state.begin_disk_sync_child(101).unwrap();
+            }
+
+            assert_eq!(
+                state.rdb.current_bgsave_type,
+                Some(super::BgsaveMethod::Fork)
+            );
+            assert!(state.current_bgsave_duration_sec() >= 0);
+            assert_eq!(state.rdb.saves, 10);
+            assert_eq!(state.rdb.last_bgsave_try_sec, 41);
+            assert_eq!(state.dirty(), 13);
+        }
+    }
+
+    #[test]
+    fn replication_transfer_completion_and_abort_clear_save_metrics() {
+        for is_diskless in [true, false] {
+            for should_abort in [true, false] {
+                let mut state = PersistenceState::new();
+                state.add_dirty(13);
+                state.rdb.last_bgsave_status = OperationStatus::Err;
+                state.rdb.last_bgsave_type = Some(super::BgsaveMethod::Forkless);
+                state.rdb.last_save_time_sec = 42;
+                if is_diskless {
+                    state.begin_diskless_child(101).unwrap();
+                } else {
+                    state.begin_disk_sync_child(101).unwrap();
+                }
+                state.rdb.started = Some(
+                    super::Instant::now()
+                        .checked_sub(std::time::Duration::from_secs(7))
+                        .unwrap(),
+                );
+                state.rdb.current_cow_size = 100;
+                state.rdb.current_save_keys_processed = 10;
+                state.rdb.current_save_keys_total = 100;
+                state.rdb.current_fork_perc = 50.0;
+
+                if should_abort {
+                    assert!(state.abort_child().is_some());
+                } else if is_diskless {
+                    state.complete_diskless_child();
+                } else {
+                    state.complete_disk_sync_child();
+                }
+
+                assert!(state.rdb.last_bgsave_duration_sec >= 7);
+                assert_eq!(state.current_bgsave_duration_sec(), -1);
+                assert_eq!(state.rdb.current_bgsave_type, None);
+                assert_eq!(state.rdb.current_cow_size, 0);
+                assert_eq!(state.rdb.current_save_keys_processed, 0);
+                assert_eq!(state.rdb.current_save_keys_total, 0);
+                assert_eq!(state.rdb.current_fork_perc, 0.0);
+                assert!(!state.rdb_bgsave_in_progress());
+                assert_eq!(state.dirty(), 13);
+                assert_eq!(state.rdb.last_bgsave_status, OperationStatus::Err);
+                assert_eq!(
+                    state.rdb.last_bgsave_type,
+                    Some(super::BgsaveMethod::Forkless)
+                );
+                assert_eq!(state.rdb.last_save_time_sec, 42);
+            }
+        }
+    }
 
     #[test]
     fn diskless_child_registers_and_reports_bgsave_in_progress() {

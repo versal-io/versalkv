@@ -258,6 +258,7 @@ impl Server {
             apply_cluster_config_snapshot(&mut backend.ctx)
                 .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
             backend.set_cluster_config_path(cluster_config_path);
+            backend.save_cluster_config_now()?;
             crate::server_log!(notice, "Cluster mode enabled (node_id={})", node_id);
 
             let mut bus_addresses = std::collections::HashSet::new();

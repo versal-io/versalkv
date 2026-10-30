@@ -77,7 +77,9 @@ impl ServerWorkerState {
         let token_value = input.token.0;
         let diagnostic = self.record_command_diagnostic(&input);
         let _diagnostic_guard = crate::foundation::io::sys::log::enter_active_command(diagnostic);
-        if self.apply_slot_import_command(token_value, input.args.clone()) {
+        if !self.should_defer_slot_import_write(token_value, &input.args)
+            && self.apply_slot_import_command(token_value, input.args.clone())
+        {
             return if self.connection_registry[input.token].state == ConnectionState::Closing {
                 fx.mark_closing = true;
                 LoopAction::Break

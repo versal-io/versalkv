@@ -23,6 +23,8 @@ pub mod flushall;
 #[rustfmt::skip]
 pub mod flushdb;
 #[rustfmt::skip]
+pub mod hotkeys;
+#[rustfmt::skip]
 pub mod info;
 #[rustfmt::skip]
 pub mod lastsave;
@@ -73,6 +75,7 @@ pub fn register_all(reg: &mut CommandRegistry) {
     reg.register(failover::FAILOVER_SPEC);
     reg.register(flushall::FLUSHALL_SPEC);
     reg.register(flushdb::FLUSHDB_SPEC);
+    reg.register(hotkeys::HOTKEYS_SPEC);
     reg.register(info::INFO_SPEC);
     reg.register(lastsave::LASTSAVE_SPEC);
     reg.register(latency::LATENCY_SPEC);

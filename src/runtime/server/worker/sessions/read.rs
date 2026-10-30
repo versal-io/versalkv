@@ -631,10 +631,19 @@ impl ServerWorkerState {
             );
         }
         if close
-            && !self.connection_registry
+            && (self.connection_registry
+                [crate::framework::capabilities::io::Token(connection_token)]
+            .blocked
+            .as_ref()
+            .is_some_and(|blocked| {
+                matches!(
+                    blocked.cmd,
+                    crate::framework::capabilities::connection::BlockedCmd::Throttled
+                )
+            }) || !self.connection_registry
                 [crate::framework::capabilities::io::Token(connection_token)]
             .parser
-            .has_pending_data()
+            .has_pending_data())
         {
             self.remove_connection(token_value);
             return;

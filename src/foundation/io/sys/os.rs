@@ -128,8 +128,27 @@ pub fn drain_nonblocking(
     output: &mut Vec<u8>,
     mut read: impl FnMut(&mut [u8]) -> io::Result<usize>,
 ) -> io::Result<bool> {
+    drain_nonblocking_bounded(scratch, output, usize::MAX, &mut read)
+}
+
+/// Drain at most `byte_budget` bytes from a nonblocking reader. Returns `true`
+/// only for EOF; reaching the budget is reported like `WouldBlock`.
+pub fn drain_nonblocking_bounded(
+    scratch: &mut [u8],
+    output: &mut Vec<u8>,
+    byte_budget: usize,
+    mut read: impl FnMut(&mut [u8]) -> io::Result<usize>,
+) -> io::Result<bool> {
+    if byte_budget == 0 || scratch.is_empty() {
+        return Ok(false);
+    }
     loop {
-        match retry_on_interrupt(|| read(scratch)) {
+        let remaining = byte_budget.saturating_sub(output.len());
+        if remaining == 0 {
+            return Ok(false);
+        }
+        let chunk_len = remaining.min(scratch.len());
+        match retry_on_interrupt(|| read(&mut scratch[..chunk_len])) {
             Ok(0) => return Ok(true),
             Ok(n) => output.extend_from_slice(&scratch[..n]),
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(false),
@@ -187,6 +206,29 @@ pub fn socket_backpressured_write_bytes_fd(fd: RawFd) -> io::Result<usize> {
         return Ok(0);
     }
     Ok(pending)
+}
+
+#[cfg(test)]
+mod portable_tests {
+    use super::drain_nonblocking_bounded;
+
+    #[test]
+    fn bounded_nonblocking_drain_stops_at_the_byte_budget() {
+        let mut scratch = [0u8; 8];
+        let mut output = Vec::new();
+        let mut reads = 0;
+
+        let eof = drain_nonblocking_bounded(&mut scratch, &mut output, 10, |buf| {
+            reads += 1;
+            buf.fill(b'x');
+            Ok(buf.len())
+        })
+        .unwrap();
+
+        assert!(!eof);
+        assert_eq!(output, vec![b'x'; 10]);
+        assert_eq!(reads, 2);
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]

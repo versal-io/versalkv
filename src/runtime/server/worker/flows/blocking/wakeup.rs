@@ -72,6 +72,21 @@ impl ServerWorkerState {
         self.resume_wakeup_command_effects(connection_token, was_paused);
 
         if was_paused
+            && !self.should_defer_slot_import_write(connection_token, &args)
+            && self.apply_slot_import_command(connection_token, args.clone())
+        {
+            if self.connection_registry.contains(token) {
+                let is_closing = self.connection_registry[token].state
+                    == crate::framework::capabilities::connection::ConnectionState::Closing;
+                self.connection_registry[token].complete_command();
+                if !is_closing {
+                    self.queue_client_for_reprocessing(token);
+                }
+            }
+            return Vec::new();
+        }
+
+        if was_paused
             && self.connection_registry[crate::framework::capabilities::io::Token(connection_token)]
                 .transaction
                 .is_active()
@@ -313,11 +328,15 @@ impl ServerWorkerState {
         let session = self.connection_registry
             [crate::framework::capabilities::io::Token(connection_token)]
         .session_id();
-        let (blocked, was_paused) = if matches!(
+        let (blocked, was_paused) = if matches!(blocked.cmd, BlockedCmd::Throttled) {
+            self.ctx.throttled_clients_mut().shift_remove(&token);
+            (blocked, true)
+        } else if matches!(
             blocked.cmd,
-            BlockedCmd::Paused | BlockedCmd::SlotMigration(_)
+            BlockedCmd::Paused | BlockedCmd::Forkless | BlockedCmd::SlotMigration(_)
         ) {
             self.ctx.paused_clients_mut().shift_remove(&token);
+            self.ctx.forkless_clients_mut().shift_remove(&token);
             match blocked.orig_wrapped {
                 Some(wrapped) => (*wrapped, false),
                 None => (blocked, true),
@@ -343,7 +362,7 @@ impl ServerWorkerState {
             }
         }
         if let Some(ci) = self.ctx.client_info_mut(token.0) {
-            ci.flags.retain(|c| c != 'b');
+            ci.flags.retain(|c| c != 'b' && c != 'h');
             if ci.flags.is_empty() {
                 ci.flags.push('N');
             }
@@ -440,20 +459,28 @@ impl ServerWorkerState {
                 DispatchAction::Rejected => {
                     (outcome.reject_reply.unwrap_or(Value::Null), true, false)
                 }
-                DispatchAction::Postpone(
-                    PostponeReason::ClientPause | PostponeReason::SlotMigration(_),
-                ) => {
+                DispatchAction::Postpone(reason) => {
+                    let is_throttled = reason == PostponeReason::ReplicationThrottle;
+                    let is_forkless = reason == PostponeReason::ForklessKey;
+                    let command = match reason {
+                        PostponeReason::ClientPause => BlockedCmd::Paused,
+                        PostponeReason::ForklessKey => BlockedCmd::Forkless,
+                        PostponeReason::ReplicationThrottle => BlockedCmd::Throttled,
+                        PostponeReason::SlotMigration(job_id) => BlockedCmd::SlotMigration(job_id),
+                    };
                     let conn = &mut self.connection_registry
                         [crate::framework::capabilities::io::Token(connection_token)];
-                    let reply = conn.enter_blocking(
-                        BlockedCmd::Paused,
-                        Vec::new(),
-                        0,
-                        args,
-                        blocked_req_bytes,
-                    );
-                    self.ctx.paused_clients_mut().insert(token);
-                    (reply, false, false)
+                    conn.postpone_command(command, Vec::new(), 0, args, blocked_req_bytes);
+                    if is_throttled {
+                        self.ctx.throttled_clients_mut().insert(token);
+                        self.schedule_replication_throttle();
+                    } else {
+                        self.ctx.paused_clients_mut().insert(token);
+                        if is_forkless {
+                            self.ctx.forkless_clients_mut().insert(token);
+                        }
+                    }
+                    (Value::Null, false, false)
                 }
             }
         }
@@ -648,16 +675,30 @@ impl ServerWorkerState {
             blocked.start_time_ms = blocked_start_ms;
         }
         if let Some(ci) = self.ctx.client_info_mut(token.0) {
-            if !ci.flags.contains('b') {
+            let flag = if conn
+                .blocked
+                .as_ref()
+                .is_some_and(|blocked| matches!(blocked.cmd, BlockedCmd::Throttled))
+            {
+                'h'
+            } else {
+                'b'
+            };
+            if !ci.flags.contains(flag) {
                 ci.flags.retain(|c| c != 'N');
-                ci.flags.push('b');
+                ci.flags.push(flag);
             }
         }
         let token = conn.token();
         let session = conn.session_id();
         let db_id = conn.selected_db;
         if let Some(b) = &conn.blocked {
-            if matches!(b.cmd, BlockedCmd::Paused) {
+            if matches!(b.cmd, BlockedCmd::Throttled) {
+                self.ctx.throttled_clients_mut().insert(token);
+            } else if matches!(
+                b.cmd,
+                BlockedCmd::Paused | BlockedCmd::Forkless | BlockedCmd::SlotMigration(_)
+            ) {
                 self.ctx.paused_clients_mut().insert(token);
             } else {
                 self.ctx

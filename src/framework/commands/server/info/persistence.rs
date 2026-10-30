@@ -37,9 +37,14 @@ pub(super) fn gen_persistence_section(
         "rdb_last_bgsave_status",
         state.rdb().last_bgsave_status.as_str(),
     );
-    emit_line(&mut s, "rdb_last_bgsave_time_sec", -1);
-    emit_line(&mut s, "rdb_current_bgsave_time_sec", -1);
-    emit_line(&mut s, "rdb_saves", 0);
+    emit_line(&mut s, "rdb_last_bgsave_time_sec", state.rdb().last_bgsave_duration_sec);
+    emit_line(&mut s, "rdb_current_bgsave_time_sec", state.current_bgsave_duration_sec());
+    emit_line(&mut s, "rdb_current_bgsave_type", state.rdb().current_bgsave_type.map_or("none", |t| t.as_str()));
+    emit_line(&mut s, "rdb_last_bgsave_type", state.rdb().last_bgsave_type.map_or("none", |t| t.as_str()));
+    emit_line(&mut s, "rdb_saves", state.rdb().saves);
+    let forkless = state.forkless_progress();
+    emit_line(&mut s, "forkless_estimated_seconds_remaining",
+        forkless.map_or(-1, |progress| progress.estimated_seconds_remaining()));
     emit_line(&mut s, "rdb_last_cow_size", state.rdb().last_cow_size);
     emit_line(
         &mut s,
@@ -58,7 +63,7 @@ pub(super) fn gen_persistence_section(
     emit_line(
         &mut s,
         "current_save_keys_processed",
-        state.rdb().current_save_keys_processed,
+        forkless.map_or(state.rdb().current_save_keys_processed, |p| p.processed),
     );
     emit_line(&mut s, "current_save_keys_total", state.rdb().current_save_keys_total);
     let aof_enabled = if rcfg.persistence.aof_enabled { 1 } else { 0 };

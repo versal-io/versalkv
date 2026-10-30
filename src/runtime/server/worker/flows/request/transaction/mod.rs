@@ -24,6 +24,8 @@ mod exec_runner;
 mod multi_queue;
 #[cfg(test)]
 mod slot_accounting_tests;
+#[cfg(test)]
+mod throttle_tests;
 mod tx_db_object;
 
 use exec_acl::ExecAclRequest;
@@ -275,6 +277,60 @@ impl ServerWorkerState {
             }),
             PauseAction::All => true,
         }
+    }
+
+    fn exec_should_pause_for_forkless(&self, token: Token) -> bool {
+        if !self.ctx.persistence().forkless_save_in_progress() {
+            return false;
+        }
+        let connection = &self.connection_registry[token];
+        let mut db_id = connection.selected_db;
+        for command in connection.transaction.queued_commands() {
+            let Some(spec) = self.registry.lookup(&command.name) else {
+                continue;
+            };
+            let flags = super::dispatch::subcmd_flags::effective_command_flags_for_call(
+                spec.name.as_str(),
+                spec.flags,
+                command,
+                &self.ctx,
+            );
+            if super::dispatch::command_may_mutate_dataset(spec.name.as_str(), flags) {
+                if self.ctx.persistence().forkless_capture_in_progress() {
+                    return true;
+                }
+                let meta = super::dispatch::CmdPreconditions {
+                    name: spec.name.clone(),
+                    arity: spec.arity,
+                    flags,
+                    first_key: spec.first_key,
+                    last_key: spec.last_key,
+                    key_step: spec.key_step,
+                    key_flags: spec.key_flags,
+                    acl_categories: spec.acl_categories,
+                    get_keys: spec.get_keys,
+                };
+                let keys = Self::cluster_redirect_keys(&meta, command);
+                if keys.is_empty()
+                    || keys
+                        .iter()
+                        .any(|key| self.ctx.persistence().forkless_key_blocked(db_id, key))
+                {
+                    return true;
+                }
+            }
+            if command.name.eq_ignore_ascii_case(b"select") {
+                if let Some(next_db) = command
+                    .args
+                    .first()
+                    .and_then(|arg| std::str::from_utf8(arg).ok())
+                    .and_then(|arg| arg.parse::<u32>().ok())
+                {
+                    db_id = next_db;
+                }
+            }
+        }
+        false
     }
 
     fn exec_run_commands(
@@ -1185,6 +1241,77 @@ mod cluster_publish_tests {
                 .is_some(),
             "HSETEX KEEPTTL must observe the same logical time as the preceding HPEXPIRE"
         );
+    }
+
+    #[test]
+    fn exec_postpones_a_write_queued_before_forkless_capture_started() {
+        use crate::engine::extension::config::persistence::BgsaveMethod;
+        use crate::foundation::io::store::Robj;
+        use crate::runtime::server::worker::flows::request::dispatch::CommandEffects;
+        use crate::runtime::server::worker::flows::request::outcome::{
+            CommandDisposition, SpecialCommandResult,
+        };
+
+        let mut backend = ServerWorkerState::new(1).unwrap();
+        crate::framework::commands::register_all(&mut backend.registry);
+        let mut connection = Connection::new_fake();
+        connection.set_token_for_test(Token(7));
+        connection.set_custom_reply_enabled(false);
+        connection.cmd_count = 1;
+        begin_with_commands(
+            &mut connection,
+            vec![CommandArgs::from_parts(vec![
+                Bytes::from_static(b"SET"),
+                Bytes::from_static(b"queued-write"),
+                Bytes::from_static(b"value"),
+            ])],
+        );
+        let _ = backend.connection_registry.insert(connection);
+        for index in 0..256 {
+            backend.ctx.db_mut(0).unwrap().set(
+                format!("capture-{index}").into_bytes(),
+                Robj::string_raw(Bytes::from_static(b"value")),
+            );
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "versal-forkless-exec-barrier-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        backend.ctx.config_mut().persistence.dir = dir.to_string_lossy().into_owned();
+        backend.ctx.config_mut().persistence.dbfilename = "dump.rdb".to_string();
+        backend.ctx.config_mut().persistence.bgsave_default_method = BgsaveMethod::Forkless;
+        crate::framework::commands::server::save::start_bgsave(&mut backend.ctx).unwrap();
+        assert!(backend.ctx.persistence().forkless_capture_in_progress());
+        let mut effects = CommandEffects::default();
+
+        let result =
+            backend.try_handle_exec(CommandTarget::new(Token(7)), "exec", false, &mut effects);
+        let key_is_absent = backend
+            .ctx
+            .db(0)
+            .unwrap()
+            .get_no_expire(b"queued-write")
+            .is_none();
+        let transaction_is_active = backend.connection_registry[Token(7)]
+            .transaction
+            .is_active();
+        let client_is_blocked = backend.ctx.forkless_clients_mut().contains(&Token(7));
+
+        backend
+            .ctx
+            .abort_forkless_save(crate::foundation::io::sys::time::mstime() / 1_000);
+        let _ = std::fs::remove_dir_all(dir);
+
+        assert_eq!(
+            result,
+            SpecialCommandResult::Handled(CommandDisposition::Blocked)
+        );
+        assert!(key_is_absent);
+        assert!(transaction_is_active);
+        assert!(client_is_blocked);
     }
 }
 

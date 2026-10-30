@@ -80,6 +80,8 @@ fn output_buffer_limits_for_connection(
 
 mod cluster_actions;
 mod cluster_config;
+mod cluster_config_writer;
+pub(crate) use cluster_config_writer::ClusterConfigWriter;
 mod cluster_demote_empty_primary;
 mod cluster_demote_stale_primary;
 mod cluster_pending;
@@ -142,11 +144,20 @@ impl ServerWorkerState {
         }
         self.drive_pending_shutdown();
         self.retry_pending_transport_removals();
+        let was_forkless_capturing = self.ctx.persistence().forkless_capture_in_progress();
+        let released_forkless_key = self.ctx.drive_forkless_feed();
+        if released_forkless_key
+            || (was_forkless_capturing && !self.ctx.persistence().forkless_capture_in_progress())
+        {
+            self.release_forkless_clients();
+        }
         self.drive_slot_migration_actions();
         self.drive_slot_migration_progress();
         self.send_slot_migration_periodic_acks();
 
         let now = crate::foundation::io::sys::time::mstime();
+        self.ctx.configure_hotkeys(false);
+        self.ctx.hotkeys().rotate();
         self.ctx.sample_instantaneous_metrics(now);
         self.cleanup_closed();
         self.ctx.migrate_sockets_mut().expire_idle(Instant::now());
@@ -179,7 +190,10 @@ impl ServerWorkerState {
         self.drive_pending_dual_rdb_snapshots();
         self.refresh_replication_buffer_accounting_if_dirty();
         self.refresh_replica_output_buffer_bytes();
+        self.adjust_replication_throttle();
         self.enforce_replica_output_buffer_limits();
+        self.release_throttled_clients();
+        self.schedule_replication_throttle();
         self.drive_shutdown_progress();
         self.drive_deferred_full_resyncs();
         self.disconnect_timedout_replicas();
@@ -578,6 +592,7 @@ impl ServerWorkerState {
     fn run_expire_cycle(&mut self) {
         if !self.ctx.config_mut().server.active_expire_enabled
             || self.ctx.config_mut().server.import_mode
+            || self.ctx.persistence().forkless_capture_in_progress()
         {
             return;
         }
@@ -1053,6 +1068,46 @@ mod tests {
 
     fn offset(value: i64) -> ReplicationOffset {
         ReplicationOffset::try_from(value).expect("valid test offset")
+    }
+
+    #[test]
+    fn active_expiration_waits_until_forkless_capture_finishes() {
+        use crate::engine::extension::config::persistence::BgsaveMethod;
+        use crate::foundation::io::store::Robj;
+        use bytes::Bytes;
+        use std::time::Duration;
+
+        let mut runtime = ServerWorkerState::new(1).unwrap();
+        let expire_at = crate::foundation::io::sys::time::mstime().saturating_add(100) as u64;
+        for index in 0..256 {
+            runtime.ctx.db_mut(0).unwrap().load_entry(
+                format!("expiring-{index}").into_bytes(),
+                Robj::string_raw(Bytes::from_static(b"value")),
+                Some(expire_at),
+            );
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "versal-forkless-expire-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        runtime.ctx.config_mut().persistence.dir = dir.to_string_lossy().into_owned();
+        runtime.ctx.config_mut().persistence.dbfilename = "dump.rdb".to_string();
+        runtime.ctx.config_mut().persistence.bgsave_default_method = BgsaveMethod::Forkless;
+        runtime.ctx.config_mut().persistence.rdb_key_save_delay = 10_000_000;
+        crate::framework::commands::server::save::start_bgsave(&mut runtime.ctx).unwrap();
+        assert!(runtime.ctx.persistence().forkless_capture_in_progress());
+        std::thread::sleep(Duration::from_millis(150));
+
+        runtime.run_expire_cycle();
+
+        assert_eq!(runtime.ctx.db(0).unwrap().dbsize(), 256);
+        runtime
+            .ctx
+            .abort_forkless_save(crate::foundation::io::sys::time::mstime() / 1_000);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

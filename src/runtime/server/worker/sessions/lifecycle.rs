@@ -165,6 +165,7 @@ impl ServerWorkerState {
             return;
         }
         self.retire_runtime_source(token);
+        self.ctx.throttled_clients_mut().shift_remove(&token);
         self.full_sync.pending_dual_rdb_snapshots.remove(&token);
         self.cancel_runtime_runnable(
             crate::runtime::server::worker::reactor::RunnableKey::ClientRead(token),
