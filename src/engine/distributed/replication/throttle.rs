@@ -101,6 +101,19 @@ impl ReplicationThrottle {
             .map_or(0, |since| since.elapsed().as_secs())
     }
 
+    pub fn disable(&mut self) {
+        self.active = false;
+        self.rate = UNLIMITED_RATE;
+        self.tokens = 0.0;
+        self.refilled = Instant::now();
+        self.adjusted = None;
+        self.trends.clear();
+        self.input_pending = 0;
+        self.input_window = 0.0;
+        self.input_is_new = true;
+        self.below_guardrail_since = None;
+    }
+
     pub fn target(soft: usize, hard: usize) -> usize {
         if soft > 0 {
             soft / 2
@@ -134,9 +147,7 @@ impl ReplicationThrottle {
         online_buffers: &[(usize, usize)],
     ) {
         if !is_enabled_primary || target == 0 || !has_replicas {
-            self.active = false;
-            self.below_guardrail_since = None;
-            self.trends.clear();
+            self.disable();
             return;
         }
         if self
@@ -319,6 +330,22 @@ mod tests {
         );
         assert_eq!(throttle.rate(), 1_000.0);
         assert_eq!(throttle.more_events, 1);
+    }
+
+    #[test]
+    fn disabling_after_last_replica_clears_admission_state() {
+        let mut throttle = ReplicationThrottle::default();
+        let now = throttle.input_updated;
+        throttle.adjust_at(now, true, 32_768, true, &[(1, 65_536)]);
+        assert!(throttle.is_active());
+        throttle.try_release();
+
+        throttle.disable();
+
+        assert!(!throttle.is_active());
+        assert_eq!(throttle.rate(), -1.0);
+        assert_eq!(throttle.tokens, 0.0);
+        assert!(throttle.try_release());
     }
 
     #[test]

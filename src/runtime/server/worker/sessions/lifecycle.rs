@@ -528,6 +528,10 @@ impl ServerWorkerState {
             .remove(&plan.token_value);
         self.replication_runtime
             .remove_connection(plan.connection_id);
+        if self.replication_runtime.primary_links().is_empty() {
+            self.ctx.replication_mut().throttle.disable();
+            self.release_throttled_clients();
+        }
         if let Some(ref name) = plan.lost_replica_name {
             crate::server_log!(notice, "Connection with replica {} lost.", name);
         }
