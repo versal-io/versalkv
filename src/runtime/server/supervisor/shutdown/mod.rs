@@ -233,7 +233,6 @@ pub(crate) fn finish_shutdown(ctx: &mut ServerContext, flags: u32) -> Result<(),
         let _ = aof.appender.shutdown();
     }
 
-    crate::server_log!(notice, "{}", messages::READY_TO_EXIT);
     ctx.set_shutdown_requested(true);
     Ok(())
 }

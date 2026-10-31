@@ -19,13 +19,15 @@ impl CommandExecutionStatus {
 pub(crate) struct CommandExecution {
     pub(crate) reply: Value,
     pub(crate) status: CommandExecutionStatus,
+    pub(crate) duration_us: Option<u64>,
 }
 
 impl CommandExecution {
-    pub(crate) fn executed(reply: Value) -> Self {
+    pub(crate) fn executed(reply: Value, duration_us: Option<u64>) -> Self {
         Self {
             reply,
             status: CommandExecutionStatus::Executed,
+            duration_us,
         }
     }
 
@@ -33,6 +35,7 @@ impl CommandExecution {
         Self {
             reply,
             status: CommandExecutionStatus::Rejected,
+            duration_us: None,
         }
     }
 }

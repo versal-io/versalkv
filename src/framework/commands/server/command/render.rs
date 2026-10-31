@@ -8,6 +8,23 @@ use bytes::Bytes;
 
 command_macros::portable_command_support!();
 
+pub(super) fn builtin_doc(name: &str) -> Value {
+    let metadata = crate::framework::generated::commands::catalog::COMMAND_DOC_META
+        .iter()
+        .find(|metadata| metadata.name.eq_ignore_ascii_case(name));
+    let fields = [
+        ("summary", metadata.map_or("", |metadata| metadata.summary)),
+        ("since", metadata.map_or("", |metadata| metadata.since)),
+        ("group", metadata.map_or("", |metadata| metadata.group)),
+    ];
+    Value::Map(fields.into_iter().map(|(name, value)| {
+        (
+            Value::bulk(Bytes::from_static(name.as_bytes())),
+            Value::bulk(Bytes::from_static(value.as_bytes())),
+        )
+    }).collect())
+}
+
 pub(crate) fn flags_to_strings(flags: u64) -> Vec<&'static str> {
     let mut names = Vec::new();
     for (flag, name) in [
@@ -72,6 +89,9 @@ pub(crate) fn metadata_name(meta: &CommandMeta) -> String {
 }
 
 fn metadata_key_specs(meta: &CommandMeta) -> Vec<Value> {
+    if let Some(key_specs) = rename_key_specs(meta.name) {
+        return key_specs;
+    }
     if let Some(key_specs) = geo_key_specs(meta.name) {
         return key_specs;
     }
@@ -111,6 +131,32 @@ fn metadata_key_specs(meta: &CommandMeta) -> Vec<Value> {
     ])]
 }
 
+pub(crate) fn rename_key_specs(name: &str) -> Option<Vec<Value>> {
+    let destination_flags: &[&'static str] = if name.eq_ignore_ascii_case("rename") {
+        &["OW", "update"]
+    } else if name.eq_ignore_ascii_case("renamenx") {
+        &["OW", "insert"]
+    } else {
+        return None;
+    };
+    Some(vec![
+        single_key_spec(
+            &["RW", "access", "delete"],
+            typed_spec(
+                "index",
+                Value::Map(vec![(bulk("index"), Value::integer(1))]),
+            ),
+        ),
+        single_key_spec(
+            destination_flags,
+            typed_spec(
+                "index",
+                Value::Map(vec![(bulk("index"), Value::integer(2))]),
+            ),
+        ),
+    ])
+}
+
 /// Preserve variable destination specs instead of merging their write flags
 /// into the read-only source spec.
 pub(crate) fn geo_key_specs(name: &str) -> Option<Vec<Value>> {
@@ -121,13 +167,13 @@ pub(crate) fn geo_key_specs(name: &str) -> Option<Vec<Value>> {
     } else {
         return None;
     };
-    let source = geo_key_spec(
+    let source = single_key_spec(
         &["RO", "access"],
         typed_spec("index", Value::Map(vec![(bulk("index"), Value::integer(1))])),
     );
     let mut specs = vec![source];
     for keyword in ["STORE", "STOREDIST"] {
-        specs.push(geo_key_spec(
+        specs.push(single_key_spec(
             &["OW", "update", "variable_flags"],
             typed_spec(
                 "keyword",
@@ -141,7 +187,7 @@ pub(crate) fn geo_key_specs(name: &str) -> Option<Vec<Value>> {
     Some(specs)
 }
 
-fn geo_key_spec(flags: &[&'static str], begin_search: Value) -> Value {
+fn single_key_spec(flags: &[&'static str], begin_search: Value) -> Value {
     Value::Map(vec![
         (
             bulk("flags"),

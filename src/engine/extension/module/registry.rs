@@ -28,6 +28,8 @@ pub struct ModuleCommandHandle {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModuleCommandInfo {
+    pub summary: Option<String>,
+    pub since: Option<String>,
     pub key_specs: Vec<ModuleKeySpec>,
     pub acl_categories: Vec<String>,
     pub legacy_keys: Option<(i32, i32, i32)>,
@@ -207,6 +209,10 @@ pub struct ModuleRegistry {
     timers: HashMap<u64, ModuleTimer>,
     server_event_listeners: Vec<ModuleServerEventListener>,
     next_timer_id: u64,
+    pub(crate) pending_calls: HashMap<usize, super::api::call::pending::PendingModuleCall>,
+    pub(crate) busy_reply: Option<String>,
+    pub(crate) yield_clients: bool,
+    pub(crate) pending_effects: Vec<super::api::call::pending::ModuleCallEffects>,
 }
 
 impl ModuleRegistry {
@@ -221,6 +227,10 @@ impl ModuleRegistry {
             timers: HashMap::new(),
             server_event_listeners: Vec::new(),
             next_timer_id: 1,
+            pending_calls: HashMap::new(),
+            busy_reply: None,
+            yield_clients: false,
+            pending_effects: Vec::new(),
         }
     }
 
@@ -232,6 +242,16 @@ impl ModuleRegistry {
         self.load_order.push(name.clone());
         self.modules.insert(name, Box::new(module_ref));
         Ok(())
+    }
+
+    pub(crate) fn retain_pending_call(
+        &mut self,
+        call: super::api::call::pending::PendingModuleCall,
+    ) -> usize {
+        use crate::engine::command::context::CommandConn;
+        let id = call.conn.token().0;
+        self.pending_calls.insert(id, call);
+        id
     }
 
     /// Copy the callback without carrying a registry borrow across module code.
@@ -248,6 +268,15 @@ impl ModuleRegistry {
         if self.timers.values().any(|timer| timer.module_name == name) {
             return Err(ModuleError::InitFailed(
                 "the module holds timer that is not fired".to_string(),
+            ));
+        }
+        if self
+            .pending_calls
+            .values()
+            .any(|call| call.module_name == name)
+        {
+            return Err(ModuleError::InitFailed(
+                "the module has pending blocking calls, can't unload".to_string(),
             ));
         }
         Ok(module.onunload)
@@ -374,6 +403,12 @@ impl ModuleRegistry {
             if !info.key_specs.is_empty() && !existing.key_specs.is_empty() {
                 return false;
             }
+            if info.summary.is_some() {
+                existing.summary = info.summary;
+            }
+            if info.since.is_some() {
+                existing.since = info.since;
+            }
             if !info.key_specs.is_empty() {
                 existing.key_specs = info.key_specs;
             }
@@ -389,7 +424,11 @@ impl ModuleRegistry {
             }
             return true;
         }
-        if info.key_specs.is_empty() && info.legacy_keys.is_none() && info.acl_categories.is_empty()
+        if info.key_specs.is_empty()
+            && info.legacy_keys.is_none()
+            && info.acl_categories.is_empty()
+            && info.summary.is_none()
+            && info.since.is_none()
         {
             return false;
         }
@@ -407,6 +446,8 @@ impl ModuleRegistry {
         self.set_command_info(
             name,
             ModuleCommandInfo {
+                summary: None,
+                since: None,
                 key_specs: Vec::new(),
                 acl_categories: Vec::new(),
                 legacy_keys: Some(legacy_keys),

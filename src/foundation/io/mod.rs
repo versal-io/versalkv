@@ -1,5 +1,6 @@
 //! Byte, protocol, storage, and syscall-facing foundation modules.
 
+pub mod compression;
 pub mod persistence;
 pub mod protocol;
 pub mod store;

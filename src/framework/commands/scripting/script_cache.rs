@@ -1,5 +1,5 @@
-
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use sha1::Digest;
 
@@ -13,7 +13,7 @@ pub struct ScriptCache {
     scripts: HashMap<String, CachedScript>,
     lru_order: Vec<String>,
     total_memory: usize,
-    max_memory: usize,
+    eval_memory: usize,
     evictable_count: usize,
     evicted_scripts: usize,
 }
@@ -24,7 +24,7 @@ impl ScriptCache {
             scripts: HashMap::new(),
             lru_order: Vec::new(),
             total_memory: 0,
-            max_memory: 5 * 1024 * 1024, // 5 MB
+            eval_memory: 0,
             evictable_count: 0,
             evicted_scripts: 0,
         }
@@ -55,38 +55,41 @@ impl ScriptCache {
             .map(|s| s.body.as_str())
     }
 
-    pub fn store(&mut self, sha1: String, body: String) {
-        self.store_with_policy(sha1, body, true);
+    pub fn store(&mut self, sha1: String, body: String) -> Vec<String> {
+        self.store_with_policy(sha1, body, true)
     }
 
     pub fn store_persistent(&mut self, sha1: String, body: String) {
         self.store_with_policy(sha1, body, false);
     }
 
-    fn store_with_policy(&mut self, sha1: String, body: String, evictable: bool) {
+    fn store_with_policy(&mut self, sha1: String, body: String, evictable: bool) -> Vec<String> {
         let memory_bytes = body.len() + sha1.len();
 
         if let Some(existing) = self.scripts.get_mut(&sha1) {
-            self.total_memory = self
-                .total_memory
-                .saturating_sub(existing.memory_bytes)
-                .saturating_add(memory_bytes);
-            existing.body = body;
             if existing.evictable && !evictable {
                 self.evictable_count -= 1;
+                self.eval_memory -= existing.memory_bytes;
                 existing.evictable = false;
             }
-            existing.memory_bytes = memory_bytes;
             if let Some(pos) = self.lru_order.iter().position(|x| x == &sha1) {
                 self.lru_order.remove(pos);
             }
             if existing.evictable {
                 self.lru_order.push(sha1);
             }
-            return;
+            return Vec::new();
         }
 
-        self.evict_until(Some(memory_bytes), evictable);
+        let mut retired = Vec::new();
+        if evictable {
+            while self.evictable_count >= 500 {
+                let Some(digest) = self.evict_oldest() else {
+                    break;
+                };
+                retired.push(digest);
+            }
+        }
 
         self.scripts.insert(
             sha1.clone(),
@@ -100,7 +103,9 @@ impl ScriptCache {
         if evictable {
             self.lru_order.push(sha1);
             self.evictable_count += 1;
+            self.eval_memory += memory_bytes;
         }
+        retired
     }
 
     pub fn exists(&self, sha1: &str) -> bool {
@@ -111,6 +116,7 @@ impl ScriptCache {
         self.scripts.clear();
         self.lru_order.clear();
         self.total_memory = 0;
+        self.eval_memory = 0;
         self.evictable_count = 0;
     }
 
@@ -121,10 +127,40 @@ impl ScriptCache {
     pub fn memory_usage(&self) -> usize {
         // Valkey accounts for the separate LRU SHA allocation, its string
         // header, and the three pointers in each LRU list node.
-        let lru_entry_bytes = 40 + 4 * std::mem::size_of::<usize>();
         self.total_memory
             + self.scripts.len() * std::mem::size_of::<CachedScript>()
-            + self.evictable_count * lru_entry_bytes
+            + self.evictable_count * Self::lru_entry_bytes()
+    }
+
+    pub(crate) fn eval_memory_usage(&self) -> usize {
+        self.eval_memory
+            + self.evictable_count * (std::mem::size_of::<CachedScript>() + Self::lru_entry_bytes())
+    }
+
+    fn lru_entry_bytes() -> usize {
+        40 + 4 * std::mem::size_of::<usize>()
+    }
+
+    /// Clear existing pressure without reserving space for the next script.
+    /// The release callback is included in the sixteen-eviction time checks.
+    pub(crate) fn evict_memory_slice(
+        &mut self,
+        limit: usize,
+        mut release: impl FnMut(&str),
+    ) -> bool {
+        let start = Instant::now();
+        let mut evictions = 0usize;
+        while self.eval_memory_usage() > limit {
+            let Some(digest) = self.evict_oldest() else {
+                return false;
+            };
+            release(&digest);
+            evictions += 1;
+            if evictions.is_multiple_of(16) && start.elapsed() > Duration::from_micros(500) {
+                break;
+            }
+        }
+        self.eval_memory_usage() > limit
     }
 
     pub fn evicted_scripts(&self) -> usize {
@@ -135,31 +171,17 @@ impl ScriptCache {
         self.evicted_scripts = 0;
     }
 
-    fn evict_until(&mut self, needed: Option<usize>, adding_evictable: bool) {
-        let needed = needed.unwrap_or(0);
-        let target = if needed > self.max_memory {
-            needed
-        } else {
-            self.max_memory - needed
-        };
-
-        while (self.total_memory > target || (adding_evictable && self.evictable_count >= 500))
-            && !self.lru_order.is_empty()
-        {
-            let Some(pos) = self
-                .lru_order
-                .iter()
-                .position(|key| self.scripts.get(key).is_some_and(|entry| entry.evictable))
-            else {
-                break;
-            };
-            let oldest = self.lru_order.remove(pos);
-            if let Some(entry) = self.scripts.remove(&oldest) {
-                self.total_memory -= entry.memory_bytes;
-                self.evictable_count -= usize::from(entry.evictable);
-                self.evicted_scripts += usize::from(entry.evictable);
-            }
+    fn evict_oldest(&mut self) -> Option<String> {
+        if self.lru_order.is_empty() {
+            return None;
         }
+        let oldest = self.lru_order.remove(0);
+        let entry = self.scripts.remove(&oldest)?;
+        self.total_memory -= entry.memory_bytes;
+        self.eval_memory -= entry.memory_bytes;
+        self.evictable_count -= 1;
+        self.evicted_scripts += 1;
+        Some(oldest)
     }
 }
 
@@ -220,22 +242,86 @@ mod tests {
     #[test]
     fn test_lru_eviction() {
         let mut cache = ScriptCache::new();
-        cache.max_memory = 100; //
-
-        let mut last_sha1 = String::new();
-        for i in 0..20 {
+        for i in 0..500 {
             let script = format!("return {}", i);
             let sha1 = ScriptCache::compute_sha1(&script);
-            cache.store(sha1.clone(), script);
-            last_sha1 = sha1;
+            cache.store(sha1, script);
         }
+        let first_sha1 = ScriptCache::compute_sha1("return 0");
+        let second_sha1 = ScriptCache::compute_sha1("return 1");
+        assert_eq!(cache.lookup(&first_sha1), Some("return 0"));
+        assert!(cache.exists(&second_sha1));
 
-        assert!(cache.exists(&last_sha1));
+        cache.store(
+            ScriptCache::compute_sha1("return 500"),
+            "return 500".to_string(),
+        );
+        assert_eq!(cache.len(), 500);
+        assert_eq!(cache.evicted_scripts(), 1);
+        assert!(cache.exists(&first_sha1));
+        assert!(!cache.exists(&second_sha1));
+    }
 
-        let first_script = "return 0";
-        let first_sha1 = ScriptCache::compute_sha1(first_script);
-        let found = cache.lookup(&first_sha1);
-        assert!(found.is_none() || cache.len() < 20);
+    #[test]
+    fn test_default_budget_preserves_large_eval_scripts() {
+        let mut cache = ScriptCache::new();
+        for index in 0..500 {
+            let body = format!("--{}\nreturn {index}", "x".repeat(100_000));
+            cache.store(ScriptCache::compute_sha1(&body), body);
+        }
+        assert_eq!(cache.len(), 500);
+        assert_eq!(cache.evicted_scripts(), 0);
+    }
+
+    #[test]
+    fn test_memory_slice_uses_eval_only_pressure_and_soft_admission() {
+        let mut cache = ScriptCache::new();
+        let pinned = "p".repeat(1_000_000);
+        cache.store_persistent("pinned".to_string(), pinned);
+        assert_eq!(cache.eval_memory_usage(), 0);
+        assert!(!cache.evict_memory_slice(128 * 1024, |_| panic!("LOAD must remain pinned")));
+
+        let body = "x".repeat(1_000_000);
+        cache.store("large".to_string(), body);
+        assert!(cache.exists("large"));
+        assert_eq!(cache.evicted_scripts(), 0);
+        let mut released = Vec::new();
+        assert!(!cache.evict_memory_slice(128 * 1024, |digest| {
+            released.push(digest.to_string());
+        }));
+        assert_eq!(released, ["large"]);
+        assert!(cache.exists("pinned"));
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.eval_memory_usage(), 0);
+
+        cache.store("promoted".to_string(), "return 1".to_string());
+        let before = cache.memory_usage();
+        cache.store_persistent("promoted".to_string(), "return 1".to_string());
+        assert_eq!(cache.eval_memory_usage(), 0);
+        assert!(before - cache.memory_usage() > 64);
+        cache.store("promoted".to_string(), "return 1".to_string());
+        assert_eq!(cache.eval_memory_usage(), 0);
+        assert_eq!(cache.evicted_scripts(), 1);
+    }
+
+    #[test]
+    fn test_memory_slice_checks_time_after_sixteen_releases() {
+        let mut cache = ScriptCache::new();
+        for index in 0..32 {
+            cache.store(index.to_string(), "x".repeat(10_000));
+        }
+        let mut released = 0;
+        assert!(cache.evict_memory_slice(0, |_| {
+            released += 1;
+            if released == 1 {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }));
+        assert_eq!(released, 16);
+        assert_eq!(cache.len(), 16);
+        assert!(!cache.evict_memory_slice(0, |_| {}));
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.evicted_scripts(), 32);
     }
 
     #[test]

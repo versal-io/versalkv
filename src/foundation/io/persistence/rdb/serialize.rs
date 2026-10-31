@@ -1,3 +1,6 @@
+use super::compression::{
+    new_rdb_frame_encoder, RdbCompression, RdbSnapshotOptions, VCS_RDB_HEADER,
+};
 use super::{save_raw_string, RdbVecWriter};
 use crate::foundation::io::persistence::{
     crc64, save_len, save_millisecond_time, type_byte_with_hash_field_expires, RDB_OPCODE_AUX,
@@ -8,7 +11,94 @@ use crate::foundation::io::store::kv_engine::{now_ms, DbSet};
 use crate::foundation::io::store::Robj;
 use crate::foundation::memory::util_version as version;
 use std::collections::HashMap;
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+struct SnapshotSink<F>(F);
+
+impl<F: FnMut(&[u8]) -> bool> Write for SnapshotSink<F> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if (self.0)(bytes) {
+            Ok(bytes.len())
+        } else {
+            Err(std::io::Error::other("RDB stream sink rejected output"))
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+pub fn serialize_replication_snapshot_streaming(
+    dbs: &DbSet,
+    key_delay_us: i64,
+    function_codes: &[Vec<u8>],
+    include_keys: bool,
+    replication: Option<&RdbReplicationInfo>,
+    additional_datasets: &[&DbSet],
+    options: RdbSnapshotOptions,
+    emit: impl FnMut(&[u8]) -> bool,
+) -> bool {
+    let logical = RdbSerializeOptions {
+        compression: options.compression.uses_lzf(),
+        checksum: options.checksum && options.compression != RdbCompression::Lz4,
+    };
+    let mut sink = SnapshotSink(emit);
+    if options.compression != RdbCompression::Lz4 {
+        return serialize_all_with_functions_and_replication_streaming_with_options(
+            dbs,
+            key_delay_us,
+            function_codes,
+            include_keys,
+            replication,
+            additional_datasets,
+            logical,
+            |bytes| sink.write_all(bytes).is_ok(),
+        );
+    }
+    if sink.write_all(VCS_RDB_HEADER).is_err() {
+        return false;
+    }
+    let mut encoder = new_rdb_frame_encoder(sink, options.checksum);
+    let completed = serialize_all_with_functions_and_replication_streaming_with_options(
+        dbs,
+        key_delay_us,
+        function_codes,
+        include_keys,
+        replication,
+        additional_datasets,
+        logical,
+        |bytes| encoder.write_all(bytes).is_ok(),
+    );
+    completed && encoder.finish().is_ok()
+}
+
+pub fn serialize_replication_snapshot(
+    dbs: &DbSet,
+    key_delay_us: i64,
+    function_codes: &[Vec<u8>],
+    include_keys: bool,
+    replication: Option<&RdbReplicationInfo>,
+    additional_datasets: &[&DbSet],
+    options: RdbSnapshotOptions,
+) -> Vec<u8> {
+    let mut output = Vec::new();
+    serialize_replication_snapshot_streaming(
+        dbs,
+        key_delay_us,
+        function_codes,
+        include_keys,
+        replication,
+        additional_datasets,
+        options,
+        |bytes| {
+            output.extend_from_slice(bytes);
+            true
+        },
+    );
+    output
+}
 
 static KEY_SAVE_DELAY_INTERRUPTED: AtomicBool = AtomicBool::new(false);
 

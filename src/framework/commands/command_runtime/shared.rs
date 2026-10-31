@@ -79,6 +79,9 @@ pub struct RuntimeSession {
 }
 
 pub trait CommandRuntime {
+    fn must_obey_command(&self) -> bool {
+        false
+    }
     fn command_catalog(&self) -> &dyn crate::framework::commands::introspection::CommandCatalog;
     fn selected_db(&self) -> u32;
     fn db_mut_at(&mut self, index: u32) -> Option<&mut Db>;
@@ -166,6 +169,9 @@ pub trait CommandRuntime {
     }
     fn preserve_expired_keys(&self) -> bool {
         self.policies().preserve_expired_keys
+    }
+    fn preserves_expired_deadline(&self) -> bool {
+        self.suppress_lazy_expire() || self.preserve_expired_keys()
     }
     fn rdb_compression(&self) -> bool {
         self.policies().rdb_compression

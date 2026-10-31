@@ -50,7 +50,14 @@ impl ClusterBusManager {
             };
             Some(ReplicaEligibility {
                 node_id,
-                no_failover: node.has_flag(CLUSTER_NODE_NOFAILOVER),
+                no_failover: node.has_flag(CLUSTER_NODE_NOFAILOVER)
+                    || (node.is_myself()
+                        && local_status.no_failover_if_empty
+                        && repl_offsets
+                            .get(&node.name)
+                            .copied()
+                            .unwrap_or(node.repl_offset)
+                            == 0),
                 cluster_link_connected,
                 cluster_view_stale: node.has_flag(CLUSTER_NODE_FAIL | CLUSTER_NODE_PFAIL),
                 loading: node.is_myself() && local_status.loading,
@@ -153,6 +160,29 @@ impl ClusterBusManager {
         );
         let previous_phase = state.automatic_failover.phase();
         let previous_deadline_ms = state.automatic_failover.deadline_ms();
+        let zero_offset_blocked = !facts.manual
+            && local_status.no_failover_if_empty
+            && facts.primary.as_ref().is_some_and(|primary| {
+                primary.is_failed && primary.slots.iter().any(|claimed| *claimed)
+            })
+            && facts
+                .local
+                .as_ref()
+                .is_some_and(|local| local.replication_offset == 0);
+        if zero_offset_blocked {
+            if self
+                .last_zero_offset_warning_ms
+                .is_none_or(|last| now_ms.saturating_sub(last) >= 1000)
+            {
+                crate::server_log!(
+                    notice,
+                    "Currently unable to failover: Replication offset is 0 and no data has been received from the primary. Please check the 'cluster-replica-no-failover' configuration option."
+                );
+                self.last_zero_offset_warning_ms = Some(now_ms);
+            }
+        } else {
+            self.last_zero_offset_warning_ms = None;
+        }
         let mut actions = state.automatic_failover_on_tick(&facts);
         if previous_phase == AutomaticFailoverPhase::RequestingVotes
             && state.automatic_failover.phase() == AutomaticFailoverPhase::WaitingRankDelay

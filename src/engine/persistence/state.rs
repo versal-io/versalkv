@@ -457,6 +457,15 @@ impl PersistenceState {
         let _ = self.finish_forkless_save(now_sec, primary, additional_datasets);
     }
 
+    #[cfg(test)]
+    pub(crate) fn finish_primary_forkless_save_for_test(
+        &mut self,
+        primary: &mut DbSet,
+    ) -> Option<RdbSaveOutcome> {
+        assert!(!self.forkless_capture_in_progress());
+        self.finish_forkless_save(0, primary, &mut [])
+    }
+
     fn finish_forkless_save(
         &mut self,
         now_sec: i64,

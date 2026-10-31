@@ -64,6 +64,19 @@ pub fn value_to_lua_resp(lua: &Lua, val: &Value, resp: u8) -> LuaResult<LuaValue
             table.set("double", *f)?;
             Ok(LuaValue::Table(table))
         }
+        Value::DecimalDouble(text) if resp < 3 => {
+            Ok(LuaValue::String(lua.create_string(text.as_bytes())?))
+        }
+        Value::DecimalDouble(text) => {
+            // Lua numbers are binary64; only this capability boundary narrows the reply.
+            let number = std::str::from_utf8(text.as_bytes())
+                .map_err(LuaError::external)?
+                .parse::<f64>()
+                .map_err(LuaError::external)?;
+            let table = lua.create_table()?;
+            table.set("double", number)?;
+            Ok(LuaValue::Table(table))
+        }
         Value::BigNumber(s) => {
             let table = lua.create_table()?;
             table.set("big_number", lua.create_string(s)?)?;
@@ -119,6 +132,7 @@ pub fn value_for_script_resp(val: &Value, resp: u8) -> Value {
 
     match val {
         Value::Double(f) => Value::Bulk(Bytes::from(format_double(*f).into_bytes())),
+        Value::DecimalDouble(text) => Value::Bulk(text.bytes()),
         Value::Boolean(b) => Value::Integer(if *b { 1 } else { 0 }),
         Value::BigNumber(s) => Value::Bulk(s.clone()),
         Value::Verbatim { data, .. } => Value::Bulk(data.clone()),
@@ -323,6 +337,52 @@ fn convert_table(table: &LuaTable, depth: i32, resp: u8) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decimal_double_lua_resp2_preserves_text_and_resp3_narrows_at_bridge() {
+        use crate::foundation::io::protocol::DecimalDoubleText;
+        let lua = Lua::new();
+        for (text, number) in [
+            ("9007199254740993", 9007199254740992.0),
+            ("1e4932", f64::INFINITY),
+            ("1e-4932", 0.0),
+            ("-inf", f64::NEG_INFINITY),
+            ("0", 0.0),
+        ] {
+            let value = Value::DecimalDouble(DecimalDoubleText::new(text.to_owned()).unwrap());
+            assert_eq!(
+                value_for_script_resp(&value, 2),
+                Value::bulk(text.to_owned())
+            );
+            assert_eq!(value_for_script_resp(&value, 3), value);
+            let direct = value_to_lua_resp(&lua, &value, 2).unwrap();
+            let LuaValue::String(string) = direct else {
+                panic!("expected exact Lua string")
+            };
+            assert_eq!(string.as_bytes().as_ref(), text.as_bytes());
+            let bridged = value_to_lua_resp(&lua, &value, 3).unwrap();
+            let LuaValue::Table(table) = bridged else {
+                panic!("expected Lua double table")
+            };
+            assert_eq!(table.get::<f64>("double").unwrap(), number);
+            assert!(
+                matches!(lua_value_to_value_resp(&LuaValue::Table(table), 3),
+                Value::Double(value) if value == number)
+            );
+        }
+        let scalar = Value::DecimalDouble(DecimalDoubleText::new("9007199254740993").unwrap());
+        let nested = Value::attribute(
+            vec![(Value::bulk("meta"), scalar.clone())],
+            Value::Map(vec![(Value::bulk("key"), Value::Set(vec![scalar]))]),
+        );
+        assert_eq!(
+            value_for_script_resp(&nested, 2),
+            Value::Array(vec![
+                Value::bulk("key"),
+                Value::Array(vec![Value::bulk("9007199254740993")]),
+            ])
+        );
+    }
 
     #[test]
     fn test_value_to_lua_nil() {

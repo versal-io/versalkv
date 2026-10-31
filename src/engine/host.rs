@@ -36,6 +36,11 @@ pub enum ScriptCallMode {
 }
 
 pub enum HostYield<'a> {
+    Module {
+        flags: i32,
+        busy_reply: Option<&'a str>,
+        elapsed_ms: u64,
+    },
     ScriptCheckpoint {
         run: &'a mut ScriptRunCtx,
     },

@@ -201,6 +201,59 @@ mod tests {
             .expect("primary link must enter the dual RDB wait state");
     }
 
+    fn publish_rdb_candidate_endoff(
+        runtime: &mut ReplicationRuntime,
+        rdb: ConnectionId,
+        backlog: &mut ReplicationBacklog,
+    ) -> SnapshotBoundary {
+        let snapshot_boundary = backlog.snapshot_boundary();
+        let frame = runtime
+            .take_endoff_for_rdb_candidate_if_unambiguous(rdb, true, backlog)
+            .expect("a candidate with an available waiting main must receive ENDOFF");
+        let endoff = crate::engine::distributed::replication::protocol::parse_end_offset(&frame)
+            .expect("candidate ENDOFF must parse");
+        assert_eq!(endoff.offset, snapshot_boundary.reported_offset());
+        let wait = runtime
+            .rdb_psync_waits
+            .get(&rdb)
+            .expect("publishing ENDOFF must create a real PSYNC wait");
+        assert_eq!(wait.boundary, snapshot_boundary);
+        assert_eq!(wait.main, None);
+        snapshot_boundary
+    }
+
+    fn associate_waiting_rdb_channel(
+        runtime: &mut ReplicationRuntime,
+        main: ConnectionId,
+        rdb: ConnectionId,
+    ) {
+        runtime.register_rdb_candidate(rdb).unwrap();
+        let mut backlog = ReplicationBacklog::new("paired".to_string(), 32);
+        publish_rdb_candidate_endoff(runtime, rdb, &mut backlog);
+        runtime
+            .associate_rdb_channel(main, rdb)
+            .expect("an RDB candidate with a real ENDOFF wait must associate");
+    }
+
+    fn rdb_wait_snapshot(
+        runtime: &ReplicationRuntime,
+        rdb: ConnectionId,
+    ) -> Option<(
+        SnapshotBoundary,
+        Option<ConnectionId>,
+        Option<BacklogCursor>,
+        bool,
+    )> {
+        runtime.rdb_psync_waits.get(&rdb).map(|wait| {
+            (
+                wait.boundary,
+                wait.main,
+                wait.pin_cursor,
+                wait.pin_from_existing_tail,
+            )
+        })
+    }
+
     fn retain_unpaired_wait(
         runtime: &mut ReplicationRuntime,
         rdb: ConnectionId,
@@ -357,15 +410,281 @@ mod tests {
     fn main_channel_owns_at_most_one_rdb_channel() {
         let mut runtime = ReplicationRuntime::new();
         let main = ConnectionId(10);
-        runtime.register_primary(main, replica_info(6380));
+        register_waiting_dual_main(&mut runtime, main);
 
-        runtime
-            .register_rdb_channel(ConnectionId(11), main)
-            .expect("first RDB channel should be accepted");
+        associate_waiting_rdb_channel(&mut runtime, main, ConnectionId(11));
         assert_eq!(runtime.rdb_channel_for_main(main), Some(ConnectionId(11)));
+        let wait = rdb_wait_snapshot(&runtime, ConnectionId(11));
         assert!(runtime
             .register_rdb_channel(ConnectionId(12), main)
             .is_err());
+        assert_eq!(runtime.role(ConnectionId(12)), None);
+        assert_eq!(runtime.channel_pair_for(main), Some(ConnectionId(11)));
+        assert_eq!(runtime.channel_pair_for(ConnectionId(11)), Some(main));
+        assert_eq!(rdb_wait_snapshot(&runtime, ConnectionId(11)), wait);
+    }
+
+    #[test]
+    fn rdb_channel_registration_rejects_invalid_connections() {
+        let mut runtime = ReplicationRuntime::new();
+        let main = ConnectionId(10);
+        let unregistered = ConnectionId(11);
+        let candidate = ConnectionId(12);
+        let other_primary = ConnectionId(13);
+        register_waiting_dual_main(&mut runtime, main);
+        let main_id = runtime.primary_id(main).unwrap();
+        runtime.register_rdb_candidate(candidate).unwrap();
+        let other_id = runtime.register_primary(other_primary, replica_info(6381));
+
+        for (rdb, owner) in [
+            (main, main),
+            (unregistered, ConnectionId(99)),
+            (unregistered, candidate),
+            (candidate, main),
+            (other_primary, main),
+        ] {
+            assert_eq!(
+                runtime.register_rdb_channel(rdb, owner),
+                Err(LinkError::Protocol),
+                "registration must reject rdb={rdb:?}, main={owner:?}"
+            );
+            assert_eq!(
+                runtime.role(main),
+                Some(ReplicationConnection::Primary(main_id))
+            );
+            assert_eq!(
+                runtime.role(candidate),
+                Some(ReplicationConnection::RdbChannelCandidate)
+            );
+            assert_eq!(
+                runtime.role(other_primary),
+                Some(ReplicationConnection::Primary(other_id))
+            );
+            assert_eq!(runtime.role(unregistered), None);
+            for connection in [main, unregistered, candidate, other_primary] {
+                assert_eq!(runtime.channel_pair_for(connection), None);
+            }
+            assert_eq!(runtime.psync_wait_owner_count(), 0);
+            assert_eq!(rdb_wait_snapshot(&runtime, candidate), None);
+        }
+    }
+
+    #[test]
+    fn rdb_candidate_without_endoff_cannot_associate() {
+        for (main_mode, rdb_mode) in [
+            (RdbFilterMode::All, RdbFilterMode::Functions),
+            (RdbFilterMode::Functions, RdbFilterMode::All),
+        ] {
+            let mut runtime = ReplicationRuntime::new();
+            let main = ConnectionId(14);
+            let rdb = ConnectionId(15);
+            let mut info = replica_info(6380);
+            info.rdb_filter_mode = main_mode;
+            let main_id = runtime.register_primary(main, info);
+            runtime
+                .primary_link_mut(main_id)
+                .unwrap()
+                .transition_to_waiting_for_rdb_channel()
+                .unwrap();
+            runtime.stage_replconf_rdb_filter_only(rdb, rdb_mode);
+            runtime.register_rdb_candidate(rdb).unwrap();
+            assert_eq!(rdb_wait_snapshot(&runtime, rdb), None);
+
+            let result = runtime.associate_rdb_channel(main, rdb);
+
+            assert_eq!(
+                (
+                    result,
+                    runtime.role(main),
+                    runtime.role(rdb),
+                    runtime.channel_pair_for(main),
+                    runtime.channel_pair_for(rdb),
+                    runtime.psync_wait_owner_count(),
+                ),
+                (
+                    Err(LinkError::Protocol),
+                    Some(ReplicationConnection::Primary(main_id)),
+                    Some(ReplicationConnection::RdbChannelCandidate),
+                    None,
+                    None,
+                    0,
+                ),
+                "a candidate without ENDOFF must remain unassociated"
+            );
+            let link = runtime.primary_link(main_id).unwrap();
+            assert_eq!(link.state(), PrimaryLinkState::AwaitingPsync);
+            assert_eq!(
+                link.dual_state(),
+                PrimaryDualChannelState::WaitingForRdbChannel
+            );
+            assert_eq!(link.dual_endoff_boundary(), None);
+            assert_eq!(link.replica().rdb_filter_mode, main_mode);
+            let record = &runtime.channel_records[&rdb];
+            assert_eq!(record.state.as_deref(), Some("wait_bgsave"));
+            assert_eq!(record.endpoint.as_ref().unwrap().rdb_filter_mode, rdb_mode);
+            assert_eq!(rdb_wait_snapshot(&runtime, rdb), None);
+            assert_eq!(runtime.min_protected_backlog_cursor(), None);
+        }
+    }
+
+    #[test]
+    fn rdb_candidate_with_empty_backlog_wait_can_associate() {
+        let mut runtime = ReplicationRuntime::new();
+        let main = ConnectionId(16);
+        let rdb = ConnectionId(17);
+        register_waiting_dual_main(&mut runtime, main);
+        runtime.register_rdb_candidate(rdb).unwrap();
+        let mut backlog = ReplicationBacklog::new("empty".to_string(), 32);
+        let snapshot_boundary = publish_rdb_candidate_endoff(&mut runtime, rdb, &mut backlog);
+        assert_eq!(
+            rdb_wait_snapshot(&runtime, rdb),
+            Some((snapshot_boundary, None, None, false))
+        );
+        assert_eq!(runtime.psync_wait_owner_count(), 1);
+        assert_eq!(backlog.min_protected_cursor(), None);
+
+        assert_eq!(runtime.associate_rdb_channel(main, rdb), Ok(()));
+
+        assert_eq!(
+            runtime.role(rdb),
+            Some(ReplicationConnection::RdbChannel { main })
+        );
+        assert_eq!(runtime.channel_pair_for(main), Some(rdb));
+        assert_eq!(runtime.channel_pair_for(rdb), Some(main));
+        assert_eq!(
+            rdb_wait_snapshot(&runtime, rdb),
+            Some((snapshot_boundary, Some(main), None, false))
+        );
+        let link = runtime.primary_for_connection(main).unwrap();
+        assert_eq!(link.dual_endoff_boundary(), Some(snapshot_boundary));
+        assert_eq!(
+            link.dual_state(),
+            PrimaryDualChannelState::WaitingForRdbChannel
+        );
+        runtime
+            .finalize_dual_channel_rdb_association(main, rdb)
+            .unwrap();
+        assert_eq!(
+            runtime.primary_for_connection(main).unwrap().dual_state(),
+            PrimaryDualChannelState::WaitingForMainPsync
+        );
+        assert_eq!(runtime.psync_wait_owner_count(), 1);
+        assert_eq!(runtime.min_protected_backlog_cursor(), None);
+        assert_eq!(backlog.min_protected_cursor(), None);
+    }
+
+    #[test]
+    fn rdb_channel_association_rejects_invalid_roles_and_existing_pairs() {
+        let mut runtime = ReplicationRuntime::new();
+        let main = ConnectionId(18);
+        let other_main = ConnectionId(19);
+        let rdb = ConnectionId(20);
+        let wrong_primary = ConnectionId(21);
+        let wrong_candidate = ConnectionId(22);
+        register_waiting_dual_main(&mut runtime, main);
+        register_waiting_dual_main(&mut runtime, other_main);
+        let main_id = runtime.primary_id(main).unwrap();
+        let other_id = runtime.primary_id(other_main).unwrap();
+        let wrong_id = runtime.register_primary(wrong_primary, replica_info(6381));
+        runtime.register_rdb_candidate(wrong_candidate).unwrap();
+        runtime.register_rdb_candidate(rdb).unwrap();
+        let mut backlog =
+            ReplicationBacklog::new("0123456789abcdef0123456789abcdef01234567".to_string(), 32);
+        backlog.append(b"tail").unwrap();
+        let snapshot_boundary = publish_rdb_candidate_endoff(&mut runtime, rdb, &mut backlog);
+        let wait = rdb_wait_snapshot(&runtime, rdb);
+        let protected_cursor = runtime.min_protected_backlog_cursor();
+
+        for (owner, candidate) in [
+            (main, main),
+            (ConnectionId(99), rdb),
+            (wrong_candidate, rdb),
+            (main, ConnectionId(99)),
+            (main, wrong_primary),
+        ] {
+            assert_eq!(
+                runtime.associate_rdb_channel(owner, candidate),
+                Err(LinkError::Protocol),
+                "association must reject main={owner:?}, rdb={candidate:?}"
+            );
+            assert_eq!(
+                runtime.role(main),
+                Some(ReplicationConnection::Primary(main_id))
+            );
+            assert_eq!(
+                runtime.role(other_main),
+                Some(ReplicationConnection::Primary(other_id))
+            );
+            assert_eq!(
+                runtime.role(wrong_primary),
+                Some(ReplicationConnection::Primary(wrong_id))
+            );
+            for candidate in [rdb, wrong_candidate] {
+                assert_eq!(
+                    runtime.role(candidate),
+                    Some(ReplicationConnection::RdbChannelCandidate)
+                );
+            }
+            for connection in [main, other_main, rdb, wrong_primary, wrong_candidate] {
+                assert_eq!(runtime.channel_pair_for(connection), None);
+            }
+            assert_eq!(rdb_wait_snapshot(&runtime, rdb), wait);
+            assert_eq!(runtime.psync_wait_owner_count(), 1);
+            assert_eq!(runtime.min_protected_backlog_cursor(), protected_cursor);
+            assert_eq!(backlog.min_protected_cursor(), protected_cursor);
+            assert_eq!(
+                runtime
+                    .primary_link(main_id)
+                    .unwrap()
+                    .dual_endoff_boundary(),
+                None
+            );
+        }
+
+        runtime.associate_rdb_channel(main, rdb).unwrap();
+        let extra_rdb = ConnectionId(23);
+        runtime.register_rdb_candidate(extra_rdb).unwrap();
+        publish_rdb_candidate_endoff(&mut runtime, extra_rdb, &mut backlog);
+        let paired_wait = rdb_wait_snapshot(&runtime, rdb);
+        let extra_wait = rdb_wait_snapshot(&runtime, extra_rdb);
+
+        for (owner, candidate) in [(main, extra_rdb), (other_main, rdb)] {
+            assert_eq!(
+                runtime.associate_rdb_channel(owner, candidate),
+                Err(LinkError::Protocol)
+            );
+            assert_eq!(runtime.channel_pair_for(main), Some(rdb));
+            assert_eq!(runtime.channel_pair_for(rdb), Some(main));
+            assert_eq!(runtime.channel_pair_for(other_main), None);
+            assert_eq!(runtime.channel_pair_for(extra_rdb), None);
+            assert_eq!(
+                runtime.role(rdb),
+                Some(ReplicationConnection::RdbChannel { main })
+            );
+            assert_eq!(
+                runtime.role(extra_rdb),
+                Some(ReplicationConnection::RdbChannelCandidate)
+            );
+            assert_eq!(rdb_wait_snapshot(&runtime, rdb), paired_wait);
+            assert_eq!(rdb_wait_snapshot(&runtime, extra_rdb), extra_wait);
+            assert_eq!(runtime.psync_wait_owner_count(), 2);
+            assert_eq!(runtime.min_protected_backlog_cursor(), protected_cursor);
+            assert_eq!(backlog.min_protected_cursor(), protected_cursor);
+            assert_eq!(
+                runtime
+                    .primary_link(main_id)
+                    .unwrap()
+                    .dual_endoff_boundary(),
+                Some(snapshot_boundary)
+            );
+            assert_eq!(
+                runtime
+                    .primary_link(other_id)
+                    .unwrap()
+                    .dual_endoff_boundary(),
+                None
+            );
+        }
     }
 
     #[test]
@@ -373,13 +692,15 @@ mod tests {
         let mut runtime = ReplicationRuntime::new();
         let main = ConnectionId(20);
         let rdb = ConnectionId(21);
-        runtime.register_primary(main, replica_info(6380));
+        register_waiting_dual_main(&mut runtime, main);
 
         runtime.register_rdb_candidate(rdb).unwrap();
         assert_eq!(
             runtime.role(rdb),
             Some(ReplicationConnection::RdbChannelCandidate)
         );
+        let mut backlog = ReplicationBacklog::new("paired".to_string(), 32);
+        publish_rdb_candidate_endoff(&mut runtime, rdb, &mut backlog);
         runtime.associate_rdb_channel(main, rdb).unwrap();
         assert_eq!(
             runtime.role(rdb),
@@ -1317,24 +1638,78 @@ mod tests {
 
     #[test]
     fn rdb_filter_metadata_survives_candidate_registration_and_association() {
-        let mut runtime = ReplicationRuntime::new();
-        let main = ConnectionId(22);
-        let rdb = ConnectionId(23);
-        runtime.register_primary(main, replica_info(6380));
-        runtime.stage_replconf_rdb_filter_only(rdb, RdbFilterMode::Functions);
-
-        runtime.register_rdb_candidate(rdb).unwrap();
-        runtime.associate_rdb_channel(main, rdb).unwrap();
-
-        assert!(
+        for (main_mode, rdb_mode) in [
+            (RdbFilterMode::All, RdbFilterMode::Functions),
+            (RdbFilterMode::Functions, RdbFilterMode::All),
+        ] {
+            let mut runtime = ReplicationRuntime::new();
+            let main = ConnectionId(22);
+            let rdb = ConnectionId(23);
+            let mut info = replica_info(6380);
+            info.rdb_filter_mode = main_mode;
+            let main_id = runtime.register_primary(main, info);
             runtime
-                .primary_for_connection(main)
-                .expect("main channel should remain registered")
-                .replica()
-                .rdb_filter_mode
-                == RdbFilterMode::Functions,
-            "rdb-filter-only must survive candidate registration and association"
-        );
+                .primary_link_mut(main_id)
+                .unwrap()
+                .transition_to_waiting_for_rdb_channel()
+                .unwrap();
+            runtime.stage_replconf_rdb_filter_only(rdb, rdb_mode);
+            runtime.register_rdb_candidate(rdb).unwrap();
+            assert_eq!(
+                runtime.channel_records[&rdb]
+                    .endpoint
+                    .as_ref()
+                    .unwrap()
+                    .rdb_filter_mode,
+                rdb_mode
+            );
+            let mut backlog =
+                ReplicationBacklog::new("0123456789abcdef0123456789abcdef01234567".to_string(), 32);
+            backlog.append(b"snapshot").unwrap();
+            let snapshot_boundary = publish_rdb_candidate_endoff(&mut runtime, rdb, &mut backlog);
+            let pin = runtime.min_protected_backlog_cursor();
+            assert_eq!(pin, Some(backlog.tail_block_start_cursor()));
+
+            assert_eq!(runtime.associate_rdb_channel(main, rdb), Ok(()));
+
+            assert_eq!(
+                runtime.role(main),
+                Some(ReplicationConnection::Primary(main_id))
+            );
+            assert_eq!(
+                runtime.role(rdb),
+                Some(ReplicationConnection::RdbChannel { main })
+            );
+            assert_eq!(runtime.channel_pair_for(main), Some(rdb));
+            assert_eq!(runtime.channel_pair_for(rdb), Some(main));
+            assert_eq!(
+                rdb_wait_snapshot(&runtime, rdb),
+                Some((snapshot_boundary, Some(main), pin, true))
+            );
+            assert_eq!(runtime.psync_wait_owner_count(), 1);
+            assert_eq!(runtime.min_protected_backlog_cursor(), pin);
+            assert_eq!(backlog.min_protected_cursor(), pin);
+            let link = runtime.primary_link(main_id).unwrap();
+            assert_eq!(link.dual_endoff_boundary(), Some(snapshot_boundary));
+            assert_eq!(
+                link.dual_state(),
+                PrimaryDualChannelState::WaitingForRdbChannel
+            );
+            assert_eq!(
+                runtime.channel_records[&rdb]
+                    .endpoint
+                    .as_ref()
+                    .unwrap()
+                    .rdb_filter_mode,
+                rdb_mode,
+                "the RDB endpoint must keep its own filter mode"
+            );
+            assert_eq!(
+                link.replica().rdb_filter_mode,
+                main_mode,
+                "association must not overwrite the main channel's independent filter mode"
+            );
+        }
     }
 
     #[test]
@@ -1343,12 +1718,12 @@ mod tests {
         let main = ConnectionId(50);
         let rdb = ConnectionId(51);
         let replica_id = runtime.register_primary(main, replica_info(6380));
-        runtime.register_rdb_channel(rdb, main).unwrap();
         runtime
             .primary_link_mut(replica_id)
             .expect("main link must be registered")
             .transition_to_waiting_for_rdb_channel()
             .expect("main link waits for RDB channel");
+        associate_waiting_rdb_channel(&mut runtime, main, rdb);
         runtime
             .primary_link_mut(replica_id)
             .expect("main link must be registered")
@@ -1382,7 +1757,7 @@ mod tests {
         link.set_state(PrimaryLinkState::Streaming);
         link.transition_to_waiting_for_rdb_channel()
             .expect("main channel must enter the dual-channel wait state");
-        runtime.register_rdb_channel(rdb, main).unwrap();
+        associate_waiting_rdb_channel(&mut runtime, main, rdb);
 
         let view = runtime.rebuild_view();
 
@@ -1437,9 +1812,7 @@ mod tests {
         dual_link
             .transition_to_waiting_for_rdb_channel()
             .expect("dual main must wait for its RDB channel");
-        runtime
-            .register_rdb_channel(dual_rdb, dual_main)
-            .expect("dual channel pair must register");
+        associate_waiting_rdb_channel(&mut runtime, dual_main, dual_rdb);
 
         let view = runtime.rebuild_view();
 
@@ -1462,10 +1835,6 @@ mod tests {
 
         let classic_id = runtime.register_primary(slow_classic, replica_info(6382));
         let dual_id = runtime.register_primary(fast_dual_main, replica_info(6383));
-        runtime
-            .register_rdb_channel(fast_dual_rdb, fast_dual_main)
-            .expect("dual channel pair");
-
         let dual_link = runtime
             .primary_link_mut(dual_id)
             .expect("dual main link must exist");
@@ -1473,6 +1842,7 @@ mod tests {
         dual_link
             .transition_to_waiting_for_rdb_channel()
             .expect("dual main must wait for its RDB channel");
+        associate_waiting_rdb_channel(&mut runtime, fast_dual_main, fast_dual_rdb);
         runtime.stamp_primary_acceptance(fast_dual_main);
 
         runtime
@@ -1629,10 +1999,8 @@ mod tests {
         let mut runtime = ReplicationRuntime::new();
         let main = ConnectionId(30);
         let old_rdb = ConnectionId(31);
-        runtime.register_primary(main, replica_info(6380));
-        runtime
-            .register_rdb_channel(old_rdb, main)
-            .expect("initial pair");
+        register_waiting_dual_main(&mut runtime, main);
+        associate_waiting_rdb_channel(&mut runtime, main, old_rdb);
 
         runtime.remove_connection(old_rdb);
         let replacement = runtime.register_primary(old_rdb, replica_info(6381));
@@ -1650,7 +2018,12 @@ mod tests {
         let main = ConnectionId(40);
         let rdb = ConnectionId(41);
         let replica_id = runtime.register_primary(main, replica_info(6380));
-        runtime.register_rdb_channel(rdb, main).unwrap();
+        runtime
+            .primary_link_mut(replica_id)
+            .unwrap()
+            .transition_to_waiting_for_rdb_channel()
+            .unwrap();
+        associate_waiting_rdb_channel(&mut runtime, main, rdb);
         runtime
             .primary_link_mut(replica_id)
             .expect("main link must exist")
@@ -1675,27 +2048,33 @@ mod tests {
         let main = ConnectionId(42);
         let rdb = ConnectionId(43);
         let replica_id = runtime.register_primary(main, replica_info(6380));
-        runtime.register_rdb_channel(rdb, main).unwrap();
         let link = runtime
             .primary_link_mut(replica_id)
             .expect("main link must exist");
         link.set_state(PrimaryLinkState::Streaming);
         link.transition_to_waiting_for_rdb_channel().unwrap();
-        link.record_dual_channel_endoff_boundary(boundary(17));
+        runtime.register_rdb_candidate(rdb).unwrap();
+        let mut backlog = ReplicationBacklog::new("online".to_string(), 32);
+        backlog
+            .restore_primary_from_rdb("online", offset(17))
+            .unwrap();
+        let snapshot_boundary = publish_rdb_candidate_endoff(&mut runtime, rdb, &mut backlog);
+        assert_eq!(snapshot_boundary.reported_offset(), offset(17));
+        runtime.associate_rdb_channel(main, rdb).unwrap();
+        assert_eq!(runtime.backfill_waiting_psync_pins(cursor(17)), vec![rdb]);
+        assert_eq!(
+            rdb_wait_snapshot(&runtime, rdb),
+            Some((snapshot_boundary, Some(main), Some(cursor(17)), false))
+        );
+        let link = runtime.primary_link_mut(replica_id).unwrap();
+        assert_eq!(link.dual_endoff_boundary(), Some(snapshot_boundary));
         link.transition_to_waiting_for_main_psync().unwrap();
         link.transition_dual_state(PrimaryDualChannelState::WaitingForReplicaAck)
             .unwrap();
         link.transition_dual_state(PrimaryDualChannelState::Online)
             .unwrap();
-        runtime.rdb_psync_waits.insert(
-            rdb,
-            RdbPsyncWait {
-                boundary: boundary(17),
-                main: Some(main),
-                pin_cursor: Some(cursor(17)),
-                pin_from_existing_tail: false,
-            },
-        );
+        assert_eq!(runtime.psync_wait_pin_for_main(main), Some(cursor(17)));
+        assert_eq!(runtime.psync_wait_owner_count(), 1);
 
         assert_eq!(runtime.detach_rdb_channel_preserving_main(rdb), Some(main));
 
@@ -2176,7 +2555,7 @@ mod tests {
             .unwrap()
             .transition_to_waiting_for_rdb_channel()
             .unwrap();
-        runtime.register_rdb_channel(syncing_rdb, syncing).unwrap();
+        associate_waiting_rdb_channel(&mut runtime, syncing, syncing_rdb);
 
         assert_eq!(runtime.rebuild_view().connected_replica_count, 3);
     }

@@ -30,9 +30,9 @@ pub use codec::decoder_compact;
 pub use codec::types;
 pub use codec::{
     load_typed_object, load_typed_object_with_hash_field_expires,
-    load_typed_object_with_hash_field_expires_detailed, save_robj,
-    save_robj_with_hash_field_expires, type_byte, type_byte_with_hash_field_expires,
-    ObjectLoadError,
+    load_typed_object_with_hash_field_expires_detailed,
+    load_typed_object_with_hash_limits_detailed, save_robj, save_robj_with_hash_field_expires,
+    type_byte, type_byte_with_hash_field_expires, ObjectLoadError,
 };
 
 #[cfg(not(feature = "wasm"))]

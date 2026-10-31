@@ -1,6 +1,6 @@
 use std::sync::OnceLock;
 
-pub const RDB_VERSION: u16 = 80;
+pub const RDB_VERSION: u16 = 81;
 
 pub const RDB_TYPE_STRING: u8 = 0;
 pub const RDB_TYPE_LIST: u8 = 1;
@@ -22,6 +22,7 @@ pub const RDB_TYPE_STREAM_LISTPACKS_2: u8 = 19;
 pub const RDB_TYPE_SET_LISTPACK: u8 = 20;
 pub const RDB_TYPE_STREAM_LISTPACKS_3: u8 = 21;
 pub const RDB_TYPE_HASH_2: u8 = 22;
+pub const RDB_TYPE_PATH_HASH: u8 = 23;
 
 pub(crate) const QUICKLIST_NODE_CONTAINER_PLAIN: u64 = 1;
 pub(crate) const QUICKLIST_NODE_CONTAINER_PACKED: u64 = 2;
@@ -175,6 +176,7 @@ pub(crate) fn is_known_object_type(t: u8) -> bool {
             | RDB_TYPE_ZSET
             | RDB_TYPE_HASH
             | RDB_TYPE_HASH_2
+            | RDB_TYPE_PATH_HASH
             | RDB_TYPE_ZSET_2
             | RDB_TYPE_HASH_ZIPMAP
             | RDB_TYPE_LIST_ZIPLIST

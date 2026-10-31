@@ -8,6 +8,7 @@ pub enum Type {
     Set,
     ZSet,
     Stream,
+    PathHash,
 }
 
 impl Type {
@@ -19,6 +20,7 @@ impl Type {
             Type::Set => "set",
             Type::ZSet => "zset",
             Type::Stream => "stream",
+            Type::PathHash => "pathhash",
         }
     }
 }
@@ -35,6 +37,7 @@ pub enum Encoding {
     Skiplist,
     Btree,
     StreamP,
+    PathHash,
 }
 
 impl Encoding {
@@ -50,6 +53,7 @@ impl Encoding {
             Encoding::Skiplist => "skiplist",
             Encoding::Btree => "btree",
             Encoding::StreamP => "stream",
+            Encoding::PathHash => "pathhash",
         }
     }
 }

@@ -7,6 +7,7 @@ use super::{failover_election_delay_ms, rank_replicas, ReplicaEligibility};
 
 #[derive(Clone, Debug)]
 pub struct LocalReplicaFailoverStatus {
+    pub no_failover_if_empty: bool,
     pub loading: bool,
     pub priority: i64,
     pub data_age_ms: u64,
@@ -17,6 +18,7 @@ pub struct LocalReplicaFailoverStatus {
 impl Default for LocalReplicaFailoverStatus {
     fn default() -> Self {
         Self {
+            no_failover_if_empty: false,
             loading: false,
             priority: 100,
             data_age_ms: 0,
@@ -419,12 +421,12 @@ impl AutomaticFailover {
     pub fn on_vote_nack(
         &mut self,
         voter: NodeId,
-        epoch: u64,
+        request_epoch: u64,
         voting_primaries: usize,
         failed_voting_primaries: usize,
     ) -> Option<bool> {
         if self.phase != AutomaticFailoverPhase::RequestingVotes
-            || epoch < self.election_epoch
+            || request_epoch != self.election_epoch
             || self.voters.contains(&voter)
             || !self.rejected_voters.insert(voter)
         {

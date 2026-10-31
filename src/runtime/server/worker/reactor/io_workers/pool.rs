@@ -362,9 +362,13 @@ fn shutdown_workers(workers: &mut Vec<WorkerHandle>, wake: &TransportWakeHandle)
     for worker in workers.iter() {
         let _ = worker.sender.send(IoJob::Shutdown);
     }
-    for worker in workers.iter_mut() {
+    for (index, worker) in workers.iter_mut().enumerate() {
         if let Some(join) = worker.join.take() {
-            let _ = join.join();
+            if join.join().is_ok() {
+                crate::server_log!(notice, "IO thread(id:{}) terminated", index + 1);
+            } else {
+                crate::server_log!(warning, "IO thread(id:{}) could not be joined", index + 1);
+            }
         }
     }
     workers.clear();

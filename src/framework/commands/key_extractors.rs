@@ -16,6 +16,26 @@ pub(crate) fn set_get_keys(args: &[Bytes]) -> Vec<(&[u8], Vec<&'static str>)> {
     vec![(key.as_ref(), flags)]
 }
 
+pub(crate) fn rename_get_keys(args: &[Bytes]) -> Vec<(&[u8], Vec<&'static str>)> {
+    let [source, destination, ..] = args else {
+        return Vec::new();
+    };
+    vec![
+        (source.as_ref(), vec!["RW", "access", "delete"]),
+        (destination.as_ref(), vec!["OW", "update"]),
+    ]
+}
+
+pub(crate) fn renamenx_get_keys(args: &[Bytes]) -> Vec<(&[u8], Vec<&'static str>)> {
+    let [source, destination, ..] = args else {
+        return Vec::new();
+    };
+    vec![
+        (source.as_ref(), vec!["RW", "access", "delete"]),
+        (destination.as_ref(), vec!["OW", "insert"]),
+    ]
+}
+
 pub(crate) fn msetex_get_keys(args: &[Bytes]) -> Vec<(&[u8], Vec<&'static str>)> {
     generic_numkeys_get_keys(None, 0, 1, 2, args, &["OW", "update"], &[])
 }

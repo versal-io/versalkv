@@ -8,10 +8,15 @@ use crate::foundation::io::sys::time::mstime;
 use crate::framework::capabilities::connection::BlockedCmd;
 use crate::framework::capabilities::io::Token;
 use crate::framework::context::PauseAction;
+use crate::runtime::server::worker::flows::request::dispatch::EffectQueue;
 use bytes::Bytes;
 use std::collections::HashSet;
 
 mod wakeup;
+
+#[cfg(test)]
+#[path = "module_fifo_tests.rs"]
+mod module_fifo_tests;
 
 fn xreadgroup_group_name(args: &[Bytes]) -> Option<&[u8]> {
     let mut i = 0;
@@ -421,8 +426,23 @@ impl ServerWorkerState {
     pub(crate) fn wakeup_blocked_on_keys(
         &mut self,
         dirty_keys: &[(u32, Bytes)],
+        pending_replication: Option<&mut Vec<Vec<u8>>>,
+        pending_aof: Option<&mut Vec<Vec<u8>>>,
+    ) {
+        self.wakeup_blocked_on_keys_with_effect_queue(
+            dirty_keys,
+            pending_replication,
+            pending_aof,
+            None,
+        );
+    }
+
+    pub(crate) fn wakeup_blocked_on_keys_with_effect_queue(
+        &mut self,
+        dirty_keys: &[(u32, Bytes)],
         mut pending_replication: Option<&mut Vec<Vec<u8>>>,
         mut pending_aof: Option<&mut Vec<Vec<u8>>>,
+        mut pending_effects: Option<&mut EffectQueue>,
     ) {
         if self.processing_blocked_clients {
             return;
@@ -441,6 +461,7 @@ impl ServerWorkerState {
                 &mut ready_seen,
                 pending_replication.as_deref_mut(),
                 pending_aof.as_deref_mut(),
+                pending_effects.as_deref_mut(),
             );
         }
 
@@ -455,20 +476,53 @@ impl ServerWorkerState {
         ready_seen: &mut HashSet<(u32, Bytes)>,
         mut pending_replication: Option<&mut Vec<Vec<u8>>>,
         mut pending_aof: Option<&mut Vec<Vec<u8>>>,
+        mut pending_effects: Option<&mut EffectQueue>,
     ) {
         let waiters = self.ctx.blocking_registry().waiters_for_key(db_id, key);
         for session in waiters {
-            let Some(token) = self.connection_registry.token_for_session(session) else {
-                continue;
+            let new_dirty = if let Some(token) = self.connection_registry.token_for_session(session)
+            {
+                if !self.blocked_key_is_eligible_for_wake(token, db_id, key) {
+                    continue;
+                }
+                self.wakeup_blocked_client_with_effect_queue(
+                    token,
+                    pending_replication.as_deref_mut(),
+                    pending_aof.as_deref_mut(),
+                    pending_effects.as_deref_mut(),
+                )
+            } else {
+                let id = session.0 as usize;
+                let is_eligible = self
+                    .ctx
+                    .module_registry()
+                    .pending_calls
+                    .get(&id)
+                    .and_then(|call| {
+                        use crate::engine::command::context::CommandConn;
+                        call.conn.blocked()
+                    })
+                    .is_some_and(|blocked| {
+                        blocked_key_matches_value(
+                            &blocked.cmd,
+                            self.ctx.db(db_id).and_then(|db| db.get_no_expire(key)),
+                        )
+                    });
+                if !is_eligible {
+                    continue;
+                }
+                let effects = crate::framework::capabilities::module::complete_pending_module_call(
+                    &mut self.ctx,
+                    id,
+                    Some((db_id, key)),
+                );
+                self.commit_pending_module_effects(
+                    effects,
+                    pending_replication.as_deref_mut(),
+                    pending_aof.as_deref_mut(),
+                    pending_effects.as_deref_mut(),
+                )
             };
-            if !self.blocked_key_is_eligible_for_wake(token, db_id, key) {
-                continue;
-            }
-            let new_dirty = self.wakeup_blocked_client(
-                token,
-                pending_replication.as_deref_mut(),
-                pending_aof.as_deref_mut(),
-            );
             for dk in new_dirty {
                 if ready_seen.insert(dk.clone()) {
                     ready.push(dk);
@@ -497,30 +551,37 @@ impl ServerWorkerState {
         .as_ref() else {
             return false;
         };
-        if matches!(blocked.cmd, BlockedCmd::Xreadgroup) {
-            return true;
-        }
-        let Some(obj) = self.ctx.db(db_id).and_then(|db| db.get_no_expire(key)) else {
-            return false;
-        };
-        matches!(
-            (&blocked.cmd, obj),
-            (
-                BlockedCmd::Blpop
-                    | BlockedCmd::Brpop
-                    | BlockedCmd::Brpoplpush { .. }
-                    | BlockedCmd::Blmove { .. }
-                    | BlockedCmd::Blmpop { .. },
-                Robj::ListQuicklist(_)
-            ) | (
-                BlockedCmd::Bzpopmin | BlockedCmd::Bzpopmax | BlockedCmd::Bzmpop { .. },
-                Robj::ZSetSkiplist(_) | Robj::ZSetListpack(_)
-            ) | (
-                BlockedCmd::Xread | BlockedCmd::Xreadgroup,
-                Robj::StreamListpack(_) | Robj::StreamRadix(_)
-            )
+        blocked_key_matches_value(
+            &blocked.cmd,
+            self.ctx.db(db_id).and_then(|db| db.get_no_expire(key)),
         )
     }
+}
+
+fn blocked_key_matches_value(cmd: &BlockedCmd, obj: Option<&Robj>) -> bool {
+    if matches!(cmd, BlockedCmd::Xreadgroup) {
+        return true;
+    }
+    let Some(obj) = obj else {
+        return false;
+    };
+    matches!(
+        (cmd, obj),
+        (
+            BlockedCmd::Blpop
+                | BlockedCmd::Brpop
+                | BlockedCmd::Brpoplpush { .. }
+                | BlockedCmd::Blmove { .. }
+                | BlockedCmd::Blmpop { .. },
+            Robj::ListQuicklist(_)
+        ) | (
+            BlockedCmd::Bzpopmin | BlockedCmd::Bzpopmax | BlockedCmd::Bzmpop { .. },
+            Robj::ZSetSkiplist(_) | Robj::ZSetListpack(_)
+        ) | (
+            BlockedCmd::Xread | BlockedCmd::Xreadgroup,
+            Robj::StreamListpack(_) | Robj::StreamRadix(_)
+        )
+    )
 }
 
 impl ServerWorkerState {
@@ -845,10 +906,8 @@ impl ServerWorkerState {
         }
     }
 
-    /// Kill subscribers whose ACL channel permissions were revoked via ACL SETUSER.
-    /// Called from handle_readable after command dispatch.
-    /// Defers removal to the end of the event loop iteration so buffered replies
-    /// (e.g. OK from ACL SETUSER resetchannels) are written before the socket closes.
+    /// Collect subscribers whose ACL channel permissions were revoked.
+    /// Invoked before the next command can observe the changed permissions.
     pub(crate) fn kill_acl_subscribers(&mut self) {
         let usernames: Vec<String> = std::mem::take(self.ctx.pending_acl_client_kills_mut());
         if usernames.is_empty() {
@@ -883,6 +942,10 @@ impl ServerWorkerState {
     /// iteration, after all IO events (including writable) are processed.
     /// Protected clients are skipped.
     pub(crate) fn drain_acl_kills(&mut self) {
+        self.drain_acl_kills_for_command(None);
+    }
+
+    pub(crate) fn drain_acl_kills_for_command(&mut self, current: Option<Token>) {
         let tokens: Vec<Token> = std::mem::take(self.ctx.pending_acl_tokens_to_kill_mut());
         for token in tokens {
             // Skip protected clients
@@ -893,6 +956,11 @@ impl ServerWorkerState {
             if self.connection_registry.contains(connection_token)
                 && self.connection_registry[connection_token].protected
             {
+                self.ctx.pending_acl_tokens_to_kill_mut().push(token);
+                continue;
+            }
+            if current == Some(token) {
+                self.connection_registry[connection_token].mark_closing();
                 continue;
             }
             self.remove_connection(token.0);

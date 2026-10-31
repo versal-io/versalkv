@@ -2,6 +2,54 @@ use super::*;
 use bytes::Bytes;
 
 #[test]
+fn decimal_double_serializers_preserve_scalar_and_recursive_payloads() {
+    use crate::foundation::io::protocol::DecimalDoubleText;
+    for text in ["9007199254740993", "0.00000000000000001", "inf", "-inf"] {
+        let scalar = Value::DecimalDouble(DecimalDoubleText::new(text.to_owned()).unwrap());
+        let resp2 = format!("${}\r\n{text}\r\n", text.len());
+        let resp3 = format!(",{text}\r\n");
+        assert_eq!(serialize_to_vec_resp2(&scalar), resp2.as_bytes());
+        assert_eq!(serialize_to_vec_resp3(&scalar), resp3.as_bytes());
+        for (container, prefix2, prefix3) in [
+            (Value::Array(vec![scalar.clone()]), "*1\r\n", "*1\r\n"),
+            (Value::Set(vec![scalar.clone()]), "*1\r\n", "~1\r\n"),
+            (Value::Push(vec![scalar.clone()]), "*1\r\n", ">1\r\n"),
+            (
+                Value::Map(vec![(scalar.clone(), scalar.clone())]),
+                "*2\r\n",
+                "%1\r\n",
+            ),
+        ] {
+            let count = if matches!(container, Value::Map(_)) {
+                2
+            } else {
+                1
+            };
+            assert_eq!(
+                serialize_to_vec_resp2(&container),
+                format!("{prefix2}{}", resp2.repeat(count)).as_bytes()
+            );
+            assert_eq!(
+                serialize_to_vec_resp3(&container),
+                format!("{prefix3}{}", resp3.repeat(count)).as_bytes()
+            );
+        }
+        let attributed = Value::attribute(
+            vec![(scalar.clone(), scalar.clone())],
+            Value::Array(vec![scalar]),
+        );
+        assert_eq!(
+            serialize_to_vec_resp2(&attributed),
+            format!("*1\r\n{resp2}").as_bytes()
+        );
+        assert_eq!(
+            serialize_to_vec_resp3(&attributed),
+            format!("|1\r\n{resp3}{resp3}*1\r\n{resp3}").as_bytes()
+        );
+    }
+}
+
+#[test]
 fn test_simple_string() {
     assert_eq!(
         serialize_to_vec(&Value::SimpleString(Bytes::from_static(b"OK"))),

@@ -292,14 +292,37 @@ impl ServerWorkerState {
             return None;
         }
         let boundary = self.ctx.replication().backlog.snapshot_boundary();
+        let connection = self
+            .replication_runtime
+            .primary_link(first_target)?
+            .connection_id();
+        let snapshot = self.replication_snapshot_options(connection)?;
+        self.full_sync.disk_snapshot_options = Some(snapshot);
+        self.full_sync.disk_snapshot_version = self
+            .replication_runtime
+            .replica_snapshot_version(connection);
+        self.replication_runtime
+            .freeze_full_sync_snapshot_options(connection, snapshot);
         let dir = self.ctx.config().persistence.dir.clone();
         let unique = format!("temp-disk-sync-{}.rdb", std::process::id());
         let snapshot_path = std::path::PathBuf::from(dir).join(unique);
-        let pid = crate::framework::commands::server::save::fork_disk_rdb_file_child(
+        let pid = crate::framework::commands::server::save::fork_disk_rdb_file_child_with_options(
             &mut self.ctx,
             libs,
             &snapshot_path,
+            snapshot,
         )?;
+        crate::server_log!(
+            notice,
+            "Starting BGSAVE for SYNC with target: disk using: normal sync, compression: {}",
+            if snapshot.compression
+                == crate::foundation::io::persistence::rdb::compression::RdbCompression::Lz4
+            {
+                "lz4"
+            } else {
+                "none"
+            }
+        );
         self.register_child_process(
             crate::runtime::server::worker::reactor::sources::ChildOwner::DiskSyncReplication,
             pid,
@@ -340,7 +363,24 @@ impl ServerWorkerState {
     }
 
     pub(crate) fn join_disk_sync_batch(&mut self, id: ReplicaId) -> Option<SnapshotBoundary> {
+        if let Some(snapshot) = self.full_sync.disk_snapshot_options {
+            let connection = self.replication_runtime.primary_link(id)?.connection_id();
+            if self.replication_snapshot_options(connection) != Some(snapshot)
+                || self
+                    .replication_runtime
+                    .replica_snapshot_version(connection)
+                    != self.full_sync.disk_snapshot_version
+            {
+                if self.full_sync.disk_sync_batch.is_some() {
+                    crate::server_log!(notice, "Can't attach the replica to the current BGSAVE. Waiting for next BGSAVE for SYNC");
+                }
+                return None;
+            }
+            self.replication_runtime
+                .freeze_full_sync_snapshot_options(connection, snapshot);
+        }
         let batch = self.full_sync.disk_sync_batch.as_mut()?;
+        crate::server_log!(notice, "Waiting for end of BGSAVE for SYNC");
         let boundary = batch.boundary;
         let phase = batch.phase;
         let file_len = batch.file_len;
@@ -680,9 +720,6 @@ impl ServerWorkerState {
     }
 
     fn queue_disk_sync_header(&mut self, connection_token: Token, header: Vec<u8>) {
-        self.ctx
-            .stats_mut()
-            .add_net_repl_output_bytes(header.len() as u64);
         if let Some(conn) = self.connection_registry.get_mut(connection_token) {
             conn.queue_reply(header);
         }
@@ -826,9 +863,6 @@ impl ServerWorkerState {
                 if let Some(link) = self.replication_runtime.primary_link_mut(id) {
                     link.mark_replication_queued(tail.len());
                 }
-                self.ctx
-                    .stats_mut()
-                    .add_net_repl_output_bytes(tail.len() as u64);
                 conn.queue_replication_reply(tail);
             }
             self.transport

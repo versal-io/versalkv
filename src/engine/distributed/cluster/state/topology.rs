@@ -4,6 +4,12 @@ use super::types::{role_str, short_name, ClusterState, CLUSTER_FAIL, CLUSTER_OK,
 use super::ClusterHealth;
 
 impl ClusterState {
+    /// Approximate the two bus sockets reserved for each known remote node.
+    /// Unlike C's node dictionary, `nodes` excludes the local `myself` node.
+    pub fn connection_budget(&self) -> usize {
+        self.nodes.len().saturating_mul(2)
+    }
+
     pub fn set_require_full_coverage(&mut self, required: bool) {
         if self.require_full_coverage == required {
             return;

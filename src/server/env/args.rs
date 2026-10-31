@@ -22,14 +22,6 @@ pub(super) struct ServerArgDirective {
 }
 
 impl ServerArgDirective {
-    pub(super) fn config_string(key: &str, value: &str) -> Self {
-        Self::new(
-            key,
-            DirectiveValue::Raw(value.to_string()),
-            DirectiveApplication::ConfigString,
-        )
-    }
-
     pub(super) fn config_arguments(key: &str, values: Vec<String>) -> Self {
         Self::new(
             key,
@@ -301,12 +293,20 @@ fn extract_special_directives(
     let mut index = 1;
     while index < raw_args.len() {
         match raw_args[index].as_str() {
-            "--user" if index + 1 < raw_args.len() => {
-                directives.push(ServerArgDirective::config_string(
-                    "user",
-                    &raw_args[index + 1],
+            "--role" | "--user" => {
+                let directive = raw_args[index].trim_start_matches("--");
+                let start = index + 1;
+                index = start;
+                while index < raw_args.len() && !raw_args[index].starts_with("--") {
+                    index += 1;
+                }
+                if index == start {
+                    return Err(ServerArgError::MissingValue(directive.to_string()));
+                }
+                directives.push(ServerArgDirective::config_arguments(
+                    directive,
+                    raw_args[start..index].to_vec(),
                 ));
-                index += 2;
             }
             "--replicaof" => {
                 let (directive, consumed) = parse_replicaof(raw_args, index)?;
@@ -762,11 +762,84 @@ mod tests {
     }
 
     #[test]
-    fn planner_keeps_user_on_config_string_path() {
-        let plan = plan(&["versal-server", "--user", "alice on +@all"]);
+    fn planner_preserves_acl_argument_boundaries() {
+        for directive in ["user", "role"] {
+            let option = format!("--{directive}");
+            let separate = plan(&[
+                "versal-server",
+                &option,
+                "alice",
+                "+get",
+                "~\"*\"",
+                "(+set",
+                "~write:*)",
+                "--port",
+                "6381",
+            ]);
+            assert_eq!(separate.config().port, 6381);
+            assert_eq!(
+                separate.directives.as_slice(),
+                &[ServerArgDirective::config_arguments(
+                    directive,
+                    strings(&["alice", "+get", "~\"*\"", "(+set", "~write:*)"])
+                )]
+            );
+            assert_eq!(
+                separate.directives[0].config_line(),
+                format!("{directive} \"alice\" \"+get\" \"~\\\"*\\\"\" \"(+set\" \"~write:*)\"")
+            );
+            assert!(!separate.directives[0].uses_registry());
+
+            let single = plan(&["versal-server", &option, "alice on +@all"]);
+            assert_eq!(
+                single.directives[0].config_line(),
+                format!("{directive} \"alice on +@all\"")
+            );
+            let empty = plan(&["versal-server", &option, ""]);
+            assert_eq!(
+                empty.directives[0].config_line(),
+                format!("{directive} \"\"")
+            );
+
+            for arguments in [
+                strings(&["versal-server", &option]),
+                strings(&["versal-server", &option, "--port", "6381"]),
+            ] {
+                assert_eq!(
+                    ServerArgPlan::parse(arguments, "versal-server").unwrap_err(),
+                    ServerArgError::MissingValue(directive.to_string())
+                );
+            }
+        }
+
+        let multiple = plan(&[
+            "versal-server",
+            "--user",
+            "member",
+            "on",
+            "nopass",
+            "role=reader",
+            "--role",
+            "reader",
+            "+get",
+            "~*",
+            "--user",
+            "other",
+            "off",
+            "--port",
+            "6382",
+        ]);
+        assert_eq!(multiple.config().port, 6382);
         assert_eq!(
-            plan.directives.as_slice(),
-            &[ServerArgDirective::config_string("user", "alice on +@all")]
+            multiple.directives.as_slice(),
+            &[
+                ServerArgDirective::config_arguments(
+                    "user",
+                    strings(&["member", "on", "nopass", "role=reader"])
+                ),
+                ServerArgDirective::config_arguments("role", strings(&["reader", "+get", "~*"])),
+                ServerArgDirective::config_arguments("user", strings(&["other", "off"])),
+            ]
         );
     }
 

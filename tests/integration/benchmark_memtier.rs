@@ -126,12 +126,23 @@ fn valkey_update_benchmark_idle_ignores_dataset_workload() {
         "idle dataset mode must remain connected: {status:?}"
     );
     assert_command_calls(&server, "set", 0);
-    for template in [
+    for (index, template) in [
         &["SET", "doc", "value"][..],
         &["SET", "doc", "__field:missing__"][..],
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let stdout_path = server
+            .data_dir()
+            .join(format!("invalid-idle-dataset-{index}.stdout"));
+        let stderr_path = server
+            .data_dir()
+            .join(format!("invalid-idle-dataset-{index}.stderr"));
+        let binary = binary_path("versal-benchmark");
+        let started = std::time::Instant::now();
         let status = crate::common::command_status_with_timeout(
-            Command::new(binary_path("versal-benchmark"))
+            Command::new(&binary)
                 .args([
                     "-h",
                     "127.0.0.1",
@@ -145,14 +156,20 @@ fn valkey_update_benchmark_idle_ignores_dataset_workload() {
                 .arg(&dataset)
                 .arg("--")
                 .args(template)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null()),
+                .stdout(std::fs::File::create(&stdout_path).expect("capture benchmark stdout"))
+                .stderr(std::fs::File::create(&stderr_path).expect("capture benchmark stderr")),
             std::time::Duration::from_secs(1),
         )
         .expect("run invalid idle dataset benchmark");
+        let elapsed = started.elapsed();
+        let stdout = std::fs::read_to_string(&stdout_path).expect("read benchmark stdout");
+        let stderr = std::fs::read_to_string(&stderr_path).expect("read benchmark stderr");
         assert!(
             status.is_some_and(|status| !status.success()),
-            "idle mode must validate dataset fields: {template:?}"
+            "idle mode must validate dataset fields: template={template:?}, status={status:?}, \
+             elapsed={elapsed:?}, binary={}, stdout={stdout:?}, stderr={stderr:?}, captures={}",
+            binary.display(),
+            server.data_dir().display()
         );
     }
 }

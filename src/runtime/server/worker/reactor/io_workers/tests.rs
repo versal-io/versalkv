@@ -938,6 +938,99 @@ fn stale_read_completion_cannot_touch_reused_token() {
 }
 
 #[test]
+fn cluster_bus_full_queue_rolls_back_both_io_handles() {
+    let (mut running_transport, wake, running_job) = detached_poll(Some(Duration::from_secs(30)));
+    let (running_tx, running_rx) = std::sync::mpsc::channel();
+    let mut io = IoThreadRuntime::new_with_queue_capacity_for_test(
+        IoDriverMtConfig::new(2),
+        Token(99),
+        wake,
+        1,
+    )
+    .unwrap();
+    io.pool.set_active_workers(1);
+    io.try_submit_poll(running_job.observe_execution_for_test(running_tx))
+        .unwrap();
+    assert_eq!(
+        running_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+        "io_thd_1"
+    );
+    let (mut queued_transport, _wake, queued_job) = detached_poll(Some(Duration::from_secs(30)));
+    io.try_submit_poll(queued_job).unwrap();
+
+    let token = Token(84);
+    let (read, _read_peer) = thread_handle_pair();
+    let (write, _write_peer) = thread_handle_pair();
+    io.register_cluster_bus(token, read, write);
+    let super::WriteSubmission::Unavailable(frames) =
+        io.submit_write(token, VecDeque::from([b"queued".to_vec()]), 64)
+    else {
+        panic!("full worker queue must return the write snapshot");
+    };
+    assert_eq!(frames, VecDeque::from([b"queued".to_vec()]));
+    assert!(!io.is_write_inflight(token));
+    assert!(io.connections[&token].write_handle.is_some());
+    assert!(!io.submit_read(token, 64, false));
+    assert!(io.read_inflight_id(token).is_none());
+    assert!(io.connections[&token].read_handle.is_some());
+    assert!(!io.cluster_read_deferred(token));
+    assert_eq!(io.info().reads_pending, 0);
+    assert_eq!(io.info().writes_pending, 0);
+
+    io.configure(1, false).unwrap();
+    let mut polls = Vec::new();
+    while let Some(completion) = io.pool().try_recv_completion() {
+        if let IoCompletion::Poll(completion) = completion {
+            polls.push(completion);
+        }
+    }
+    running_transport
+        .finish_poll_offload(polls.remove(0))
+        .unwrap();
+    assert_eq!(
+        queued_transport
+            .finish_poll_offload(polls.remove(0))
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::Interrupted
+    );
+}
+
+#[test]
+fn cluster_bus_stale_completion_cannot_release_new_generation() {
+    let mut io = IoThreadRuntime::new(IoDriverMtConfig::new(1), Token(99), test_waker()).unwrap();
+    let token = Token(85);
+    let (read, _read_peer) = thread_handle_pair();
+    let (write, _write_peer) = thread_handle_pair();
+    io.register_cluster_bus(token, read, write);
+    let old = io.take_read_job(token, 64, false).unwrap();
+    let (read, _read_peer) = thread_handle_pair();
+    let (write, _write_peer) = thread_handle_pair();
+    io.register_cluster_bus(token, read, write);
+    let current = io.take_read_job(token, 64, false).unwrap();
+    assert_ne!(old.id.generation, current.id.generation);
+    assert!(matches!(
+        io.complete_read(ReadCompletion {
+            id: old.id,
+            handle: old.handle,
+            bytes: b"stale".to_vec(),
+            outcome: ReadOutcome::PeerClosed,
+            drain_to_budget: false,
+            cancelled: false,
+        }),
+        ReadCompletionAction::Stale
+    ));
+    assert!(io.is_cluster_bus(token));
+    assert_eq!(io.read_inflight_id(token), Some(current.id));
+    assert!(!io.is_close_pending(token));
+    assert!(matches!(io.complete_read(ReadCompletion {
+        id: current.id, handle: current.handle, bytes: b"current".to_vec(),
+        outcome: ReadOutcome::Quiescent, drain_to_budget: false, cancelled: false,
+    }), ReadCompletionAction::Apply { bytes, .. } if bytes == b"current"));
+    assert!(io.read_inflight_id(token).is_none());
+}
+
+#[test]
 fn event_loop_owns_a_registered_main_thread_backend() {
     let runtime = crate::runtime::server::worker::ServerWorkerState::new(1).unwrap();
 
@@ -1064,6 +1157,283 @@ fn ordinary_read_runs_on_worker_and_dispatches_on_main() {
     assert_eq!(runtime.ctx.io_thread_info().writes_processed, 1);
     assert_eq!(runtime.ctx.io_thread_info().reads_pending, 0);
     assert_eq!(runtime.ctx.io_thread_info().writes_pending, 0);
+}
+
+#[test]
+fn sync_admission_waits_for_threaded_output_settlement() {
+    let pending_output_error = b"-ERR SYNC and PSYNC are invalid with pending output\r\n";
+    for settle_before_read in [true, false] {
+        for request in [b"PSYNC ? -1\r\n".as_slice(), b"SYNC\r\n".as_slice()] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let mut runtime = crate::runtime::server::worker::ServerWorkerState::new(1).unwrap();
+            crate::framework::commands::register_all(&mut runtime.registry);
+            runtime.ctx.set_command_registry_snapshot(&runtime.registry);
+            runtime.ctx.config_mut().replication.repl_diskless_sync = true;
+            runtime
+                .ctx
+                .config_mut()
+                .replication
+                .repl_diskless_sync_delay = 0;
+            runtime.ctx.config_mut().server.io_threads = 2;
+            runtime.ctx.config_mut().server.io_threads_always_active = true;
+            runtime.configure_io_threads_from_config().unwrap();
+            let peer = runtime
+                .transport
+                .connect_tcp(listener.local_addr().unwrap())
+                .unwrap();
+            let (mut client, _) = listener.accept().unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            runtime.add_connection(
+                crate::runtime::server::worker::reactor::transport::RuntimeConnectedPeer {
+                    token: peer.token,
+                    peer_addr: peer.peer_addr,
+                },
+            );
+            runtime.connection_registry[peer.token].queue_reply(b"+PONG\r\n".to_vec());
+            runtime.writes.ordinary.begin_turn();
+            assert!(runtime.schedule_ordinary_write(peer.token.0));
+            runtime.drive_pending_ordinary_writes();
+            let completion = recv_runtime_write_completion(&mut runtime, Duration::from_secs(2));
+            assert!(completion.frames.is_empty());
+            assert_eq!(completion.written, 7);
+            assert!(runtime.io_threads.is_write_inflight(peer.token));
+            assert!(!runtime.connection_registry[peer.token].has_pending_output());
+            assert_eq!(
+                runtime.connection_registry[peer.token].output_buffer_bytes(),
+                7
+            );
+            let mut pong = [0_u8; 7];
+            client.read_exact(&mut pong).unwrap();
+            assert_eq!(&pong, b"+PONG\r\n");
+
+            // The worker has returned a real write snapshot, but only the main
+            // thread can settle its accounting before the next read is applied.
+            let pending_completion = if settle_before_read {
+                runtime.complete_io_write(completion);
+                assert_eq!(
+                    runtime.connection_registry[peer.token].output_buffer_bytes(),
+                    0
+                );
+                None
+            } else {
+                Some(completion)
+            };
+            client.write_all(request).unwrap();
+            runtime
+                .transport
+                .wait_pending_bytes_for_test(peer.token, request.len());
+            assert!(runtime.try_submit_io_read(peer.token, false));
+            let read = recv_runtime_read_completion(&mut runtime, Duration::from_secs(2));
+            assert_eq!(read.bytes, request);
+            runtime.complete_io_read(read);
+            if settle_before_read {
+                assert_eq!(runtime.ctx.stats().sync_full, 1);
+                assert!(runtime.is_priority_connection(peer.token));
+                assert!(runtime
+                    .replication_runtime
+                    .primary_for_connection(
+                        crate::framework::distributed::replication::ConnectionId(peer.token.0),
+                    )
+                    .is_some());
+                let mut header = Vec::new();
+                while !header.ends_with(b"\r\n") {
+                    let mut byte = [0_u8; 1];
+                    client.read_exact(&mut byte).unwrap();
+                    header.push(byte[0]);
+                    assert!(header.len() < 128);
+                }
+                assert!(
+                    if request.starts_with(b"PSYNC") {
+                        header.starts_with(b"+FULLRESYNC ")
+                    } else {
+                        header.starts_with(b"$")
+                    },
+                    "accepted sync must send its transfer header: {header:?}"
+                );
+            } else {
+                let snapshot =
+                    runtime.connection_registry[peer.token].take_threaded_write_snapshot();
+                assert_eq!(
+                    snapshot.frames(),
+                    &VecDeque::from([pending_output_error.to_vec()]),
+                    "unsettled write must reject {request:?}"
+                );
+                assert_eq!(runtime.ctx.stats().sync_full, 0);
+                assert_eq!(runtime.ctx.stats().sync_partial_err, 0);
+                assert!(!runtime.is_priority_connection(peer.token));
+                assert!(runtime
+                    .replication_runtime
+                    .primary_for_connection(
+                        crate::framework::distributed::replication::ConnectionId(peer.token.0),
+                    )
+                    .is_none());
+                runtime.connection_registry[peer.token]
+                    .restore_threaded_write_snapshot(snapshot.into_frames());
+            }
+            if let Some(completion) = pending_completion {
+                runtime.complete_io_write(completion);
+                assert!(!runtime.io_threads.is_write_inflight(peer.token));
+                assert_eq!(
+                    runtime.connection_registry[peer.token].output_buffer_bytes(),
+                    pending_output_error.len()
+                );
+                runtime.event_batch.begin_next_turn();
+                runtime.writes.begin_turn();
+                runtime.schedule_ordinary_write(peer.token.0);
+                runtime.drive_pending_ordinary_writes();
+                let completion =
+                    recv_runtime_write_completion(&mut runtime, Duration::from_secs(2));
+                runtime.complete_io_write(completion);
+                let mut error = vec![0_u8; pending_output_error.len()];
+                client.read_exact(&mut error).unwrap();
+                assert_eq!(error, pending_output_error);
+                assert_eq!(
+                    runtime.connection_registry[peer.token].output_buffer_bytes(),
+                    0
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn closing_inline_error_waits_for_threaded_output_settlement() {
+    use crate::foundation::io::transport::Interest;
+    use crate::framework::capabilities::connection::ConnectionState;
+
+    let error = b"-ERR Protocol error: embedded NUL byte in inline request\r\n";
+    let expected = [b"+PONG\r\n".as_slice(), error.as_slice()].concat();
+    for byte_budget in [0, 3, 7, 10, expected.len()] {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut runtime = crate::runtime::server::worker::ServerWorkerState::new(1).unwrap();
+        crate::framework::commands::register_all(&mut runtime.registry);
+        runtime.ctx.set_command_registry_snapshot(&runtime.registry);
+        runtime.ctx.config_mut().server.io_threads = 2;
+        runtime.ctx.config_mut().server.io_threads_always_active = true;
+        runtime.configure_io_threads_from_config().unwrap();
+        let peer = runtime
+            .transport
+            .connect_tcp(listener.local_addr().unwrap())
+            .unwrap();
+        let (mut client, _) = listener.accept().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        runtime.add_connection(
+            crate::runtime::server::worker::reactor::transport::RuntimeConnectedPeer {
+                token: peer.token,
+                peer_addr: peer.peer_addr,
+            },
+        );
+
+        let request = b"PING\r\nSET key value\0\r\nSET next value\r\n";
+        client.write_all(request).unwrap();
+        runtime
+            .transport
+            .wait_pending_bytes_for_test(peer.token, request.len());
+        assert!(runtime.try_submit_io_read(peer.token, false));
+        let read = recv_runtime_read_completion(&mut runtime, Duration::from_secs(2));
+        assert_eq!(read.bytes, request);
+        runtime.complete_io_read(read);
+        assert_eq!(
+            runtime.connection_registry[peer.token].state,
+            ConnectionState::Closing
+        );
+        let snapshot = runtime.connection_registry[peer.token].take_threaded_write_snapshot();
+        assert_eq!(
+            snapshot.frames(),
+            &VecDeque::from([b"+PONG\r\n".to_vec(), error.to_vec()])
+        );
+        assert!(matches!(
+            runtime
+                .io_threads
+                .submit_write(peer.token, snapshot.into_frames(), byte_budget),
+            super::WriteSubmission::Submitted
+        ));
+        let id = runtime.io_threads.write_inflight_id(peer.token).unwrap();
+        runtime.acquire_io_worker_write_socket_lease(id);
+        let completion = recv_runtime_write_completion(&mut runtime, Duration::from_secs(2));
+        assert_eq!(completion.written, byte_budget);
+        assert_eq!(
+            completion
+                .frames
+                .iter()
+                .flatten()
+                .copied()
+                .collect::<Vec<_>>(),
+            expected[byte_budget..]
+        );
+        assert!(matches!(
+            completion.outcome,
+            WriteOutcome::Complete | WriteOutcome::BudgetExhausted
+        ));
+        assert!(runtime.io_threads.is_write_inflight(peer.token));
+        assert!(!runtime.connection_registry[peer.token].has_pending_output());
+        assert_eq!(
+            runtime.connection_registry[peer.token].output_buffer_bytes(),
+            expected.len()
+        );
+
+        // Hold a real completion until after the cron cleanup, fixing the
+        // ordering independently of socket timing or worker scheduling.
+        runtime.cleanup_closed();
+        assert!(
+            runtime.connection_registry.contains(peer.token),
+            "cron must retain unsettled output for budget {byte_budget}"
+        );
+        assert!(!runtime.io_threads.is_close_pending(peer.token));
+        runtime.transport.clear_interest_requests_for_test();
+        runtime.complete_io_write(completion);
+        assert!(!runtime.io_threads.is_write_inflight(peer.token));
+
+        if byte_budget < expected.len() {
+            assert!(runtime.connection_registry.contains(peer.token));
+            assert_eq!(
+                runtime.connection_registry[peer.token].state,
+                ConnectionState::Closing
+            );
+            assert_eq!(
+                runtime.connection_registry[peer.token].output_buffer_bytes(),
+                expected.len() - byte_budget
+            );
+            assert_eq!(
+                runtime.connection_registry[peer.token]
+                    .output
+                    .queue
+                    .iter()
+                    .flatten()
+                    .copied()
+                    .collect::<Vec<_>>(),
+                expected[byte_budget..]
+            );
+            assert_eq!(
+                runtime.transport.last_set_interest_calls_for_test().last(),
+                Some(&(peer.token, Interest::Writable))
+            );
+            runtime.cleanup_closed();
+            assert!(runtime.connection_registry.contains(peer.token));
+            runtime.event_batch.begin_next_turn();
+            runtime.writes.begin_turn();
+            assert!(runtime.schedule_ordinary_write(peer.token.0));
+            runtime.drive_pending_ordinary_writes();
+            let completion = recv_runtime_write_completion(&mut runtime, Duration::from_secs(2));
+            assert!(completion.frames.is_empty());
+            assert_eq!(completion.written, expected.len() - byte_budget);
+            assert!(matches!(completion.outcome, WriteOutcome::Complete));
+            runtime.cleanup_closed();
+            assert!(runtime.connection_registry.contains(peer.token));
+            runtime.complete_io_write(completion);
+        }
+        assert!(!runtime.connection_registry.contains(peer.token));
+        let mut reply = Vec::new();
+        client.read_to_end(&mut reply).unwrap();
+        assert_eq!(
+            reply, expected,
+            "all bytes must drain for budget {byte_budget}"
+        );
+    }
 }
 
 #[test]

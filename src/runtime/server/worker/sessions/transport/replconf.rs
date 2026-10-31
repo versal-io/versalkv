@@ -7,7 +7,7 @@ enum ReplconfOption<'a> {
     ListeningPort(u16),
     IpAddress(&'a [u8]),
     Capability(&'a [u8]),
-    RdbFilterOnly(RdbFilterMode),
+    RdbFilterOnly(Vec<bytes::Bytes>),
     Version(u32),
     RdbOnly(bool),
     RdbChannel(bool),
@@ -237,9 +237,6 @@ impl ServerWorkerState {
     }
 
     fn queue_promoted_replica_tail(&mut self, connection_token: usize, tail: Vec<u8>) {
-        self.ctx
-            .stats_mut()
-            .add_net_repl_output_bytes(tail.len() as u64);
         self.connection_registry[crate::framework::capabilities::io::Token(connection_token)]
             .queue_replication_reply(tail);
         self.transport
@@ -281,8 +278,19 @@ impl ServerWorkerState {
             ReplconfOption::Capability(capability) => {
                 self.add_replconf_capability(request.connection_id, capability)
             }
-            ReplconfOption::RdbFilterOnly(mode) => {
-                self.set_replconf_filter(request.connection_id, mode)
+            ReplconfOption::RdbFilterOnly(filters) => {
+                let mut mode = RdbFilterMode::Empty;
+                self.set_replconf_filter(request.connection_id, mode);
+                for filter in filters {
+                    if !filter.eq_ignore_ascii_case(b"functions") {
+                        return Err(format!(
+                            "ERR Unsupported rdb-filter-only option: {}",
+                            String::from_utf8_lossy(&filter)
+                        ));
+                    }
+                    mode = RdbFilterMode::Functions;
+                    self.set_replconf_filter(request.connection_id, mode);
+                }
             }
             ReplconfOption::Version(version) => {
                 self.set_replconf_version(request.connection_id, version)
@@ -382,6 +390,8 @@ impl ServerWorkerState {
         }
         value.eq_ignore_ascii_case(b"eof")
             || value.eq_ignore_ascii_case(b"psync2")
+            || value.eq_ignore_ascii_case(b"lz4")
+            || value.eq_ignore_ascii_case(b"zstd")
             || value.eq_ignore_ascii_case(b"skip-rdb-checksum")
     }
 
@@ -456,7 +466,7 @@ impl ServerWorkerState {
         else {
             self.replication_runtime
                 .try_associate_retained_rdb_wait(connection_id, public_client_id, mstime())
-                .map_err(|_| "ERR unrecognized RDB client id".to_string())?;
+                .map_err(|_| format!("ERR Unrecognized RDB client id {public_client_id}"))?;
             crate::server_log!(
                 debug,
                 "dual-rdb boundary: associated retained RDB wait main={} public_client_id={}",
@@ -468,7 +478,7 @@ impl ServerWorkerState {
         let rdb_connection_id = ConnectionId(rdb_token);
         self.replication_runtime
             .associate_rdb_channel(connection_id, rdb_connection_id)
-            .map_err(|_| "ERR unrecognized RDB client id".to_string())?;
+            .map_err(|_| format!("ERR Unrecognized RDB client id {public_client_id}"))?;
         self.associate_direct_dual_rdb_child_target(rdb_connection_id, connection_id);
         self.finalize_replconf_rdb_association(connection_id, rdb_connection_id);
         self.release_full_dual_snapshot_batch();
@@ -491,20 +501,6 @@ impl ServerWorkerState {
     }
 
     fn release_full_dual_snapshot_batch(&mut self) {
-        let max_replicas = self
-            .ctx
-            .config()
-            .replication
-            .repl_diskless_sync_max_replicas;
-        if max_replicas <= 0
-            || (self.full_sync.pending_dual_rdb_snapshots.len() as i64) < max_replicas
-        {
-            return;
-        }
-        let now = mstime();
-        for (ready_at, _) in self.full_sync.pending_dual_rdb_snapshots.values_mut() {
-            *ready_at = now;
-        }
         self.drive_pending_dual_rdb_snapshots();
     }
 
@@ -611,7 +607,6 @@ impl ServerWorkerState {
         resp3: bool,
         replies: &mut Vec<Vec<u8>>,
     ) -> bool {
-        let configured_delay_ms = self.configured_diskless_delay_ms();
         self.refresh_replication_view();
         self.ctx.end_cmd("replconf", false);
         replies.push(if resp3 {
@@ -627,21 +622,18 @@ impl ServerWorkerState {
                 String::from_utf8_lossy(rdb_client_id)
             );
         }
-        if request.has_enabled_rdb_channel {
-            self.schedule_dual_rdb_snapshot(request.connection_id, configured_delay_ms);
-        }
         false
     }
 
-    fn configured_diskless_delay_ms(&self) -> i64 {
-        self.ctx
-            .config()
-            .replication
-            .repl_diskless_sync_delay
-            .saturating_mul(1_000)
+    pub(super) fn configured_diskless_delay_ms(&self) -> i64 {
+        let config = &self.ctx.config().replication;
+        if !config.repl_diskless_sync {
+            return 0;
+        }
+        config.repl_diskless_sync_delay.saturating_mul(1_000)
     }
 
-    fn schedule_dual_rdb_snapshot(
+    pub(super) fn schedule_dual_rdb_snapshot(
         &mut self,
         connection_id: ConnectionId,
         configured_delay_ms: i64,
@@ -656,20 +648,6 @@ impl ServerWorkerState {
             crate::framework::capabilities::io::Token(connection_id.0),
             (mstime().saturating_add(configured_delay_ms), Vec::new()),
         );
-        let max_replicas = self
-            .ctx
-            .config()
-            .replication
-            .repl_diskless_sync_max_replicas;
-        if max_replicas <= 0
-            || (self.full_sync.pending_dual_rdb_snapshots.len() as i64) < max_replicas
-        {
-            return;
-        }
-        let now = mstime();
-        for (ready_at, _) in self.full_sync.pending_dual_rdb_snapshots.values_mut() {
-            *ready_at = now;
-        }
     }
 
     fn replconf_error(&mut self, resp3: bool, replies: &mut Vec<Vec<u8>>, message: &str) -> bool {
@@ -713,21 +691,8 @@ fn parse_live_ack_offset(
     Some(offset)
 }
 
-fn parse_rdb_filter_only(value: &[u8]) -> Result<RdbFilterMode, String> {
-    let filters =
-        parse_inline_args(value).map_err(|_| "ERR Missing rdb-filter-only values".to_string())?;
-    let saw_filter = !filters.is_empty();
-    for filter in filters {
-        let filter = String::from_utf8_lossy(&filter);
-        if !filter.eq_ignore_ascii_case("functions") {
-            return Err(format!("ERR Unsupported rdb-filter-only option: {filter}"));
-        }
-    }
-    Ok(if saw_filter {
-        RdbFilterMode::Functions
-    } else {
-        RdbFilterMode::Empty
-    })
+fn parse_rdb_filter_only(value: &[u8]) -> Result<Vec<bytes::Bytes>, String> {
+    parse_inline_args(value).map_err(|_| "ERR Missing rdb-filter-only values".to_string())
 }
 
 fn parse_replconf_bool(value: &[u8]) -> Option<bool> {

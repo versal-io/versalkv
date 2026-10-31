@@ -31,6 +31,7 @@ fn approximate_trim_honors_simulated_node_boundaries_and_limits() {
     assert_eq!(stream.first_id(), Some(StreamID::new(601, 0)));
 
     let mut limited = ValkeyStream::new();
+    limited.set_append_node_limits(10, 0);
     for ms in 1..=101 {
         append_id(&mut limited, ms, 0);
     }
@@ -41,6 +42,7 @@ fn approximate_trim_honors_simulated_node_boundaries_and_limits() {
     assert_eq!(limited.len(), 62);
 
     let mut tiny_nodes = ValkeyStream::new();
+    tiny_nodes.set_append_node_limits(1, 0);
     for ms in 1..=102 {
         append_id(&mut tiny_nodes, ms, 0);
     }

@@ -65,12 +65,16 @@ pub(super) fn gen_one(ctx: &mut ServerContext, sec: &str) -> String {
         "errorstats" => stats::gen_errorstats_section(ctx.stats()),
         "stats" => stats::gen_stats_section(ctx),
         "sentinel" if ctx.sentinel_state().sentinel_mode => cluster::gen_sentinel_section(ctx),
-        "tls" => cluster::gen_tls_section(),
+        "tls" => cluster::gen_tls_section(ctx),
         "module_list" | "modules" => cluster::gen_modules_section(ctx),
         "cluster" => cluster::gen_cluster_section(ctx),
         "cluster_info" => cluster::gen_cluster_info_section(ctx),
         "scriptingengines" => cluster::gen_scriptingengines_section(ctx),
-        "debug" => stats::gen_debug_section(ctx),
+        "debug" => {
+            let mut section = stats::gen_debug_section(ctx);
+            memory::append_external_memory_debug(&mut section);
+            section
+        }
         "throttling" => {
             let throttle = &ctx.replication().throttle;
             format!("# Throttling\r\ntotal_throttled_commands:{}\r\nrepl_throttle_rate:{:.2}\r\nrepl_throttle_activation_events:{}\r\nrepl_throttle_below_guardrail_secs:{}\r\nrepl_throttle_total_commands:{}\r\n",

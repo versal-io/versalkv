@@ -11,6 +11,8 @@ mod set_misc;
 mod set_persistence;
 mod set_server;
 mod set_stats;
+#[cfg(test)]
+mod tls_tests;
 
 use set_cluster::apply_cluster_config_snapshot;
 use set_memory::config_set_memory;
@@ -92,6 +94,7 @@ fn apply_config_set_one_with_exec(
     val_trimmed: &str,
     val_bytes: &[u8],
     in_exec: bool,
+    should_defer_log_config: bool,
 ) -> Result<(), String> {
     if matches!(param, "requirepass" | "primaryauth" | "masterauth") {
         let value = val_bytes
@@ -138,6 +141,9 @@ fn apply_config_set_one_with_exec(
     }
     if let Some(result) = config_registry().try_set(ctx.config_mut(), param, val_trimmed) {
         result?;
+        if param == "maxmemory-scripts" {
+            ctx.schedule_script_eviction();
+        }
         if param.starts_with("hotkeys-") {
             ctx.configure_hotkeys(true);
         }
@@ -167,6 +173,10 @@ fn apply_config_set_one_with_exec(
             | "commandlog-slow-execution-max-len"
             | "commandlog-large-request-max-len"
             | "commandlog-large-reply-max-len" => {
+                // TLS batches commit log owners only after runtime validation.
+                if should_defer_log_config {
+                    return Ok(());
+                }
                 return config_set_stats(ctx, param, val_trimmed, val_bytes);
             }
             "hz" | "watchdog-period" | "acllog-max-len" | "latency-monitor-threshold" => {
@@ -209,7 +219,7 @@ pub(crate) fn apply_config_set_one(
     val_trimmed: &str,
     val_bytes: &[u8],
 ) -> Result<(), String> {
-    apply_config_set_one_with_exec(ctx, param, val_trimmed, val_bytes, false)
+    apply_config_set_one_with_exec(ctx, param, val_trimmed, val_bytes, false, false)
 }
 
 fn config_set_one(
@@ -217,6 +227,7 @@ fn config_set_one(
     ctx: &mut ServerContext,
     param: &str,
     val_bytes: &[u8],
+    should_defer_log_config: bool,
 ) -> Result<(), String> {
     if (ctx.is_loading() || ctx.replication().async_loading)
         && matches!(param, "appendonly" | "repl-diskless-load" | "dir")
@@ -225,8 +236,30 @@ fn config_set_one(
     }
 
     let val_str = String::from_utf8_lossy(val_bytes).to_string();
-    let val_trimmed = val_str.trim_matches(|c| c == '\'' || c == '"');
-    apply_config_set_one_with_exec(ctx, param, val_trimmed, val_bytes, conn.in_transaction())
+    let val_trimmed = if param.starts_with("tls-") {
+        val_str.as_str()
+    } else {
+        val_str.trim_matches(|c| c == '\'' || c == '"')
+    };
+    apply_config_set_one_with_exec(
+        ctx,
+        param,
+        val_trimmed,
+        val_bytes,
+        conn.in_transaction(),
+        should_defer_log_config,
+    )
+}
+
+pub(crate) fn commit_tls_log_config(ctx: &mut ServerContext) {
+    for param in [
+        "commandlog-execution-slower-than",
+        "commandlog-request-larger-than",
+        "commandlog-reply-larger-than",
+    ] {
+        // These fixed parameters select infallible log-owner reconfiguration.
+        let _ = config_set_stats(ctx, param, "", b"");
+    }
 }
 
 fn format_config_set_error(param: &str, error: String) -> String {
@@ -267,6 +300,15 @@ pub fn config_set(
     args: &CommandArgs,
     ctx: &mut ServerContext,
 ) -> Value {
+    // Mark secrets before validation so malformed batches cannot expose them.
+    for index in 1..args.args.len().saturating_sub(1) {
+        if matches!(
+            args.args[index].to_ascii_lowercase().as_slice(),
+            b"tls-key-file-pass" | b"tls-alt-key-file-pass" | b"tls-client-key-file-pass"
+        ) {
+            conn.redact_command_argument(index + 2);
+        }
+    }
     if args.args.len() < 3 {
         return CommandError::wrong_arity("config");
     }
@@ -278,6 +320,7 @@ pub fn config_set(
     let mut seen = std::collections::HashSet::new();
     let mut cluster_config_changed = false;
     let mut tls_config_changed = false;
+    let mut tls_changed_parameter = String::new();
     while check < args.args.len() {
         let param = String::from_utf8_lossy(&args.args[check]).to_ascii_lowercase();
         let value_arg_count = config_set_value_arg_count(args, check, &param);
@@ -306,25 +349,41 @@ pub fn config_set(
                 param.as_str(),
                 "availability-zone" | "bind" | "port" | "tls-port"
             );
-        tls_config_changed |= matches!(
+        let is_unchanged_tls_password = matches!(
             param.as_str(),
-            "tls-port"
-                | "tls-cert-file"
-                | "tls-key-file"
-                | "tls-ca-cert-file"
-                | "tls-ca-cert-dir"
-                | "tls-auth-clients"
-                | "tls-protocols"
-                | "tls-ciphers"
-                | "tls-ciphersuites"
-                | "tls-prefer-server-ciphers"
-                | "tls-session-caching"
-                | "tls-session-cache-size"
-                | "tls-replication"
-                | "tls-cluster"
-                | "tls-client-cert-file"
-                | "tls-client-key-file"
-        );
+            "tls-key-file-pass" | "tls-alt-key-file-pass" | "tls-client-key-file-pass"
+        ) && config_registry()
+            .lookup(&param)
+            .is_some_and(|spec| (spec.get)(ctx.config()).as_str() == value);
+        tls_config_changed |= !is_unchanged_tls_password
+            && matches!(
+                param.as_str(),
+                "tls-port"
+                    | "tls-cert-file"
+                    | "tls-key-file"
+                    | "tls-key-file-pass"
+                    | "tls-alt-cert-file"
+                    | "tls-alt-key-file"
+                    | "tls-alt-key-file-pass"
+                    | "tls-auto-reload-interval"
+                    | "tls-ca-cert-file"
+                    | "tls-ca-cert-dir"
+                    | "tls-auth-clients"
+                    | "tls-protocols"
+                    | "tls-ciphers"
+                    | "tls-ciphersuites"
+                    | "tls-prefer-server-ciphers"
+                    | "tls-session-caching"
+                    | "tls-session-cache-size"
+                    | "tls-replication"
+                    | "tls-cluster"
+                    | "tls-client-cert-file"
+                    | "tls-client-key-file"
+                    | "tls-client-key-file-pass"
+            );
+        if tls_config_changed && tls_changed_parameter.is_empty() {
+            tls_changed_parameter = param.clone();
+        }
         if param == "maxmemory-clients"
             && value.ends_with('%')
             && value[..value.len() - 1].parse::<u64>().unwrap_or(101) > 100
@@ -370,11 +429,13 @@ pub fn config_set(
                 Err(_) => Err("ERR argument port must be numeric".to_string()),
             }
         } else {
-            config_set_one(conn, ctx, &param, value)
+            config_set_one(conn, ctx, &param, value, tls_config_changed)
         };
         if let Err(e) = result {
             // Rollback: restore server fields from snapshot taken before first mutation.
             ctx.config_mut().server = server_snapshot.clone();
+            ctx.config_mut().replication = runtime_config_snapshot.replication.clone();
+            ctx.config_mut().persistence = runtime_config_snapshot.persistence.clone();
             ctx.sync_eviction_policy();
             // Restore OS-level oom_score_adj via the high-level helper so oom_score_adj_adjusted
             // flag is reset correctly.
@@ -384,7 +445,16 @@ pub fn config_set(
             if let Some(raw) = oom_snapshot {
                 let _ = write_oom_score_adj(raw);
             }
-            return Value::error(format_config_set_error(&param, e));
+            let error = if param.starts_with("tls-") {
+                format!(
+                    "ERR CONFIG SET failed (possibly related to argument '{}') - {}",
+                    param,
+                    e.strip_prefix("ERR ").unwrap_or(&e)
+                )
+            } else {
+                format_config_set_error(&param, e)
+            };
+            return Value::error(error);
         }
         i += 1 + value_arg_count;
     }
@@ -444,11 +514,7 @@ pub fn config_set(
             tls_port_changed,
             tls_replication_changed || tls_client_material_changed || tls_context_policy_changed,
             tls_cluster_changed || (tls_context_policy_changed && ctx.config().server.tls_cluster),
-            if tls_port_changed {
-                "tls-port"
-            } else {
-                "TLS configuration"
-            },
+            tls_changed_parameter,
         );
         conn.set_custom_reply(true);
     }

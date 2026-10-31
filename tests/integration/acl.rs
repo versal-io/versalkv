@@ -660,9 +660,23 @@ fn config_rewrite_persists_acl_user_rules_across_restart() {
         "CONFIG REWRITE must succeed"
     );
     let rewritten = std::fs::read_to_string(&config_path).expect("read rewritten config");
-    assert!(
-        rewritten.contains("user default on nopass ~* +@all -flushdb"),
-        "CONFIG REWRITE must persist the ACL user rule: {rewritten}"
+    let user_rules = rewritten
+        .lines()
+        .find(|line| line.starts_with("user default "))
+        .expect("CONFIG REWRITE must persist the default user");
+    assert_eq!(
+        user_rules.split_whitespace().collect::<Vec<_>>(),
+        [
+            "user",
+            "default",
+            "on",
+            "nopass",
+            "~*",
+            "resetchannels",
+            "+@all",
+            "-flushdb",
+        ],
+        "CONFIG REWRITE must persist the complete ACL user rule: {rewritten}"
     );
 
     client.send(&[b"SHUTDOWN", b"NOSAVE"]);

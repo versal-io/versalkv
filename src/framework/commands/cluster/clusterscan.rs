@@ -400,7 +400,9 @@ fn parse_slot(raw: &[u8]) -> Result<usize, Value> {
     Ok(slot)
 }
 
-const VALID_TYPE_NAMES: &[&str] = &["string", "list", "hash", "set", "zset", "stream"];
+const VALID_TYPE_NAMES: &[&str] = &[
+    "string", "list", "hash", "set", "zset", "stream", "pathhash",
+];
 
 fn is_valid_type_name(name: &[u8]) -> bool {
     VALID_TYPE_NAMES

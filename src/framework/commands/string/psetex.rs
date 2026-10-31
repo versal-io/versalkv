@@ -1,26 +1,24 @@
 use crate::engine::core::{CommandEffects, CommandOutcome, CoreEvent, Value};
-use crate::framework::{CommandArgs, CommandError};
 use crate::framework::commands::command_runtime::CommandRuntime;
+use crate::framework::{CommandArgs, CommandError};
 use bytes::Bytes;
 use command_macros::command;
 
 #[command("PSETEX", runtime)]
 pub fn psetex(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> CommandOutcome {
-    let milliseconds = match std::str::from_utf8(&args.args[1])
-        .ok()
-        .and_then(|s| s.trim().parse::<i64>().ok())
-    {
-        Some(v) => v,
-        None => {
-            return CommandOutcome::reply(Value::error(
-                "ERR value is not an integer or out of range",
-            ))
-        }
-    };
+    let milliseconds =
+        match crate::foundation::io::store::structure::string::encoding::int_encodable(
+            &args.args[1],
+        ) {
+            Some(v) => v,
+            None => {
+                return CommandOutcome::reply(Value::error(
+                    "ERR value is not an integer or out of range",
+                ))
+            }
+        };
     if milliseconds <= 0 {
-        return CommandOutcome::reply(Value::error(
-            "ERR invalid expire time in 'psetex' command",
-        ));
+        return CommandOutcome::reply(Value::error("ERR invalid expire time in 'psetex' command"));
     }
     let abs_ms = match milliseconds.checked_add(runtime.now_ms() as i64) {
         Some(v) => v,

@@ -50,6 +50,7 @@ pub(crate) fn with_legacy_host_dispatcher<R>(
         }
         crate::engine::host::HostRequest::Yield(
             crate::engine::host::HostYield::RdbProgress { .. }
+            | crate::engine::host::HostYield::Module { .. }
             | crate::engine::host::HostYield::AofProgress { .. }
             | crate::engine::host::HostYield::ReplicationReplay { .. },
         ) => Err(crate::engine::host::HostError::Invariant(
@@ -730,6 +731,16 @@ fn map_command_acl_denial(
                 .map(|key| String::from_utf8_lossy(key).to_string())
                 .unwrap_or_default(),
         },
+        AclDenial::Channel(index) => ScriptAclDenial {
+            message: "No permissions to access a channel".to_string(),
+            reason: crate::engine::extension::acl::ACL_DENIED_CHANNEL,
+            object: invocation
+                .args
+                .args
+                .get(index)
+                .map(|channel| String::from_utf8_lossy(channel).into_owned())
+                .unwrap_or_default(),
+        },
     }
 }
 
@@ -904,9 +915,8 @@ fn record_nested_tracking(
         && !conn.tracking_bcast()
         && (!conn.tracking_optin() || conn.tracking_caching())
         && (!conn.tracking_optout() || !conn.tracking_caching());
-    conn.set_tracking_caching(false);
     if should_track {
-        let token = conn.token().0;
+        let token = conn.tracking_token().0;
         for index in invocation.key_indices.into_iter().flatten() {
             runtime.remember_tracked_key(token, &invocation.args.args[index]);
         }

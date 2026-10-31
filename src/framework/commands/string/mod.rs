@@ -7,6 +7,8 @@ pub mod decr;
 #[rustfmt::skip]
 pub mod decrby;
 #[rustfmt::skip]
+pub mod delex;
+#[rustfmt::skip]
 pub mod delifeq;
 #[rustfmt::skip]
 pub mod get;
@@ -24,6 +26,8 @@ pub mod incr;
 pub mod incrby;
 #[rustfmt::skip]
 pub mod incrbyfloat;
+#[rustfmt::skip]
+pub mod increx;
 #[rustfmt::skip]
 pub mod lcs;
 #[rustfmt::skip]
@@ -57,6 +61,7 @@ pub fn register_all(reg: &mut CommandRegistry) {
     reg.register(append::APPEND_SPEC);
     reg.register(decr::DECR_SPEC);
     reg.register(decrby::DECRBY_SPEC);
+    reg.register(delex::DELEX_SPEC);
     reg.register(delifeq::DELIFEQ_SPEC);
     reg.register(get::GET_SPEC);
     reg.register(getdel::GETDEL_SPEC);
@@ -66,6 +71,7 @@ pub fn register_all(reg: &mut CommandRegistry) {
     reg.register(incr::INCR_SPEC);
     reg.register(incrby::INCRBY_SPEC);
     reg.register(incrbyfloat::INCRBYFLOAT_SPEC);
+    reg.register(increx::INCREX_SPEC);
     reg.register(lcs::LCS_SPEC);
     reg.register(mget::MGET_SPEC);
     reg.register(mset::MSET_SPEC);

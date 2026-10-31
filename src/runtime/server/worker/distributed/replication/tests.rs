@@ -16,6 +16,8 @@ use bytes::Bytes;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 
+mod codec_fix_tests;
+
 fn offset(value: i64) -> ReplicationOffset {
     ReplicationOffset::try_from(value).expect("valid test offset")
 }
@@ -39,6 +41,7 @@ fn _queued(conn: &Connection) -> Vec<u8> {
 }
 
 fn send_endoff_for_test(backend: &mut ServerWorkerState, rdb: ConnectionId) {
+    backend.admit_rdb_sync_for_test(rdb);
     let frame = backend
         .replication_runtime
         .take_endoff_for_rdb_candidate_if_unambiguous(
@@ -46,8 +49,84 @@ fn send_endoff_for_test(backend: &mut ServerWorkerState, rdb: ConnectionId) {
             backend.connection_registry.contains(Token(rdb.0)),
             &mut backend.ctx.replication_mut().backlog,
         );
-    if let Some(frame) = frame {
-        backend.connection_registry[Token(rdb.0)].queue_reply(frame);
+    backend.connection_registry[Token(rdb.0)]
+        .queue_reply(frame.expect("admitted RDB candidate must receive ENDOFF"));
+}
+
+impl ServerWorkerState {
+    pub(crate) fn admit_rdb_sync_for_test(&mut self, rdb: ConnectionId) {
+        assert_eq!(
+            self.replication_runtime.role(rdb),
+            Some(crate::framework::distributed::replication::ReplicationConnection::RdbChannelCandidate)
+        );
+        assert!(!self
+            .full_sync
+            .pending_dual_rdb_snapshots
+            .contains_key(&Token(rdb.0)));
+        let mut replies = Vec::new();
+        let mut unblocks = Vec::new();
+        let capa = CommandArgs::from_parts(vec![
+            Bytes::from_static(b"REPLCONF"),
+            Bytes::from_static(b"capa"),
+            Bytes::from_static(b"eof"),
+        ]);
+        assert_eq!(
+            self.try_handle_transport_cmd(
+                rdb.0,
+                rdb.0,
+                &capa,
+                "replconf",
+                false,
+                &mut replies,
+                &mut unblocks
+            ),
+            Some(false)
+        );
+        assert_eq!(replies, vec![b"+OK\r\n".to_vec()]);
+        replies.clear();
+        let sync = CommandArgs::from_parts(vec![Bytes::from_static(b"SYNC")]);
+        assert_eq!(
+            self.try_handle_transport_cmd(
+                rdb.0,
+                rdb.0,
+                &sync,
+                "sync",
+                false,
+                &mut replies,
+                &mut unblocks
+            ),
+            Some(false)
+        );
+        assert!(
+            replies.is_empty(),
+            "candidate SYNC must not send FULLRESYNC: {replies:?}"
+        );
+        assert!(self
+            .full_sync
+            .pending_dual_rdb_snapshots
+            .contains_key(&Token(rdb.0)));
+    }
+
+    pub(crate) fn associate_waiting_rdb_for_test(&mut self, main: ConnectionId, rdb: ConnectionId) {
+        let link = self
+            .replication_runtime
+            .primary_for_connection_mut(main)
+            .unwrap();
+        if link.dual_state() == PrimaryDualChannelState::Disabled {
+            link.transition_to_waiting_for_rdb_channel().unwrap();
+        }
+        self.replication_runtime
+            .register_rdb_candidate(rdb)
+            .unwrap();
+        assert!(self
+            .replication_runtime
+            .associate_rdb_channel(main, rdb)
+            .is_err());
+        assert_eq!(self.replication_runtime.channel_pair_for(main), None);
+        send_endoff_for_test(self, rdb);
+        self.replication_runtime
+            .associate_rdb_channel(main, rdb)
+            .unwrap();
     }
 }
 
@@ -616,18 +695,17 @@ fn deferred_diskless_resync_advertises_fire_time_offset_and_resumes_from_it() {
         .backlog
         .restore_primary_from_rdb("restored", offset(41))
         .unwrap();
-    // This test exercises the fire-time *offset alignment* invariant, which runs
-    // identically on both the fork/relay and the in-process fallback paths. Force
-    // the in-process fallback (mark a persistence child active) so the fire does
-    // NOT fork(): forking inside the shared multi-threaded cargo-test process is
-    // unsound and would reuse fds across parallel tests. The real fork/relay path
-    // is covered by the out-of-process integration test
-    // (tests/integration/replication/diskless_fork.rs).
-    backend
-        .ctx
-        .persistence_mut()
-        .begin_rdb_child(99, 0)
-        .unwrap();
+    // Exercise real admission and offset alignment without forking the shared
+    // test process. Invalid affinity preparation fails before fork and selects
+    // the in-process fallback. An active child would correctly keep All queued.
+    backend.ctx.config_mut().server.bgsave_cpulist = "not-a-cpu-list".to_string();
+    assert!(
+        crate::framework::commands::server::save::prepare_bgsave_cpu_affinity(
+            &backend.ctx.config().server.bgsave_cpulist,
+        )
+        .is_err()
+    );
+    assert!(!backend.ctx.persistence().has_active_child());
 
     let token_value = 41usize;
     let connection_token = add_connection(&mut backend, token_value);
@@ -674,6 +752,7 @@ fn deferred_diskless_resync_advertises_fire_time_offset_and_resumes_from_it() {
     );
 
     backend.fire_deferred_full_resyncs(vec![id]);
+    assert_eq!(backend.ctx.stats().total_forks, 0);
 
     let queued: Vec<u8> = backend.connection_registry[Token(connection_token)]
         .output
@@ -1837,6 +1916,7 @@ fn backlog_pin_resists_eviction_under_churn() {
 
     let main_id = crate::framework::distributed::replication::ConnectionId(main_token);
     let rdb_id = crate::framework::distributed::replication::ConnectionId(rdb_token);
+    send_endoff_for_test(&mut backend, rdb_id);
     backend
         .replication_runtime
         .associate_rdb_channel(main_id, rdb_id)
@@ -1905,10 +1985,10 @@ fn classic_non_dual_main_link_association_is_noop() {
 
     let main_id2 = crate::framework::distributed::replication::ConnectionId(main_token);
     let rdb_id2 = crate::framework::distributed::replication::ConnectionId(rdb_token);
-    backend
+    assert!(backend
         .replication_runtime
         .associate_rdb_channel(main_id2, rdb_id2)
-        .unwrap();
+        .is_err());
     {
         let ServerWorkerState {
             ref mut replication_runtime,
@@ -2017,6 +2097,8 @@ fn unpaired_rdb_candidate_starts_direct_child_after_endoff_flush() {
         &mut pending_unblock,
     );
     assert_eq!(replies, vec![b"+OK\r\n".to_vec()]);
+    assert!(backend.full_sync.pending_dual_rdb_snapshots.is_empty());
+    backend.admit_rdb_sync_for_test(rdb_id);
     assert!(backend
         .full_sync
         .pending_dual_rdb_snapshots
@@ -2150,6 +2232,7 @@ fn paired_rdb_channel_waits_for_unpaired_cohort_member_before_fork() {
         .replication_runtime
         .register_rdb_candidate(second_rdb)
         .unwrap();
+    send_endoff_for_test(&mut backend, first_rdb);
     backend
         .full_sync
         .pending_dual_rdb_snapshots
@@ -2206,6 +2289,7 @@ fn dual_happy_path_rdb_over_rdb_channel() {
 
     let main_id = crate::framework::distributed::replication::ConnectionId(main_token);
     let rdb_id = crate::framework::distributed::replication::ConnectionId(rdb_token);
+    send_endoff_for_test(&mut backend, rdb_id);
     backend
         .replication_runtime
         .associate_rdb_channel(main_id, rdb_id)
@@ -2334,10 +2418,13 @@ fn stale_rdb_token_fallback_to_main_no_panic() {
         .register_rdb_candidate(rdb_id)
         .unwrap();
 
+    add_connection(&mut backend, rdb_token);
+    send_endoff_for_test(&mut backend, rdb_id);
     backend
         .replication_runtime
         .associate_rdb_channel(main_id, rdb_id)
         .unwrap();
+    backend.connection_registry.remove(Token(rdb_token));
 
     backend
         .replication_runtime
@@ -2414,6 +2501,7 @@ fn eof_marker_only_on_rdb_channel_in_dual_mode() {
 
     let main_id = crate::framework::distributed::replication::ConnectionId(main_token);
     let rdb_id = crate::framework::distributed::replication::ConnectionId(rdb_token);
+    send_endoff_for_test(&mut backend, rdb_id);
     backend
         .replication_runtime
         .associate_rdb_channel(main_id, rdb_id)
@@ -2487,3 +2575,302 @@ mod dual;
 mod full_sync;
 mod paused_dual;
 mod regression;
+
+fn boundary_replconf(backend: &mut ServerWorkerState, token: usize, parts: Vec<Bytes>) {
+    let args = CommandArgs {
+        name: Bytes::from_static(b"REPLCONF"),
+        args: parts,
+    };
+    let mut replies = Vec::new();
+    assert_eq!(
+        backend.try_handle_transport_cmd(
+            token,
+            token,
+            &args,
+            "replconf",
+            false,
+            &mut replies,
+            &mut Vec::new(),
+        ),
+        Some(false)
+    );
+    assert_eq!(replies, vec![b"+OK\r\n".to_vec()]);
+}
+
+fn boundary_waiting_main(backend: &mut ServerWorkerState) -> (usize, TcpStream) {
+    let (token, target) = add_runtime_connection(backend);
+    boundary_replconf(
+        backend,
+        token,
+        vec![
+            Bytes::from_static(b"capa"),
+            Bytes::from_static(b"eof"),
+            Bytes::from_static(b"capa"),
+            Bytes::from_static(b"psync2"),
+            Bytes::from_static(b"capa"),
+            Bytes::from_static(b"dual-channel"),
+        ],
+    );
+    assert_eq!(
+        run_psync(backend, token, token, b"PSYNC"),
+        vec![protocol::DUAL_CHANNEL_SYNC_REPLY.to_vec()]
+    );
+    assert_eq!(
+        backend
+            .replication_runtime
+            .primary_for_connection(ConnectionId(token))
+            .unwrap()
+            .dual_state(),
+        PrimaryDualChannelState::WaitingForRdbChannel
+    );
+    (token, target)
+}
+
+fn boundary_sync_candidate(backend: &mut ServerWorkerState, filter: &[u8]) -> (usize, TcpStream) {
+    let (token, target) = add_runtime_connection(backend);
+    boundary_replconf(
+        backend,
+        token,
+        vec![
+            Bytes::from_static(b"capa"),
+            Bytes::from_static(b"eof"),
+            Bytes::from_static(b"rdb-only"),
+            Bytes::from_static(b"1"),
+            Bytes::from_static(b"rdb-channel"),
+            Bytes::from_static(b"1"),
+            Bytes::from_static(b"rdb-filter-only"),
+            Bytes::copy_from_slice(filter),
+        ],
+    );
+    backend.admit_rdb_sync_for_test(ConnectionId(token));
+    (token, target)
+}
+
+fn boundary_read_endoff(target: &mut TcpStream) -> protocol::EndOffset {
+    target
+        .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+        .unwrap();
+    let mut line = Vec::new();
+    for _ in 0..256 {
+        let mut byte = [0];
+        target.read_exact(&mut byte).expect("read flushed ENDOFF");
+        line.push(byte[0]);
+        if line.ends_with(b"\r\n") {
+            return protocol::parse_end_offset(&line)
+                .expect("first frame must be a complete ENDOFF");
+        }
+    }
+    panic!("ENDOFF exceeded the bounded line length");
+}
+
+#[test]
+fn boundary_dual_candidates_keep_other_filter_deadlines_and_waits() {
+    let _fork_guard = crate::framework::commands::server::save::diskless_fork_test_guard();
+    let mut observations = Vec::new();
+    for associate in [false, true] {
+        let mut backend = ServerWorkerState::new(1).unwrap();
+        backend
+            .ctx
+            .config_mut()
+            .replication
+            .dual_channel_replication = true;
+        backend.ctx.config_mut().replication.repl_diskless_sync = true;
+        backend
+            .ctx
+            .config_mut()
+            .replication
+            .repl_diskless_sync_delay = 30;
+        backend
+            .ctx
+            .config_mut()
+            .replication
+            .repl_diskless_sync_max_replicas = 2;
+        let (main, _main_target) = boundary_waiting_main(&mut backend);
+        let (_other_main, _other_main_target) = boundary_waiting_main(&mut backend);
+        let (first, _first_target) = boundary_sync_candidate(&mut backend, b"functions");
+        let first_deadline = backend.full_sync.pending_dual_rdb_snapshots[&Token(first)].0;
+        let (other, mut other_target) = boundary_sync_candidate(&mut backend, b"");
+        let preserved_after_sync =
+            backend.full_sync.pending_dual_rdb_snapshots[&Token(first)].0 == first_deadline;
+        let other_deadline = backend.full_sync.pending_dual_rdb_snapshots[&Token(other)].0;
+        let other_future = other_deadline > crate::foundation::io::sys::time::mstime();
+
+        if associate {
+            // Exercise the real association release with an existing ENDOFF API.
+            let frame = backend
+                .replication_runtime
+                .take_endoff_for_rdb_candidate_if_unambiguous(
+                    ConnectionId(first),
+                    true,
+                    &mut backend.ctx.replication_mut().backlog,
+                )
+                .unwrap();
+            let endoff = protocol::parse_end_offset(&frame).unwrap();
+            assert_eq!(
+                endoff.offset,
+                backend.ctx.replication().backlog.reported_offset()
+            );
+            let client_id = backend.connection_registry[Token(first)].client_id();
+            boundary_replconf(
+                &mut backend,
+                main,
+                vec![
+                    Bytes::from_static(b"set-rdb-client-id"),
+                    Bytes::from(client_id.to_string()),
+                ],
+            );
+        } else {
+            backend.drive_pending_dual_rdb_snapshots();
+        }
+        let preserved_after_release = backend
+            .full_sync
+            .pending_dual_rdb_snapshots
+            .get(&Token(other))
+            .map(|pending| pending.0)
+            == Some(other_deadline);
+        let no_other_endoff = backend
+            .full_sync
+            .pending_dual_rdb_snapshots
+            .get(&Token(other))
+            .is_some_and(|pending| pending.1.is_empty());
+        let waits = backend.replication_runtime.psync_wait_owner_count();
+        let no_child = backend.full_sync.direct_dual_rdb_child.is_none();
+        backend.abort_direct_dual_rdb_child_for_shutdown();
+        other_target.set_nonblocking(true).unwrap();
+        let mut byte = [0];
+        let no_other_wire = matches!(other_target.read(&mut byte), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock);
+        observations.push((
+            associate,
+            preserved_after_sync,
+            other_future,
+            preserved_after_release,
+            no_other_endoff,
+            waits,
+            no_child,
+            no_other_wire,
+        ));
+    }
+    for (associate, sync_deadline, future, release_deadline, no_endoff, waits, no_child, no_wire) in
+        observations
+    {
+        assert_eq!(
+            (
+                sync_deadline,
+                future,
+                release_deadline,
+                no_endoff,
+                waits,
+                no_child,
+                no_wire
+            ),
+            (true, true, true, true, usize::from(associate), true, true),
+            "different-filter candidate must not alter another cohort; association={associate}"
+        );
+    }
+}
+
+#[test]
+fn boundary_dual_same_filter_max_starts_before_deadline() {
+    let _fork_guard = crate::framework::commands::server::save::diskless_fork_test_guard();
+    let mut backend = ServerWorkerState::new(1).unwrap();
+    backend
+        .ctx
+        .config_mut()
+        .replication
+        .dual_channel_replication = true;
+    backend.ctx.config_mut().replication.repl_diskless_sync = true;
+    backend
+        .ctx
+        .config_mut()
+        .replication
+        .repl_diskless_sync_delay = 30;
+    backend
+        .ctx
+        .config_mut()
+        .replication
+        .repl_diskless_sync_max_replicas = 2;
+    let (_first_main, _first_main_target) = boundary_waiting_main(&mut backend);
+    let (_second_main, _second_main_target) = boundary_waiting_main(&mut backend);
+    let (first, mut first_target) = boundary_sync_candidate(&mut backend, b"functions");
+    assert!(
+        backend.full_sync.pending_dual_rdb_snapshots[&Token(first)].0
+            > crate::foundation::io::sys::time::mstime()
+    );
+    let (second, mut second_target) = boundary_sync_candidate(&mut backend, b"functions");
+    let boundary = backend.ctx.replication().backlog.snapshot_boundary();
+    backend.drive_pending_dual_rdb_snapshots();
+    let child_connections = backend
+        .full_sync
+        .direct_dual_rdb_child
+        .as_ref()
+        .map(|child| child.rdb_connections.clone());
+    let waits = backend.replication_runtime.psync_wait_owner_count();
+    backend.abort_direct_dual_rdb_child_for_shutdown();
+
+    let mut child_connections = child_connections.expect("same-filter max must start a snapshot");
+    child_connections.sort_by_key(|connection| connection.0);
+    assert_eq!(
+        child_connections,
+        vec![ConnectionId(first), ConnectionId(second)]
+    );
+    assert_eq!(waits, 2);
+    for target in [&mut first_target, &mut second_target] {
+        assert_eq!(
+            boundary_read_endoff(target).offset,
+            boundary.reported_offset()
+        );
+    }
+}
+
+#[test]
+fn boundary_dual_expired_group_starts_with_two_waiting_mains() {
+    let _fork_guard = crate::framework::commands::server::save::diskless_fork_test_guard();
+    let mut backend = ServerWorkerState::new(1).unwrap();
+    backend
+        .ctx
+        .config_mut()
+        .replication
+        .dual_channel_replication = true;
+    backend.ctx.config_mut().replication.repl_diskless_sync = true;
+    backend
+        .ctx
+        .config_mut()
+        .replication
+        .repl_diskless_sync_delay = 30;
+    backend
+        .ctx
+        .config_mut()
+        .replication
+        .repl_diskless_sync_max_replicas = 2;
+    let (_first_main, _first_main_target) = boundary_waiting_main(&mut backend);
+    let (_second_main, _second_main_target) = boundary_waiting_main(&mut backend);
+    let (rdb, mut target) = boundary_sync_candidate(&mut backend, b"functions");
+    assert_eq!(backend.full_sync.pending_dual_rdb_snapshots.len(), 1);
+    // Only time is controlled; admission and ENDOFF ownership remain real.
+    backend
+        .full_sync
+        .pending_dual_rdb_snapshots
+        .get_mut(&Token(rdb))
+        .unwrap()
+        .0 = crate::foundation::io::sys::time::mstime().saturating_sub(1);
+    let boundary = backend.ctx.replication().backlog.snapshot_boundary();
+    backend.drive_pending_dual_rdb_snapshots();
+    let child_connections = backend
+        .full_sync
+        .direct_dual_rdb_child
+        .as_ref()
+        .map(|child| child.rdb_connections.clone());
+    let waits = backend.replication_runtime.psync_wait_owner_count();
+    backend.abort_direct_dual_rdb_child_for_shutdown();
+
+    assert_eq!(
+        child_connections,
+        Some(vec![ConnectionId(rdb)]),
+        "expired cohort must not depend on waiting-main count"
+    );
+    assert_eq!(waits, 1);
+    assert_eq!(
+        boundary_read_endoff(&mut target).offset,
+        boundary.reported_offset()
+    );
+}

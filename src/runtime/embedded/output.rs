@@ -11,6 +11,8 @@ pub enum Reply {
     Bulk(Option<String>),
     Integer(i64),
     Double(f64),
+    #[cfg_attr(feature = "wasm", serde(rename = "decimal_double"))]
+    DecimalDouble(String),
     Boolean(bool),
     Array(Vec<Option<String>>),
     Replies(Vec<Reply>),
@@ -37,6 +39,7 @@ impl Reply {
             Value::Error(value) => Self::Error(lossy(&value)),
             Value::Integer(value) => Self::Integer(value),
             Value::Double(value) => Self::Double(value),
+            Value::DecimalDouble(value) => Self::DecimalDouble(lossy(value.as_bytes())),
             Value::Bulk(value) => Self::Bulk(Some(lossy(&value))),
             Value::Null | Value::NullArray => Self::Bulk(None),
             Value::Boolean(value) => Self::Boolean(value),
@@ -80,4 +83,34 @@ impl Reply {
 
 fn lossy(value: &[u8]) -> String {
     String::from_utf8_lossy(value).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::foundation::io::protocol::DecimalDoubleText;
+
+    #[test]
+    fn decimal_double_embedded_replies_preserve_numeric_identity_recursively() {
+        for text in ["9007199254740993", "1e4932", "inf", "-inf"] {
+            let scalar = Value::DecimalDouble(DecimalDoubleText::new(text.to_owned()).unwrap());
+            let expected = Reply::DecimalDouble(text.to_owned());
+            assert_eq!(Reply::from_value(scalar.clone()), expected);
+            assert_eq!(
+                Reply::from_value(Value::Array(vec![scalar.clone(), scalar.clone()])),
+                Reply::Replies(vec![expected.clone(), expected.clone()])
+            );
+            assert_eq!(
+                Reply::from_value(Value::Map(vec![(Value::bulk("key"), scalar.clone())])),
+                Reply::Map(vec![(
+                    Reply::Bulk(Some("key".to_owned())),
+                    expected.clone()
+                )])
+            );
+            assert_eq!(
+                Reply::from_value(Value::attribute(vec![], scalar)),
+                expected
+            );
+        }
+    }
 }

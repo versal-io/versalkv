@@ -176,6 +176,12 @@ impl ServerContext {
     pub fn io_thread_info(&self) -> &IoThreadInfo {
         &self.io_thread_info
     }
+    pub fn tls_info(&self) -> &crate::foundation::memory::tls::TlsInfo {
+        &self.tls_info
+    }
+    pub fn set_tls_info(&mut self, info: crate::foundation::memory::tls::TlsInfo) {
+        self.tls_info = info;
+    }
     pub fn set_io_thread_info(&mut self, info: IoThreadInfo) {
         self.io_thread_info = info;
     }

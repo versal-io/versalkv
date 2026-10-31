@@ -197,10 +197,7 @@ fn abnormal_reap_closes_unpaired_candidates_and_associated_main_once() {
         .register_rdb_candidate(unpaired_rdb)
         .unwrap();
     let replica_id = register_primary(&mut backend, main);
-    backend
-        .replication_runtime
-        .register_rdb_channel(paired_rdb, main)
-        .unwrap();
+    backend.associate_waiting_rdb_for_test(main, paired_rdb);
     let mut child = install_child(
         &mut backend,
         vec![unpaired_rdb, paired_rdb],
@@ -250,10 +247,7 @@ fn target_drop_before_publication_aborts_direct_child_cohort() {
         add_connection(&mut backend, connection.0);
     }
     let replica_id = register_primary(&mut backend, main);
-    backend
-        .replication_runtime
-        .register_rdb_channel(paired_rdb, main)
-        .unwrap();
+    backend.associate_waiting_rdb_for_test(main, paired_rdb);
     backend
         .replication_runtime
         .register_rdb_candidate(remaining_candidate)
@@ -292,10 +286,7 @@ fn waiting_direct_child() -> (ServerWorkerState, ConnectionId, ConnectionId, Rep
         .primary_link_mut(replica_id)
         .expect("primary link exists");
     link.transition_to_waiting_for_rdb_channel().unwrap();
-    backend
-        .replication_runtime
-        .register_rdb_channel(rdb, main)
-        .unwrap();
+    backend.associate_waiting_rdb_for_test(main, rdb);
     let link = backend
         .replication_runtime
         .primary_link_mut(replica_id)

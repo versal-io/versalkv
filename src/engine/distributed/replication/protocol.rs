@@ -82,6 +82,23 @@ pub fn build_replconf_rdb_only() -> Vec<u8> {
 
 #[allow(dead_code)] // Wired into the dual-channel state machine in a later slice.
 pub fn build_replconf_rdb_channel() -> Vec<u8> {
+    build_replconf_rdb_channel_with_compression("no")
+}
+
+pub fn build_replconf_rdb_channel_with_compression(mode: &str) -> Vec<u8> {
+    if compression_is_lz4(mode) {
+        return encode_command(&[
+            b"REPLCONF",
+            b"capa",
+            b"eof",
+            b"capa",
+            b"lz4",
+            b"rdb-only",
+            b"1",
+            b"rdb-channel",
+            b"1",
+        ]);
+    }
     encode_command(&[
         b"REPLCONF",
         b"capa",
@@ -124,7 +141,13 @@ pub fn parse_end_offset(line: &[u8]) -> Option<EndOffset> {
         .filter(|field| !field.is_empty());
     let offset = parse_live_replication_offset(fields.next()?)?;
     let replid = parse_replid(fields.next()?)?.to_string();
-    let db_id = parse_utf8::<u32>(fields.next()?)?;
+    let db_field = fields.next()?;
+    // C uses -1 before the replication stream selects its first database.
+    let db_id = if db_field == b"-1" {
+        0
+    } else {
+        parse_utf8::<u32>(db_field)?
+    };
     let client_id = parse_utf8::<u64>(fields.next()?)?;
     if fields.next().is_some() {
         return None;
@@ -159,6 +182,28 @@ pub fn build_replconf_capa_with_dual_channel(enabled: bool) -> Vec<u8> {
     } else {
         build_replconf_capa()
     }
+}
+
+pub fn compression_is_lz4(mode: &str) -> bool {
+    mode.eq_ignore_ascii_case("yes") || mode.eq_ignore_ascii_case("lz4")
+}
+
+pub fn negotiate_lz4(mode: &str, capabilities: &[String]) -> bool {
+    compression_is_lz4(mode) && peer_supports_capability(capabilities, "lz4")
+}
+
+pub fn build_replconf_capabilities(dual_channel: bool, mode: &str) -> Vec<u8> {
+    let mut parts: Vec<&[u8]> = vec![b"REPLCONF", b"capa", b"eof", b"capa", b"psync2"];
+    if dual_channel {
+        parts.extend([b"capa".as_slice(), DUAL_CHANNEL_CAPABILITY.as_bytes()]);
+    }
+    if mode.eq_ignore_ascii_case("zstd") {
+        parts.extend([b"capa".as_slice(), b"zstd"]);
+    }
+    if compression_is_lz4(mode) || mode.eq_ignore_ascii_case("zstd") {
+        parts.extend([b"capa".as_slice(), b"lz4"]);
+    }
+    encode_command(&parts)
 }
 
 pub fn peer_supports_capability(capabilities: &[String], expected: &str) -> bool {
@@ -540,5 +585,43 @@ mod tests {
             build_auth(Some(b"user"), b"pass"),
             b"*3\r\n$4\r\nAUTH\r\n$4\r\nuser\r\n$4\r\npass\r\n".to_vec()
         );
+    }
+
+    #[test]
+    fn boundary_end_offset_unselected_database_defaults_to_zero() {
+        let replid = "0123456789abcdef0123456789abcdef01234567";
+        for db_id in ["-2", "-2147483648", "4294967296", "invalid"] {
+            let frame = format!("$ENDOFF:123 {replid} {db_id} 91\r\n");
+            assert_eq!(
+                parse_end_offset(frame.as_bytes()),
+                None,
+                "invalid database {db_id}"
+            );
+        }
+        for frame in [
+            format!("$ENDOFF:-1 {replid} -1 91\r\n"),
+            format!("$ENDOFF:9223372036854775808 {replid} -1 91\r\n"),
+            "$ENDOFF:123 invalid -1 91\r\n".to_string(),
+            format!("$ENDOFF:123 {replid} -1 -1\r\n"),
+            format!("$ENDOFF:123 {replid} -1 91 extra\r\n"),
+        ] {
+            assert_eq!(parse_end_offset(frame.as_bytes()), None, "{frame:?}");
+        }
+        let frames = [
+            format!("$ENDOFF:123 {replid} -1 91\r\n"),
+            format!("$ENDOFF:123 {replid} -1 91"),
+        ];
+        for frame in frames {
+            assert_eq!(
+                parse_end_offset(frame.as_bytes()),
+                Some(EndOffset {
+                    offset: offset(123),
+                    replid: replid.to_string(),
+                    db_id: 0,
+                    client_id: 91,
+                }),
+                "only the exact unselected-database sentinel maps to local DB 0"
+            );
+        }
     }
 }

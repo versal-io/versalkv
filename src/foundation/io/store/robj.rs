@@ -4,6 +4,7 @@ use std::fmt::Debug;
 use crate::foundation::io::store::structure::hash::{HashHt, HashLp};
 use crate::foundation::io::store::structure::hashtable::HashTable;
 use crate::foundation::io::store::structure::list::{ListLp, ListValue};
+use crate::foundation::io::store::structure::path_hash::PathHash;
 use crate::foundation::io::store::structure::set::{IntSet, SetLp, ValkeySet};
 use crate::foundation::io::store::structure::stream::{StreamLp, ValkeyStream};
 use crate::foundation::io::store::structure::string::encoding::int_encodable;
@@ -154,6 +155,18 @@ impl Collection for ValkeyStream {
     }
 }
 
+impl Collection for PathHash {
+    fn type_name(&self) -> &'static str {
+        "pathhash"
+    }
+    fn len(&self) -> usize {
+        self.len()
+    }
+    fn memory_usage(&self) -> usize {
+        self.memory_usage()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Robj {
     StrInt(StrInt),
@@ -170,6 +183,7 @@ pub enum Robj {
     ZSetListpack(ZSetLp),
     StreamListpack(Box<ValkeyStream>),
     StreamRadix(StreamLp),
+    PathHash(Box<PathHash>),
 }
 
 impl Robj {
@@ -198,6 +212,7 @@ impl Robj {
             Robj::SetHashtable(_) | Robj::SetIntset(_) | Robj::SetListpack(_) => Type::Set,
             Robj::ZSetSkiplist(_) | Robj::ZSetListpack(_) => Type::ZSet,
             Robj::StreamListpack(_) | Robj::StreamRadix(_) => Type::Stream,
+            Robj::PathHash(_) => Type::PathHash,
         }
     }
 
@@ -217,6 +232,7 @@ impl Robj {
             Robj::ZSetListpack(_) => Encoding::Listpack,
             Robj::StreamListpack(_) => Encoding::StreamP,
             Robj::StreamRadix(_) => Encoding::StreamP,
+            Robj::PathHash(_) => Encoding::PathHash,
         }
     }
 
@@ -293,6 +309,7 @@ impl Robj {
             Robj::ZSetListpack(v) => Some(v as &dyn Collection),
             Robj::StreamListpack(v) => Some(v.as_ref() as &dyn Collection),
             Robj::StreamRadix(_) => None,
+            Robj::PathHash(v) => Some(v.as_ref() as &dyn Collection),
             Robj::StrInt(_) | Robj::StrEmbstr(_) | Robj::StrRaw(_) => None,
         }
     }
@@ -310,6 +327,7 @@ impl Robj {
             Robj::ZSetListpack(v) => Some(v as &mut dyn Collection),
             Robj::StreamListpack(v) => Some(v.as_mut() as &mut dyn Collection),
             Robj::StreamRadix(_) => None,
+            Robj::PathHash(v) => Some(v.as_mut() as &mut dyn Collection),
             Robj::StrInt(_) | Robj::StrEmbstr(_) | Robj::StrRaw(_) => None,
         }
     }
@@ -326,6 +344,7 @@ impl Robj {
             Robj::HashHashtable(_) | Robj::HashListpack(_) => self.hash_is_empty(),
             Robj::ZSetSkiplist(_) | Robj::ZSetListpack(_) => self.zset_is_empty(),
             Robj::StreamListpack(_) | Robj::StreamRadix(_) => false,
+            Robj::PathHash(_) => false,
             Robj::StrInt(_) | Robj::StrEmbstr(_) | Robj::StrRaw(_) => false,
         }
     }
@@ -346,6 +365,7 @@ impl Robj {
             Robj::ZSetListpack(v) => v.memory_usage(),
             Robj::StreamListpack(v) => v.memory_usage(),
             Robj::StreamRadix(_) => std::mem::size_of::<Robj>(),
+            Robj::PathHash(v) => v.memory_usage(),
         }
     }
 

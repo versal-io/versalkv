@@ -6,7 +6,7 @@ use crate::framework::{CmdFlags, CommandMeta, DispatchGroup};
 
 pub const SISMEMBER_META: CommandMeta = CommandMeta {
     name: "sismember",
-    arity: 3,
+    arity: -3,
     flags: (CMD_READONLY | CMD_FAST) as CmdFlags,
     dispatch_group: DispatchGroup::Default,
     first_key: 1,

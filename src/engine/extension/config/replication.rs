@@ -11,6 +11,7 @@ pub struct ReplicationConfig {
     pub replica_announce_port: u16,
     pub replica_announced: bool,
     pub dual_channel_replication: bool,
+    pub repl_compression: String,
     pub replica_read_only: bool,
     /// C `replica-ignore-maxmemory`, enabled by default to preserve primary parity.
     pub replica_ignore_maxmemory: bool,
@@ -58,6 +59,7 @@ impl ReplicationConfig {
             replica_announce_port: 0,
             replica_announced: true,
             dual_channel_replication: false,
+            repl_compression: "no".to_string(),
             replica_read_only: true,
             replica_ignore_maxmemory: true,
             replica_ignore_disk_write_errors: false,

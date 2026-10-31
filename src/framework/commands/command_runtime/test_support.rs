@@ -8,9 +8,11 @@ pub(crate) struct TestCommandRuntime {
     pub selected_db: u32,
     pub now_ms: u64,
     pub read_expired_values: bool,
+    pub suppress_lazy_expire: bool,
     pub touch_read_keys: bool,
     pub active_expire_enabled: bool,
     pub stream_node_limits: (usize, usize),
+    pub hash_encoding_limits: (usize, usize),
 }
 
 impl TestCommandRuntime {
@@ -20,9 +22,11 @@ impl TestCommandRuntime {
             selected_db: 0,
             now_ms,
             read_expired_values: false,
+            suppress_lazy_expire: false,
             touch_read_keys: false,
             active_expire_enabled: true,
             stream_node_limits: (100, 4096),
+            hash_encoding_limits: (512, 64),
         }
     }
 }
@@ -51,6 +55,7 @@ impl CommandRuntime for TestCommandRuntime {
     fn limits(&self) -> RuntimeLimits {
         RuntimeLimits {
             stream_node: self.stream_node_limits,
+            hash_encoding: self.hash_encoding_limits,
             ..RuntimeLimits::default()
         }
     }
@@ -59,7 +64,7 @@ impl CommandRuntime for TestCommandRuntime {
         RuntimePolicies {
             read_expired_values: self.read_expired_values,
             touch_read_keys: self.touch_read_keys,
-            suppress_lazy_expire: self.read_expired_values,
+            suppress_lazy_expire: self.read_expired_values || self.suppress_lazy_expire,
             preserve_expired_keys: self.read_expired_values,
             active_expire: self.active_expire_enabled,
             ..RuntimePolicies::default()

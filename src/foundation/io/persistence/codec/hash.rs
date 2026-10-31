@@ -9,7 +9,7 @@ use crate::foundation::io::store::structure::hash::{HashHt, HashLp};
 use crate::foundation::io::store::Robj;
 use bytes::Bytes;
 use indexmap::IndexMap;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub struct HashCodec;
 
@@ -122,16 +122,36 @@ impl HashCodec {
         }
     }
 
-    pub(super) fn load_with_field_expires_detailed(
+    #[cfg(test)]
+    fn load_with_field_expires_detailed(
         buf: &[u8],
         pos: &mut usize,
         now_ms: Option<u64>,
     ) -> Option<(HashHt, HashMap<Vec<u8>, u64>, Vec<Bytes>)> {
+        let (hash, expires, skipped, _) =
+            Self::load_with_field_expires_and_limits(buf, pos, now_ms, 512, 64)?;
+        Some((hash, expires, skipped))
+    }
+
+    pub(super) fn load_with_field_expires_and_limits(
+        buf: &[u8],
+        pos: &mut usize,
+        now_ms: Option<u64>,
+        max_entries: usize,
+        max_value_size: usize,
+    ) -> Option<(HashHt, HashMap<Vec<u8>, u64>, Vec<Bytes>, usize)> {
         let (len, encoded) = load_len(buf, pos)?;
         if encoded {
             return None;
         }
-        let mut map = IndexMap::with_capacity(len as usize);
+        let declared_len = usize::try_from(len).ok()?;
+        // Each triple needs at least two string headers and an expiry.
+        if declared_len > buf.len().saturating_sub(*pos) / 10 {
+            return None;
+        }
+        let mut is_listpack = declared_len <= max_entries;
+        let mut seen = HashSet::new();
+        let mut map = IndexMap::with_capacity(declared_len);
         let mut expires = HashMap::new();
         let mut skipped_expired_fields = Vec::new();
         for _ in 0..len {
@@ -143,9 +163,16 @@ impl HashCodec {
             if expiry < -1 {
                 return None;
             }
+            if is_listpack && !seen.insert(field.clone()) {
+                return None;
+            }
             if matches!(now_ms, Some(now) if expiry != -1 && (expiry as u64) < now) {
                 skipped_expired_fields.push(Bytes::from(field));
                 continue;
+            }
+            if is_listpack && (field.len() > max_value_size || value.len() > max_value_size) {
+                is_listpack = false;
+                seen.clear();
             }
             if expiry != -1 {
                 expires.insert(field.clone(), expiry as u64);
@@ -160,6 +187,7 @@ impl HashCodec {
             },
             expires,
             skipped_expired_fields,
+            declared_len,
         ))
     }
 }
@@ -174,6 +202,65 @@ mod tests {
         save_len(&mut out, s.len() as u64);
         out.extend_from_slice(s);
         out
+    }
+
+    #[test]
+    fn hfe_hash_2_rebuilds_real_listpack_and_retains_declared_length_choice() {
+        use crate::foundation::io::persistence::codec::{
+            load_robj_with_hash_field_expires, types::RDB_TYPE_HASH_2,
+        };
+        for count in [1, 513] {
+            let mut buf = Vec::new();
+            save_len(&mut buf, count);
+            for index in 0..count {
+                buf.extend_from_slice(&enc_string(format!("f{index}").as_bytes()));
+                buf.extend_from_slice(&enc_string(b"v"));
+                buf.extend_from_slice(&(if index == 0 { 100i64 } else { 1i64 }).to_le_bytes());
+            }
+            let mut pos = 0;
+            let (object, expires) =
+                load_robj_with_hash_field_expires(&buf, &mut pos, RDB_TYPE_HASH_2, Some(100))
+                    .unwrap();
+            assert_eq!(object.hash_len(), 1);
+            assert_eq!(expires.get(b"f0" as &[u8]), Some(&100));
+            assert_eq!(matches!(object, Robj::HashListpack(_)), count == 1);
+        }
+    }
+
+    #[test]
+    fn hfe_hash_2_listpack_rejects_duplicates_before_expiry_filter() {
+        use crate::foundation::io::persistence::codec::{
+            load_robj_with_hash_field_expires, types::RDB_TYPE_HASH_2,
+        };
+        let mut buf = Vec::new();
+        save_len(&mut buf, 2);
+        for expiry in [1i64, 200] {
+            buf.extend_from_slice(&enc_string(b"duplicate"));
+            buf.extend_from_slice(&enc_string(b"v"));
+            buf.extend_from_slice(&expiry.to_le_bytes());
+        }
+        let mut pos = 0;
+        assert!(
+            load_robj_with_hash_field_expires(&buf, &mut pos, RDB_TYPE_HASH_2, Some(100)).is_none()
+        );
+    }
+
+    #[test]
+    fn hfe_hash_2_rejects_invalid_and_truncated_expiries() {
+        let mut buf = Vec::new();
+        save_len(&mut buf, 1);
+        buf.extend_from_slice(&enc_string(b"f"));
+        buf.extend_from_slice(&enc_string(b"v"));
+        let prefix_len = buf.len();
+        buf.extend_from_slice(&(-2i64).to_le_bytes());
+        assert!(HashCodec::load_with_field_expires_detailed(&buf, &mut 0, None).is_none());
+        buf[prefix_len..].copy_from_slice(&i64::MAX.to_le_bytes());
+        for length in prefix_len..buf.len() {
+            assert!(
+                HashCodec::load_with_field_expires_detailed(&buf[..length], &mut 0, None).is_none()
+            );
+        }
+        assert!(HashCodec::load_with_field_expires_detailed(&buf, &mut 0, None).is_some());
     }
 
     #[test]

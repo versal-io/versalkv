@@ -83,6 +83,10 @@ impl ServerWorkerState {
     }
 
     pub(crate) fn complete_io_read(&mut self, completion: ReadCompletion) {
+        if self.io_threads.is_cluster_bus(completion.id.token) {
+            self.complete_cluster_bus_read(completion);
+            return;
+        }
         let id = completion.id;
         match self.io_threads.complete_read(completion) {
             ReadCompletionAction::Apply {
@@ -128,6 +132,10 @@ impl ServerWorkerState {
     }
 
     pub(crate) fn complete_io_write(&mut self, completion: WriteCompletion) {
+        if self.io_threads.is_cluster_bus(completion.id.token) {
+            self.complete_cluster_bus_write(completion);
+            return;
+        }
         self.apply_threaded_write_completion(completion);
     }
 
@@ -357,9 +365,11 @@ impl ServerWorkerState {
 
     pub(crate) fn dispatch_worker_completion_events(&mut self) {
         let completions = self.worker_completions.drain();
+        self.begin_cluster_bus_receive_batch();
         for completion in completions {
             self.dispatch_worker_completion_now(completion);
         }
+        self.finish_cluster_bus_receive_batch();
     }
 
     pub(crate) fn apply_worker_completion(&mut self, completion: WorkerCompletionEvent) {

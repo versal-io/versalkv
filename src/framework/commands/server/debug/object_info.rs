@@ -1,4 +1,3 @@
-
 use crate::engine::command::context::CommandConn;
 use crate::foundation::io::persistence::codec::decoder_compact;
 use crate::foundation::io::persistence::codec::types::QUICKLIST_NODE_CONTAINER_PACKED;
@@ -30,7 +29,7 @@ pub(super) fn debug_object(
 
     let key = args.args[1].clone();
     let db_idx = conn.selected_db();
-    let (obj, field_expires, eviction) = {
+    let (obj, field_expires, eviction, hash_has_string_refs) = {
         let db = match ctx.db(db_idx) {
             Some(d) => d,
             None => return Value::error("ERR DB index is out of range"),
@@ -50,15 +49,17 @@ pub(super) fn debug_object(
                 idle: db.get_lru_idle(&key),
             }
         };
-        (entry.0, entry.2, eviction)
+        (
+            entry.0,
+            entry.2,
+            eviction,
+            db.hash_key_has_string_refs(&key),
+        )
     };
-    let hash_has_volatile = !field_expires.is_empty();
-    let enc = encoding_display_name(&obj, object_encoding_limits(ctx), hash_has_volatile);
+    let hash_requires_hashtable = !field_expires.is_empty() || hash_has_string_refs;
+    let enc = encoding_display_name(&obj, object_encoding_limits(ctx), hash_requires_hashtable);
 
-    let mut line = format!(
-        "Value at:0x0000000000000000 refcount:1 encoding:{}",
-        enc
-    );
+    let mut line = format!("Value at:0x0000000000000000 refcount:1 encoding:{}", enc);
     if !fast {
         let fill = ctx.config().encoding.list_max_listpack_size;
         let compress = ctx.config().persistence.rdbcompression.uses_lzf();
@@ -216,7 +217,6 @@ where
     w.write_string(&decoder_compact::listpack_encode(&items));
 }
 
-
 #[derive(Clone, Copy, PartialEq)]
 enum Container {
     Packed,
@@ -303,7 +303,7 @@ fn save_quicklist2_body<W: RdbWriter>(list: &ListValue, fill: i64, w: &mut W) {
     w.write_len(nodes.len() as u64);
     for node in &nodes {
         let container = match node.container {
-            Container::Plain => 1, // QUICKLIST_NODE_CONTAINER_PLAIN
+            Container::Plain => 1,  // QUICKLIST_NODE_CONTAINER_PLAIN
             Container::Packed => 2, // QUICKLIST_NODE_CONTAINER_PACKED
         };
         w.write_len(container);
@@ -335,7 +335,6 @@ fn quicklist_extras(obj: &Robj, ctx: &ServerContext, fast: bool) -> String {
     }
     extra
 }
-
 
 const STREAM_NODE_MAX_BYTES: usize = 4096;
 
@@ -379,7 +378,11 @@ fn split_stream_nodes(stream: &ValkeyStream, max_entries: i64) -> Vec<MacroNode>
                 lp: Vec::new(),
             });
         } else {
-            nodes.last_mut().expect("tail node").entries.push((*id, fields.clone()));
+            nodes
+                .last_mut()
+                .expect("tail node")
+                .entries
+                .push((*id, fields.clone()));
         }
     }
     for node in &mut nodes {
@@ -440,11 +443,7 @@ fn build_node_lp(primary: StreamID, entries: &[(StreamID, Vec<(Bytes, Bytes)>)])
 }
 
 fn fields_same(master: &[(Bytes, Bytes)], fields: &[(Bytes, Bytes)]) -> bool {
-    master.len() == fields.len()
-        && master
-            .iter()
-            .zip(fields)
-            .all(|((a, _), (b, _))| a == b)
+    master.len() == fields.len() && master.iter().zip(fields).all(|((a, _), (b, _))| a == b)
 }
 
 fn save_stream_group<W: RdbWriter>(group: &StreamGroup, w: &mut W) {
@@ -474,4 +473,34 @@ fn save_stream_group<W: RdbWriter>(group: &StreamGroup, w: &mut W) {
 
 fn write_raw_id<W: RdbWriter>(id: &StreamID, w: &mut W) {
     w.write_raw(&encode_stream_id(id));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::framework::capabilities::connection::Connection;
+
+    #[test]
+    fn debug_object_reports_stringref_hashtable_with_and_without_fast_mode() {
+        let mut ctx = ServerContext::new(1);
+        let db = ctx.db_mut(0).unwrap();
+        db.hash_set_with_limits(b"hash", b"field", b"value", 512, 64)
+            .unwrap();
+        assert!(db.set_hash_string_ref(b"hash", b"field", b"value"));
+        assert!(!db.hash_key_has_volatile_fields(b"hash"));
+        let mut conn = Connection::new_fake();
+        for is_fast in [false, true] {
+            let mut parts = vec!["DEBUG".into(), "OBJECT".into(), "hash".into()];
+            if is_fast {
+                parts.push("FAST".into());
+            }
+            let result = debug_object(&mut conn, &CommandArgs::from_parts(parts), &mut ctx);
+            let Value::SimpleString(line) = result else {
+                panic!("expected a debug object description");
+            };
+            assert!(std::str::from_utf8(&line)
+                .unwrap()
+                .contains("encoding:hashtable"));
+        }
+    }
 }

@@ -560,6 +560,24 @@ int VM_ReplyWithLongDouble(ValkeyModuleCtx* ctx, long double value)
     return VM_ReplyWithDoubleValue(ctx, (double)value);
 }
 
+extern int VM_HashGetField(ValkeyModuleKey *key, int flags, void *field, void *output);
+
+int VM_HashGet(ValkeyModuleKey *key, int flags, ...)
+{
+    int result = VM_HashGetField(key, flags, NULL, NULL);
+    if (result != 0) return result;
+    va_list ap;
+    va_start(ap, flags);
+    void *field;
+    while ((field = va_arg(ap, void *)) != NULL) {
+        void *output = va_arg(ap, void *);
+        result = VM_HashGetField(key, flags, field, output);
+        if (result != 0) break;
+    }
+    va_end(ap);
+    return result;
+}
+
 int VM_HashSet(ValkeyModuleKey* key, int flags, ...)
 {
     va_list ap;

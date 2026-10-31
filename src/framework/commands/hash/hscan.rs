@@ -60,20 +60,18 @@ fn hscan_reply(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> Value {
         }
     }
 
+    let read_expired_values = runtime.read_expired_values();
+    let now_ms = runtime.now_ms();
     let Some(db) = runtime.db_mut() else {
         return CommandError::db_index_out_of_range();
     };
-        db.cleanup_expired_hash_fields(key);
-        db.set_no_lazy_expire(true);
 
         let (encoding, hash_len, mut pairs): (Encoding, usize, Vec<(Bytes, Bytes)>) = {
             let hash = match db.get_hash_object(key) {
                 Err(_) => {
-                    db.set_no_lazy_expire(false);
                     return CommandError::wrong_type();
                 }
                 Ok(None) => {
-                    db.set_no_lazy_expire(false);
                     return Value::Array(vec![
                         Value::bulk(b"0".to_vec()),
                         Value::Array(Vec::new()),
@@ -86,7 +84,7 @@ fn hscan_reply(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> Value {
             let collected = hash.hash_entries();
             (encoding, len, collected)
         };
-        pairs.retain(|(f, _)| !db.hash_field_expired(key, f));
+        pairs.retain(|(f, _)| read_expired_values || !db.hash_field_expired_at(key, f, now_ms));
 
         let match_all = match pattern {
             Some(p) => p == b"*",
@@ -127,7 +125,6 @@ fn hscan_reply(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> Value {
                     break;
                 }
             }
-            db.set_no_lazy_expire(false);
             let next_cursor_str = cur.to_string().into_bytes();
             return Value::Array(vec![Value::bulk(next_cursor_str), Value::Array(out)]);
         }
@@ -144,6 +141,5 @@ fn hscan_reply(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> Value {
                 }
             }
         }
-        db.set_no_lazy_expire(false);
         Value::Array(vec![Value::bulk(b"0".to_vec()), Value::Array(out)])
 }

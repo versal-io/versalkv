@@ -8,14 +8,15 @@ use crate::foundation::io::persistence::codec::RdbWriter;
 use crate::foundation::io::store::structure::stream::groups::{
     RestoredStreamConsumer, RestoredStreamGroup, RestoredStreamPendingEntry,
 };
-use crate::foundation::io::store::structure::stream::{StreamID, ValkeyStream};
+use crate::foundation::io::store::structure::stream::{StreamID, StreamNodeSnapshot, ValkeyStream};
 use crate::foundation::io::store::structure::string::encoding::int_encodable;
 use crate::foundation::io::store::Robj;
 use bytes::Bytes;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 const STREAM_DUMP_MARKER_V1: &[u8] = b"VALKEY_RUST_STREAM_V1";
 const STREAM_DUMP_MARKER_V2: &[u8] = b"VALKEY_RUST_STREAM_V2";
+const STREAM_DUMP_MARKER_V3: &[u8] = b"VALKEY_RUST_STREAM_V3";
 
 pub struct StreamCodec;
 
@@ -45,17 +46,19 @@ impl StreamCodec {
         if type_byte != RDB_TYPE_STREAM_LISTPACKS_3 {
             return false;
         }
-        let has_owned_marker = buf.get(pos) == Some(&(STREAM_DUMP_MARKER_V2.len() as u8))
+        let has_owned_marker = buf.get(pos) == Some(&(STREAM_DUMP_MARKER_V3.len() as u8))
             && buf
-                .get(pos.saturating_add(1)..pos.saturating_add(1 + STREAM_DUMP_MARKER_V2.len()))
+                .get(pos.saturating_add(1)..pos.saturating_add(1 + STREAM_DUMP_MARKER_V3.len()))
                 .is_some_and(|marker| {
-                    marker == STREAM_DUMP_MARKER_V1 || marker == STREAM_DUMP_MARKER_V2
+                    marker == STREAM_DUMP_MARKER_V1
+                        || marker == STREAM_DUMP_MARKER_V2
+                        || marker == STREAM_DUMP_MARKER_V3
                 });
         !has_owned_marker
     }
 
     pub fn save<W: RdbWriter>(stream: &ValkeyStream, w: &mut W) {
-        w.write_string(STREAM_DUMP_MARKER_V2);
+        w.write_string(STREAM_DUMP_MARKER_V3);
         w.write_len(stream.len() as u64);
         for (id, fields) in stream.iter() {
             w.write_string(&encode_stream_id(id));
@@ -91,11 +94,34 @@ impl StreamCodec {
                 w.write_len(pending.delivery_count);
             }
         }
+
+        w.write_string(&encode_stream_id(&stream.last_id));
+        w.write_len(stream.entries_added);
+        w.write_string(&encode_stream_id(&stream.max_deleted_entry_id));
+        w.write_string(&encode_stream_id(&stream.recorded_first_entry_id()));
+
+        let snapshots = stream.node_snapshots();
+        w.write_len(snapshots.len() as u64);
+        for snapshot in snapshots {
+            w.write_string(&encode_stream_id(&snapshot.primary_id));
+            w.write_len(snapshot.ids.len() as u64);
+            for id in snapshot.ids {
+                w.write_string(&encode_stream_id(&id));
+            }
+            w.write_len(snapshot.bytes as u64);
+            w.write_len(snapshot.fields.len() as u64);
+            for field in snapshot.fields {
+                w.write_string(&field);
+            }
+        }
     }
 
     fn load(buf: &[u8], pos: &mut usize) -> Option<ValkeyStream> {
         let marker = decoder::load_string(buf, pos)?;
-        if marker != STREAM_DUMP_MARKER_V1 && marker != STREAM_DUMP_MARKER_V2 {
+        if marker != STREAM_DUMP_MARKER_V1
+            && marker != STREAM_DUMP_MARKER_V2
+            && marker != STREAM_DUMP_MARKER_V3
+        {
             return None;
         }
 
@@ -137,6 +163,51 @@ impl StreamCodec {
         for _ in 0..group_count {
             let group = load_group(buf, pos)?;
             stream.restore_group(group).ok()?;
+        }
+
+        if marker == STREAM_DUMP_MARKER_V3 {
+            let last_id = decode_stream_id(&decoder::load_string(buf, pos)?)?;
+            let entries_added = load_plain_len(buf, pos)?;
+            let max_deleted_entry_id = decode_stream_id(&decoder::load_string(buf, pos)?)?;
+            let recorded_first_entry_id = decode_stream_id(&decoder::load_string(buf, pos)?)?;
+            let node_count = usize::try_from(load_plain_len(buf, pos)?).ok()?;
+            if node_count > buf.len().checked_sub(*pos)? / 4 {
+                return None;
+            }
+            let mut snapshots = Vec::with_capacity(node_count);
+            for _ in 0..node_count {
+                let primary_id = decode_stream_id(&decoder::load_string(buf, pos)?)?;
+                let id_count = usize::try_from(load_plain_len(buf, pos)?).ok()?;
+                let mut ids = BTreeSet::new();
+                for _ in 0..id_count {
+                    let id = decode_stream_id(&decoder::load_string(buf, pos)?)?;
+                    if !ids.insert(id) {
+                        return None;
+                    }
+                }
+                let bytes = usize::try_from(load_plain_len(buf, pos)?).ok()?;
+                let field_count = usize::try_from(load_plain_len(buf, pos)?).ok()?;
+                if field_count > buf.len().checked_sub(*pos)? {
+                    return None;
+                }
+                let mut fields = Vec::with_capacity(field_count);
+                for _ in 0..field_count {
+                    fields.push(Bytes::from(decoder::load_string(buf, pos)?));
+                }
+                snapshots.push(StreamNodeSnapshot {
+                    primary_id,
+                    ids,
+                    bytes,
+                    fields,
+                });
+            }
+            stream.restore_persistence_state(
+                last_id,
+                entries_added,
+                max_deleted_entry_id,
+                recorded_first_entry_id,
+                snapshots,
+            )?;
         }
 
         Some(stream)
@@ -1100,6 +1171,187 @@ mod tests {
         assert_eq!(restored.len(), 2);
         assert!(restored.get_entry(&StreamID::new(1, 1)).is_some());
         assert!(restored.get_entry(&StreamID::new(2, 1)).is_some());
+        assert_eq!(pos, buf.len());
+    }
+
+    #[test]
+    fn stream_dump_rejects_impossible_node_byte_size() {
+        let last_id = StreamID::new(128, 0);
+        let mut buf = Vec::new();
+        buf.write_string(STREAM_DUMP_MARKER_V3);
+        buf.write_len(1);
+        buf.write_string(&encode_stream_id(&last_id));
+        buf.write_len(1);
+        buf.write_string(b"f");
+        buf.write_string(b"v");
+        buf.write_len(0);
+        buf.write_string(&encode_stream_id(&last_id));
+        buf.write_len(128);
+        buf.write_string(&encode_stream_id(&StreamID::new(127, 0)));
+        buf.write_string(&encode_stream_id(&last_id));
+        buf.write_len(1);
+        buf.write_string(&encode_stream_id(&StreamID::new(1, 0)));
+        buf.write_len(128);
+        for ms in 1..=128 {
+            buf.write_string(&encode_stream_id(&StreamID::new(ms, 0)));
+        }
+        buf.write_len(u64::MAX);
+        buf.write_len(1);
+        buf.write_string(b"f");
+        let mut pos = 0;
+        assert!(StreamCodec::load(&buf, &mut pos).is_none());
+    }
+
+    #[test]
+    fn stream_dump_rejects_impossible_snapshot_counts() {
+        let mut base = Vec::new();
+        StreamCodec::save(&ValkeyStream::new(), &mut base);
+        // An empty V3 dump ends in its zero node count.
+        assert_eq!(base.pop(), Some(0));
+        let mut invalid_nodes = base.clone();
+        invalid_nodes.write_len(u64::MAX);
+
+        let mut invalid_fields = base.clone();
+        invalid_fields.write_len(1);
+        invalid_fields.write_string(&encode_stream_id(&StreamID::zero()));
+        invalid_fields.write_len(0);
+        invalid_fields.write_len(0);
+        invalid_fields.write_len(u64::MAX);
+        let mut panicking_counts = Vec::new();
+        for (name, payload) in [
+            ("node count", invalid_nodes),
+            ("field count", invalid_fields),
+            ("truncated node metadata", base),
+        ] {
+            let result = std::panic::catch_unwind(|| {
+                let mut pos = 0;
+                StreamCodec::load(&payload, &mut pos)
+            });
+            match result {
+                Ok(restored) => assert!(restored.is_none(), "{name} must be rejected"),
+                Err(_) => panicking_counts.push(name),
+            }
+        }
+        assert!(
+            panicking_counts.is_empty(),
+            "counts panicked: {panicking_counts:?}"
+        );
+        let mut valid = Vec::new();
+        StreamCodec::save(&ValkeyStream::new(), &mut valid);
+        let mut pos = 0;
+        assert!(StreamCodec::load(&valid, &mut pos).unwrap().is_empty());
+        assert_eq!(pos, valid.len());
+    }
+
+    #[test]
+    fn stream_dump_loads_owned_v2_entries() {
+        let stream = stream_with_two_entries();
+        let mut buf = Vec::new();
+        buf.write_string(STREAM_DUMP_MARKER_V2);
+        buf.write_len(stream.len() as u64);
+        for (id, fields) in stream.iter() {
+            buf.write_string(&encode_stream_id(id));
+            buf.write_len(fields.len() as u64);
+            for (field, value) in fields {
+                buf.write_string(field);
+                buf.write_string(value);
+            }
+        }
+        buf.write_len(0);
+
+        let mut pos = 0;
+        let restored = StreamCodec::load(&buf, &mut pos).unwrap();
+
+        assert_eq!(restored.len(), 2);
+        assert_eq!(restored.last_id, StreamID::new(2, 1));
+        assert_eq!(restored.entries_added, 2);
+        assert_eq!(pos, buf.len());
+    }
+
+    #[test]
+    fn stream_dump_round_trips_empty_stream_history_metadata() {
+        let mut stream = stream_with_two_entries();
+        stream
+            .append(
+                StreamID::new(3, 1),
+                vec![(Bytes::from_static(b"f"), Bytes::from_static(b"v"))],
+                true,
+                false,
+                0,
+            )
+            .unwrap();
+        assert_eq!(
+            stream.delete_multiple(&[
+                StreamID::new(1, 1),
+                StreamID::new(2, 1),
+                StreamID::new(3, 1),
+            ]),
+            3
+        );
+
+        let mut buf = Vec::new();
+        StreamCodec::save(&stream, &mut buf);
+        let mut pos = 0;
+        let restored = StreamCodec::load(&buf, &mut pos).unwrap();
+
+        assert_eq!(restored.len(), 0);
+        assert_eq!(restored.last_id, StreamID::new(3, 1));
+        assert_eq!(restored.entries_added, 3);
+        assert_eq!(restored.max_deleted_entry_id, StreamID::new(3, 1));
+        assert_eq!(restored.recorded_first_entry_id(), StreamID::zero());
+        assert_eq!(pos, buf.len());
+    }
+
+    #[test]
+    fn stream_dump_round_trips_node_tombstones() {
+        let mut stream = ValkeyStream::new();
+        stream.set_append_node_limits(2, 0);
+        for ms in 1..=4 {
+            stream
+                .append(StreamID::new(ms, 0), vec![], true, false, 0)
+                .unwrap();
+        }
+        assert!(stream.delete(&StreamID::new(3, 0)));
+        assert_eq!(stream.trim_by_length_limit(1, true, Some(1), 2), 0);
+
+        let mut buf = Vec::new();
+        StreamCodec::save(&stream, &mut buf);
+        let mut pos = 0;
+        let mut restored = StreamCodec::load(&buf, &mut pos).unwrap();
+
+        assert_eq!(restored.trim_by_length_limit(1, true, Some(1), 2), 0);
+        assert_eq!(restored.trim_by_length_limit(1, true, Some(2), 2), 2);
+        assert_eq!(
+            restored.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![StreamID::new(4, 0)]
+        );
+        assert_eq!(pos, buf.len());
+    }
+
+    #[test]
+    fn stream_dump_round_trips_nodes_created_before_config_change() {
+        let mut stream = ValkeyStream::new();
+        stream.set_append_node_limits(2, 0);
+        for ms in 1..=2 {
+            stream
+                .append(StreamID::new(ms, 0), vec![], true, false, 0)
+                .unwrap();
+        }
+        stream.set_append_node_limits(1, 0);
+        stream
+            .append(StreamID::new(3, 0), vec![], true, false, 0)
+            .unwrap();
+
+        let mut buf = Vec::new();
+        StreamCodec::save(&stream, &mut buf);
+        let mut pos = 0;
+        let mut restored = StreamCodec::load(&buf, &mut pos).unwrap();
+
+        assert_eq!(restored.trim_by_length_limit(1, true, Some(2), 2), 2);
+        assert_eq!(
+            restored.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![StreamID::new(3, 0)]
+        );
         assert_eq!(pos, buf.len());
     }
 

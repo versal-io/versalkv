@@ -33,6 +33,8 @@ struct DbCommandSnapshotBuffer {
     bytes: Vec<u8>,
     count: usize,
     options: DbCommandSnapshotOptions,
+    mode: SnapshotEntryMode,
+    cutoff_ms: u64,
 }
 
 impl DbCommandSnapshotBuffer {
@@ -49,7 +51,14 @@ impl DbCommandSnapshotBuffer {
                 self.options.dbid.to_string().as_bytes(),
             ]));
         }
-        serialize_key_value(&mut self.bytes, key, value, hash_field_expires);
+        serialize_key_value(
+            &mut self.bytes,
+            key,
+            value,
+            hash_field_expires,
+            self.mode,
+            self.cutoff_ms,
+        );
         if let Some(expire_ms) = expire {
             self.bytes.extend_from_slice(&encode_command(&[
                 b"PEXPIREAT",
@@ -113,6 +122,8 @@ fn write_db_command_entries_with_mode(
         bytes: Vec::new(),
         count: 0,
         options,
+        mode,
+        cutoff_ms: crate::foundation::io::store::kv_engine::now_ms(),
     };
     let mut write_error = None;
     let mut encode_entry =
@@ -166,6 +177,8 @@ fn serialize_key_value(
     key: &[u8],
     value: &Robj,
     hash_field_expires: Option<&std::collections::HashMap<Vec<u8>, u64>>,
+    mode: SnapshotEntryMode,
+    cutoff_ms: u64,
 ) {
     match value {
         Robj::StrInt(value) => append_string(out, key, value.as_bytes()),
@@ -182,12 +195,16 @@ fn serialize_key_value(
             parts.extend(values.iter().map(Vec::as_slice));
             out.extend_from_slice(&encode_command(&parts));
         }
-        Robj::HashHashtable(hash) => {
-            let mut parts: Vec<&[u8]> = vec![b"HSET", key];
-            for (field, value) in hash.iter() {
+        Robj::HashHashtable(_) | Robj::HashListpack(_) => {
+            let pairs = value.hash_entries();
+            let mut parts: Vec<&[u8]> = vec![b"HMSET", key];
+            for (field, value) in &pairs {
                 if let Some(timestamp) =
                     hash_field_expires.and_then(|expires| expires.get(field.as_ref()))
                 {
+                    if matches!(mode, SnapshotEntryMode::Live) && *timestamp <= cutoff_ms {
+                        continue;
+                    }
                     let timestamp = timestamp.to_string();
                     out.extend_from_slice(&encode_command(&[
                         b"HSETEX",
@@ -207,15 +224,6 @@ fn serialize_key_value(
             if parts.len() > 2 {
                 out.extend_from_slice(&encode_command(&parts));
             }
-        }
-        Robj::HashListpack(hash) => {
-            let mut parts: Vec<&[u8]> = vec![b"HSET", key];
-            let pairs = hash.all_pairs();
-            for (field, value) in &pairs {
-                parts.push(field);
-                parts.push(value);
-            }
-            out.extend_from_slice(&encode_command(&parts));
         }
         Robj::SetHashtable(set) => {
             let mut parts: Vec<&[u8]> = vec![b"SADD", key];
@@ -250,6 +258,22 @@ fn serialize_key_value(
         }
         Robj::StreamListpack(stream) => serialize_stream(out, key, stream),
         Robj::StreamRadix(_) => {}
+        Robj::PathHash(hash) => {
+            if hash.is_empty() {
+                out.extend_from_slice(&encode_command(&[
+                    b"PHSET", key, b"", b"FIELDS", b"1", b"", b"",
+                ]));
+                out.extend_from_slice(&encode_command(&[b"PHDEL", key, b""]));
+            } else {
+                for (path, payload) in hash.iter() {
+                    for (field, value) in payload.entries() {
+                        out.extend_from_slice(&encode_command(&[
+                            b"PHSET", key, path, b"FIELDS", b"1", &field, &value,
+                        ]));
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -359,12 +383,7 @@ fn append_stream_groups(
 
 fn encode_command(parts: &[&[u8]]) -> Vec<u8> {
     let mut out = Vec::new();
-    out.extend_from_slice(format!("*{}\r\n", parts.len()).as_bytes());
-    for part in parts {
-        out.extend_from_slice(format!("${}\r\n", part.len()).as_bytes());
-        out.extend_from_slice(part);
-        out.extend_from_slice(b"\r\n");
-    }
+    crate::foundation::io::protocol::serializer::serialize_command(parts, &mut out);
     out
 }
 
@@ -373,6 +392,56 @@ mod tests {
     use super::{encode_command, write_db_command_entries, DbCommandSnapshotOptions};
     use crate::foundation::io::store::kv_engine::{now_ms, Db};
     use bytes::Bytes;
+
+    #[test]
+    fn hfe_aof_rewrite_splits_both_encodings_at_strict_cutoff() {
+        let _clock = crate::foundation::io::sys::time::enter_command_time_snapshot(100);
+        for max_entries in [128, 0] {
+            let mut db = Db::new();
+            for field in [b"persistent".as_slice(), b"live", b"equal", b"ghost"] {
+                db.hash_set_with_limits(b"h", field, b"v", max_entries, 64)
+                    .unwrap();
+            }
+            db.set_hash_field_expire(b"h", b"live", 101);
+            db.set_hash_field_expire(b"h", b"equal", 100);
+            db.set_hash_field_expire(b"h", b"ghost", 99);
+            let mut output = Vec::new();
+            write_db_command_entries(
+                &db,
+                |_| true,
+                &mut output,
+                DbCommandSnapshotOptions::new(0, false, 0),
+            )
+            .unwrap();
+            let mut expected = encode_command(&[
+                b"HSETEX", b"h", b"PXAT", b"101", b"FIELDS", b"1", b"live", b"v",
+            ]);
+            expected.extend_from_slice(&encode_command(&[b"HMSET", b"h", b"persistent", b"v"]));
+            assert_eq!(output, expected, "max entries {max_entries}");
+            assert_eq!(db.get_hash_object(b"h").unwrap().unwrap().hash_len(), 4);
+        }
+    }
+
+    #[test]
+    fn hfe_physical_command_snapshot_preserves_expired_field_deadlines() {
+        let _clock = crate::foundation::io::sys::time::enter_command_time_snapshot(100);
+        let mut db = Db::new();
+        db.hash_set_with_limits(b"h", b"ghost", b"v", 128, 64)
+            .unwrap();
+        db.set_hash_field_expire(b"h", b"ghost", 99);
+        let mut output = Vec::new();
+        super::write_db_command_entries_including_expired(
+            &db,
+            |_| true,
+            &mut output,
+            DbCommandSnapshotOptions::new(0, false, 0),
+        )
+        .unwrap();
+        assert_eq!(
+            output,
+            encode_command(&[b"HSETEX", b"h", b"PXAT", b"99", b"FIELDS", b"1", b"ghost", b"v"])
+        );
+    }
 
     #[test]
     fn command_snapshot_encodes_volatile_hash_fields_as_hsetex_pxat() {

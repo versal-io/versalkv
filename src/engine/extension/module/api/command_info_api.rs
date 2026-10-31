@@ -21,23 +21,23 @@ const FK_KEYNUM: c_int = 3;
 
 #[repr(C)]
 pub struct ValkeyModuleCommandInfoVersion {
-    version: c_int,
-    sizeof_historyentry: size_t,
-    sizeof_keyspec: size_t,
-    sizeof_arg: size_t,
+    pub(crate) version: c_int,
+    pub(crate) sizeof_historyentry: size_t,
+    pub(crate) sizeof_keyspec: size_t,
+    pub(crate) sizeof_arg: size_t,
 }
 
 #[repr(C)]
 pub struct ValkeyModuleCommandInfo {
-    version: *const ValkeyModuleCommandInfoVersion,
-    summary: *const c_char,
-    complexity: *const c_char,
-    since: *const c_char,
-    history: *mut c_void,
-    tips: *const c_char,
-    arity: c_int,
-    key_specs: *mut ValkeyModuleCommandKeySpec,
-    args: *mut c_void,
+    pub(crate) version: *const ValkeyModuleCommandInfoVersion,
+    pub(crate) summary: *const c_char,
+    pub(crate) complexity: *const c_char,
+    pub(crate) since: *const c_char,
+    pub(crate) history: *mut c_void,
+    pub(crate) tips: *const c_char,
+    pub(crate) arity: c_int,
+    pub(crate) key_specs: *mut ValkeyModuleCommandKeySpec,
+    pub(crate) args: *mut c_void,
 }
 
 #[repr(C)]
@@ -118,6 +118,8 @@ pub unsafe extern "C" fn ValkeyModule_SetCommandInfo(
             registry.set_command_info(
                 &handle.command_name,
                 ModuleCommandInfo {
+                    summary: copy_optional_string((*info).summary),
+                    since: copy_optional_string((*info).since),
                     key_specs,
                     acl_categories: Vec::new(),
                     legacy_keys: Some((first_key, last_key, key_step)),
@@ -142,6 +144,19 @@ pub unsafe extern "C" fn ValkeyModule_SetCommandInfo(
             VALKEYMODULE_ERR
         }
     }
+}
+
+// SAFETY: value is null or points to a live NUL-terminated module string.
+unsafe fn copy_optional_string(value: *const c_char) -> Option<String> {
+    if value.is_null() {
+        return None;
+    }
+    // SAFETY: the caller guarantees a readable string for this synchronous copy.
+    Some(
+        unsafe { CStr::from_ptr(value) }
+            .to_string_lossy()
+            .into_owned(),
+    )
 }
 
 // SAFETY: key_specs must be null or reference a BS_INVALID-terminated array whose
@@ -272,6 +287,19 @@ fn legacy_key_range(specs: &[ModuleKeySpec]) -> (i32, i32, i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn optional_command_documentation_strings_are_owned_and_nullable() {
+        use std::ffi::CString;
+
+        let summary = CString::new("Appends a message.").unwrap();
+        // SAFETY: summary remains readable until the synchronous copy returns.
+        let copied = unsafe { copy_optional_string(summary.as_ptr()) };
+        drop(summary);
+        assert_eq!(copied.as_deref(), Some("Appends a message."));
+        // SAFETY: null is explicitly supported by this optional-string copier.
+        assert_eq!(unsafe { copy_optional_string(std::ptr::null()) }, None);
+    }
 
     #[test]
     fn converts_module_key_flags_in_command_order() {

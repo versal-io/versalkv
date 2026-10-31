@@ -117,7 +117,10 @@ fn append_node_value(node: CallReplyNode<'_>, builder: &mut ReplyBuilder) {
                 .unwrap_or_else(|| Bytes::from_static(b"ERR")),
         ),
         CallReplyKind::Integer => builder.add_integer(reply.int_val),
-        CallReplyKind::Double => builder.add_double(reply.double_val),
+        CallReplyKind::Double => match node.decimal_double() {
+            Some(value) => builder.add_decimal_double(value.clone()),
+            None => builder.add_double(reply.double_val),
+        },
         CallReplyKind::Bool => builder.add_bool(reply.bool_val != 0),
         CallReplyKind::BigNumber | CallReplyKind::VerbatimString => {
             append_resp3_scalar(node, builder)
@@ -216,6 +219,32 @@ mod tests {
 
         assert_eq!(result, VALKEYMODULE_OK, "rejected {value:?}");
         assert_eq!(forwarded, value);
+    }
+
+    #[test]
+    fn decimal_double_module_forwarding_preserves_exact_nested_payloads() {
+        use crate::foundation::io::protocol::DecimalDoubleText;
+        for text in ["9007199254740993", "1e4932", "inf", "-inf"] {
+            let scalar = Value::DecimalDouble(DecimalDoubleText::new(text.to_owned()).unwrap());
+            assert_resp3_round_trip(scalar.clone());
+            assert_resp3_round_trip(Value::Array(vec![scalar.clone()]));
+            assert_resp3_round_trip(Value::Set(vec![scalar.clone()]));
+            assert_resp3_round_trip(Value::Map(vec![(scalar.clone(), scalar.clone())]));
+            assert_resp3_round_trip(Value::attribute(
+                vec![(Value::bulk("meta"), scalar.clone())],
+                scalar.clone(),
+            ));
+            assert_resp2_rejects(scalar.clone());
+            let mut context = ReplyTestContext::new(2);
+            let mut reply = ValkeyModuleCallReply::from_value_with_resp(&scalar, true, false);
+            // SAFETY: the fixture and this uniquely owned reply remain live for the call.
+            assert_eq!(
+                unsafe { ValkeyModule_ReplyWithCallReply(context.ctx, &mut *reply) },
+                VALKEYMODULE_OK
+            );
+            assert_eq!(context.take_reply(), Value::bulk(text.to_owned()));
+            free_reply(&mut reply);
+        }
     }
 
     fn assert_resp2_round_trip(value: Value, exact: bool) {

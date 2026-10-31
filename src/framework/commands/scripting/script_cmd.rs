@@ -1,12 +1,11 @@
-
 use command_macros::command;
 
-use crate::framework::{CommandArgs, CommandError};
-use crate::framework::context::ServerContext;
-use crate::engine::extension::lua::reset_lua_runtime;
+use crate::engine::command::context::CommandConn;
+use crate::engine::extension::lua::{clear_eval_scripts, LuaEngine};
 use crate::foundation::io::protocol::Value;
 use crate::framework::commands::scripting::script_cache::ScriptCache;
-use crate::engine::command::context::CommandConn;
+use crate::framework::context::ServerContext;
+use crate::framework::{CommandArgs, CommandError};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 static SCRIPT_DEBUG_ENABLED: AtomicBool = AtomicBool::new(false);
@@ -56,6 +55,15 @@ fn script_load(args: &CommandArgs, ctx: &mut ServerContext) -> Value {
     };
 
     let sha1 = ScriptCache::compute_sha1(script);
+    if !ctx.script().script_cache.exists(&sha1) {
+        if let Err(error) = LuaEngine.prepare_cached_eval(
+            &sha1,
+            script,
+            ctx.config().server.lua_enable_insecure_api,
+        ) {
+            return error.into_value();
+        }
+    }
     ctx.script_mut()
         .script_cache
         .store_persistent(sha1.clone(), script.to_string());
@@ -110,7 +118,8 @@ fn script_show(args: &CommandArgs, ctx: &ServerContext) -> Value {
 /// SCRIPT FLUSH
 fn script_flush(ctx: &mut ServerContext) -> Value {
     ctx.script_mut().script_cache.flush();
-    reset_lua_runtime();
+    ctx.script_mut().scripts_eviction_pending = false;
+    clear_eval_scripts();
     Value::ok()
 }
 
@@ -221,9 +230,7 @@ fn script_debug(args: &CommandArgs) -> Value {
 mod tests {
     use super::{request_script_kill, script_debug, KillCommand};
     use crate::engine::command::CommandArgs;
-    use crate::engine::extension::script::{
-        KillSource, ScriptRunCtx, SCRIPT_EVAL_MODE,
-    };
+    use crate::engine::extension::script::{KillSource, ScriptRunCtx, SCRIPT_EVAL_MODE};
     use crate::foundation::io::protocol::Value;
     use crate::framework::context::ServerContext;
 
@@ -305,7 +312,12 @@ mod tests {
             ctx.script_mut().running_script = Some(run.control.clone());
             ctx.set_script_busy(case.flags & SCRIPT_EVAL_MODE == 0, case.dirty);
 
-            assert_eq!(request_script_kill(&mut ctx, case.command), case.expected, "{}", case.name);
+            assert_eq!(
+                request_script_kill(&mut ctx, case.command),
+                case.expected,
+                "{}",
+                case.name
+            );
             assert_eq!(run.is_killed(), case.killed, "{}", case.name);
             assert_eq!(run.control.kill_source(), case.source, "{}", case.name);
             assert!(ctx.is_script_busy(), "{}", case.name);
@@ -315,8 +327,14 @@ mod tests {
     #[test]
     fn request_script_kill_preserves_idle_error_shapes() {
         let mut ctx = ServerContext::new(1);
-        assert_eq!(request_script_kill(&mut ctx, KillCommand::Script), Value::error("ERR NOTBUSY No scripts in execution right now."));
-        assert_eq!(request_script_kill(&mut ctx, KillCommand::Function), Value::error("NOTBUSY No scripts in execution"));
+        assert_eq!(
+            request_script_kill(&mut ctx, KillCommand::Script),
+            Value::error("ERR NOTBUSY No scripts in execution right now.")
+        );
+        assert_eq!(
+            request_script_kill(&mut ctx, KillCommand::Function),
+            Value::error("NOTBUSY No scripts in execution")
+        );
     }
 
     #[test]
@@ -325,7 +343,10 @@ mod tests {
         for mode in [b"yes".as_slice(), b"sync", b"no"] {
             let args = CommandArgs {
                 name: bytes::Bytes::from_static(b"SCRIPT"),
-                args: vec![bytes::Bytes::from_static(b"debug"), bytes::Bytes::copy_from_slice(mode)],
+                args: vec![
+                    bytes::Bytes::from_static(b"debug"),
+                    bytes::Bytes::copy_from_slice(mode),
+                ],
             };
             assert_eq!(script_debug(&args), Value::ok());
         }

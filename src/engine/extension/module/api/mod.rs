@@ -44,9 +44,20 @@ mod timer;
 #[cfg(test)]
 pub(crate) use active_registry::with_active_registry;
 pub(crate) use active_registry::{ActiveModuleContextScope, ActiveModuleRegistryScope};
+#[cfg(test)]
+pub(crate) use command_info_api::{
+    ValkeyModuleCommandInfo, ValkeyModuleCommandInfoVersion, ValkeyModuleCommandKeySpec,
+    ValkeyModule_SetCommandInfo,
+};
 pub(crate) use get_api::module_get_api_impl;
+#[cfg(test)]
+pub(crate) use key_api::{ValkeyModule_CloseKey, ValkeyModule_OpenKey};
 use libc::{c_char, c_int, size_t};
 pub(crate) use reply_builder::ReplyBuilder;
+#[cfg(test)]
+pub(crate) use scan::{
+    ValkeyModuleScanCursor, ValkeyModule_ScanKey, ValkeyModule_ScanKeyRawBorrowed,
+};
 
 use super::{ValkeyModuleCtx, VALKEYMODULE_ERR, VALKEYMODULE_OK};
 use crate::engine::extension::module::capability::runtime_from_opaque;

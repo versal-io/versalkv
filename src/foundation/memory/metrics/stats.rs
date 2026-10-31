@@ -175,10 +175,15 @@ impl CmdStat {
 }
 
 pub struct ServerStats {
+    pub cluster_io_threaded_reads_processed: u64,
+    pub cluster_io_threaded_writes_processed: u64,
+    pub cluster_io_main_thread_fallbacks: u64,
     pub start_time: Instant,
     pub connections_received: u64,
     pub connected_clients: u64,
+    pub connected_priority_clients: u64,
     pub rejected_connections: u64,
+    pub rejected_priority_connections: u64,
     pub cmd_stats: HashMap<String, CmdStat>,
     pub active_time_usec: u64,
     pub tcp_port: u16,
@@ -221,6 +226,15 @@ pub struct ServerStats {
     pub eventloop_cycles: u64,
     pub eventloop_duration_sum: u64,
     pub eventloop_duration_cmd_sum: u64,
+    pub eventloop_priority_cycles: u64,
+    pub eventloop_priority_duration_sum: u64,
+    pub eventloop_priority_duration_cmd_sum: u64,
+    pub eventloop_priority_duration_max: u64,
+    pub eventloop_priority_cmd_per_cycle_max: u64,
+    pub(crate) priority_commands_processed: u64,
+    pub(crate) reset_generation: u64,
+    pub(crate) last_reset_at: Instant,
+    is_priority_command: bool,
     pub eventloop_duration_aof_sum: u64,
     pub eventloop_duration_cron_sum: u64,
     pub eventloop_events_collected: u64,
@@ -236,6 +250,7 @@ pub struct ServerStats {
     pub instantaneous_eventloop_duration_usec: u64,
     pub run_id: String,
     pub acl_access_denied_auth: u64,
+    pub acl_access_denied_tls_cert: u64,
     pub acl_access_denied_cmd: u64,
     pub acl_access_denied_key: u64,
     pub acl_access_denied_channel: u64,
@@ -263,10 +278,15 @@ impl ServerStats {
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         Self {
+            cluster_io_threaded_reads_processed: 0,
+            cluster_io_threaded_writes_processed: 0,
+            cluster_io_main_thread_fallbacks: 0,
             start_time: Instant::now(),
             connections_received: 0,
             connected_clients: 0,
+            connected_priority_clients: 0,
             rejected_connections: 0,
+            rejected_priority_connections: 0,
             cmd_stats: HashMap::new(),
             active_time_usec: 0,
             tcp_port: 0,
@@ -309,6 +329,15 @@ impl ServerStats {
             eventloop_cycles: 0,
             eventloop_duration_sum: 0,
             eventloop_duration_cmd_sum: 0,
+            eventloop_priority_cycles: 0,
+            eventloop_priority_duration_sum: 0,
+            eventloop_priority_duration_cmd_sum: 0,
+            eventloop_priority_duration_max: 0,
+            eventloop_priority_cmd_per_cycle_max: 0,
+            priority_commands_processed: 0,
+            reset_generation: 0,
+            last_reset_at: Instant::now(),
+            is_priority_command: false,
             eventloop_duration_aof_sum: 0,
             eventloop_duration_cron_sum: 0,
             eventloop_events_collected: 0,
@@ -324,6 +353,7 @@ impl ServerStats {
             instantaneous_eventloop_duration_usec: 0,
             run_id: generate_run_id(),
             acl_access_denied_auth: 0,
+            acl_access_denied_tls_cert: 0,
             acl_access_denied_cmd: 0,
             acl_access_denied_key: 0,
             acl_access_denied_channel: 0,
@@ -495,6 +525,28 @@ impl ServerStats {
             .saturating_add(duration_usec);
     }
 
+    pub fn record_eventloop_priority_cycle(&mut self, duration_usec: u64, cmd_count: u64) {
+        self.eventloop_priority_cycles = self.eventloop_priority_cycles.saturating_add(1);
+        self.eventloop_priority_duration_sum = self
+            .eventloop_priority_duration_sum
+            .saturating_add(duration_usec);
+        self.eventloop_priority_duration_max =
+            self.eventloop_priority_duration_max.max(duration_usec);
+        self.eventloop_priority_cmd_per_cycle_max =
+            self.eventloop_priority_cmd_per_cycle_max.max(cmd_count);
+    }
+
+    pub(crate) fn set_priority_command(&mut self, is_priority: bool) -> bool {
+        std::mem::replace(&mut self.is_priority_command, is_priority)
+    }
+
+    pub(crate) fn record_priority_command(&mut self, duration_usec: u64) {
+        self.priority_commands_processed = self.priority_commands_processed.saturating_add(1);
+        self.eventloop_priority_duration_cmd_sum = self
+            .eventloop_priority_duration_cmd_sum
+            .saturating_add(duration_usec);
+    }
+
     pub fn record_eventloop_aof(&mut self, duration_usec: u64) {
         self.eventloop_duration_aof_sum = self
             .eventloop_duration_aof_sum
@@ -594,6 +646,9 @@ impl ServerStats {
         if self.pending_latency_name.is_some() {
             self.pending_latency_name = None;
         }
+        if !rejected && self.is_priority_command {
+            self.record_priority_command(duration_us);
+        }
         duration_us
     }
 
@@ -616,6 +671,12 @@ impl ServerStats {
     }
 
     pub fn reset(&mut self) {
+        self.cluster_io_threaded_reads_processed = 0;
+        self.cluster_io_threaded_writes_processed = 0;
+        self.cluster_io_main_thread_fallbacks = 0;
+        self.reset_generation = self.reset_generation.wrapping_add(1);
+        self.last_reset_at = Instant::now();
+        self.priority_commands_processed = 0;
         self.cmd_stats.clear();
         self.latency_histos.clear();
         self.expired_keys = 0;
@@ -627,6 +688,7 @@ impl ServerStats {
         self.connections_received = 0;
         self.connected_clients = 0;
         self.rejected_connections = 0;
+        self.rejected_priority_connections = 0;
         self.sync_full = 0;
         self.sync_partial_ok = 0;
         self.sync_partial_err = 0;
@@ -658,6 +720,11 @@ impl ServerStats {
         self.eventloop_cycles = 0;
         self.eventloop_duration_sum = 0;
         self.eventloop_duration_cmd_sum = 0;
+        self.eventloop_priority_cycles = 0;
+        self.eventloop_priority_duration_sum = 0;
+        self.eventloop_priority_duration_cmd_sum = 0;
+        self.eventloop_priority_duration_max = 0;
+        self.eventloop_priority_cmd_per_cycle_max = 0;
         self.eventloop_duration_aof_sum = 0;
         self.eventloop_duration_cron_sum = 0;
         self.eventloop_events_collected = 0;

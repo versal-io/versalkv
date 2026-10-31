@@ -83,6 +83,37 @@ impl ServerContext {
     pub fn has_running_script(&self) -> bool {
         self.script.running_script.is_some()
     }
+    pub(crate) fn schedule_script_eviction(&mut self) {
+        self.script.scripts_eviction_pending = true;
+    }
+
+    pub(crate) fn drive_script_eviction(&mut self) {
+        if self.has_running_script() {
+            return;
+        }
+        let config = &self.config().server;
+        let limit = crate::engine::extension::config::server::scripts_memory::effective_limit(
+            config.maxmemory_scripts,
+            config.maxmemory,
+        );
+        // Read the current limit even without a pending flag: startup registry
+        // replay and non-command configuration updates use the same driver.
+        self.script.scripts_eviction_pending = limit.is_some_and(|limit| {
+            self.script
+                .script_cache
+                .evict_memory_slice(limit, crate::engine::extension::lua::release_eval_script)
+        });
+    }
+
+    pub(crate) fn register_eval_script(&mut self, digest: String, body: String) {
+        if !self.script.script_cache.exists(&digest) {
+            self.drive_script_eviction();
+        }
+        for retired in self.script.script_cache.store(digest, body) {
+            crate::engine::extension::lua::release_eval_script(&retired);
+        }
+        self.schedule_script_eviction();
+    }
     pub(crate) fn command_registry(&self) -> &CommandRegistry {
         &self.script.command_registry
     }
@@ -152,5 +183,55 @@ impl ServerContext {
     }
     pub(crate) fn leave_script(&mut self) {
         self.script.running_script = None;
+        self.schedule_script_eviction();
+    }
+}
+
+#[cfg(test)]
+mod script_memory_tests {
+    use super::*;
+    use crate::engine::extension::lua::LuaEngine;
+    use crate::engine::extension::script::ScriptRunCtx;
+    use crate::framework::commands::scripting::script_cache::ScriptCache;
+
+    #[test]
+    fn script_eviction_waits_for_running_vm_and_resumes_after_exit() {
+        crate::engine::extension::lua::reset_lua_runtime();
+        let mut ctx = ServerContext::new(1);
+        ctx.config_mut().server.maxmemory_scripts = 1;
+        let body = format!("--{}\nreturn redis.call('PING')", "x".repeat(200_000));
+        let digest = ScriptCache::compute_sha1(&body);
+        LuaEngine
+            .prepare_cached_eval(&digest, &body, false)
+            .unwrap();
+        ctx.register_eval_script(digest.clone(), body.clone());
+        assert_eq!(ctx.script().script_cache.len(), 1);
+
+        let mut run = ScriptRunCtx::new_eval_detached(false, true, true, false);
+        run.func_name = digest;
+        ctx.enter_script(run.control.clone());
+        let mut host = |request: crate::engine::host::HostRequest<'_>| match request {
+            crate::engine::host::HostRequest::ExecuteCommand { .. } => {
+                ctx.drive_script_eviction();
+                assert_eq!(ctx.script().script_cache.len(), 1);
+                assert!(ctx.script().scripts_eviction_pending);
+                Ok(crate::engine::host::HostReply::Command(
+                    crate::foundation::io::protocol::Value::ok(),
+                ))
+            }
+            _ => panic!("unexpected host request"),
+        };
+        assert_eq!(
+            LuaEngine
+                .eval_with_host(&body, &mut run, &mut host)
+                .unwrap(),
+            crate::foundation::io::protocol::Value::ok()
+        );
+        ctx.leave_script();
+        ctx.drive_script_eviction();
+        assert_eq!(ctx.script().script_cache.len(), 0);
+        assert_eq!(ctx.script().script_cache.evicted_scripts(), 1);
+        assert!(!ctx.script().scripts_eviction_pending);
+        crate::engine::extension::lua::reset_lua_runtime();
     }
 }

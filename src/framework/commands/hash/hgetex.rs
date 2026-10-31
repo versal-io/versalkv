@@ -124,7 +124,7 @@ pub fn hgetex(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> CommandOu
         None
     };
     let ignore_expiry = runtime.read_expired_values();
-    let active_expire_enabled = runtime.active_expire_enabled();
+    let should_preserve_deadline = runtime.preserves_expired_deadline();
 
     let (result, any_expire, any_expired, hash_empty, expired_fields_count, changed_fields) = {
         let db = match runtime.db_mut() {
@@ -138,23 +138,11 @@ pub fn hgetex(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> CommandOu
         let mut expired_fields_count = 0;
         let mut changed_fields = Vec::new();
 
-        // Hash field lookup in C applies the expiry policy before returning a
-        // value. Primaries delete lazily here; read-only replicas only hide the
-        // field and wait for the primary's synthesized HDEL.
         let mut expired_on_read = Vec::with_capacity(num_fields);
         for j in 0..num_fields {
             let field = &args.args[fields_start + j];
-            let expired = !ignore_expiry && db.hash_field_expired(key, field);
-            if expired && active_expire_enabled {
-                let _ = db.check_hash_field_expired(key, field);
-            }
+            let expired = !ignore_expiry && db.hash_field_expired_at(key, field, now_ms);
             expired_on_read.push(expired);
-        }
-        if active_expire_enabled
-            && expired_on_read.iter().any(|expired| *expired)
-            && matches!(db.get_hash_object(key), Ok(Some(hash)) if hash.hash_is_empty())
-        {
-            db.del(key);
         }
 
         let result = match db.get_hash_object(key) {
@@ -191,7 +179,7 @@ pub fn hgetex(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> CommandOu
                 if !field_exists {
                     continue;
                 }
-                if ms > now_ms || ignore_expiry {
+                if ms > now_ms || should_preserve_deadline {
                     db.set_hash_field_expire(key, field, ms);
                     any_expire = true;
                     changed_fields.push(field.clone());
@@ -354,7 +342,7 @@ mod tests {
     }
 
     #[test]
-    fn read_only_form_lazily_removes_an_expired_last_field() {
+    fn read_only_form_retains_an_expired_last_field() {
         let mut runtime = runtime_with_hash();
         runtime.db_mut().unwrap().set_hash_field_expire(
             b"key",
@@ -369,7 +357,8 @@ mod tests {
                 crate::foundation::io::protocol::Value::Null,
             ])
         );
-        assert!(runtime.dbs.get(0).unwrap().get_allow_expired(b"key").is_none());
+        assert!(runtime.dbs.get(0).unwrap().get_allow_expired(b"key").is_some());
+        assert_eq!(runtime.dbs.get(0).unwrap().get_hash_field_expire(b"key", b"f1"), Some(999));
     }
 
     #[test]

@@ -3,11 +3,11 @@ use crate::engine::command::SessionId;
 use crate::foundation::io::protocol::parser::Parser;
 use crate::foundation::io::protocol::Value;
 use crate::foundation::io::sys::time::mstime;
+use crate::foundation::memory::client_id::next_client_id;
 use crate::framework::capabilities::io::Token;
 use bytes::Bytes;
 use std::collections::VecDeque;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 mod command_conn;
@@ -27,7 +27,6 @@ use reply::ReplyPolicy;
 use tracking::TrackingState;
 pub(crate) use transaction::{TransactionEnd, TransactionState};
 
-static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
 const C_RAX_NODE_ACCOUNTING_BYTES: usize =
     std::mem::size_of::<u32>() + std::mem::size_of::<usize>();
 
@@ -96,6 +95,7 @@ pub struct Connection {
     /// Replication offset produced by this connection's latest propagated write.
     last_write_offset: crate::engine::distributed::replication::ReplicationOffset,
     pub peer_addr: SocketAddr,
+    pub(crate) is_priority: bool,
     pub state: ConnectionState,
     pub parser: Parser,
     pub last_query_snapshot: Vec<u8>,
@@ -103,6 +103,7 @@ pub struct Connection {
     pub resp_version: u8,
     pub authenticated: bool,
     pub ever_authenticated: bool,
+    pub(crate) tls_identity_checked: bool,
     pub username: String,
     pub selected_db: u32,
     pub last_interaction: Instant,
@@ -171,7 +172,7 @@ impl Connection {
     }
 
     pub fn new(token: Token, peer_addr: SocketAddr, requirepass: bool) -> Self {
-        let client_id = NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed);
+        let client_id = next_client_id() as u64;
         Self::new_with_client_id(token, client_id, peer_addr, requirepass)
     }
 
@@ -189,6 +190,7 @@ impl Connection {
             command_seq: 0,
             last_write_offset: crate::engine::distributed::replication::ReplicationOffset::ZERO,
             peer_addr,
+            is_priority: false,
             state: ConnectionState::Connected,
             parser: Parser::new(),
             last_query_snapshot: Vec::new(),
@@ -196,6 +198,7 @@ impl Connection {
             resp_version: 2,
             authenticated: authed,
             ever_authenticated: authed,
+            tls_identity_checked: false,
             username: "default".to_string(),
             selected_db: 0,
             last_interaction: now,
@@ -246,6 +249,7 @@ impl Connection {
     pub(crate) fn begin_admitted_command(&mut self, command_name: &str) {
         let request_bytes = self.parser.last_cmd_len();
         self.command_cycle.begin(request_bytes, self.tot_net_out);
+        self.tracking.should_preserve_caching = command_name.eq_ignore_ascii_case("client");
         if request_bytes > 32 * 1024 {
             self.refresh_query_buffer_capacity();
         }
@@ -711,6 +715,12 @@ impl Connection {
     }
 
     pub(crate) fn finish_reply_cycle(&mut self) {
+        if self.blocked.is_none()
+            && !self.transaction.is_active()
+            && !self.tracking.should_preserve_caching
+        {
+            self.tracking.caching = false;
+        }
         self.finish_command_reply_state();
         self.reply.finish_command();
     }
@@ -894,6 +904,7 @@ impl Connection {
             command_seq: 0,
             last_write_offset: crate::engine::distributed::replication::ReplicationOffset::ZERO,
             peer_addr: ([127, 0, 0, 1], 0).into(),
+            is_priority: false,
             state: ConnectionState::Connected,
             parser: Parser::new(),
             last_query_snapshot: Vec::new(),
@@ -901,6 +912,7 @@ impl Connection {
             resp_version: 2,
             authenticated: true,
             ever_authenticated: true,
+            tls_identity_checked: false,
             username: "default".to_string(),
             selected_db: 0,
             last_interaction: now,

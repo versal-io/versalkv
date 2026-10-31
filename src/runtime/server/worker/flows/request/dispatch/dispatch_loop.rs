@@ -54,6 +54,18 @@ impl ServerWorkerState {
         resp3: bool,
         batch: &mut ReadBatchEffects,
     ) -> LoopAction {
+        self.refresh_connection_priorities();
+        let is_priority = self.is_priority_connection(token);
+        let previous_token = self.priority_command_token.replace(token);
+        let previous_nested = std::mem::replace(
+            &mut self.priority_command_is_nested,
+            self.command_execution_depth != 0,
+        );
+        let previous_priority = self
+            .ctx
+            .stats_mut()
+            .set_priority_command(is_priority && !self.priority_command_is_nested);
+        let owns_priority_cycle = is_priority && self.begin_priority_cycle();
         let input = ParsedCommandInput {
             token,
             args,
@@ -63,8 +75,13 @@ impl ServerWorkerState {
         let mut effects = CommandEffects::default();
         let token = input.token;
         let action = self.dispatch_parsed_command(input, &batch.replies, &mut effects);
+        self.refresh_connection_priorities();
         self.account_command_reply_effects(token, &mut effects);
         batch.commit(effects);
+        self.finish_priority_cycle(owns_priority_cycle);
+        self.priority_command_token = previous_token;
+        self.priority_command_is_nested = previous_nested;
+        self.ctx.stats_mut().set_priority_command(previous_priority);
         action
     }
 
@@ -93,10 +110,10 @@ impl ServerWorkerState {
         self.apply_client_test_tcp_buffer_policy(input.token, &input.name, &input.args);
 
         self.ctx.begin_cmd();
-        self.connection_registry[input.token].begin_admitted_command(&input.name);
-
         let (dispatch_group, command_flags) = {
             let spec = self.registry.lookup(&input.args.name);
+            self.connection_registry[input.token]
+                .begin_admitted_command(spec.map(|s| s.name.as_str()).unwrap_or(&input.name));
             (
                 spec.map(|s| s.dispatch_group)
                     .unwrap_or(DispatchGroup::Default),
@@ -333,7 +350,12 @@ impl ServerWorkerState {
             let reply_end = completion.reply_end.min(effects.replies.len());
             effects.replies.drain(completion.reply_start..reply_end);
         }
-        CommandDisposition::Completed
+        if self.connection_registry[token].state == ConnectionState::Closing {
+            effects.mark_closing = true;
+            CommandDisposition::Closing
+        } else {
+            CommandDisposition::Completed
+        }
     }
 
     fn take_special_reply_effects(
@@ -383,6 +405,11 @@ impl ServerWorkerState {
             return SpecialCommandResult::Handled(CommandDisposition::Completed);
         }
 
+        if name_lower.eq_ignore_ascii_case("exec") {
+            self.connection_registry[input.token]
+                .transaction
+                .set_exec_arguments(args.args.clone());
+        }
         let exec_result = self.try_handle_exec(
             CommandTarget::new(Token(token_value)),
             std::str::from_utf8(&args.name).unwrap_or(name_lower),
@@ -502,11 +529,7 @@ impl ServerWorkerState {
                     .touch_watched_key(*db_id, key, exists_after);
             }
         }
-        self.wakeup_blocked_on_keys(
-            &effects.watch_dirty,
-            Some(&mut effects.replication_only),
-            Some(&mut effects.aof_only),
-        );
-        effects.watch_dirty.clear();
+        let dirty_keys = std::mem::take(&mut effects.watch_dirty);
+        self.wakeup_blocked_on_keys_with_effect_queue(&dirty_keys, None, None, Some(effects));
     }
 }

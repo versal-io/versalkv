@@ -1,7 +1,6 @@
 use bytes::Bytes;
 use libc::{c_int, c_void};
 use std::ffi::CString;
-use std::marker::PhantomData;
 use std::ptr::NonNull;
 
 use crate::engine::command::context::CommandConn;
@@ -10,25 +9,31 @@ use crate::engine::extension::module::api::{
     ActiveModuleContextScope, ActiveModuleRegistryScope, ReplyBuilder,
 };
 use crate::engine::extension::module::capability::{ActiveModuleRuntimeScope, ModuleRuntimeHandle};
+
+#[cfg(test)]
+#[path = "module_command_info_tests.rs"]
+mod module_command_info_tests;
+#[cfg(test)]
+#[path = "module_script_tracking_tests.rs"]
+mod module_script_tracking_tests;
 use crate::engine::extension::module::{
     create_module_cmd_ctx, create_module_ctx, free_module_ctx, ModuleRef, ModuleRegistry,
     ValkeyModuleCtx, ValkeyModuleString, VALKEYMODULE_OK,
 };
 use crate::foundation::io::protocol::Value;
-use crate::framework::capabilities::runtime::ModuleCommandConnScope;
+pub(crate) use crate::framework::capabilities::runtime::ModuleCommandConnScope;
 use crate::framework::context::ServerContext;
 
-pub(crate) struct ModuleInvocationScope<'a> {
+pub(crate) struct ModuleInvocationScope {
     module_ctx: NonNull<ValkeyModuleCtx>,
     argv: Vec<*mut ValkeyModuleString>,
     registry: NonNull<ModuleRegistry>,
     runtime_handle: Box<ModuleRuntimeHandle>,
-    _context: PhantomData<&'a mut ServerContext>,
 }
 
-impl<'a> ModuleInvocationScope<'a> {
-    fn new(
-        ctx: &'a mut ServerContext,
+impl ModuleInvocationScope {
+    pub(crate) fn new(
+        ctx: &mut ServerContext,
         module_name: &str,
         command_name: &str,
         db_idx: u32,
@@ -83,31 +88,30 @@ impl<'a> ModuleInvocationScope<'a> {
             argv,
             registry,
             runtime_handle,
-            _context: PhantomData,
         }
     }
 
-    fn module_ctx(&self) -> *mut ValkeyModuleCtx {
+    pub(crate) fn module_ctx(&self) -> *mut ValkeyModuleCtx {
         self.module_ctx.as_ptr()
     }
 
-    fn argv(&self) -> *mut *mut ValkeyModuleString {
+    pub(crate) fn argv(&self) -> *mut *mut ValkeyModuleString {
         self.argv.as_ptr() as *mut *mut ValkeyModuleString
     }
 
-    fn argc(&self) -> c_int {
+    pub(crate) fn argc(&self) -> c_int {
         self.argv.len() as c_int
     }
 
-    fn runtime_handle(&mut self) -> *mut ModuleRuntimeHandle {
+    pub(crate) fn runtime_handle(&mut self) -> *mut ModuleRuntimeHandle {
         &mut *self.runtime_handle
     }
 
-    fn registry(&self) -> *mut ModuleRegistry {
+    pub(crate) fn registry(&self) -> *mut ModuleRegistry {
         self.registry.as_ptr()
     }
 
-    fn take_reply(&mut self) -> Value {
+    pub(crate) fn take_reply(&mut self) -> Value {
         // SAFETY: module_ctx and its internal reply pointer are owned by this
         // invocation; clearing reply_ptr transfers the builder exactly once.
         unsafe {
@@ -122,7 +126,7 @@ impl<'a> ModuleInvocationScope<'a> {
     }
 }
 
-impl Drop for ModuleInvocationScope<'_> {
+impl Drop for ModuleInvocationScope {
     fn drop(&mut self) {
         // SAFETY: registry and module_ctx remain owned by the ServerContext and
         // this invocation respectively until drop completes.
@@ -138,6 +142,10 @@ pub fn module_cmd_dispatcher(
     args: &CommandArgs,
     ctx: &mut ServerContext,
 ) -> Value {
+    // Inline execution can hold a runtime borrow in its caller. It must not
+    // re-enter an ancestor's host dispatcher from that borrowed context.
+    let _host_scope =
+        crate::engine::extension::module::capability::ActiveModuleHostScope::enter(None);
     let cmd_name = match std::str::from_utf8(&args.name) {
         Ok(name) => name,
         Err(_) => return Value::error("ERR invalid command name encoding"),
@@ -188,7 +196,11 @@ pub fn module_cmd_dispatcher(
     reply
 }
 
-fn module_dispatch_name(cmd_name: &str, args: &CommandArgs, registry: &ModuleRegistry) -> String {
+pub(crate) fn module_dispatch_name(
+    cmd_name: &str,
+    args: &CommandArgs,
+    registry: &ModuleRegistry,
+) -> String {
     if let Some(first) = args.args.first() {
         let subcommand_name = format!("{}|{}", cmd_name, String::from_utf8_lossy(first));
         if registry.lookup_cmd_func(&subcommand_name).is_some() {
@@ -198,7 +210,10 @@ fn module_dispatch_name(cmd_name: &str, args: &CommandArgs, registry: &ModuleReg
     cmd_name.to_string()
 }
 
-fn module_argv(args: &CommandArgs, registry: &ModuleRegistry) -> Vec<*mut ValkeyModuleString> {
+pub(crate) fn module_argv(
+    args: &CommandArgs,
+    registry: &ModuleRegistry,
+) -> Vec<*mut ValkeyModuleString> {
     let subcommand_name = if args.args.is_empty() {
         None
     } else {
@@ -238,6 +253,8 @@ pub(crate) fn invoke_module_timer(
     timer: crate::engine::extension::module::registry::ModuleTimer,
     ctx: &mut ServerContext,
 ) {
+    let _host_scope =
+        crate::engine::extension::module::capability::ActiveModuleHostScope::enter(None);
     let mut module_conn =
         crate::engine::extension::module::api::call::call_conn::ModuleCallConn::with_tracking(
             timer.db_idx,
@@ -267,6 +284,9 @@ pub(crate) fn invoke_module_timer(
 }
 
 pub(crate) fn fire_module_event_loop(ctx: &mut ServerContext, subevent: u64) {
+    let _host_scope =
+        crate::engine::extension::module::capability::ActiveModuleHostScope::enter(None);
+    poll_pending_module_calls(ctx);
     let listeners = ctx
         .module_registry()
         .server_event_listeners(crate::engine::extension::module::VALKEYMODULE_EVENT_EVENTLOOP);
@@ -297,11 +317,159 @@ pub(crate) fn fire_module_event_loop(ctx: &mut ServerContext, subevent: u64) {
     }
 }
 
+pub(crate) fn poll_pending_module_calls(ctx: &mut ServerContext) {
+    let ids: Vec<usize> = ctx
+        .module_registry()
+        .pending_calls
+        .keys()
+        .copied()
+        .collect();
+    for id in ids {
+        let effects = complete_pending_module_call(ctx, id, None);
+        ctx.module_registry_mut().pending_effects.extend(effects);
+    }
+}
+
+pub(crate) fn complete_pending_module_call(
+    ctx: &mut ServerContext,
+    id: usize,
+    ready_key: Option<(u32, &[u8])>,
+) -> Vec<crate::engine::extension::module::api::call::pending::ModuleCallEffects> {
+    use crate::engine::command::context::BlockedCmd;
+    use crate::engine::extension::module::capability::ModuleRuntime;
+
+    let _host_scope =
+        crate::engine::extension::module::capability::ActiveModuleHostScope::enter(None);
+    let mut effects = Vec::new();
+    let now_ms = crate::foundation::io::sys::time::mstime();
+    let Some(mut call) = ctx.module_registry_mut().pending_calls.remove(&id) else {
+        return effects;
+    };
+    let Some(blocked) = call.conn.blocked().cloned() else {
+        return effects;
+    };
+    let is_timed_out = blocked.timeout_ms != 0
+        && now_ms.saturating_sub(blocked.start_time_ms) as u64 >= blocked.timeout_ms;
+    let has_ready_key = ready_key.is_some_and(|(db_idx, key)| {
+        call.conn.selected_db() == db_idx
+            && blocked
+                .keys
+                .iter()
+                .any(|candidate| candidate.as_ref() == key)
+    });
+    let terminal_reply = match blocked.cmd {
+        BlockedCmd::Wait {
+            required,
+            target_offset,
+        } => {
+            let acked = ctx.replication().count_replicas_acked_to(target_offset);
+            (is_timed_out || acked >= required).then(|| Value::integer(acked))
+        }
+        BlockedCmd::WaitAof {
+            numlocal,
+            numreplicas,
+            target_offset,
+        } => {
+            let local =
+                crate::framework::commands::generic::waitaof::waitaof_local_ack(ctx, target_offset);
+            let replicas = ctx.replication().count_replicas_aof_acked_to(target_offset);
+            (is_timed_out || (local >= numlocal && replicas >= numreplicas))
+                .then(|| Value::Array(vec![Value::integer(local), Value::integer(replicas)]))
+        }
+        _ => None,
+    };
+    if terminal_reply.is_none() && !is_timed_out && !has_ready_key {
+        ctx.module_registry_mut().pending_calls.insert(id, call);
+        return effects;
+    }
+    call.conn.set_blocked(None);
+    let result = if let Some(reply) = terminal_reply {
+        reply
+    } else if is_timed_out {
+        match blocked.cmd {
+            BlockedCmd::Blpop
+            | BlockedCmd::Brpop
+            | BlockedCmd::Bzpopmin
+            | BlockedCmd::Bzpopmax
+            | BlockedCmd::Bzmpop { .. }
+            | BlockedCmd::Blmpop { .. }
+            | BlockedCmd::Xread
+            | BlockedCmd::Xreadgroup => Value::NullArray,
+            _ => Value::Null,
+        }
+    } else {
+        let result =
+            ctx.execute_command(&blocked.orig_args.name, &mut call.conn, &blocked.orig_args);
+        if let Some(reblocked) = call.conn.blocked().cloned() {
+            let mut preserved = reblocked;
+            preserved.start_time_ms = blocked.start_time_ms;
+            preserved.timeout_ms = blocked.timeout_ms;
+            call.conn.set_blocked(Some(preserved));
+            let partial = call.conn.take_call_effects(
+                &call.command,
+                &blocked.orig_args,
+                call.format.propagation_targets(),
+                false,
+            );
+            if !partial.is_empty() {
+                effects.push(partial);
+            }
+            // Keep the original queue position when a ready key cannot satisfy this call.
+            ctx.module_registry_mut().pending_calls.insert(id, call);
+            return effects;
+        }
+        result
+    };
+    call.conn.set_blocked(Some(blocked.clone()));
+    crate::framework::capabilities::runtime::unregister_pending_module_call(ctx, &call.conn);
+    call.conn.set_blocked(None);
+    let completed_effects = call.conn.take_call_effects(
+        &call.command,
+        &blocked.orig_args,
+        call.format.propagation_targets(),
+        !is_timed_out && !matches!(result, Value::Error(_) | Value::Null | Value::NullArray),
+    );
+    if !completed_effects.is_empty() {
+        effects.push(completed_effects);
+    }
+    let db_idx = call.conn.selected_db();
+    let resp_version = call.conn.resp_version();
+    let mut invocation = ModuleInvocationScope::new(
+        ctx,
+        &call.module_name,
+        "module.call-completion",
+        db_idx,
+        resp_version,
+        None,
+        Vec::new(),
+    );
+    let mut callback_conn =
+        crate::engine::extension::module::api::call::call_conn::ModuleCallConn::with_tracking(
+            db_idx, None,
+        );
+    {
+        let _conn_scope = ModuleCommandConnScope::enter(&mut callback_conn);
+        let _ctx_scope = ActiveModuleContextScope::enter(invocation.module_ctx());
+        let _runtime_scope = ActiveModuleRuntimeScope::enter(invocation.runtime_handle());
+        let _registry_scope = ActiveModuleRegistryScope::enter(invocation.registry());
+        // SAFETY: the fresh invocation and copied callbacks remain live until completion ends.
+        unsafe { call.complete(invocation.module_ctx(), result) };
+    }
+    drop(invocation);
+    let callback_effects = callback_conn.take_recorded_effects();
+    if !callback_effects.is_empty() {
+        effects.push(callback_effects);
+    }
+    effects
+}
+
 pub(crate) fn load_module(
     path: &str,
     args: &[&[u8]],
     ctx: &mut ServerContext,
 ) -> Result<String, crate::engine::extension::module::registry::ModuleError> {
+    let _host_scope =
+        crate::engine::extension::module::capability::ActiveModuleHostScope::enter(None);
     let registry = NonNull::from(ctx.module_registry_mut());
     let mut runtime_handle = Box::new(ModuleRuntimeHandle::new(ctx));
     let _runtime_scope =
@@ -323,6 +491,8 @@ pub(crate) fn unload_module(
     name: &str,
     ctx: &mut ServerContext,
 ) -> Result<(), crate::engine::extension::module::registry::ModuleError> {
+    let _host_scope =
+        crate::engine::extension::module::capability::ActiveModuleHostScope::enter(None);
     use crate::engine::extension::module::capability::ModuleRuntime;
     use crate::engine::extension::module::registry::ModuleError;
 
@@ -385,6 +555,143 @@ mod tests {
     use std::cell::RefCell;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex, Weak};
+
+    #[test]
+    fn allowed_calls_from_one_host_use_distinct_temporary_identities() {
+        use super::ModuleInvocationScope;
+        use crate::engine::command::context::CommandConn;
+        use crate::engine::extension::module::api::call::VM_CallArgv;
+        use crate::engine::extension::module::capability::{
+            ActiveModuleRuntimeScope, ModuleRuntime,
+        };
+        use crate::framework::capabilities::connection::Connection;
+        use crate::framework::capabilities::io::Token;
+        use crate::framework::capabilities::runtime::ModuleCommandConnScope;
+        use bytes::Bytes;
+
+        let mut ctx = ServerContext::new(1);
+        let mut registry = crate::framework::CommandRegistry::new();
+        crate::framework::commands::register_all(&mut registry);
+        ctx.set_command_registry_snapshot(&registry);
+        let mut outer = Connection::new_fake();
+        outer.set_token_for_test(Token(42));
+        let outer_session = outer.session_id();
+        ctx.blocking_registry_mut().register_client(
+            0,
+            &[Bytes::from_static(b"outer")],
+            outer_session,
+        );
+        let mut invocation = ModuleInvocationScope::new(
+            &mut ctx,
+            "pending-test",
+            "pending.call",
+            0,
+            2,
+            None,
+            Vec::new(),
+        );
+        {
+            let _conn_scope = ModuleCommandConnScope::enter(&mut outer);
+            let _runtime_scope = ActiveModuleRuntimeScope::enter(invocation.runtime_handle());
+            let _ctx_scope = crate::engine::extension::module::api::ActiveModuleContextScope::enter(
+                invocation.module_ctx(),
+            );
+            for name in [b"first".as_slice(), b"second".as_slice()] {
+                let mut argv: Vec<_> = [b"BLPOP".as_slice(), name, b"0"]
+                    .into_iter()
+                    .map(|value| {
+                        Box::into_raw(
+                            crate::engine::extension::module::ValkeyModuleString::from_bytes(value),
+                        )
+                    })
+                    .collect();
+                // SAFETY: the invocation owns the context; argv contains live caller-owned strings.
+                unsafe {
+                    assert_eq!(
+                        VM_CallArgv(
+                            invocation.module_ctx(),
+                            argv.as_mut_ptr(),
+                            argv.len() as libc::c_int,
+                            (1 << 11) | (1 << 8),
+                            std::ptr::null(),
+                            std::ptr::null_mut(),
+                        ),
+                        crate::engine::extension::module::VALKEYMODULE_OK
+                    );
+                    for string in argv {
+                        crate::engine::extension::module::ValkeyModuleString::release(string);
+                    }
+                }
+            }
+        }
+        drop(invocation);
+        assert_eq!(ctx.module_registry().pending_calls.len(), 2);
+        assert_eq!(ctx.blocking_registry().count(), 3);
+        let ids: Vec<_> = ctx
+            .module_registry()
+            .pending_calls
+            .keys()
+            .copied()
+            .collect();
+        assert_ne!(ids[0], ids[1]);
+        for id in ids {
+            assert_ne!(id, outer.token().0);
+            assert!(ctx.abort_pending_module_call(id));
+            assert!(!ctx.abort_pending_module_call(id));
+        }
+        assert!(ctx.blocking_registry().is_client_blocked(&outer_session));
+        assert_eq!(ctx.blocking_registry().count(), 1);
+        assert!(outer.blocked().is_none());
+        assert_eq!(outer.output_buffer_bytes(), 0);
+    }
+
+    #[test]
+    fn module_server_info_exports_owned_replication_snapshot() {
+        use crate::engine::distributed::replication::{ReplicationOffset, ReplicationRole};
+        use crate::engine::extension::module::api::call::{
+            ValkeyModule_FreeServerInfo, ValkeyModule_GetServerInfo,
+            ValkeyModule_ServerInfoGetFieldC, ValkeyModule_ServerInfoGetFieldSigned,
+        };
+        use crate::engine::extension::module::capability::{
+            ActiveModuleRuntimeScope, ModuleRuntimeHandle,
+        };
+
+        let mut ctx = ServerContext::new(1);
+        ctx.replication_mut().role = ReplicationRole::Replica;
+        ctx.replication_mut().slave_read_repl_offset = ReplicationOffset::try_from(123).unwrap();
+        let mut handle = ModuleRuntimeHandle::new(&mut ctx);
+        let _scope = ActiveModuleRuntimeScope::enter(&mut handle).unwrap();
+        // SAFETY: strings are static C strings; the returned snapshot is freed once.
+        unsafe {
+            let info = ValkeyModule_GetServerInfo(std::ptr::null_mut(), c"replication".as_ptr());
+            assert!(!info.is_null());
+            let value = ValkeyModule_ServerInfoGetFieldC(info, c"slave_read_repl_offset".as_ptr());
+            assert!(
+                !value.is_null(),
+                "replication INFO must contain the real read offset"
+            );
+            ctx.replication_mut().slave_read_repl_offset =
+                ReplicationOffset::try_from(456).unwrap();
+            assert_eq!(std::ffi::CStr::from_ptr(value).to_bytes(), b"123");
+            let mut err = -1;
+            assert_eq!(
+                ValkeyModule_ServerInfoGetFieldSigned(
+                    info,
+                    c"slave_read_repl_offset".as_ptr(),
+                    &mut err
+                ),
+                123
+            );
+            assert_eq!(err, 0);
+            assert_eq!(
+                ValkeyModule_ServerInfoGetFieldSigned(info, c"role".as_ptr(), &mut err),
+                0
+            );
+            assert_eq!(err, 1);
+            assert!(ValkeyModule_ServerInfoGetFieldC(info, c"mem_allocator".as_ptr()).is_null());
+            ValkeyModule_FreeServerInfo(std::ptr::null_mut(), info);
+        }
+    }
 
     thread_local! {
         static CAPTURED_NAMES: RefCell<Vec<Weak<str>>> = const { RefCell::new(Vec::new()) };

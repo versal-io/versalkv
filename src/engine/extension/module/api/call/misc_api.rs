@@ -88,18 +88,43 @@ pub struct ValkeyModuleServerInfoData {
 }
 
 struct ServerInfoOwned {
-    mem_allocator: CString,
+    fields: std::collections::HashMap<String, CString>,
+}
+
+// SAFETY: optional pointers refer to a live context and a NUL-terminated string.
+pub unsafe extern "C" fn ValkeyModule_Yield(
+    _ctx: *mut ValkeyModuleCtx,
+    flags: c_int,
+    busy_reply: *const c_char,
+) {
+    // SAFETY: the optional C string is borrowed only until host dispatch returns.
+    let busy_reply = unsafe { busy_reply.as_ref() }
+        .and_then(|_| unsafe { CStr::from_ptr(busy_reply) }.to_str().ok());
+    crate::engine::extension::module::capability::yield_module_to_host(flags, busy_reply);
 }
 
 // SAFETY: Called from C shim or module code; caller must pass a valid or NULL ValkeyModuleCtx pointer and C string pointer.
 pub unsafe extern "C" fn ValkeyModule_GetServerInfo(
     ctx: *mut ValkeyModuleCtx,
-    _section: *const c_char,
+    section: *const c_char,
 ) -> *mut ValkeyModuleServerInfoData {
     let _ = ctx;
-    let owned = Box::new(ServerInfoOwned {
-        mem_allocator: CString::new("libc").expect("static allocator name has no NUL"),
-    });
+    // SAFETY: section is null or the caller's live C string.
+    let section =
+        unsafe { section.as_ref() }.and_then(|_| unsafe { CStr::from_ptr(section) }.to_str().ok());
+    let text = crate::engine::extension::module::capability::with_active_runtime(|runtime| {
+        runtime.module_server_info(section)
+    })
+    .unwrap_or_default();
+    let fields = text
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .filter_map(|line| {
+            let (field, value) = line.split_once(':')?;
+            Some((field.to_owned(), CString::new(value).ok()?))
+        })
+        .collect();
+    let owned = Box::new(ServerInfoOwned { fields });
     Box::into_raw(Box::new(ValkeyModuleServerInfoData {
         _data: Box::into_raw(owned).cast(),
     }))
@@ -130,12 +155,41 @@ pub unsafe extern "C" fn ValkeyModule_ServerInfoGetFieldC(
         if info.is_null() || field.is_null() || (*info)._data.is_null() {
             return std::ptr::null();
         }
-        if CStr::from_ptr(field).to_bytes() != b"mem_allocator" {
-            return std::ptr::null();
-        }
         let owned = &*((*info)._data as *const ServerInfoOwned);
-        owned.mem_allocator.as_ptr()
+        CStr::from_ptr(field)
+            .to_str()
+            .ok()
+            .and_then(|field| owned.fields.get(field))
+            .map_or(std::ptr::null(), |value| value.as_ptr())
     }
+}
+
+// SAFETY: info and field are live or null; err is null or a writable integer.
+pub unsafe extern "C" fn ValkeyModule_ServerInfoGetFieldSigned(
+    info: *mut ValkeyModuleServerInfoData,
+    field: *const c_char,
+    err: *mut c_int,
+) -> c_longlong {
+    // SAFETY: the same optional pointer contract is passed to the field getter.
+    let value = unsafe { ValkeyModule_ServerInfoGetFieldC(info, field) };
+    let parsed = if value.is_null() {
+        None
+    } else {
+        // SAFETY: the field getter returns a C string owned by the live snapshot.
+        unsafe { CStr::from_ptr(value) }
+            .to_str()
+            .ok()
+            .and_then(|v| v.parse().ok())
+    };
+    // SAFETY: a non-null err points to the caller's writable integer.
+    if let Some(err) = unsafe { err.as_mut() } {
+        *err = if parsed.is_some() {
+            VALKEYMODULE_OK
+        } else {
+            VALKEYMODULE_ERR
+        };
+    }
+    parsed.unwrap_or(0)
 }
 
 // SAFETY: Called from C shim or module code; caller must pass a valid or NULL ValkeyModuleCtx pointer and a valid function pointer.

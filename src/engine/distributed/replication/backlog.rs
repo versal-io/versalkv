@@ -317,12 +317,16 @@ impl ReplicationBacklog {
     }
 
     pub fn read_from(&self, cursor: BacklogCursor) -> Option<Vec<u8>> {
+        self.read_from_bounded(cursor, usize::MAX)
+    }
+
+    pub fn read_from_bounded(&self, cursor: BacklogCursor, limit: usize) -> Option<Vec<u8>> {
         let first = self.first_byte_cursor();
         if cursor < first || cursor > self.next_cursor {
             return None;
         }
         let skip = cursor.checked_distance_from(first)?;
-        Some(self.bytes.iter().skip(skip).copied().collect())
+        Some(self.bytes.range(skip..).take(limit).copied().collect())
     }
 
     pub fn set_capacity(&mut self, capacity: usize) {

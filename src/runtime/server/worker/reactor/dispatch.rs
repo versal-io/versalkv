@@ -422,14 +422,41 @@ impl ServerWorkerState {
         // on every readable connection mutate topology immediately, while
         // election results they carry settle once after the full batch.
         self.begin_cluster_bus_receive_batch();
+        let mut owns_priority_cycle = false;
+        let mut last_priority_poll = std::time::Instant::now();
+        let mut normal_event_count = 0usize;
         while let Some(event) = self.event_batch.pop_ready() {
+            let should_check_preemption = event.lane == EventLane::Normal
+                && matches!(context, DispatchContext::Normal)
+                && normal_event_count & 3 == 0;
+            if event.lane == EventLane::Normal {
+                normal_event_count = normal_event_count.saturating_add(1);
+            }
+            if self.event_is_priority(&event) {
+                if !owns_priority_cycle {
+                    owns_priority_cycle = self.begin_priority_cycle();
+                }
+            } else {
+                self.finish_priority_cycle(std::mem::take(&mut owns_priority_cycle));
+            }
             self.dispatch_event(event, &context);
             if self.exit_if_shutdown_requested() {
+                self.finish_priority_cycle(owns_priority_cycle);
                 self.event_batch.finish_phase(EventPhase::Ready);
                 self.finish_cluster_bus_receive_batch();
                 return Ok(LoopControl::Stop);
             }
+            if should_check_preemption {
+                if let Err(error) = self.collect_preemptive_priority_events(&mut last_priority_poll)
+                {
+                    self.finish_priority_cycle(owns_priority_cycle);
+                    self.event_batch.finish_phase(EventPhase::Ready);
+                    self.finish_cluster_bus_receive_batch();
+                    return Err(error);
+                }
+            }
         }
+        self.finish_priority_cycle(owns_priority_cycle);
         self.event_batch.finish_phase(EventPhase::Ready);
         self.finish_cluster_bus_receive_batch();
         Ok(LoopControl::Continue)
@@ -522,6 +549,7 @@ impl ServerWorkerState {
         context: &DispatchContext,
     ) -> DispatchOutcome {
         let started_at = std::time::Instant::now();
+        let owns_priority_cycle = self.event_is_priority(&event) && self.begin_priority_cycle();
         let payload_kind = match event.payload {
             EventPayload::Readiness(_) => EventPayloadKind::Readiness,
             EventPayload::Timer(_) => EventPayloadKind::Timer,
@@ -565,7 +593,32 @@ impl ServerWorkerState {
             self.metrics_outcome(outcome),
             started_at.elapsed().as_micros() as u64,
         );
+        self.finish_priority_cycle(owns_priority_cycle);
         outcome
+    }
+
+    fn event_is_priority(&self, event: &EventLoopEvent) -> bool {
+        let token = match &event.payload {
+            EventPayload::Readiness(event) => event.token,
+            EventPayload::Runnable(event) => match event.key {
+                RunnableKey::ClientRead(token)
+                | RunnableKey::ClientWrite(token)
+                | RunnableKey::SlotExportWrite(token)
+                | RunnableKey::DeferredReadiness(token) => token,
+                _ => return false,
+            },
+            EventPayload::WorkerCompletion(completion) => match completion {
+                super::WorkerCompletionEvent::SocketRead(completion) => completion.id.token,
+                super::WorkerCompletionEvent::SocketWrite(completion) => completion.id.token,
+                _ => return false,
+            },
+            _ => return false,
+        };
+        self.is_priority_connection(token)
+            || self
+                .runtime_sources
+                .resolve_token(token)
+                .is_some_and(|route| matches!(route.owner, SourceOwner::ClusterBus))
     }
 
     fn dispatch_event_payload(
@@ -627,7 +680,16 @@ impl ServerWorkerState {
         match context {
             DispatchContext::Normal => false,
             DispatchContext::CommandBlocked { protected_client } => {
-                *protected_client == token || self.blocked_events.is_read_protected(token)
+                let module_defers_client = self.ctx.module_registry().busy_reply.is_some()
+                    && !self.ctx.module_registry().yield_clients
+                    && self.connection_registry.contains(token)
+                    && self
+                        .replication_runtime
+                        .role(ConnectionId(token.0))
+                        .is_none();
+                *protected_client == token
+                    || self.blocked_events.is_read_protected(token)
+                    || module_defers_client
             }
             DispatchContext::HostedBlocked {
                 protected_resources,
@@ -890,9 +952,12 @@ impl ServerWorkerState {
             .map(|route| &route.owner)
         {
             Some(
-                SourceOwner::IoWorkerWake | SourceOwner::ControlWake | SourceOwner::ChildSignal(_),
+                SourceOwner::IoWorkerWake
+                | SourceOwner::ControlWake
+                | SourceOwner::ChildSignal(_)
+                | SourceOwner::ClusterBus,
             ) => EventLane::Control,
-            _ if self.is_master_link(token.0) => EventLane::Upstream,
+            _ if self.is_priority_connection(token) => EventLane::Upstream,
             _ => EventLane::Normal,
         }
     }
@@ -1132,14 +1197,22 @@ impl ServerWorkerState {
         if self.is_pending_transport_removal(token) || !self.transport.is_registered(token) {
             return self.source_dispatch_outcome(token, &SourceOwner::ClusterBus, false);
         }
+        let mut is_read_budget_exhausted = false;
         if ready.is_readable() {
             if is_listener {
                 self.handle_cluster_bus_listener(token);
             } else {
-                self.handle_cluster_bus_readable(token);
+                is_read_budget_exhausted = self.handle_cluster_bus_readable(token);
             }
         }
-        self.finish_readable_hup(token, &SourceOwner::ClusterBus, ready.read_hup);
+        // HUP can accompany a readable tail larger than this turn's budget.
+        // Let level-triggered readiness drain that tail before closing.
+        if !is_read_budget_exhausted
+            && self.io_threads.read_inflight_id(token).is_none()
+            && !self.io_threads.cluster_read_deferred(token)
+        {
+            self.finish_readable_hup(token, &SourceOwner::ClusterBus, ready.read_hup);
+        }
         self.source_dispatch_outcome(token, &SourceOwner::ClusterBus, false)
     }
 

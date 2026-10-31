@@ -17,10 +17,72 @@ pub struct LuaEngine;
 pub static LUA_ENGINE: LuaEngine = LuaEngine;
 
 impl LuaEngine {
+    pub(crate) fn prepare_cached_eval(
+        &self,
+        digest: &str,
+        code: &str,
+        enable_insecure_api: bool,
+    ) -> Result<(), ScriptError> {
+        with_lua_runtime(enable_insecure_api, |runtime| {
+            if runtime.compiled_eval_scripts.contains_key(digest) {
+                return Ok(());
+            }
+            let (mut body, _, has_shebang) = parse_shebang(code, 0)?;
+            if has_shebang {
+                // Valkey removes the shebang text but retains its newline.
+                body.insert(0, '\n');
+            }
+            let function: LuaFunction = runtime
+                .lua
+                .load(&body)
+                .set_name("@user_script")
+                .into_function()
+                .map_err(|error| ScriptError::Compile(error.to_string()))?;
+            let key = runtime
+                .lua
+                .create_registry_value(function)
+                .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+            runtime
+                .compiled_eval_scripts
+                .insert(digest.to_string(), key);
+            Ok(())
+        })
+    }
+
     pub fn eval_with_host(
         &self,
         code: &str,
         ctx: &mut ScriptRunCtx,
+        dispatcher: &mut crate::engine::host::HostDispatcher<'_>,
+    ) -> Result<Value, ScriptError> {
+        self.eval_with_identity(None, code, ctx, None, dispatcher)
+    }
+
+    pub(crate) fn eval_cached_with_host(
+        &self,
+        code: &str,
+        ctx: &mut ScriptRunCtx,
+        keys: &[bytes::Bytes],
+        args: &[bytes::Bytes],
+        dispatcher: &mut crate::engine::host::HostDispatcher<'_>,
+    ) -> Result<Value, ScriptError> {
+        if ctx.func_name.is_empty() {
+            with_lua_runtime(ctx.lua_enable_insecure_api, |runtime| {
+                super::runtime::bind_eval_arguments(&runtime.lua, keys, args)
+                    .map_err(|error| ScriptError::Runtime(error.to_string()))
+            })?;
+            return self.eval(code, ctx, dispatcher);
+        }
+        let digest = ctx.func_name.clone();
+        self.eval_with_identity(Some(&digest), code, ctx, Some((keys, args)), dispatcher)
+    }
+
+    fn eval_with_identity(
+        &self,
+        digest: Option<&str>,
+        code: &str,
+        ctx: &mut ScriptRunCtx,
+        arguments: Option<(&[bytes::Bytes], &[bytes::Bytes])>,
         dispatcher: &mut crate::engine::host::HostDispatcher<'_>,
     ) -> Result<Value, ScriptError> {
         let _time_guard = crate::foundation::io::sys::time::enter_command_time_snapshot(
@@ -29,7 +91,14 @@ impl LuaEngine {
         let (body, flags, _has_shebang) = parse_shebang(code, ctx.flags)?;
         ctx.flags = flags;
 
-        let wrapped = format!("return function(...)\n{}\nend", body);
+        let wrapped = if digest.is_none() {
+            format!("return function(...)\n{}\nend", body)
+        } else {
+            String::new()
+        };
+        if let Some(digest) = digest {
+            self.prepare_cached_eval(digest, code, ctx.lua_enable_insecure_api)?;
+        }
         let result = with_lua_runtime(ctx.lua_enable_insecure_api, |runtime| {
             let lua = &runtime.lua;
             let pcall_fn: LuaFunction = lua
@@ -37,7 +106,7 @@ impl LuaEngine {
                 .get("pcall")
                 .map_err(|e| ScriptError::Runtime(format!("Failed to get pcall: {}", e)))?;
 
-            if !runtime.compiled_scripts.contains_key(&wrapped) {
+            if digest.is_none() && !runtime.compiled_scripts.contains_key(&wrapped) {
                 let chunk_fn: LuaFunction = match lua.load(&wrapped).set_name("@user_script").eval()
                 {
                     Ok(function) => function,
@@ -49,10 +118,18 @@ impl LuaEngine {
                 runtime.compiled_scripts.insert(wrapped.clone(), key);
             }
 
-            let key = runtime.compiled_scripts.get(&wrapped).unwrap();
+            let key = match digest {
+                Some(digest) => runtime.compiled_eval_scripts.get(digest),
+                None => runtime.compiled_scripts.get(&wrapped),
+            }
+            .ok_or_else(|| ScriptError::Runtime("Compiled script is unavailable".to_string()))?;
             let chunk_fn: LuaFunction = lua
                 .registry_value(key)
                 .map_err(|e| ScriptError::Runtime(e.to_string()))?;
+            if let Some((keys, args)) = arguments {
+                super::runtime::bind_eval_arguments(lua, keys, args)
+                    .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+            }
 
             let pcall_result: LuaMultiValue =
                 super::runtime::with_lua_host(lua, ctx, dispatcher, || pcall_fn.call(chunk_fn))
@@ -77,9 +154,14 @@ impl LuaEngine {
                     return Err(ScriptError::KillError(ctx.kill_message()));
                 }
                 let err_obj = iter.next().cloned().unwrap_or(LuaValue::Nil);
-                let err_msg = super::lua_value_to_err_string(&err_obj);
+                let mut err_msg = super::lua_value_to_err_string(&err_obj);
+                if digest.is_some() && err_msg.trim().starts_with("user_script:") {
+                    // Raw EVAL chunks need no legacy wrapper-line adjustment.
+                    err_msg = format!("ERR {}", err_msg.trim());
+                }
                 Err(ScriptError::Runtime(super::format_top_level_lua_error(
-                    &err_msg, &body,
+                    &err_msg,
+                    if digest.is_some() { code } else { &body },
                 )))
             }
         });

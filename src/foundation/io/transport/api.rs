@@ -6,7 +6,7 @@ use std::os::fd::RawFd;
 use std::path::Path;
 use std::time::Duration;
 
-use super::{ThreadIoHandle, TlsClientConfig, TlsConfig, TransportWakeHandle};
+use super::{ThreadIoHandle, TlsClientConfig, TlsConfig, TlsContextBatch, TransportWakeHandle};
 
 #[derive(Debug)]
 pub(crate) enum ReadOutcome {
@@ -151,6 +151,16 @@ pub struct UnixBindOptions {
 }
 
 pub trait TransportRuntime {
+    /// None means the TLS handshake has not completed or this is not TLS.
+    fn tls_peer_names(&self, _id: TransportId, _use_uri: bool) -> Option<Vec<Vec<u8>>> {
+        None
+    }
+    fn swap_tls_contexts(&mut self, _batch: TlsContextBatch) -> io::Result<TlsContextBatch> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "TLS context batches are not supported by this transport",
+        ))
+    }
     /// Configure the backlog used for future TCP listener binds.
     fn set_tcp_backlog(&mut self, _backlog: i32) -> io::Result<()> {
         Ok(())

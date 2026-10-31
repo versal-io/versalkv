@@ -16,6 +16,7 @@ pub(crate) const BUILTIN_ACL_CATEGORY_NAMES: &[&str] = &[
     "SORTEDSET",
     "LIST",
     "HASH",
+    "PATHHASH",
     "STRING",
     "BITMAP",
     "HYPERLOGLOG",

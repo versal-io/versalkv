@@ -7,7 +7,7 @@ use crate::framework::commands::command_runtime::{command_specs, lookup_command_
 use crate::framework::commands::introspection::CommandCatalog;
 use crate::framework::CommandMeta;
 
-use super::render::{metadata_entry, metadata_name};
+use super::render::{builtin_doc, metadata_entry, metadata_name};
 
 pub struct StaticCommandCatalog;
 
@@ -53,11 +53,7 @@ fn command_docs(names: &[Bytes]) -> Value {
             supported_meta(command_name)?;
             Some((
                 Value::bulk(name.clone()),
-                Value::Map(vec![
-                    (bulk("summary"), Value::bulk(Bytes::new())),
-                    (bulk("since"), Value::bulk(Bytes::new())),
-                    (bulk("group"), Value::bulk(Bytes::new())),
-                ]),
+                builtin_doc(command_name),
             ))
         })
         .collect::<Vec<_>>();

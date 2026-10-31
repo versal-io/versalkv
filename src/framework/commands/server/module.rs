@@ -1,14 +1,84 @@
-use crate::engine::extension::config::server::ProtectedAction;
-use crate::framework::{CommandArgs, CommandError};
-use crate::framework::context::ServerContext;
-use crate::foundation::io::protocol::Value;
 use crate::engine::command::context::CommandConn;
+use crate::engine::extension::config::server::ProtectedAction;
+use crate::foundation::io::protocol::Value;
+use crate::framework::context::ServerContext;
+use crate::framework::{CommandArgs, CommandError};
 use bytes::Bytes;
 use command_macros::command;
 
 #[cfg(test)]
 mod tests {
     use crate::engine::extension::config::server::ProtectedAction;
+
+    #[test]
+    fn module_unload_rejects_unassigned_acl_role_references() {
+        use crate::engine::extension::acl::{acl_roles, acl_users, AclUser};
+        use crate::engine::extension::module::{ModuleRef, ValkeyModuleCtx, ValkeyModuleString};
+        use crate::foundation::io::protocol::Value;
+        use crate::framework::context::ServerContext;
+        use crate::framework::CommandArgs;
+
+        extern "C" fn command(
+            _ctx: *mut ValkeyModuleCtx,
+            _argv: *mut *mut ValkeyModuleString,
+            _argc: libc::c_int,
+        ) -> libc::c_int {
+            0
+        }
+
+        let mut ctx = ServerContext::new(1);
+        ctx.module_registry_mut()
+            .register(ModuleRef::new(
+                "role-unload-probe",
+                std::ptr::null_mut(),
+                1,
+                true,
+            ))
+            .unwrap();
+        ctx.module_registry_mut()
+            .register_command(
+                "role-unload-probe",
+                "role-unload-probe.command",
+                Some(command),
+            )
+            .unwrap();
+        let args = CommandArgs::from_parts(vec![
+            "MODULE".into(),
+            "unload".into(),
+            "role-unload-probe".into(),
+        ]);
+
+        for rule in [
+            "+role-unload-probe.command",
+            "-role-unload-probe.command",
+            "(+role-unload-probe.command)",
+        ] {
+            let mut role = AclUser::new_disabled();
+            role.apply_rule(rule).unwrap();
+            {
+                let _users = acl_users().lock().unwrap();
+                acl_roles()
+                    .lock()
+                    .unwrap()
+                    .insert("role-unload-probe".into(), role);
+            }
+            let result = super::cmd_unload(&args, &mut ctx);
+            {
+                let _users = acl_users().lock().unwrap();
+                acl_roles().lock().unwrap().remove("role-unload-probe");
+            }
+            assert_eq!(
+                result,
+                Value::error(
+                    "ERR Can't unload module: one or more ACL users reference commands from this module"
+                ),
+                "{rule}"
+            );
+            assert!(ctx.module_registry().lookup("role-unload-probe").is_some());
+        }
+        assert_eq!(super::cmd_unload(&args, &mut ctx), Value::ok());
+        assert!(ctx.module_registry().lookup("role-unload-probe").is_none());
+    }
 
     #[test]
     fn module_gate_honors_no_yes_and_local_modes() {
@@ -127,21 +197,36 @@ fn cmd_unload(args: &CommandArgs, ctx: &mut ServerContext) -> Value {
         Ok(s) => s,
         Err(_) => return Value::error("ERR Invalid module name"),
     };
-    let users = crate::engine::extension::acl::acl_users().lock().unwrap();
+    let users = match crate::engine::extension::acl::acl_users().lock() {
+        Ok(users) => users,
+        Err(_) => return Value::error("ERR ACL user registry is unavailable"),
+    };
     let command_names = ctx
         .module_registry()
         .lookup(name)
         .map(|module| module.commands.clone())
         .unwrap_or_default();
-    if command_names.iter().any(|command| {
-        users
-            .values()
-            .any(|user| user.references_command(command))
-    }) {
+    if command_names
+        .iter()
+        .any(|command| users.values().any(|user| user.references_command(command)))
+    {
         return Value::error(
             "ERR Can't unload module: one or more ACL users reference commands from this module",
         );
     }
+    let roles = match crate::engine::extension::acl::acl_roles().lock() {
+        Ok(roles) => roles,
+        Err(_) => return Value::error("ERR ACL role registry is unavailable"),
+    };
+    if command_names
+        .iter()
+        .any(|command| roles.values().any(|role| role.references_command(command)))
+    {
+        return Value::error(
+            "ERR Can't unload module: one or more ACL users reference commands from this module",
+        );
+    }
+    drop(roles);
     drop(users);
 
     match crate::framework::capabilities::module::unload_module(name, ctx) {

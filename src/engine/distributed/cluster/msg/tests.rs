@@ -35,6 +35,67 @@ fn literal_packet(message_type: u16, body: &[u8]) -> Vec<u8> {
     packet
 }
 
+#[test]
+fn literal_nack_body_uses_sixteen_byte_layout() {
+    let body = [1, 2, 3, 4, 5, 6, 7, 8, 7, 0, 0, 0, 0, 0, 0, 0];
+    let packet = literal_packet(11, &body);
+    let (message, consumed) = ClusterBusMessage::decode(&packet).unwrap();
+    assert_eq!(consumed, CLUSTER_BUS_HEADER_LEN + 16);
+    assert_eq!(message.msg_type, ClusterMsgType::FailoverAuthNack);
+    assert_eq!(&message.encode().unwrap()[CLUSTER_BUS_HEADER_LEN..], &body);
+}
+
+#[test]
+fn typed_nack_body_encodes_sixteen_bytes_with_zero_reserved() {
+    let sender = node("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", true);
+    let packet = ClusterBusMessage::from_node(
+        ClusterMsgType::FailoverAuthNack,
+        &sender,
+        99,
+        ClusterBusBody::FailoverAuthNack {
+            request_epoch: 0,
+            reason: 3,
+        },
+    )
+    .encode()
+    .unwrap();
+    assert_eq!(
+        &packet[CLUSTER_BUS_HEADER_LEN..],
+        &[0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0]
+    );
+}
+
+#[test]
+fn nack_body_decodes_request_epoch_independently_of_header_epoch() {
+    for request_epoch in [0, 10, u64::MAX] {
+        let mut body = request_epoch.to_be_bytes().to_vec();
+        body.extend_from_slice(&[2, 0, 0, 0, 0, 0, 0, 0]);
+        let mut packet = literal_packet(11, &body);
+        packet[16..24].copy_from_slice(&99u64.to_be_bytes());
+        let (message, consumed) = ClusterBusMessage::decode(&packet).unwrap();
+        assert_eq!(consumed, CLUSTER_BUS_HEADER_LEN + 16);
+        assert_eq!(message.current_epoch, 99);
+        assert_eq!(
+            message.body,
+            ClusterBusBody::FailoverAuthNack {
+                request_epoch,
+                reason: 2
+            }
+        );
+    }
+}
+
+#[test]
+fn nack_body_rejects_non_sixteen_byte_lengths() {
+    for length in [0, 1, 8, 9, 15, 17] {
+        let packet = literal_packet(11, &vec![0; length]);
+        assert!(
+            ClusterBusMessage::decode(&packet).is_err(),
+            "accepted NACK body length {length}"
+        );
+    }
+}
+
 fn empty_body_for(kind: u16) -> Vec<u8> {
     match kind {
         0..=2 | 5 | 6 | 8 => Vec::new(),

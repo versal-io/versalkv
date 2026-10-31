@@ -5,6 +5,7 @@ pub(crate) mod call_conn;
 mod call_reply;
 mod db;
 mod misc_api;
+pub(crate) mod pending;
 mod reply_api;
 mod string_api;
 #[cfg(test)]

@@ -78,24 +78,24 @@ impl ServerWorkerState {
     ) -> Option<Value> {
         let request = self.ctx.take_tls_reconfigure_request()?;
         let previous_config = request.previous_config.clone();
+        self.tls_reload.generation = self.tls_reload.generation.wrapping_add(1);
         self.connection_registry[crate::framework::capabilities::io::Token(connection_token)]
             .set_custom_reply(false);
+        let mut previous_batch = None;
         let result: io::Result<()> = (|| {
-            if request.port_changed {
-                self.rebind_tls_listeners()?;
-            } else {
-                self.configure_tls_server_from_config()?;
-            }
-            if request.reconnect_replica && self.ctx.config().server.tls_replication {
-                self.configure_tls_client_from_config()?;
-            }
+            let batch = super::super::tls::prepare_contexts(&self.ctx.config().server)?;
+            previous_batch = Some(self.publish_tls_contexts(batch)?);
             if request.rebind_cluster_bus {
                 self.rebind_cluster_bus_transport()?;
+            }
+            if request.port_changed {
+                self.rebind_tls_listeners()?;
             }
             Ok(())
         })();
         Some(match result {
             Ok(()) => {
+                crate::framework::commands::server::config::commit_tls_log_config(&mut self.ctx);
                 if request.reconnect_replica && self.ctx.config().replication.master_host.is_some()
                 {
                     self.abort_replica_session_for_role_change();
@@ -103,14 +103,39 @@ impl ServerWorkerState {
                 Value::ok()
             }
             Err(error) => {
+                crate::server_log!(warning, "Unable to update TLS configuration: {}", error);
+                let restore_tcp = self.ctx.config().server.bind != previous_config.server.bind
+                    || self.ctx.config().server.listening_port
+                        != previous_config.server.listening_port;
+                if restore_tcp {
+                    if let Err(restore_error) = self.rebind_tcp_listeners(
+                        &previous_config.server.bind,
+                        previous_config.server.listening_port,
+                    ) {
+                        crate::server_log!(
+                            warning,
+                            "Failed restoring TCP listeners: {}",
+                            restore_error
+                        );
+                    }
+                }
                 self.restore_runtime_config(previous_config);
-                let _ = self.configure_tls_server_from_config();
+                if let Some(batch) = previous_batch {
+                    let _ = self.publish_tls_contexts(batch);
+                }
                 if request.rebind_cluster_bus {
                     let _ = self.rebind_cluster_bus_transport();
                 }
+                let detail = "Unable to update TLS configuration. Check server logs.";
+                #[cfg(not(feature = "tls"))]
+                let detail = if error.kind() == io::ErrorKind::Unsupported {
+                    "Unable to update TLS configuration: TLS support is not compiled in."
+                } else {
+                    detail
+                };
                 Value::error(format!(
-                    "ERR CONFIG SET failed (possibly related to argument '{}') - Unable to update TLS configuration: {}",
-                    request.changed_parameter, error
+                    "ERR CONFIG SET failed (possibly related to argument '{}') - {}",
+                    request.changed_parameter, detail
                 ))
             }
         })
@@ -280,7 +305,6 @@ impl ServerWorkerState {
         let targets = crate::framework::config::bind_targets(&bind, tls_port);
         let mut new_handles = Vec::with_capacity(targets.len());
         if tls_port != 0 {
-            self.configure_tls_server_from_config()?;
             for target in targets {
                 let address = target
                     .addr

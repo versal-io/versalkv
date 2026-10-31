@@ -230,9 +230,19 @@ impl ServerWorkerState {
                 .max()
                 .unwrap_or(0)
         };
+        let codecs: usize = self
+            .replication_runtime
+            .primary_links()
+            .values()
+            .map(|link| link.compression_memory_bytes())
+            .sum::<usize>()
+            + self
+                .replication_runtime
+                .replica_link()
+                .map_or(0, |link| link.compression_memory_bytes());
         let replication = self.ctx.replication_mut();
-        replication.replica_output_buffer_bytes = live_total;
-        replication.replica_output_buffer_allocation_bytes = allocation;
+        replication.replica_output_buffer_bytes = live_total.saturating_add(codecs);
+        replication.replica_output_buffer_allocation_bytes = allocation.saturating_add(codecs);
         replication.replica_output_buffer_peak =
             replication.replica_output_buffer_peak.max(live_total);
     }
@@ -270,7 +280,8 @@ impl ServerWorkerState {
             let queued_bytes = self
                 .connection_registry
                 .get(Token(connection_id.0))
-                .map_or(0, |conn| conn.output_buffer_bytes());
+                .map_or(0, |conn| conn.output_buffer_bytes())
+                .saturating_add(link.compression_memory_bytes());
             let snapshot_transfer_active = self.replica_snapshot_transfer_active(connection_id);
             let dual_channel_link = link
                 .replica()
@@ -282,7 +293,9 @@ impl ServerWorkerState {
                 PrimaryLinkState::PreparingFullResync
                     | PrimaryLinkState::SendingRdb
                     | PrimaryLinkState::WaitingForReplicaAck
-            ) {
+            ) || (link.is_compressed()
+                && link.state() == PrimaryLinkState::Streaming)
+            {
                 checked_cursor_distance(backlog_tail, link.next_send_cursor()).map(Some)
             } else {
                 Ok(None)

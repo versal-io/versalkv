@@ -9,6 +9,7 @@ pub(crate) const ACL_DENIED_CMD: i32 = 2;
 pub(crate) const ACL_DENIED_KEY: i32 = 3;
 pub(crate) const ACL_DENIED_AUTH: i32 = 4;
 pub(crate) const ACL_DENIED_CHANNEL: i32 = 5;
+pub(crate) const ACL_DENIED_TLS_CERT: i32 = 6;
 
 pub(crate) const ACL_LOG_CTX_TOPLEVEL: i32 = 0;
 pub(crate) const ACL_LOG_CTX_LUA: i32 = 1;
@@ -68,6 +69,7 @@ pub(crate) fn reason_str(reason: i32) -> &'static str {
         ACL_DENIED_KEY => "key",
         ACL_DENIED_AUTH => "auth",
         ACL_DENIED_CHANNEL => "channel",
+        ACL_DENIED_TLS_CERT => "tls-cert",
         _ => "unknown",
     }
 }

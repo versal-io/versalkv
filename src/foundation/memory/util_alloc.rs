@@ -1,3 +1,5 @@
+pub use super::external::ExternalMemoryError;
+use super::external::MODULE_EXTERNAL_MEMORY;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -137,15 +139,38 @@ static PEAK: AtomicUsize = AtomicUsize::new(0);
 
 #[inline]
 fn update_peak(candidate: usize) {
-    let prev = PEAK.load(Ordering::Relaxed);
-    if candidate > prev {
-        let _ = PEAK.compare_exchange(prev, candidate, Ordering::Relaxed, Ordering::Relaxed);
-    }
+    PEAK.fetch_max(
+        candidate.saturating_add(external_allocated()),
+        Ordering::Relaxed,
+    );
 }
 
 #[inline]
 pub fn total_allocated() -> usize {
-    ALLOCATED.load(Ordering::Relaxed)
+    ALLOCATED
+        .load(Ordering::Relaxed)
+        .saturating_add(external_allocated())
+}
+
+/// Return reported resident bytes not owned by the server allocator.
+pub fn external_allocated() -> usize {
+    MODULE_EXTERNAL_MEMORY.used()
+}
+
+/// Account for external resident memory without allocating or touching it.
+pub fn increase_external_memory(bytes: usize) -> Result<(), ExternalMemoryError> {
+    let external = MODULE_EXTERNAL_MEMORY.increase(bytes)?;
+    PEAK.fetch_max(
+        ALLOCATED.load(Ordering::Relaxed).saturating_add(external),
+        Ordering::Relaxed,
+    );
+    Ok(())
+}
+
+/// Remove external accounting without freeing or touching the reported memory.
+pub fn decrease_external_memory(bytes: usize) -> Result<(), ExternalMemoryError> {
+    MODULE_EXTERNAL_MEMORY.decrease(bytes)?;
+    Ok(())
 }
 
 /// Return the allocator-owned usable bytes for a live Vec backing allocation.

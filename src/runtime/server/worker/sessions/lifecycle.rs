@@ -72,6 +72,7 @@ impl ServerWorkerState {
         }
         let default_user_requires_auth = !crate::engine::extension::acl::default_user_has_nopass();
         let mut conn = Connection::new(client.token, client.peer_addr, default_user_requires_auth);
+        conn.is_priority = self.peer_is_priority(client.peer_addr);
         let client_id = conn.client_id();
         let io_handles = self
             .transport
@@ -92,6 +93,9 @@ impl ServerWorkerState {
         self.connection_registry
             .register(conn)
             .expect("a newly accepted transport token and client id must be unique");
+        if self.is_priority_connection(client.token) {
+            self.ctx.stats_mut().connected_priority_clients += 1;
+        }
         self.refresh_client_memory_usage(client.token, true);
         match io_handles {
             Ok((read, write)) => {
@@ -592,6 +596,11 @@ impl ServerWorkerState {
                 .connection_registry
                 .remove(token)
                 .expect("connection presence was checked before removal");
+            if conn.is_priority {
+                let stats = self.ctx.stats_mut();
+                stats.connected_priority_clients =
+                    stats.connected_priority_clients.saturating_sub(1);
+            }
             crate::server_log!(verbose, "Closing conn from {}", conn.peer_addr);
             self.ctx.add_net_input_bytes(conn.tot_net_in);
             self.ctx.add_net_output_bytes(conn.tot_net_out);
@@ -637,6 +646,7 @@ impl ServerWorkerState {
             return;
         }
         let maxclients = self.ctx.config().server.maxclients;
+        self.refresh_connection_priorities();
         for _ in 0..accept_budget {
             match self.transport.accept(listener) {
                 Ok(Some(c)) => {
@@ -658,7 +668,7 @@ impl ServerWorkerState {
                         c.peer_addr,
                     ) {
                         self.reject_protected_mode_client(c);
-                    } else if self.connected_clients() >= maxclients as usize {
+                    } else if !self.has_client_capacity(self.peer_is_priority(c.peer_addr)) {
                         self.reject_accepted_client(c, maxclients);
                     } else {
                         self.add_connection(c);
@@ -681,9 +691,17 @@ impl ServerWorkerState {
 
     fn reject_accepted_client(&mut self, client: RuntimeConnectedPeer, maxclients: u32) {
         if let Some(mut stream) = self.transport.stream(client.token) {
-            let _ = stream.write_all(b"-ERR max number of clients reached\r\n");
+            let error: &[u8] = if self.ctx.config().server.cluster_enabled {
+                b"-ERR max number of clients + cluster connections reached\r\n"
+            } else {
+                b"-ERR max number of clients reached\r\n"
+            };
+            let _ = stream.write_all(error);
         }
         self.ctx.incr_rejected_connections();
+        if self.peer_is_priority(client.peer_addr) {
+            self.ctx.stats_mut().rejected_priority_connections += 1;
+        }
         // A rejected client was never inserted into any business index, so
         // teardown is just the L1 deregister (deferred to a retry on failure).
         self.deregister_or_defer(client.token, PendingRemovalOwner::RejectedClient);
@@ -723,7 +741,10 @@ impl ServerWorkerState {
     pub(crate) fn cleanup_closed(&mut self) {
         let mut to_remove = Vec::new();
         for (_, conn) in self.connection_registry.iter() {
-            if conn.state == ConnectionState::Closing && !conn.has_pending_output() {
+            if conn.state == ConnectionState::Closing
+                && !conn.has_pending_output()
+                && !self.io_threads.is_write_inflight(conn.token())
+            {
                 to_remove.push(conn.token().0);
             }
         }
@@ -1092,10 +1113,7 @@ mod tests {
                 rdb_filter_mode: crate::framework::distributed::replication::RdbFilterMode::All,
             },
         );
-        backend
-            .replication_runtime
-            .register_rdb_channel(rdb, main)
-            .expect("RDB channel should associate with main channel");
+        backend.associate_waiting_rdb_for_test(main, rdb);
         backend.full_sync.diskless_relay = Some(DisklessRelay {
             transfer_id: crate::runtime::server::worker::reactor::sources::TransferId(0),
             source: None,
@@ -1260,10 +1278,7 @@ mod tests {
             .unwrap()
             .transition_to_waiting_for_rdb_channel()
             .unwrap();
-        backend
-            .replication_runtime
-            .register_rdb_channel(rdb, main)
-            .unwrap();
+        backend.associate_waiting_rdb_for_test(main, rdb);
         backend
             .replication_runtime
             .primary_link_mut(id)
@@ -1323,10 +1338,7 @@ mod tests {
             .expect("main link must exist")
             .transition_to_waiting_for_rdb_channel()
             .unwrap();
-        backend
-            .replication_runtime
-            .register_rdb_channel(rdb, main)
-            .unwrap();
+        backend.associate_waiting_rdb_for_test(main, rdb);
         backend
             .replication_runtime
             .primary_link_mut(replica_id)
@@ -1384,16 +1396,7 @@ mod tests {
                 rdb_filter_mode: crate::framework::distributed::replication::RdbFilterMode::All,
             },
         );
-        backend
-            .replication_runtime
-            .register_rdb_channel(rdb, main)
-            .unwrap();
-        backend
-            .replication_runtime
-            .primary_link_mut(replica_id)
-            .unwrap()
-            .transition_to_waiting_for_rdb_channel()
-            .unwrap();
+        backend.associate_waiting_rdb_for_test(main, rdb);
         backend
             .replication_runtime
             .primary_link_mut(replica_id)
@@ -1484,16 +1487,7 @@ mod tests {
                 rdb_filter_mode: crate::framework::distributed::replication::RdbFilterMode::All,
             },
         );
-        backend
-            .replication_runtime
-            .register_rdb_channel(rdb, syncing)
-            .unwrap();
-        backend
-            .replication_runtime
-            .primary_link_mut(syncing_id)
-            .unwrap()
-            .transition_to_waiting_for_rdb_channel()
-            .unwrap();
+        backend.associate_waiting_rdb_for_test(syncing, rdb);
         backend
             .replication_runtime
             .primary_link_mut(syncing_id)
@@ -1640,16 +1634,7 @@ mod tests {
                 rdb_filter_mode: crate::framework::distributed::replication::RdbFilterMode::All,
             },
         );
-        backend
-            .replication_runtime
-            .register_rdb_channel(rdb, main)
-            .unwrap();
-        backend
-            .replication_runtime
-            .primary_link_mut(replica_id)
-            .unwrap()
-            .transition_to_waiting_for_rdb_channel()
-            .unwrap();
+        backend.associate_waiting_rdb_for_test(main, rdb);
         backend
             .replication_runtime
             .primary_link_mut(replica_id)

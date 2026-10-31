@@ -1843,7 +1843,7 @@ fn lazy_expiry_uses_del_when_lazyfree_expire_is_disabled() {
 }
 
 #[test]
-fn lazy_hash_expiry_propagates_hdel_before_unlink_and_notifies_in_order() {
+fn ordinary_hash_read_hides_ghost_without_propagating_or_notifying() {
     let mut backend = ServerWorkerState::new(1).unwrap();
     crate::framework::commands::register_all(&mut backend.registry);
     let connection_token = add_fake_connection(&mut backend);
@@ -1869,8 +1869,6 @@ fn lazy_hash_expiry_propagates_hdel_before_unlink_and_notifies_in_order() {
     );
     let flags = spec.flags;
     let mut effects = DispatchSideEffects::default();
-    let frame =
-        |parts: &[&[u8]]| crate::engine::distributed::replication::protocol::encode_command(parts);
     let connection_effects = take_connection_command_effects(&mut backend, connection_token);
 
     backend.build_command_propagation(
@@ -1886,25 +1884,13 @@ fn lazy_hash_expiry_propagates_hdel_before_unlink_and_notifies_in_order() {
         &mut effects,
     );
 
-    assert_eq!(
-        effects.replication_only,
-        vec![
-            frame(&[b"MULTI"]),
-            frame(&[b"SELECT", b"0"]),
-            frame(&[b"HDEL", b"hash", b"field"]),
-            frame(&[b"UNLINK", b"hash"]),
-            frame(&[b"EXEC"]),
-        ]
-    );
-    let payloads = effects
-        .publish
-        .iter()
-        .map(|(_, payload)| payload.as_ref())
-        .collect::<Vec<_>>();
-    assert_eq!(
-        payloads,
-        vec![b"hexpired".as_slice(), b"hash", b"del", b"hash"]
-    );
+    assert!(effects.replication_only.is_empty());
+    assert!(effects.aof_only.is_empty());
+    assert!(effects.publish.is_empty());
+    let db = backend.ctx.db_mut(0).unwrap();
+    assert_eq!(db.get_hash_object(b"hash").unwrap().unwrap().hash_len(), 1);
+    assert!(db.get_hash_field_expire(b"hash", b"field").is_some());
+    assert_eq!(db.lazy_expired_hash_fields, 0);
 }
 
 #[test]

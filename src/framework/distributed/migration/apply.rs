@@ -105,4 +105,23 @@ impl MigrationCommandPlayer {
         crate::framework::aof_replay::apply_replay_command(&mut self.conn, args, registry, ctx)
             .map_err(MigrationApplyError::Command)
     }
+
+    pub(crate) fn apply_with_execution(
+        &mut self,
+        args: CommandArgs,
+        registry: &CommandRegistry,
+        ctx: &mut ServerContext,
+    ) -> (
+        Result<(), MigrationApplyError>,
+        crate::framework::aof_replay::ReplayExecution,
+    ) {
+        ctx.set_command_registry_snapshot(registry);
+        let (result, execution) = crate::framework::aof_replay::apply_replay_command_with_execution(
+            &mut self.conn,
+            args,
+            registry,
+            ctx,
+        );
+        (result.map_err(MigrationApplyError::Command), execution)
+    }
 }

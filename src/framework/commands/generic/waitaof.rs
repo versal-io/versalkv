@@ -72,7 +72,7 @@ fn parse_waitaof_numlocal(raw: &[u8]) -> Result<i64, &'static str> {
     }
 }
 
-fn waitaof_local_ack(
+pub(crate) fn waitaof_local_ack(
     ctx: &ServerContext,
     target_offset: crate::engine::distributed::replication::ReplicationOffset,
 ) -> i64 {

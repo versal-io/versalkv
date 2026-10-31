@@ -2,6 +2,7 @@ use crate::engine::distributed::replication::{
     backlog::{ContinueMatch, ReplicationBacklog},
     BacklogCursor, PsyncRequestOffset, ReplicationOffset, SnapshotBoundary,
 };
+use crate::foundation::io::compression::{StreamEncoder, StreamKind, REPLICATION_BATCH_BYTES};
 
 use super::{
     ConnectionId, LinkError, PrimaryDualChannelState, PrimaryLinkState, PrimarySyncPlan,
@@ -51,6 +52,11 @@ pub struct PrimaryLink {
     /// Rust half-open backlog cursor of the next byte not yet written.
     sent_cursor: BacklogCursor,
     pending_replication_bytes: usize,
+    compression: Option<StreamEncoder>,
+    compression_batch: Option<CompressionBatch>,
+    compression_frozen: bool,
+    compressed_bytes: u64,
+    uncompressed_bytes: u64,
     dual_main_stream_started: bool,
     dual_main_resume_read_cursor: Option<BacklogCursor>,
     dual_rdb_complete: bool,
@@ -110,6 +116,13 @@ struct FullResyncTransfer {
     should_wait_for_ack: bool,
 }
 
+#[derive(Debug)]
+struct CompressionBatch {
+    end: BacklogCursor,
+    logical_bytes: usize,
+    wire_bytes: usize,
+}
+
 impl PrimaryLink {
     pub fn new(connection_id: ConnectionId, replica: ReplicaConnectionInfo) -> Self {
         let zero = BacklogCursor::try_from(0).expect("zero is a valid replication cursor");
@@ -123,6 +136,11 @@ impl PrimaryLink {
             dual_main_backlog_pin_cursor: None,
             sent_cursor: zero,
             pending_replication_bytes: 0,
+            compression: None,
+            compression_batch: None,
+            compression_frozen: false,
+            compressed_bytes: 0,
+            uncompressed_bytes: 0,
             dual_main_stream_started: false,
             dual_main_resume_read_cursor: None,
             dual_rdb_complete: false,
@@ -307,18 +325,44 @@ impl PrimaryLink {
         if self.state != PrimaryLinkState::Streaming {
             return Ok(Vec::new());
         }
+        if self.compression_batch.is_some() {
+            return Ok(Vec::new());
+        }
         let backlog_end = backlog.next_stream_cursor();
         Self::enforce_cursor_invariant(self.sent_cursor, self.next_send_cursor, backlog_end)?;
         let read_cursor = self
             .dual_main_resume_read_cursor
             .unwrap_or(self.next_send_cursor);
-        let bytes = match backlog.read_from(read_cursor) {
+        let read = if self.compression.is_some() {
+            backlog.read_from_bounded(read_cursor, REPLICATION_BATCH_BYTES)
+        } else {
+            backlog.read_from(read_cursor)
+        };
+        let bytes = match read {
             Some(bytes) => bytes,
             None => {
                 self.state = PrimaryLinkState::Closing;
                 return Err(LinkError::BacklogEvicted);
             }
         };
+        if let Some(encoder) = self.compression.as_mut() {
+            let count = bytes.len().min(REPLICATION_BATCH_BYTES);
+            if count == 0 {
+                return Ok(Vec::new());
+            }
+            let wire = encoder
+                .flush_batch(&bytes[..count])
+                .map_err(|_| LinkError::Protocol)?;
+            self.compression_batch = Some(CompressionBatch {
+                end: read_cursor
+                    .checked_advance(count)
+                    .ok_or(LinkError::Protocol)?,
+                logical_bytes: count,
+                wire_bytes: wire.len(),
+            });
+            self.dual_main_resume_read_cursor = None;
+            return Ok(wire);
+        }
         Self::enforce_cursor_invariant(self.sent_cursor, backlog_end, backlog_end)?;
         self.next_send_cursor = backlog_end;
         self.dual_main_resume_read_cursor = None;
@@ -340,6 +384,20 @@ impl PrimaryLink {
             return Err(LinkError::Protocol);
         }
         Self::enforce_cursor_invariant(self.sent_cursor, self.next_send_cursor, backlog_end)?;
+        if self.compression_batch.is_some() {
+            self.pending_replication_bytes -= bytes;
+            if self.pending_replication_bytes == 0 {
+                let batch = self.compression_batch.take().expect("checked batch");
+                if batch.end > backlog_end {
+                    return Err(LinkError::Protocol);
+                }
+                self.sent_cursor = batch.end;
+                self.next_send_cursor = batch.end;
+                self.compressed_bytes += batch.wire_bytes as u64;
+                self.uncompressed_bytes += batch.logical_bytes as u64;
+            }
+            return Ok(());
+        }
         let sent_cursor = self
             .sent_cursor
             .checked_advance(bytes)
@@ -363,6 +421,9 @@ impl PrimaryLink {
         append_end: BacklogCursor,
         backlog_end: BacklogCursor,
     ) -> Result<bool, LinkError> {
+        if self.compression.is_some() {
+            return Ok(false);
+        }
         if self.state != PrimaryLinkState::Streaming
             || self.dual_state != PrimaryDualChannelState::WaitingForReplicaAck
         {
@@ -721,6 +782,35 @@ impl PrimaryLink {
         } else {
             self.next_send_cursor
         }
+    }
+
+    pub fn freeze_compression(&mut self, mode: &str) {
+        if self.compression_frozen {
+            return;
+        }
+        self.compression_frozen = true;
+        if crate::engine::distributed::replication::protocol::negotiate_lz4(
+            mode,
+            &self.replica.capability,
+        ) {
+            self.compression = Some(StreamEncoder::new(StreamKind::Replication, true, false));
+        }
+    }
+
+    pub fn is_compressed(&self) -> bool {
+        self.compression.is_some()
+    }
+
+    pub fn compression_stats(&self) -> Option<(u64, u64)> {
+        self.compression
+            .as_ref()
+            .map(|_| (self.compressed_bytes, self.uncompressed_bytes))
+    }
+
+    pub fn compression_memory_bytes(&self) -> usize {
+        self.compression
+            .as_ref()
+            .map_or(0, StreamEncoder::memory_bytes)
     }
 
     #[cfg(test)]

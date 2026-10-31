@@ -51,6 +51,274 @@ fn requester(primary_id: &str, requester_id: &str) -> ClusterNode {
     requester
 }
 
+fn nack_candidate() -> (ClusterBusManager, ClusterState, AutomaticFailoverFacts) {
+    let manager = ClusterBusManager::new();
+    let mut state = ClusterState::new("127.0.0.1", 6380, 16380);
+    let primary_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    for (id, slot, is_failed) in [
+        (primary_id, 7, true),
+        ("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", 8, false),
+        ("cccccccccccccccccccccccccccccccccccccccc", 9, false),
+    ] {
+        let mut primary =
+            ClusterNode::new(id.to_string(), "127.0.0.1".to_string(), 6379, 16379, true);
+        primary.flags &= !CLUSTER_NODE_MYSELF;
+        if is_failed {
+            primary.flags |= CLUSTER_NODE_FAIL;
+        }
+        primary.slots[slot] = true;
+        primary.numslots = 1;
+        state.nodes.insert(id.to_string(), primary);
+    }
+    state.myself.flags &= !CLUSTER_NODE_PRIMARY;
+    state.myself.flags |= CLUSTER_NODE_REPLICA;
+    state.myself.replicaof = primary_id.to_string();
+    let local = ReplicaEligibility {
+        node_id: NodeId::parse(state.myself.name.as_bytes()).unwrap(),
+        no_failover: false,
+        cluster_link_connected: true,
+        cluster_view_stale: false,
+        loading: false,
+        priority: 100,
+        cluster_replica_priority: 0,
+        replication_offset: 42,
+        data_age_ms: 0,
+        node_timeout_ms: 1_000,
+        repl_ping_period_ms: 0,
+        replica_validity_factor: 0,
+    };
+    let facts = AutomaticFailoverFacts {
+        now_ms: 1_000,
+        node_timeout_ms: 1_000,
+        current_epoch: 9,
+        voting_primaries: 3,
+        failed_primary_rank: 0,
+        all_replicas_primary_failed: true,
+        local: Some(local.clone()),
+        primary: Some(FailedPrimaryFacts {
+            node_id: NodeId::parse(primary_id.as_bytes()).unwrap(),
+            shard_id: NodeId::parse(primary_id.as_bytes()).unwrap(),
+            slots: state.nodes[primary_id].slots.clone(),
+            is_failed: true,
+        }),
+        siblings: vec![local],
+        manual: false,
+    };
+    state.automatic_failover.on_tick(&facts);
+    state.automatic_failover.on_tick(&facts);
+    state.current_epoch = 10;
+    (manager, state, facts)
+}
+
+#[test]
+fn nack_ignored_reasons_preserve_the_timeout_cadence() {
+    for reason in [1, 4, 5, 6, 0, 8, u8::MAX] {
+        let (mut manager, mut state, mut facts) = nack_candidate();
+        let voter_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let token = Token(90);
+        manager.register_incoming(token, "127.0.0.1:16390".parse().unwrap());
+        manager.connections.get_mut(&token.0).unwrap().node_name = voter_id.to_string();
+        let packet = msg::ClusterBusMessage::from_node(
+            ClusterMsgType::FailoverAuthNack,
+            &state.nodes[voter_id],
+            10,
+            ClusterBusBody::FailoverAuthNack {
+                request_epoch: 10,
+                reason,
+            },
+        )
+        .encode()
+        .unwrap();
+        let mut reader = PacketReader {
+            packet: Some(packet),
+        };
+        assert!(!manager.readable(&mut state, &mut reader, token.0, 1_001));
+        assert_eq!(
+            state.automatic_failover.rejected_voter_count(),
+            0,
+            "reason {reason}"
+        );
+        assert_eq!(state.automatic_failover.election_epoch(), 10);
+        assert_eq!(
+            state.automatic_failover.phase(),
+            AutomaticFailoverPhase::RequestingVotes
+        );
+        facts.now_ms = 3_000;
+        assert!(state.automatic_failover.on_tick(&facts).is_empty());
+        assert_eq!(
+            state.automatic_failover.phase(),
+            AutomaticFailoverPhase::RequestingVotes
+        );
+        facts.now_ms = 3_001;
+        assert!(state.automatic_failover.on_tick(&facts).is_empty());
+        assert_eq!(
+            state.automatic_failover.phase(),
+            AutomaticFailoverPhase::WaitingRankDelay
+        );
+        assert_eq!(state.automatic_failover.deadline_ms(), 5_000);
+    }
+}
+
+#[test]
+fn nack_sender_echoes_the_rejected_request_epoch() {
+    use crate::engine::distributed::cluster::node::CLUSTER_NODE_FAILOVER_AUTH_NACK_SUPPORTED;
+
+    let mut manager = ClusterBusManager::new();
+    let mut state = ClusterState::new("127.0.0.1", 6379, 16379);
+    state.add_slot(8).unwrap();
+    state.observe_topology_evaluation(0);
+    state.current_epoch = 99;
+    let requester_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let mut requester = requester("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", requester_id);
+    requester.flags |= CLUSTER_NODE_FAILOVER_AUTH_NACK_SUPPORTED;
+    state
+        .nodes
+        .insert(requester_id.to_string(), requester.clone());
+    let incoming = Token(91);
+    let outgoing = Token(92);
+    manager.register_incoming(incoming, "127.0.0.1:16381".parse().unwrap());
+    manager.register_outgoing_for_node(
+        outgoing,
+        "127.0.0.1:16381".parse().unwrap(),
+        false,
+        requester_id.to_string(),
+    );
+    manager
+        .connections
+        .get_mut(&outgoing.0)
+        .unwrap()
+        .handshake_sent = true;
+    let mut reader = PacketReader {
+        packet: Some(failover_packet(
+            &requester,
+            ClusterMsgType::FailoverAuthRequest,
+            10,
+        )),
+    };
+    assert!(!manager.readable(&mut state, &mut reader, incoming.0, 3_000));
+    let packet = &manager.connections[&outgoing.0].write_buf;
+    let (response, consumed) = msg::ClusterBusMessage::decode(packet).unwrap();
+    assert_eq!(response.msg_type, ClusterMsgType::FailoverAuthNack);
+    assert_eq!(response.current_epoch, 99);
+    assert_eq!(consumed, msg::CLUSTER_BUS_HEADER_LEN + 16);
+    assert_eq!(
+        &packet[msg::CLUSTER_BUS_HEADER_LEN..],
+        &[0, 0, 0, 0, 0, 0, 0, 10, 2, 0, 0, 0, 0, 0, 0, 0]
+    );
+}
+
+#[test]
+fn nack_per_round_reasons_preserve_voting_primary_and_fail_guards() {
+    for reason in [2, 3, 7] {
+        for guard in ["none", "failed", "replica", "slotless", "unknown", "acked"] {
+            let (mut manager, mut state, _) = nack_candidate();
+            let voter_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+            let voter = state.nodes.get_mut(voter_id).unwrap();
+            match guard {
+                "failed" => voter.flags |= CLUSTER_NODE_FAIL,
+                "replica" => {
+                    voter.flags &= !CLUSTER_NODE_PRIMARY;
+                    voter.flags |= CLUSTER_NODE_REPLICA;
+                }
+                "slotless" => {
+                    voter.slots.fill(false);
+                    voter.numslots = 0;
+                }
+                _ => {}
+            }
+            let sender = voter.clone();
+            if guard == "unknown" {
+                state.nodes.remove(voter_id);
+            }
+            if guard == "acked" {
+                assert!(state
+                    .automatic_failover
+                    .on_vote_ack(NodeId::parse(voter_id.as_bytes()).unwrap(), 10, true)
+                    .is_empty());
+            }
+            let token = Token(94);
+            manager.register_incoming(token, "127.0.0.1:16390".parse().unwrap());
+            manager.connections.get_mut(&token.0).unwrap().node_name = voter_id.to_string();
+            let packet = msg::ClusterBusMessage::from_node(
+                ClusterMsgType::FailoverAuthNack,
+                &sender,
+                99,
+                ClusterBusBody::FailoverAuthNack {
+                    request_epoch: 10,
+                    reason,
+                },
+            )
+            .encode()
+            .unwrap();
+            let mut reader = PacketReader {
+                packet: Some(packet),
+            };
+            assert!(!manager.readable(&mut state, &mut reader, token.0, 1_001));
+            let is_counted = guard == "none";
+            assert_eq!(
+                state.automatic_failover.rejected_voter_count(),
+                usize::from(is_counted),
+                "reason={reason}, guard={guard}"
+            );
+            assert_eq!(
+                state.automatic_failover.phase(),
+                if is_counted {
+                    AutomaticFailoverPhase::Idle
+                } else {
+                    AutomaticFailoverPhase::RequestingVotes
+                },
+                "reason={reason}, guard={guard}"
+            );
+        }
+    }
+}
+
+#[test]
+fn nack_receiver_matches_request_epoch_instead_of_header_epoch() {
+    for (header_epoch, request_epoch, is_counted) in [
+        (10, 9, false),
+        (10, 11, false),
+        (10, u64::MAX, false),
+        (9, 10, true),
+        (10, 10, true),
+        (99, 10, true),
+    ] {
+        let (mut manager, mut state, _) = nack_candidate();
+        let voter_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let token = Token(93);
+        manager.register_incoming(token, "127.0.0.1:16390".parse().unwrap());
+        manager.connections.get_mut(&token.0).unwrap().node_name = voter_id.to_string();
+        let packet = msg::ClusterBusMessage::from_node(
+            ClusterMsgType::FailoverAuthNack,
+            &state.nodes[voter_id],
+            header_epoch,
+            ClusterBusBody::FailoverAuthNack {
+                request_epoch,
+                reason: 2,
+            },
+        )
+        .encode()
+        .unwrap();
+        let mut reader = PacketReader {
+            packet: Some(packet),
+        };
+        assert!(!manager.readable(&mut state, &mut reader, token.0, 1_001));
+        assert_eq!(
+            state.automatic_failover.rejected_voter_count(),
+            usize::from(is_counted),
+            "header={header_epoch}, request={request_epoch}"
+        );
+        assert_eq!(
+            state.automatic_failover.phase(),
+            if is_counted {
+                AutomaticFailoverPhase::Idle
+            } else {
+                AutomaticFailoverPhase::RequestingVotes
+            }
+        );
+    }
+}
+
 #[test]
 fn non_heartbeat_sender_updates_preserve_learned_cluster_priority() {
     for kind in [

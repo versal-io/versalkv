@@ -22,6 +22,140 @@ fn inline_echo() {
         ])
     );
 }
+
+#[test]
+fn inline_line_endings_preserve_command_boundaries() {
+    for ending in [b"\n".as_slice(), b"\r\n".as_slice()] {
+        let mut parser = Parser::new();
+        let mut request = b"ECHO hello".to_vec();
+        request.extend_from_slice(ending);
+        request.extend_from_slice(b"PING\r\nPING\n");
+        parser.feed(&request);
+        assert_eq!(
+            parser.try_parse().unwrap(),
+            Some(vec![
+                Bytes::from_static(b"ECHO"),
+                Bytes::from_static(b"hello"),
+            ])
+        );
+        assert_eq!(parser.last_cmd_len(), 10 + ending.len());
+        for expected_len in [6, 5] {
+            assert_eq!(
+                parser.try_parse().unwrap(),
+                Some(vec![Bytes::from_static(b"PING")])
+            );
+            assert_eq!(parser.last_cmd_len(), expected_len);
+        }
+        assert_eq!(parser.try_parse().unwrap(), None);
+        assert!(!parser.has_inflight_request());
+    }
+}
+
+#[test]
+fn inline_nul_is_rejected_only_after_its_line_is_complete() {
+    for suffix in [b"\n".as_slice(), b"\r\n".as_slice()] {
+        let mut parser = Parser::new();
+        parser.feed(b"SET key value\0");
+        assert_eq!(parser.try_parse().unwrap(), None);
+        assert!(parser.has_inflight_request());
+        if suffix == b"\r\n" {
+            parser.feed(b"\r");
+            assert_eq!(parser.try_parse().unwrap(), None);
+        }
+        parser.feed(b"\n");
+        assert_eq!(
+            parser.try_parse(),
+            Err(ParseError::Protocol(
+                "Protocol error: embedded NUL byte in inline request".into()
+            ))
+        );
+        assert!(!parser.has_inflight_request());
+        assert_eq!(parser.try_parse().unwrap(), None);
+    }
+}
+
+#[test]
+fn inline_nul_does_not_reject_preceding_mixed_lines() {
+    for prefix in [b"PING\n".as_slice(), b"PING\r\n".as_slice()] {
+        let mut parser = Parser::new();
+        parser.feed(prefix);
+        parser.feed(b"SET key value\0\nPING\r\n");
+        assert_eq!(
+            parser.try_parse().unwrap(),
+            Some(vec![Bytes::from_static(b"PING")])
+        );
+        assert_eq!(parser.last_cmd_len(), prefix.len());
+        assert_eq!(
+            parser.try_parse(),
+            Err(ParseError::Protocol(
+                "Protocol error: embedded NUL byte in inline request".into()
+            ))
+        );
+        assert!(!parser.has_inflight_request());
+    }
+}
+
+#[test]
+fn inline_lf_compaction_preserves_partial_next_line() {
+    let mut parser = Parser::new();
+    parser.feed(&b"PING\n".repeat(1000));
+    parser.feed(b"ECHO tail\r");
+    for _ in 0..1000 {
+        assert_eq!(
+            parser.try_parse().unwrap(),
+            Some(vec![Bytes::from_static(b"PING")])
+        );
+    }
+    assert_eq!(parser.try_parse().unwrap(), None);
+    assert_eq!(parser.pending_len(), 10);
+    parser.feed(b"\n");
+    assert_eq!(
+        parser.try_parse().unwrap(),
+        Some(vec![
+            Bytes::from_static(b"ECHO"),
+            Bytes::from_static(b"tail")
+        ])
+    );
+    assert_eq!(parser.last_cmd_len(), 11);
+    assert!(!parser.has_inflight_request());
+}
+
+#[test]
+fn inline_lf_does_not_relax_multibulk_crlf() {
+    for request in [b"*1\n".as_slice(), b"*1\r\n$4\n".as_slice()] {
+        let mut parser = Parser::new();
+        parser.feed(request);
+        assert_eq!(parser.try_parse().unwrap(), None);
+        assert!(parser.has_inflight_request());
+    }
+    let mut parser = Parser::new();
+    parser.feed(b"*1\r\n$4\r\nPING\nX");
+    assert_eq!(
+        parser.try_parse(),
+        Err(ParseError::Protocol(
+            "Protocol error: invalid CRLF in request".into()
+        ))
+    );
+
+    let mut parser = Parser::new();
+    parser.feed(b"PING\n*2\r\n$4\r\nECHO\r\n$7\r\nbar\0baz\r\nPING\n");
+    assert_eq!(
+        parser.try_parse().unwrap(),
+        Some(vec![Bytes::from_static(b"PING")])
+    );
+    assert_eq!(
+        parser.try_parse().unwrap(),
+        Some(vec![
+            Bytes::from_static(b"ECHO"),
+            Bytes::from_static(b"bar\0baz"),
+        ])
+    );
+    assert_eq!(
+        parser.try_parse().unwrap(),
+        Some(vec![Bytes::from_static(b"PING")])
+    );
+    assert_eq!(parser.try_parse().unwrap(), None);
+}
 #[test]
 fn mbulk_ping() {
     let mut p = Parser::new();
@@ -272,7 +406,7 @@ fn try_parse_limited_rejects_over_limit_multibulk_and_bulk() {
 #[test]
 fn invalid_crlf_and_bulk_length_errors() {
     let mut p = Parser::new();
-    p.feed(b"PING\rX\n");
+    p.feed(b"*1\rX\n");
     assert!(p.try_parse().is_err());
 
     let mut p = Parser::new();
@@ -286,6 +420,16 @@ fn invalid_crlf_and_bulk_length_errors() {
     let mut p = Parser::new();
     p.feed(b"*1\r\n$-1\r\n");
     assert!(p.try_parse().is_err());
+}
+
+#[test]
+fn inline_internal_cr_remains_an_argument_separator() {
+    let mut parser = Parser::new();
+    parser.feed(b"PING\rX\n");
+    assert_eq!(
+        parser.try_parse().unwrap(),
+        Some(vec![Bytes::from_static(b"PING"), Bytes::from_static(b"X")])
+    );
 }
 
 #[test]

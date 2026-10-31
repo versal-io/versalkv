@@ -1,5 +1,6 @@
 mod aof;
 mod lua;
+mod module;
 mod rdb;
 
 pub(crate) use aof::{
@@ -7,12 +8,14 @@ pub(crate) use aof::{
     AofTaskError, DebugAofTask,
 };
 pub(crate) use lua::{prepare_lua_task, run_lua_task_inline, LuaTask};
+pub(crate) use module::{prepare_module_task, ModuleTask};
 pub(crate) use rdb::{
     replace_function_libraries, DatasetVisibility, DebugRdbTask, RdbLoadTask, RdbTaskError,
 };
 
 pub(crate) enum PreparedHostTask {
     Lua(LuaTask),
+    Module(ModuleTask),
     DebugRdb(DebugRdbTask),
     DebugAof(DebugAofTask),
     DrainClusterConfig,

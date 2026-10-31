@@ -9,166 +9,130 @@ pub fn getex(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> CommandOut
     let key = &args.args[0];
     let db_idx = runtime.selected_db();
     let now_ms = runtime.now_ms();
+    let option = match parse_getex_options(&args.args[1..], now_ms) {
+        Ok(option) => option,
+        Err(error) => return CommandOutcome::reply(error),
+    };
+    let should_preserve_deadline = runtime.preserves_expired_deadline();
+    let should_read_expired = runtime.read_expired_values();
+    let should_suppress_expire = runtime.suppress_lazy_expire();
+    let should_mark_local_expire = runtime.should_mark_replica_local_expire();
+    let db = match runtime.db_mut() {
+        Some(db) => db,
+        None => return CommandOutcome::reply(CommandError::db_index_out_of_range()),
+    };
+    db.set_no_lazy_expire(should_suppress_expire);
+    let object = if should_read_expired {
+        db.get_allow_expired(key)
+    } else {
+        db.get_at(key, now_ms)
+    };
+    let reply = match object {
+        Some(object) if object.is_string() => Value::bulk(object.as_bytes().to_vec()),
+        Some(_) => CommandError::wrong_type(),
+        None => Value::null(),
+    };
+    db.set_no_lazy_expire(false);
+    if matches!(reply, Value::Error(_) | Value::Null) {
+        return CommandOutcome::reply(reply);
+    }
     let mut effects = CommandEffects {
         skip_propagate: true,
         ..CommandEffects::default()
     };
-    let mut has_write = false;
-    let mut notify_expire = false;
-    let mut i = 1;
-    while i < args.args.len() {
-        let opt = String::from_utf8_lossy(&args.args[i]).to_ascii_uppercase();
-        match opt.as_str() {
-            "EX" | "PX" | "EXAT" | "PXAT" => {
-                if i + 1 >= args.args.len() {
-                    return CommandOutcome::reply(CommandError::syntax_error());
-                }
-                let raw = &args.args[i + 1];
-                let n = match std::str::from_utf8(raw)
-                    .ok()
-                    .and_then(|s| s.trim().parse::<i64>().ok())
-                {
-                    Some(v) => v,
-                    None => {
-                        return CommandOutcome::reply(Value::error(
-                            "ERR value is not an integer or out of range",
-                        ))
-                    }
-                };
-                let abs_ms = match opt.as_str() {
-                    "EX" => {
-                        if n <= 0 {
-                            return CommandOutcome::reply(Value::error(
-                                "ERR invalid expire time in 'getex' command",
-                            ));
-                        }
-                        n.checked_mul(1000)
-                            .and_then(|d| d.checked_add(now_ms as i64))
-                    }
-                    "PX" => {
-                        if n <= 0 {
-                            return CommandOutcome::reply(Value::error(
-                                "ERR invalid expire time in 'getex' command",
-                            ));
-                        }
-                        n.checked_add(now_ms as i64)
-                    }
-                    "EXAT" => {
-                        if n <= 0 {
-                            return CommandOutcome::reply(Value::error(
-                                "ERR invalid expire time in 'getex' command",
-                            ));
-                        }
-                        n.checked_mul(1000)
-                    }
-                    _ => {
-                        if n <= 0 {
-                            return CommandOutcome::reply(Value::error(
-                                "ERR invalid expire time in 'getex' command",
-                            ));
-                        }
-                        Some(n)
-                    }
-                };
-                let abs_ms = match abs_ms {
-                    Some(v) => v,
-                    None => {
-                        return CommandOutcome::reply(Value::error(
-                            "ERR invalid expire time in 'getex' command",
-                        ))
-                    }
-                };
-                {
-                    let db = match runtime.db_mut() {
-                        Some(d) => d,
-                        None => {
-                            return CommandOutcome::reply(CommandError::db_index_out_of_range())
-                        }
-                    };
-                    if abs_ms <= now_ms as i64 {
-                        db.del(key);
-                        db.expired_deletions.push(key.to_vec());
-                        effects.custom_propagations.clear();
-                    } else {
-                        db.set_expire(key, abs_ms as u64);
-                        effects.custom_propagations.push(vec![
-                            Bytes::from_static(b"PEXPIREAT"),
-                            key.clone(),
-                            abs_ms.to_string().into(),
-                        ]);
-                    }
-                }
-                notify_expire = true;
-                has_write = true;
-                i += 2;
-            }
-            "PERSIST" => {
-                {
-                    let db = match runtime.db_mut() {
-                        Some(d) => d,
-                        None => {
-                            return CommandOutcome::reply(CommandError::db_index_out_of_range())
-                        }
-                    };
-                    db.persist(key);
-                }
-                effects
-                    .custom_propagations
-                    .push(vec![Bytes::from_static(b"PERSIST"), key.clone()]);
-                has_write = true;
-                i += 1;
-            }
-            _ => return CommandOutcome::reply(CommandError::syntax_error()),
+    let event = match option {
+        GetExOption::None => None,
+        GetExOption::At(deadline_ms) if deadline_ms <= now_ms && !should_preserve_deadline => {
+            db.del(key);
+            db.expired_deletions.push(key.to_vec());
+            None
         }
-    }
-
-    let obj = {
-        let db = match runtime.db_mut() {
-            Some(d) => d,
-            None => return CommandOutcome::reply(CommandError::db_index_out_of_range()),
-        };
-        match db.get(key) {
-            Some(obj) => {
-                if !obj.is_string() {
-                    return CommandOutcome::reply(CommandError::wrong_type());
-                }
-                Some(obj.clone())
+        GetExOption::At(deadline_ms) => {
+            db.set_expire(key, deadline_ms);
+            if should_mark_local_expire {
+                db.mark_replica_local_expire(key);
             }
-            None => None,
+            effects.custom_propagations.push(vec![
+                Bytes::from_static(b"PEXPIREAT"),
+                key.clone(),
+                Bytes::from(deadline_ms.to_string()),
+            ]);
+            Some("expire")
         }
+        GetExOption::Persist if db.persist(key) => {
+            effects
+                .custom_propagations
+                .push(vec![Bytes::from_static(b"PERSIST"), key.clone()]);
+            Some("persist")
+        }
+        GetExOption::Persist => None,
     };
-
-    if obj.is_none() {
-        effects.changed_keys.clear();
-        effects.events.clear();
-        effects.custom_propagations.clear();
-        effects.skip_propagate = true;
-        return CommandOutcome {
-            reply: Value::null(),
-            effects,
-        };
-    }
-
-    if notify_expire {
+    if let Some(kind) = event {
+        effects.changed_keys.push((db_idx, key.clone()));
         effects.events.push(CoreEvent {
-            kind: "expire",
+            kind,
             key: key.clone(),
         });
     }
+    CommandOutcome { reply, effects }
+}
 
-    if has_write {
-        effects.skip_propagate = false;
-        effects.changed_keys.push((db_idx, key.clone()));
-    }
+enum GetExOption {
+    None,
+    Persist,
+    At(u64),
+}
 
-    CommandOutcome {
-        reply: Value::bulk(
-            obj.expect("GETEX value existence was checked above")
-                .as_bytes()
-                .to_vec(),
-        ),
-        effects,
+fn parse_getex_options(options: &[Bytes], now_ms: u64) -> Result<GetExOption, Value> {
+    let mut mode: Option<&[u8]> = None;
+    let mut timeout = None;
+    let mut index = 0;
+    while index < options.len() {
+        let option = options[index].as_ref();
+        let is_persist = option.eq_ignore_ascii_case(b"PERSIST");
+        let is_expiry = [b"EX".as_slice(), b"PX", b"EXAT", b"PXAT"]
+            .iter()
+            .any(|candidate| option.eq_ignore_ascii_case(candidate));
+        if !is_persist && !is_expiry {
+            return Err(CommandError::syntax_error());
+        }
+        if mode.is_some_and(|previous| !previous.eq_ignore_ascii_case(option)) {
+            return Err(CommandError::syntax_error());
+        }
+        mode = Some(option);
+        index += 1;
+        if is_expiry {
+            timeout = Some(options.get(index).ok_or_else(CommandError::syntax_error)?);
+            index += 1;
+        }
     }
+    let Some(mode) = mode else {
+        return Ok(GetExOption::None);
+    };
+    let Some(timeout) = timeout else {
+        return Ok(GetExOption::Persist);
+    };
+    let value = crate::foundation::io::store::structure::string::encoding::int_encodable(timeout)
+        .ok_or_else(|| Value::error("ERR value is not an integer or out of range"))?;
+    let invalid_expire = || Value::error("ERR invalid expire time in 'getex' command");
+    if value <= 0 {
+        return Err(invalid_expire());
+    }
+    let is_seconds = mode.eq_ignore_ascii_case(b"EX") || mode.eq_ignore_ascii_case(b"EXAT");
+    let value_ms = if is_seconds {
+        value.checked_mul(1_000).ok_or_else(invalid_expire)?
+    } else {
+        value
+    };
+    let deadline = if mode.eq_ignore_ascii_case(b"EX") || mode.eq_ignore_ascii_case(b"PX") {
+        i64::try_from(now_ms)
+            .ok()
+            .and_then(|base| base.checked_add(value_ms))
+            .ok_or_else(invalid_expire)?
+    } else {
+        value_ms
+    };
+    Ok(GetExOption::At(deadline as u64))
 }
 
 #[cfg(test)]
@@ -196,7 +160,7 @@ mod tests {
 
         let outcome = getex(&mut runtime, &args);
 
-        assert_eq!(outcome.reply, Value::null());
+        assert_eq!(outcome.reply, Value::bulk("value"));
         assert!(outcome.effects.skip_propagate);
         assert!(outcome.effects.changed_keys.is_empty());
         assert!(outcome.effects.custom_propagations.is_empty());
@@ -204,5 +168,66 @@ mod tests {
             runtime.db_mut().unwrap().expired_deletions,
             vec![b"key".to_vec()]
         );
+    }
+
+    #[test]
+    fn invalid_options_preserve_the_value_and_deadline() {
+        for options in [
+            vec!["PX", "50000", "invalid"],
+            vec!["PX", "50000", "EX", "5"],
+            vec!["PXAT", "999", "PERSIST"],
+        ] {
+            let now_ms = crate::foundation::io::store::kv_engine::now_ms();
+            let mut runtime = TestCommandRuntime::new(1, now_ms);
+            let db = runtime.db_mut().unwrap();
+            db.set(b"key".to_vec(), Robj::string("value"));
+            db.set_expire(b"key", now_ms + 20_000);
+            let args = CommandArgs::from_parts(
+                ["GETEX", "key"]
+                    .into_iter()
+                    .chain(options)
+                    .map(Bytes::from)
+                    .collect(),
+            );
+
+            let outcome = getex(&mut runtime, &args);
+
+            assert_eq!(outcome.reply, Value::error("ERR syntax error"));
+            let db = runtime.db_mut().unwrap();
+            assert_eq!(db.get(b"key").unwrap().as_bytes(), b"value");
+            assert_eq!(db.get_expire(b"key"), Some(now_ms + 20_000));
+            assert!(db.expired_deletions.is_empty());
+            assert!(outcome.effects.changed_keys.is_empty());
+        }
+    }
+
+    #[test]
+    fn valid_options_return_the_value_and_update_only_the_deadline() {
+        let now_ms = crate::foundation::io::store::kv_engine::now_ms();
+        for (options, expected_deadline) in [
+            (vec![], Some(now_ms + 20_000)),
+            (vec!["PX", "50000", "PX", "60000"], Some(now_ms + 60_000)),
+            (vec!["PERSIST", "PERSIST"], None),
+        ] {
+            let mut runtime = TestCommandRuntime::new(1, now_ms);
+            let db = runtime.db_mut().unwrap();
+            db.set(b"key".to_vec(), Robj::string("value"));
+            db.set_expire(b"key", now_ms + 20_000);
+            let args = CommandArgs::from_parts(
+                ["GETEX", "key"]
+                    .into_iter()
+                    .chain(options)
+                    .map(Bytes::from)
+                    .collect(),
+            );
+
+            let outcome = getex(&mut runtime, &args);
+
+            assert_eq!(outcome.reply, Value::bulk("value"));
+            assert_eq!(
+                runtime.db_mut().unwrap().get_expire(b"key"),
+                expected_deadline
+            );
+        }
     }
 }

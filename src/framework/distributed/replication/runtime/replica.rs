@@ -4,6 +4,7 @@
 //! opening and closing its transport.
 
 use super::*;
+use crate::framework::distributed::replication::RdbFilterMode;
 
 impl ReplicationRuntime {
     pub fn set_replica_link(&mut self, link: ReplicaLink) {
@@ -340,11 +341,23 @@ impl ReplicationRuntime {
 
     /// Count how many primary links are currently in the deferred diskless
     /// window (PreparingFullResync and waiting for the delay).
+    #[cfg(test)]
     pub fn count_deferred_diskless_links(&self) -> usize {
         self.primary_links
             .values()
             .filter(|l| l.is_deferred_diskless())
             .count()
+    }
+
+    /// Collect only deferred links that can share the selected RDB filter.
+    pub fn collect_deferred_links_for_filter(&self, filter_mode: RdbFilterMode) -> Vec<ReplicaId> {
+        self.primary_links
+            .iter()
+            .filter(|(_, link)| {
+                link.is_deferred_diskless() && link.replica().rdb_filter_mode == filter_mode
+            })
+            .map(|(&id, _)| id)
+            .collect()
     }
 
     pub fn set_replica_resume(

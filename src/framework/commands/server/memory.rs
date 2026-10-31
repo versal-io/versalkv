@@ -228,7 +228,13 @@ fn memory_usage(conn: &mut dyn CommandConn, args: &CommandArgs, dbs: &mut DbSet)
     };
     match db.get(key) {
         Some(obj) => {
-            let usage = estimate_memory(key.as_ref(), obj);
+            let mut usage = estimate_memory(key.as_ref(), obj);
+            if let Some(fields) = db.hash_field_expires_for(key) {
+                usage += fields
+                    .keys()
+                    .map(|field| field.len() + std::mem::size_of::<u64>() + 2 * std::mem::size_of::<usize>())
+                    .sum::<usize>();
+            }
             Value::integer(usage as i64)
         }
         None => Value::null(),
@@ -256,7 +262,7 @@ fn estimate_memory(key: &[u8], obj: &Robj) -> usize {
             }
             total
         }
-        Robj::HashListpack(h) => h.memory_usage(),
+        Robj::HashListpack(h) => h.raw_bytes().len(),
         Robj::SetHashtable(s) => {
             let mut total = 0;
             for item in s.data.keys() {
@@ -288,6 +294,7 @@ fn estimate_memory(key: &[u8], obj: &Robj) -> usize {
             total
         }
         Robj::StreamRadix(_) => 0,
+        Robj::PathHash(hash) => hash.memory_usage(),
     };
     key_len + value_len + HASHMAP_ENTRY_OVERHEAD
 }

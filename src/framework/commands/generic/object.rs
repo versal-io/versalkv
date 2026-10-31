@@ -15,34 +15,30 @@ pub struct ObjectEncodingLimits {
 /// Compute the encoding name as reported by OBJECT ENCODING / DEBUG OBJECT.
 /// Lists and legacy hashes use size-based inference. ZSets report their
 /// physical encoding so configuration changes cannot downgrade existing trees.
+/// Hashes with field TTLs or string references must retain hashtable storage.
 pub fn encoding_display_name(
     obj: &Robj,
     limits: ObjectEncodingLimits,
-    hash_has_volatile: bool,
+    hash_requires_hashtable: bool,
 ) -> &'static str {
     match obj {
         Robj::ListQuicklist(l) => l.encoding_name(limits.list_max_listpack_size),
         Robj::HashHashtable(h) => {
-            let enc = crate::foundation::io::store::structure::hash::infer_hash_encoding(
+            if hash_requires_hashtable {
+                return "hashtable";
+            }
+            crate::foundation::io::store::structure::hash::infer_hash_encoding(
                 h,
                 limits.hash_max_listpack_entries,
                 limits.hash_max_listpack_value,
-            );
-            if enc == "listpack" && hash_has_volatile {
-                "hashtable"
-            } else {
-                enc
-            }
+            )
         }
         _ => obj.encoding_name(),
     }
 }
 
 #[command("OBJECT", runtime)]
-pub fn object_cmd(
-    runtime: &mut dyn CommandRuntime,
-    args: &CommandArgs,
-) -> CommandOutcome {
+pub fn object_cmd(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> CommandOutcome {
     CommandOutcome::reply(object_reply(runtime, args))
 }
 
@@ -59,7 +55,7 @@ fn object_reply(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> Value {
             if args.args.len() != 2 {
                 return CommandError::wrong_arity("object|encoding");
             }
-            let (obj, hash_has_volatile) = {
+            let (obj, hash_requires_hashtable) = {
                 let db = match runtime.db_mut() {
                     Some(d) => d,
                     None => return CommandError::db_index_out_of_range(),
@@ -68,11 +64,12 @@ fn object_reply(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> Value {
                     Some(o) => o.clone(),
                     None => return Value::error("ERR no such key"),
                 };
-                let volatile = matches!(obj, Robj::HashHashtable(_))
-                    && db.hash_key_has_volatile_fields(&args.args[1]);
-                (obj, volatile)
+                let requires_hashtable = matches!(obj, Robj::HashHashtable(_))
+                    && (db.hash_key_has_volatile_fields(&args.args[1])
+                        || db.hash_key_has_string_refs(&args.args[1]));
+                (obj, requires_hashtable)
             };
-            let enc = encoding_display_name(&obj, limits, hash_has_volatile);
+            let enc = encoding_display_name(&obj, limits, hash_requires_hashtable);
             Value::bulk(enc.as_bytes().to_vec())
         }
         "refcount" => {
@@ -109,5 +106,34 @@ fn object_reply(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> Value {
             "ERR Unknown subcommand or wrong number of arguments for '{}'.",
             sub
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::framework::commands::command_runtime::TestCommandRuntime;
+
+    #[test]
+    fn stringref_hash_encoding_reports_hashtable_without_field_ttl() {
+        let mut runtime = TestCommandRuntime::new(1, 100);
+        runtime
+            .db_mut()
+            .unwrap()
+            .hash_set_with_limits(b"hash", b"field", b"value", 512, 64)
+            .unwrap();
+        let args = CommandArgs::from_parts(vec!["OBJECT".into(), "ENCODING".into(), "hash".into()]);
+        assert_eq!(object_reply(&mut runtime, &args), Value::bulk("listpack"));
+        assert!(runtime
+            .db_mut()
+            .unwrap()
+            .set_hash_string_ref(b"hash", b"field", b"value"));
+        assert!(!runtime
+            .db_mut()
+            .unwrap()
+            .hash_key_has_volatile_fields(b"hash"));
+        assert_eq!(object_reply(&mut runtime, &args), Value::bulk("hashtable"));
+        runtime.hash_encoding_limits = (1024, 1024);
+        assert_eq!(object_reply(&mut runtime, &args), Value::bulk("hashtable"));
     }
 }

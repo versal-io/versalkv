@@ -1,15 +1,14 @@
 use crate::engine::core::{CommandEffects, CommandOutcome, CoreEvent, Value};
-use crate::framework::{CommandArgs, CommandError};
 use crate::framework::commands::command_runtime::CommandRuntime;
+use crate::framework::{CommandArgs, CommandError};
 use bytes::Bytes;
 use command_macros::command;
 
 #[command("SETEX", runtime)]
 pub fn setex(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> CommandOutcome {
-    let seconds = match std::str::from_utf8(&args.args[1])
-        .ok()
-        .and_then(|s| s.trim().parse::<i64>().ok())
-    {
+    let seconds = match crate::foundation::io::store::structure::string::encoding::int_encodable(
+        &args.args[1],
+    ) {
         Some(v) => v,
         None => {
             return CommandOutcome::reply(Value::error(
@@ -18,9 +17,7 @@ pub fn setex(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> CommandOut
         }
     };
     if seconds <= 0 {
-        return CommandOutcome::reply(Value::error(
-            "ERR invalid expire time in 'setex' command",
-        ));
+        return CommandOutcome::reply(Value::error("ERR invalid expire time in 'setex' command"));
     }
     let now_ms = runtime.now_ms();
     let abs_ms = match seconds

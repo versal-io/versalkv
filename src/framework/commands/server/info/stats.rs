@@ -154,6 +154,7 @@ fn emit_connection_and_network_stats(s: &mut String, ctx: &ServerContext) {
 fn emit_expiration_and_keyspace_stats(s: &mut String, ctx: &ServerContext) {
     let stats = ctx.stats();
     emit_line(s, "rejected_connections", stats.rejected_connections);
+    emit_line(s, "rejected_priority_connections", stats.rejected_priority_connections);
     emit_line(s, "sync_full", stats.sync_full);
     emit_line(s, "sync_partial_ok", stats.sync_partial_ok);
     emit_line(s, "sync_partial_err", stats.sync_partial_err);
@@ -313,6 +314,9 @@ fn emit_eventloop_and_acl_stats(s: &mut String, ctx: &ServerContext) {
         "instantaneous_eventloop_duration_usec",
         stats.instantaneous_eventloop_duration_usec,
     );
+    emit_line(s, "eventloop_priority_cycles", stats.eventloop_priority_cycles);
+    emit_line(s, "eventloop_priority_duration_sum", stats.eventloop_priority_duration_sum);
+    emit_line(s, "eventloop_priority_duration_cmd_sum", stats.eventloop_priority_duration_cmd_sum);
     emit_line(
         s,
         "acl_access_denied_auth",
@@ -333,7 +337,7 @@ fn emit_eventloop_and_acl_stats(s: &mut String, ctx: &ServerContext) {
         "acl_access_denied_channel",
         ACL_STATS_CHANNEL.load(std::sync::atomic::Ordering::Relaxed),
     );
-    emit_line(s, "acl_access_denied_tls_cert", 0);
+    emit_line(s, "acl_access_denied_tls_cert", stats.acl_access_denied_tls_cert);
     emit_line(
         s,
         "acl_access_denied_db",
@@ -344,6 +348,8 @@ fn emit_eventloop_and_acl_stats(s: &mut String, ctx: &ServerContext) {
 pub(super) fn gen_debug_section(ctx: &ServerContext) -> String {
     let mut s = String::new();
     s.push_str("# Debug\r\n");
+    emit_line(&mut s, "eventloop_priority_duration_max", ctx.stats().eventloop_priority_duration_max);
+    emit_line(&mut s, "eventloop_priority_cmd_per_cycle_max", ctx.stats().eventloop_priority_cmd_per_cycle_max);
     let forkless = ctx.persistence().forkless_progress();
     emit_line(&mut s, "forkless_current_item_ms", forkless.map_or(-1, |p| p.current_item_ms));
     emit_line(&mut s, "forkless_current_queue_length", forkless.map_or(0, |p| p.queue_length));
@@ -422,6 +428,7 @@ mod tests {
                 "instantaneous_input_repl_kbps",
                 "instantaneous_output_repl_kbps",
                 "rejected_connections",
+                "rejected_priority_connections",
                 "sync_full",
                 "sync_partial_ok",
                 "sync_partial_err",
@@ -481,6 +488,9 @@ mod tests {
                 "eventloop_events_dispatch_latency_sum",
                 "instantaneous_eventloop_cycles_per_sec",
                 "instantaneous_eventloop_duration_usec",
+                "eventloop_priority_cycles",
+                "eventloop_priority_duration_sum",
+                "eventloop_priority_duration_cmd_sum",
                 "acl_access_denied_auth",
                 "acl_access_denied_cmd",
                 "acl_access_denied_key",

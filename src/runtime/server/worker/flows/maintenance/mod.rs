@@ -139,6 +139,8 @@ impl ServerWorkerState {
             crate::foundation::io::sys::signal::schedule_watchdog(watchdog_period);
         }
         self.check_pending_signal();
+        self.drive_tls_reload();
+        self.resume_tracking_eviction();
         if self.ctx.pause_cron() != 0 {
             return;
         }
@@ -177,6 +179,7 @@ impl ServerWorkerState {
         self.check_pause_state();
         self.apply_deferred_replica_events();
         self.check_script_kill_state();
+        self.ctx.drive_script_eviction();
         // Reap a completed diskless child before scheduling a new full sync.
         // The relay EOF path clears the relay before waitpid(WNOHANG) can
         // observe the child's exit; ordering this before drive_replication
@@ -435,6 +438,8 @@ impl ServerWorkerState {
         }
         let local_failover_status =
             crate::engine::distributed::cluster::state::failover::LocalReplicaFailoverStatus {
+                no_failover_if_empty: self.ctx.config().server.cluster_replica_no_failover
+                    == crate::engine::extension::config::server::ClusterReplicaNoFailover::IfEmpty,
                 loading: self.ctx.is_loading() || self.ctx.replication().async_loading,
                 priority: self.ctx.config().replication.replica_priority,
                 data_age_ms: self.ctx.replication().primary_failover_data_age_ms(now),
@@ -592,7 +597,6 @@ impl ServerWorkerState {
     fn run_expire_cycle(&mut self) {
         if !self.ctx.config_mut().server.active_expire_enabled
             || self.ctx.config_mut().server.import_mode
-            || self.ctx.persistence().forkless_capture_in_progress()
         {
             return;
         }
@@ -612,14 +616,8 @@ impl ServerWorkerState {
             self.ctx.replication().is_replica() && !self.ctx.config().replication.replica_read_only;
         let expire_effort = self.ctx.config().server.active_expire_effort;
         for db_idx in 0..num_dbs {
-            if let Some(db) = self.ctx.db_mut(db_idx as u32) {
-                db.set_replica_local_expire_only(replica_local_only);
-                crate::foundation::io::store::kv_engine::expire::active_expire_cycle_with_effort(
-                    db,
-                    false,
-                    expire_effort,
-                );
-            }
+            self.ctx
+                .run_active_expire_cycle(db_idx as u32, expire_effort, replica_local_only);
         }
         let elapsed = mstime() - expire_start;
         if elapsed > 0 {
@@ -887,16 +885,7 @@ impl ServerWorkerState {
     }
 
     fn update_pause_skip_expire(&mut self) {
-        let now = mstime();
-        let paused = self.ctx.client_pause().is_paused(now) != PauseAction::None
-            || (self.ctx.replication().is_replica()
-                && self.ctx.config().replication.replica_read_only);
-        let num_dbs = self.ctx.num_dbs();
-        for db_idx in 0..num_dbs {
-            if let Some(db) = self.ctx.db_mut(db_idx as u32) {
-                db.set_pause_skip_expire(paused);
-            }
-        }
+        self.ctx.set_forkless_capture_expiration_paused(false);
     }
 
     pub(crate) fn run_eviction(&mut self) {
@@ -972,6 +961,9 @@ impl ServerWorkerState {
         }
     }
 }
+
+#[cfg(test)]
+mod forkless_lazy_pause_tests;
 
 #[cfg(test)]
 mod active_defrag_tests {
@@ -1070,44 +1062,323 @@ mod tests {
         ReplicationOffset::try_from(value).expect("valid test offset")
     }
 
-    #[test]
-    fn active_expiration_waits_until_forkless_capture_finishes() {
-        use crate::engine::extension::config::persistence::BgsaveMethod;
-        use crate::foundation::io::store::Robj;
-        use bytes::Bytes;
-        use std::time::Duration;
+    struct ForklessExpiryFixture {
+        runtime: ServerWorkerState,
+        dir: std::path::PathBuf,
+        expire_at: u64,
+    }
 
-        let mut runtime = ServerWorkerState::new(1).unwrap();
-        let expire_at = crate::foundation::io::sys::time::mstime().saturating_add(100) as u64;
-        for index in 0..256 {
+    impl ForklessExpiryFixture {
+        fn new() -> Self {
+            use crate::foundation::io::persistence::rdb::{
+                compression::{RdbCompression, RdbSnapshotOptions},
+                frozen::FrozenRdb,
+                RdbSerializeOptions,
+            };
+            use crate::foundation::io::persistence::snapshot::background::BackgroundRdbSave;
+            use crate::foundation::io::store::Robj;
+            use bytes::Bytes;
+
+            let mut runtime = ServerWorkerState::new(2).unwrap();
+            // Model a snapshot started before the deadline without sleeping or
+            // changing TTL metadata after capture. The real feed owns every
+            // frozen value, and an open feed prevents the worker from finishing.
+            let expire_at = crate::foundation::io::store::kv_engine::now_ms() - 1_000;
             runtime.ctx.db_mut(0).unwrap().load_entry(
-                format!("expiring-{index}").into_bytes(),
-                Robj::string_raw(Bytes::from_static(b"value")),
+                b"shared-expired".to_vec(),
+                Robj::string_raw(Bytes::from(vec![b'x'; EVICTION_EXPORT_KEY_BYTES])),
                 Some(expire_at),
             );
+            runtime.ctx.db_mut(0).unwrap().load_entry(
+                b"live".to_vec(),
+                Robj::string_raw(Bytes::from_static(b"retained-value")),
+                Some(expire_at + 60_000),
+            );
+            for index in 0..1_024 {
+                runtime.ctx.db_mut(1).unwrap().load_entry(
+                    format!("expiring-{index}").into_bytes(),
+                    Robj::string_raw(Bytes::from_static(b"value")),
+                    Some(expire_at),
+                );
+            }
+            for db_id in 0..2 {
+                let db = runtime.ctx.db_mut(db_id).unwrap();
+                db.hash_set_with_limits(b"hash", b"field", b"value", 512, 64)
+                    .unwrap();
+                db.set_hash_field_expire(b"hash", b"field", expire_at);
+            }
+            let dir = std::env::temp_dir().join(format!(
+                "versal-forkless-expire-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let options = RdbSerializeOptions {
+                compression: false,
+                checksum: true,
+            };
+            let frozen = FrozenRdb::capture_header(runtime.ctx.dbs(), &[], &[], None, options);
+            let (task, feeder) = BackgroundRdbSave::start_incremental(
+                frozen.total_keys(),
+                dir.clone(),
+                "dump.rdb".into(),
+                1,
+                0,
+                false,
+                RdbSnapshotOptions {
+                    compression: RdbCompression::No,
+                    checksum: true,
+                },
+            )
+            .unwrap();
+            let feed = frozen.into_incremental_feed(feeder, expire_at - 1_000, false);
+            runtime.ctx.set_forkless_capture_expiration_paused(true);
+            runtime
+                .ctx
+                .persistence_mut()
+                .begin_forkless_save(task, (expire_at / 1_000) as i64, Vec::new(), Some(feed))
+                .unwrap();
+            runtime.ctx.drive_forkless_feed();
+            assert!(runtime.ctx.persistence().forkless_capture_in_progress());
+            assert!(runtime.ctx.persistence().forkless_save_in_progress());
+            assert!(runtime
+                .ctx
+                .persistence()
+                .forkless_key_captured(0, b"shared-expired"));
+            Self {
+                runtime,
+                dir,
+                expire_at,
+            }
         }
-        let dir = std::env::temp_dir().join(format!(
-            "versal-forkless-expire-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        runtime.ctx.config_mut().persistence.dir = dir.to_string_lossy().into_owned();
-        runtime.ctx.config_mut().persistence.dbfilename = "dump.rdb".to_string();
-        runtime.ctx.config_mut().persistence.bgsave_default_method = BgsaveMethod::Forkless;
-        runtime.ctx.config_mut().persistence.rdb_key_save_delay = 10_000_000;
-        crate::framework::commands::server::save::start_bgsave(&mut runtime.ctx).unwrap();
-        assert!(runtime.ctx.persistence().forkless_capture_in_progress());
-        std::thread::sleep(Duration::from_millis(150));
+    }
+
+    impl Drop for ForklessExpiryFixture {
+        fn drop(&mut self) {
+            self.runtime
+                .ctx
+                .abort_forkless_save(crate::foundation::io::sys::time::mstime() / 1_000);
+            std::fs::remove_dir_all(&self.dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn active_expiration_only_deletes_captured_keys_during_forkless_save() {
+        let mut fixture = ForklessExpiryFixture::new();
+        let runtime = &mut fixture.runtime;
+        let uncaptured: Vec<_> = runtime
+            .ctx
+            .db(1)
+            .unwrap()
+            .all_keys_sorted()
+            .into_iter()
+            .filter(|key| !runtime.ctx.persistence().forkless_key_captured(1, key))
+            .collect();
+        assert!(!uncaptured.is_empty());
+        // Lazy expiration stays paused even for a captured, expired key.
+        assert!(runtime
+            .ctx
+            .db_mut(0)
+            .unwrap()
+            .get(b"shared-expired")
+            .is_none());
+        assert!(runtime
+            .ctx
+            .db(0)
+            .unwrap()
+            .get_allow_expired(b"shared-expired")
+            .is_some());
+        let expired_before = runtime.ctx.stats().expired_keys;
 
         runtime.run_expire_cycle();
+        runtime.process_expired_deletions();
 
-        assert_eq!(runtime.ctx.db(0).unwrap().dbsize(), 256);
-        runtime
+        assert!(runtime.ctx.persistence().forkless_capture_in_progress());
+        assert!(runtime.ctx.persistence().forkless_save_in_progress());
+        for key in uncaptured {
+            let db = runtime.ctx.db(1).unwrap();
+            assert!(db.get_allow_expired(&key).is_some(), "uncaptured key lost");
+            if key != b"hash" {
+                assert_eq!(db.get_expire(&key), Some(fixture.expire_at));
+            }
+        }
+        assert_eq!(
+            runtime
+                .ctx
+                .db(1)
+                .unwrap()
+                .get_hash_field_expire(b"hash", b"field"),
+            Some(fixture.expire_at)
+        );
+        assert!(runtime.ctx.stats().expired_keys > expired_before);
+        assert!(runtime
             .ctx
-            .abort_forkless_save(crate::foundation::io::sys::time::mstime() / 1_000);
-        let _ = std::fs::remove_dir_all(dir);
+            .db(0)
+            .unwrap()
+            .get_allow_expired(b"shared-expired")
+            .is_none());
+    }
+
+    #[test]
+    fn forkless_expiration_abort_restores_uncaptured_and_lazy_expiration() {
+        use crate::foundation::io::store::Robj;
+
+        let mut fixture = ForklessExpiryFixture::new();
+        let runtime = &mut fixture.runtime;
+        runtime.ctx.abort_forkless_save(0);
+        assert!(!runtime.ctx.persistence().forkless_capture_in_progress());
+        assert!(!runtime.ctx.persistence().forkless_save_in_progress());
+        runtime.run_expire_cycle();
+        assert_eq!(runtime.ctx.db(0).unwrap().dbsize(), 1);
+        assert_eq!(runtime.ctx.db(1).unwrap().dbsize(), 0);
+        assert!(!fixture.dir.join("dump.rdb").exists());
+        runtime.ctx.db_mut(0).unwrap().load_entry(
+            b"lazy-expired".to_vec(),
+            Robj::string("value"),
+            Some(fixture.expire_at),
+        );
+        assert!(runtime
+            .ctx
+            .db_mut(0)
+            .unwrap()
+            .get(b"lazy-expired")
+            .is_none());
+    }
+
+    #[test]
+    fn forkless_active_expiration_preserves_snapshot_values_ttls_and_crc() {
+        use crate::foundation::io::persistence::rdb::{RdbDecoder, RdbStep};
+        use crate::foundation::io::persistence::snapshot::background::RdbSaveOutcome;
+        use crate::foundation::io::store::kv_engine::DbSet;
+
+        let mut fixture = ForklessExpiryFixture::new();
+        let runtime = &mut fixture.runtime;
+        runtime.run_expire_cycle();
+        assert!(runtime
+            .ctx
+            .db(0)
+            .unwrap()
+            .get_allow_expired(b"shared-expired")
+            .is_none());
+        assert!(runtime.ctx.persistence().forkless_capture_in_progress());
+        // Advance the real incremental producer, then join the save worker.
+        // Completion is synchronized by join, not a delay or polling retry.
+        while runtime.ctx.persistence().forkless_capture_in_progress() {
+            runtime.ctx.drive_forkless_feed();
+        }
+        assert!(matches!(
+            runtime.ctx.finish_primary_forkless_save_for_test(),
+            Some(RdbSaveOutcome::Saved)
+        ));
+        let bytes = std::fs::read(fixture.dir.join("dump.rdb")).unwrap();
+        let payload_end = bytes.len() - 8;
+        let expected_crc = u64::from_le_bytes(bytes[payload_end..].try_into().unwrap());
+        assert_ne!(expected_crc, 0);
+        assert_eq!(
+            expected_crc,
+            crate::foundation::io::persistence::crc64(0, &bytes[..payload_end])
+        );
+        // Retain expired entries during decoding to verify the snapshot itself,
+        // including deadlines that a normal startup load would discard.
+        let mut decoder = RdbDecoder::new(true);
+        let mut restored = DbSet::new(2);
+        decoder.feed(&bytes);
+        loop {
+            match decoder.step(&mut restored).unwrap() {
+                RdbStep::RecordApplied => {}
+                RdbStep::Finished(_) => break,
+                RdbStep::NeedInput => panic!("complete snapshot requested more input"),
+            }
+        }
+        assert_eq!(decoder.consumed_bytes(), bytes.len());
+        let first = restored.get(0).unwrap();
+        assert_eq!(first.dbsize(), 3);
+        assert_eq!(
+            first
+                .get_allow_expired(b"shared-expired")
+                .unwrap()
+                .as_bytes(),
+            vec![b'x'; EVICTION_EXPORT_KEY_BYTES]
+        );
+        assert_eq!(first.get_expire(b"shared-expired"), Some(fixture.expire_at));
+        assert_eq!(
+            first.get_allow_expired(b"live").unwrap().as_bytes(),
+            b"retained-value"
+        );
+        assert_eq!(first.get_expire(b"live"), Some(fixture.expire_at + 60_000));
+        let second = restored.get(1).unwrap();
+        assert_eq!(second.dbsize(), 1_025);
+        for index in 0..1_024 {
+            let key = format!("expiring-{index}");
+            assert_eq!(
+                second.get_allow_expired(key.as_bytes()).unwrap().as_bytes(),
+                b"value"
+            );
+            assert_eq!(second.get_expire(key.as_bytes()), Some(fixture.expire_at));
+        }
+        for db_id in 0..2 {
+            let db = restored.get(db_id).unwrap();
+            assert_eq!(
+                db.get_allow_expired(b"hash")
+                    .unwrap()
+                    .hash_get(b"field")
+                    .unwrap(),
+                b"value"
+            );
+            assert_eq!(
+                db.get_hash_field_expire(b"hash", b"field"),
+                Some(fixture.expire_at)
+            );
+        }
+        runtime.run_expire_cycle();
+        assert_eq!(runtime.ctx.db(0).unwrap().dbsize(), 1);
+        assert_eq!(runtime.ctx.db(1).unwrap().dbsize(), 0);
+    }
+
+    #[test]
+    fn forkless_active_expiration_keeps_existing_runtime_gates() {
+        use crate::framework::context::PauseAction;
+
+        for mode in [
+            "disabled",
+            "import",
+            "read-only",
+            "writable-primary",
+            "pause-all",
+            "pause-write",
+        ] {
+            let mut fixture = ForklessExpiryFixture::new();
+            let runtime = &mut fixture.runtime;
+            match mode {
+                "disabled" => runtime.ctx.config_mut().server.active_expire_enabled = false,
+                "import" => runtime.ctx.config_mut().server.import_mode = true,
+                "read-only" => {
+                    runtime.ctx.replication_mut().switch_to_replica();
+                    runtime.ctx.config_mut().replication.replica_read_only = true;
+                }
+                "writable-primary" => {
+                    runtime.ctx.replication_mut().switch_to_replica();
+                    runtime.ctx.config_mut().replication.replica_read_only = false;
+                }
+                "pause-all" | "pause-write" => {
+                    let state = runtime.ctx.client_pause_mut();
+                    state.action = if mode == "pause-all" {
+                        PauseAction::All
+                    } else {
+                        PauseAction::Write
+                    };
+                    state.end_time_ms = i64::MAX;
+                }
+                _ => unreachable!(),
+            }
+            runtime.run_expire_cycle();
+            assert_eq!(runtime.ctx.db(0).unwrap().dbsize(), 3, "{mode}");
+            assert_eq!(runtime.ctx.db(1).unwrap().dbsize(), 1_025, "{mode}");
+            assert!(
+                runtime.ctx.drain_active_expired_deletions().is_empty(),
+                "{mode}"
+            );
+        }
     }
 
     #[test]

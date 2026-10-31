@@ -533,6 +533,12 @@ impl super::ServerWorkerState {
                 self.cancel_disk_sync_batch();
                 self.abort_direct_dual_rdb_child_for_shutdown();
                 self.close_listeners_for_shutdown();
+                self.shutdown_io_threads();
+                crate::server_log!(
+                    notice,
+                    "{}",
+                    crate::engine::distributed::shutdown::messages::READY_TO_EXIT
+                );
                 return true;
             }
             return false;
@@ -547,6 +553,12 @@ impl super::ServerWorkerState {
         self.cancel_disk_sync_batch();
         self.abort_direct_dual_rdb_child_for_shutdown();
         self.close_listeners_for_shutdown();
+        self.shutdown_io_threads();
+        crate::server_log!(
+            notice,
+            "{}",
+            crate::engine::distributed::shutdown::messages::READY_TO_EXIT
+        );
         true
     }
 

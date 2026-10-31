@@ -389,8 +389,8 @@ fn file_is_rdb(path: &Path) -> bool {
         return false;
     };
     let mut signature = [0; 9];
-    file.read_exact(&mut signature).is_ok()
-        && (signature.starts_with(b"REDIS") || signature.starts_with(b"VALKEY"))
+    file.read(&mut signature)
+        .is_ok_and(|length| versal::foundation::io::persistence::is_rdb_magic(&signature[..length]))
 }
 
 fn parse_manifest(path: &Path) -> Result<AofManifest, AofRunError> {
@@ -422,4 +422,51 @@ fn parse_manifest(path: &Path) -> Result<AofManifest, AofRunError> {
         }
     }
     Ok(manifest)
+}
+
+#[cfg(test)]
+mod codec_fix_tests {
+    use super::*;
+
+    #[test]
+    fn short_vcs_is_an_unrepairable_preamble_in_old_and_manifest_aof() {
+        let directory = std::env::temp_dir().join(format!(
+            "versal-short-vcs-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let mut prefix = b"VCS\x01\x01\x00\x01\x04".to_vec();
+        for length in 3..=8 {
+            let bytes = &prefix[..length];
+            let base = directory.join("appendonly.aof.1.base.rdb");
+            fs::write(&base, bytes).unwrap();
+            assert!(file_is_rdb(&base), "VCS prefix length {length}");
+            assert_eq!(classify_path(&base), InputFileType::RdbPreamble);
+            let options = AofCheckOptions {
+                file: base.clone(),
+                mode: AofCheckMode::Fix,
+            };
+            assert!(check_aof(&options).is_err());
+            assert_eq!(fs::read(&base).unwrap(), bytes);
+            let manifest = directory.join("appendonly.aof.manifest");
+            fs::write(&manifest, b"file appendonly.aof.1.base.rdb seq 1 type b\n").unwrap();
+            assert!(check_aof(&AofCheckOptions {
+                file: manifest,
+                mode: AofCheckMode::Fix,
+            })
+            .is_err());
+            assert_eq!(fs::read(&base).unwrap(), bytes);
+        }
+        prefix[..3].copy_from_slice(b"VCX");
+        let other = directory.join("other.aof");
+        for bytes in [&b""[..], &b"V"[..], &b"VC"[..], &prefix[..]] {
+            fs::write(&other, bytes).unwrap();
+            assert!(!file_is_rdb(&other));
+        }
+        fs::remove_dir_all(directory).unwrap();
+    }
 }

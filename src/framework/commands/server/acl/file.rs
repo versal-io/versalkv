@@ -1,97 +1,82 @@
-use crate::framework::context::ServerContext;
-use crate::engine::extension::acl::AclUser;
+use crate::engine::extension::acl::{
+    acl_roles, acl_users, parse_acl_file, replace_acl_state, AclFileState,
+};
 use crate::foundation::io::protocol::Value;
-
-fn users_lock() -> std::sync::MutexGuard<'static, std::collections::HashMap<String, AclUser>> {
-    crate::engine::extension::acl::acl_users().lock().unwrap()
-}
+use crate::framework::context::ServerContext;
 
 pub fn acl_load(ctx: &mut ServerContext) -> Value {
     if ctx.config().server.aclfile.is_empty() {
         return Value::error("ERR This instance is not configured to use an ACL file. To use an ACL file, specify the 'aclfile' configuration directive.");
     }
     let path = &ctx.config().server.aclfile;
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(e) => return Value::error(format!("ERR Could not read ACL file '{}': {}", path, e)),
+    let content = match std::fs::read(path) {
+        Ok(content) => content,
+        Err(error) => {
+            return Value::error(format!("ERR Could not read ACL file '{path}': {error}"))
+        }
     };
-    let mut users = users_lock();
-    let existing_usernames: Vec<String> = users.keys().cloned().collect();
-    let mut seen_users: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 2 || parts[0] != "user" {
-            continue;
-        }
-        let username = parts[1].to_string();
-        if !seen_users.insert(username.clone()) {
-            drop(users);
-            return Value::error(format!("ERR Duplicate user '{}' found in the ACL file", username));
-        }
+    let state = match parse_acl_file(
+        &content,
+        ctx.config().server.acl_pubsub_default == "allchannels",
+    ) {
+        Ok(state) => state,
+        Err(error) => return Value::error(format!("ERR {error}")),
+    };
+    if let Err(error) = validate_acl_file(&state, ctx) {
+        return Value::error(format!("ERR {error}"));
     }
-    users.clear();
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 2 || parts[0] != "user" {
-            continue;
-        }
-        let username = parts[1].to_string();
-        let mut user = AclUser::new_disabled();
-        let rules = match crate::engine::extension::acl::merge_acl_tokens(&parts[2..]) {
-            Ok(r) => r,
-            Err(()) => {
-                drop(users);
-                return Value::error(format!(
-                    "ERR Error loading ACL file: unmatched parenthesis for user '{}'",
-                    username
-                ));
-            }
-        };
-        for rule in &rules {
-            let _ = user.apply_rule(rule);
-        }
-        users.insert(username, user);
-    }
-    if !users.contains_key("default") {
-        let mut default_user = AclUser::new_disabled();
-        let _ = default_user.apply_rule("on");
-        let _ = default_user.apply_rule("+@all");
-        let _ = default_user.apply_rule("~*");
-        let _ = default_user.apply_rule("&*");
-        let _ = default_user.apply_rule("nopass");
-        users.insert("default".to_string(), default_user);
-    }
-    drop(users);
-    for name in existing_usernames {
-        ctx.pending_acl_client_kills_mut().push(name);
+    match replace_acl_state(state) {
+        Ok(existing) => ctx.pending_acl_client_kills_mut().extend(existing),
+        Err(error) => return Value::error(format!("ERR {error}")),
     }
     Value::ok()
+}
+
+pub(crate) fn validate_acl_file(state: &AclFileState, ctx: &ServerContext) -> Result<(), String> {
+    for rule in &state.declared_rules {
+        super::setuser::validate_acl_rule_bytes(rule, ctx).map_err(|error| {
+            format!(
+                "Error loading ACL rule {}: {error}",
+                crate::engine::extension::acl::permissions::quote_acl_bytes(rule)
+            )
+        })?;
+    }
+    Ok(())
 }
 
 pub fn acl_save(ctx: &ServerContext) -> Value {
     if ctx.config().server.aclfile.is_empty() {
         return Value::error("ERR This instance is not configured to use an ACL file. To use an ACL file, specify the 'aclfile' configuration directive.");
     }
-    let users = users_lock();
-    let mut content = String::new();
-    let mut entries: Vec<(&String, &AclUser)> = users.iter().collect();
-    entries.sort_by(|a, b| a.0.cmp(b.0));
-    for (username, user) in &entries {
-        content.push_str(&format!("user {}\n", user.to_acl_rule_string(username)));
+    let users = match acl_users().lock() {
+        Ok(users) => users,
+        Err(_) => return Value::error("ERR ACL user registry is unavailable"),
+    };
+    let roles = match acl_roles().lock() {
+        Ok(roles) => roles,
+        Err(_) => return Value::error("ERR ACL role registry is unavailable"),
+    };
+    let mut role_entries: Vec<_> = roles.iter().collect();
+    role_entries.sort_by_key(|(name, _)| *name);
+    let mut user_entries: Vec<_> = users.iter().collect();
+    user_entries.sort_by_key(|(name, _)| *name);
+    let mut content = Vec::new();
+    for (name, role) in role_entries {
+        content.extend_from_slice(b"role ");
+        content.extend_from_slice(&role.describe_role_bytes(name));
+        content.push(b'\n');
     }
+    for (name, user) in user_entries {
+        content.extend_from_slice(b"user ");
+        content.extend_from_slice(&user.describe(name));
+        content.push(b'\n');
+    }
+    drop(roles);
     drop(users);
-    if let Err(e) = std::fs::write(&ctx.config().server.aclfile, &content) {
+    if let Err(error) = std::fs::write(&ctx.config().server.aclfile, content) {
         return Value::error(format!(
-            "ERR Could not write ACL file '{}': {}",
-            ctx.config().server.aclfile, e
+            "ERR Could not write ACL file '{}': {error}",
+            ctx.config().server.aclfile
         ));
     }
     Value::ok()

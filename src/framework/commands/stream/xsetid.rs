@@ -190,3 +190,24 @@ fn xsetid_reply(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> Value {
     stream.last_id = id;
     Value::ok()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use crate::framework::commands::command_runtime::TestCommandRuntime;
+
+    #[test]
+    fn set_id_records_effects_on_success_but_not_rejected_ids() {
+        let mut runtime = TestCommandRuntime::new(1, 0);
+        let stream = runtime.db_mut().unwrap().get_or_create_stream(b"s").unwrap();
+        stream.append(StreamID::new(1, 0), vec![], true, false, 0).unwrap();
+        for (id, should_dirty) in [(b"2-0".as_slice(), true), (b"0-0", false)] {
+            let args = CommandArgs::from_parts([b"XSETID".as_slice(), b"s", id]
+                .into_iter().map(Bytes::copy_from_slice).collect());
+            let outcome = xsetid(&mut runtime, &args);
+            assert_eq!(outcome.effects.changed_keys.is_empty(), !should_dirty);
+            assert_eq!(matches!(outcome.reply, Value::Error(_)), !should_dirty);
+        }
+    }
+}

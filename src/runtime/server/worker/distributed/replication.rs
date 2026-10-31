@@ -43,6 +43,9 @@ pub(crate) struct FullSyncCoordinator {
     pub(crate) direct_dual_rdb_child: Option<DirectDualRdbChild>,
     /// A shared disk snapshot served to independent replica cursors.
     pub(crate) disk_sync_batch: Option<DiskSyncBatch>,
+    pub(crate) disk_snapshot_options:
+        Option<crate::foundation::io::persistence::rdb::compression::RdbSnapshotOptions>,
+    pub(crate) disk_snapshot_version: u32,
 }
 
 fn resolve_master_addr(host: &str, port: u16) -> Option<SocketAddr> {
@@ -84,6 +87,25 @@ fn min_protected_cursor(
 }
 
 impl ServerWorkerState {
+    pub(super) fn account_replica_wire_input(&mut self, link: &mut ReplicaLink) {
+        self.ctx
+            .stats_mut()
+            .add_net_repl_input_bytes(link.take_wire_input_bytes());
+    }
+
+    pub(crate) fn replication_snapshot_options(
+        &self,
+        connection: ConnectionId,
+    ) -> Option<crate::foundation::io::persistence::rdb::compression::RdbSnapshotOptions> {
+        let config = self.ctx.config();
+        self.replication_runtime.full_sync_snapshot_options(
+            connection,
+            &config.replication.repl_compression,
+            config.persistence.rdbcompression,
+            config.persistence.rdbchecksum,
+        )
+    }
+
     pub(super) fn replica_rdb_load_mode(&self) -> RdbLoadMode {
         match self.ctx.config().replication.repl_diskless_load.as_str() {
             "swapdb" => RdbLoadMode::Swap,
@@ -100,6 +122,14 @@ impl ServerWorkerState {
     }
 
     pub(super) fn pin_replica_rdb_load_mode(&self, link: &mut ReplicaLink) {
+        link.prepare_rdb_snapshot_options(
+            crate::foundation::io::persistence::rdb::compression::RdbSnapshotOptions {
+                compression: self.ctx.config().persistence.rdbcompression,
+                checksum: self.ctx.config().persistence.rdbchecksum,
+            },
+            !self.ctx.config().persistence.rdbchecksum
+                || self.ctx.config().server.skip_checksum_validation,
+        );
         if link.rdb_load_mode().is_none() {
             link.pin_rdb_load_mode(self.replica_rdb_load_mode());
         }
@@ -320,9 +350,6 @@ impl ServerWorkerState {
                 [crate::framework::capabilities::io::Token(connection_token)]
             .token();
             if !bytes.is_empty() {
-                self.ctx
-                    .stats_mut()
-                    .add_net_repl_output_bytes(bytes.len() as u64);
                 self.connection_registry
                     [crate::framework::capabilities::io::Token(connection_token)]
                 .queue_replication_reply(bytes);
@@ -417,6 +444,7 @@ impl ServerWorkerState {
     }
 
     pub(crate) fn pump_full_resync_transfers(&mut self) {
+        self.pump_compressed_replication_batches();
         let now = crate::foundation::io::sys::time::mstime();
         let ids: Vec<_> = self
             .replication_runtime
@@ -483,9 +511,6 @@ impl ServerWorkerState {
             let token = self.connection_registry
                 [crate::framework::capabilities::io::Token(connection_token)]
             .token();
-            self.ctx
-                .stats_mut()
-                .add_net_repl_output_bytes((rdb_bytes.len() + tail.len()) as u64);
             let connection = &mut self.connection_registry
                 [crate::framework::capabilities::io::Token(connection_token)];
             if !rdb_bytes.is_empty() {
@@ -497,6 +522,45 @@ impl ServerWorkerState {
             self.transport
                 .set_interest(token, Interest::ReadWritable)
                 .ok();
+        }
+    }
+
+    fn pump_compressed_replication_batches(&mut self) {
+        let ids: Vec<_> = self
+            .replication_runtime
+            .primary_links()
+            .keys()
+            .copied()
+            .collect();
+        for id in ids {
+            let result = {
+                let Some(link) = self.replication_runtime.primary_link_mut(id) else {
+                    continue;
+                };
+                if !link.is_compressed() || link.has_pending_replication() {
+                    continue;
+                }
+                let connection_id = link.connection_id();
+                link.pump(&self.ctx.replication().backlog).map(|bytes| {
+                    link.mark_replication_queued(bytes.len());
+                    (connection_id, bytes)
+                })
+            };
+            match result {
+                Ok((connection_id, bytes)) if !bytes.is_empty() => {
+                    let token = crate::framework::capabilities::io::Token(connection_id.0);
+                    if self.connection_registry.contains(token) {
+                        self.connection_registry[token].queue_replication_reply(bytes);
+                        let _ = self.transport.set_interest(token, Interest::ReadWritable);
+                    }
+                }
+                Err(_) => {
+                    if let Some(link) = self.replication_runtime.primary_link(id) {
+                        self.remove_connection(link.connection_id().0);
+                    }
+                }
+                _ => {}
+            }
         }
     }
 
@@ -597,8 +661,12 @@ impl ServerWorkerState {
             return;
         };
 
-        match link.on_rdb_bytes(&rdb_bytes) {
+        let previous_state = link.rdb_channel_state();
+        let decoded = link.on_rdb_bytes(&rdb_bytes);
+        self.account_replica_wire_input(&mut link);
+        match decoded {
             Ok((_events, actions)) => {
+                self.send_dual_rdb_sync_after_handshake(connection_token, previous_state, &link);
                 self.replication_runtime.set_replica_link(link);
                 self.queue_replica_actions(main_connection_token, actions);
             }
@@ -616,6 +684,26 @@ impl ServerWorkerState {
         }
     }
 
+    pub(super) fn send_dual_rdb_sync_after_handshake(
+        &mut self,
+        connection_token: usize,
+        previous_state: ReplicaRdbChannelState,
+        link: &ReplicaLink,
+    ) {
+        if previous_state != ReplicaRdbChannelState::Handshake
+            || link.rdb_channel_state() != ReplicaRdbChannelState::WaitingForEndOffset
+        {
+            return;
+        }
+        let token = Token(connection_token);
+        self.connection_registry[token].queue_reply(
+            crate::engine::distributed::replication::protocol::encode_command(&[b"SYNC"]),
+        );
+        self.transport
+            .set_interest(token, Interest::ReadWritable)
+            .ok();
+    }
+
     /// Classic drain-to-`WouldBlock` read of the pure command stream (post-RDB
     /// `Streaming` phase) lives in `rdb_recv_path::recv_replication_stream`,
     /// alongside the bounded RDB path it dispatches to.
@@ -625,7 +713,8 @@ impl ServerWorkerState {
             .client_pause()
             .is_paused(crate::foundation::io::sys::time::mstime())
             != crate::framework::context::PauseAction::None
-            || self.ctx.persistence().forkless_capture_in_progress();
+            || self.ctx.persistence().forkless_capture_in_progress()
+            || self.ctx.module_registry().busy_reply.is_some();
         if paused {
             return;
         }
@@ -1067,6 +1156,7 @@ impl ServerWorkerState {
                 self.connection_registry
                     .register(conn)
                     .expect("a newly connected primary transport token must be unique");
+                self.prioritize_connection(handle.token);
                 let master = MasterInfo {
                     host: args.host.clone(),
                     port: args.port,
@@ -1075,6 +1165,7 @@ impl ServerWorkerState {
                 link.set_failover_request(args.failover_in_progress);
                 link.set_cluster_node_id(args.cluster_node_id.clone());
                 link.set_dual_channel_enabled(args.dual_channel_enabled);
+                link.set_compression_mode(&self.ctx.config().replication.repl_compression);
                 if args.force_full_sync_from_reconfigure {
                     self.ctx.replication_mut().force_full_sync_on_next_reconnect = false;
                     self.replication_runtime.clear_replica_resume();
@@ -1233,49 +1324,74 @@ impl ServerWorkerState {
             return;
         }
         let now = crate::foundation::io::sys::time::mstime();
-        let force = self.ctx.config().replication.repl_diskless_sync_delay == 0;
-        let any_ready = self
+        // Select one compatible filter cohort before publishing any ENDOFF.
+        // Capture its boundary in the same turn that starts the snapshot.
+        let Some((filter_mode, earliest_deadline_ms, first_connection)) = self
             .full_sync
             .pending_dual_rdb_snapshots
             .iter()
-            .any(|(_, (ready_at, _))| force || now >= *ready_at);
-        if !any_ready {
+            .filter(|(token, _)| {
+                self.connection_registry.contains(**token)
+                    && matches!(
+                        self.replication_runtime.role(ConnectionId(token.0)),
+                        Some(
+                            ReplicationConnection::RdbChannelCandidate
+                                | ReplicationConnection::RdbChannel { .. }
+                        )
+                    )
+            })
+            .min_by_key(|(token, (ready_at, _))| (*ready_at, token.0))
+            .map(|(token, (ready_at, _))| {
+                (
+                    self.replication_runtime
+                        .replica_sync_preferences(ConnectionId(token.0))
+                        .0,
+                    *ready_at,
+                    ConnectionId(token.0),
+                )
+            })
+        else {
             return;
-        }
-        let max_replicas = self
-            .ctx
-            .config()
-            .replication
-            .repl_diskless_sync_max_replicas
-            .max(0) as usize;
-        if max_replicas > 0 {
-            let waiting_main_count = self
-                .replication_runtime
-                .primary_links()
-                .values()
-                .filter(|link| {
-                    link.dual_state()
-                        == crate::framework::distributed::replication::PrimaryDualChannelState::WaitingForRdbChannel
-                })
-                .count();
-            let required = waiting_main_count.min(max_replicas);
-            if self.full_sync.pending_dual_rdb_snapshots.len() < required {
-                return;
-            }
-        }
-        // C `shouldStartChildReplication()` starts one socket-target child for
-        // every compatible replica currently waiting when the oldest waiter
-        // reaches the delay. Do not split the cohort by each token's local
-        // ready_at timestamp. Unlike C's synchronous REPLCONF write, the Rust
-        // command path queues +OK first; ENDOFF is therefore captured here,
-        // in the same event-loop call that starts the fork, so no write can
-        // fall between the advertised boundary and the RDB snapshot.
+        };
+        let snapshot = self.replication_snapshot_options(first_connection);
+        let snapshot_version = self
+            .replication_runtime
+            .replica_snapshot_version(first_connection);
         let ready: Vec<crate::framework::capabilities::io::Token> = self
             .full_sync
             .pending_dual_rdb_snapshots
             .keys()
+            .filter(|token| {
+                self.connection_registry.contains(**token)
+                    && matches!(
+                        self.replication_runtime.role(ConnectionId(token.0)),
+                        Some(
+                            ReplicationConnection::RdbChannelCandidate
+                                | ReplicationConnection::RdbChannel { .. }
+                        )
+                    )
+                    && self
+                        .replication_runtime
+                        .replica_sync_preferences(ConnectionId(token.0))
+                        .0
+                        == filter_mode
+                    && self.replication_snapshot_options(ConnectionId(token.0)) == snapshot
+                    && self
+                        .replication_runtime
+                        .replica_snapshot_version(ConnectionId(token.0))
+                        == snapshot_version
+            })
             .copied()
             .collect();
+        let config = &self.ctx.config().replication;
+        let max_replicas = config.repl_diskless_sync_max_replicas.max(0) as usize;
+        let should_start = !config.repl_diskless_sync
+            || config.repl_diskless_sync_delay == 0
+            || (max_replicas > 0 && ready.len() >= max_replicas)
+            || earliest_deadline_ms <= now;
+        if !should_start {
+            return;
+        }
         let mut endoff_candidates = Vec::new();
         for token in ready {
             let token_value = token.0;
@@ -1329,6 +1445,7 @@ impl ServerWorkerState {
                 snapshot_db,
             )
         };
+        self.refresh_replication_view();
         for (rdb_connection_id, frame) in endoff_frames {
             let Some(connection_token) = self
                 .connection_registry
@@ -1369,10 +1486,20 @@ impl ServerWorkerState {
             .any(|(token, (_, sent_endoff))| {
                 let connection_id =
                     crate::framework::distributed::replication::ConnectionId(token.0);
-                matches!(
-                    self.replication_runtime.role(connection_id),
-                    Some(ReplicationConnection::RdbChannelCandidate)
-                ) && sent_endoff.is_empty()
+                self.replication_runtime
+                    .replica_sync_preferences(connection_id)
+                    .0
+                    == filter_mode
+                    && matches!(
+                        self.replication_runtime.role(connection_id),
+                        Some(ReplicationConnection::RdbChannelCandidate)
+                    )
+                    && sent_endoff.is_empty()
+                    && self.replication_snapshot_options(connection_id) == snapshot
+                    && self
+                        .replication_runtime
+                        .replica_snapshot_version(connection_id)
+                        == snapshot_version
             });
         if has_candidate_waiting_for_endoff_flush {
             return;
@@ -1384,6 +1511,19 @@ impl ServerWorkerState {
             .filter_map(|(&token, (_, sent_endoff))| {
                 let connection_id =
                     crate::framework::distributed::replication::ConnectionId(token.0);
+                if self
+                    .replication_runtime
+                    .replica_sync_preferences(connection_id)
+                    .0
+                    != filter_mode
+                    || self.replication_snapshot_options(connection_id) != snapshot
+                    || self
+                        .replication_runtime
+                        .replica_snapshot_version(connection_id)
+                        != snapshot_version
+                {
+                    return None;
+                }
                 let can_snapshot = matches!(
                     self.replication_runtime.role(connection_id),
                     Some(ReplicationConnection::RdbChannel { .. })
@@ -1409,14 +1549,17 @@ impl ServerWorkerState {
             return;
         }
 
-        let function_codes: Vec<Vec<u8>> = self
-            .ctx
-            .script()
-            .function_registry
-            .list_libraries()
-            .into_iter()
-            .map(|library| library.code.as_bytes().to_vec())
-            .collect();
+        let function_codes = if filter_mode == RdbFilterMode::Empty {
+            Vec::new()
+        } else {
+            self.ctx
+                .script()
+                .function_registry
+                .list_libraries()
+                .into_iter()
+                .map(|library| library.code.as_bytes().to_vec())
+                .collect()
+        };
         if self.try_begin_direct_dual_fork(&function_codes, &fork_targets) {
             return;
         }
@@ -1559,12 +1702,6 @@ impl ServerWorkerState {
     /// Cron hook for deferred diskless full-resyncs.  Drains links whose
     /// diskless delay has elapsed and materializes their RDB snapshot.
     pub(crate) fn drive_deferred_full_resyncs(&mut self) {
-        // Keep a deferred link queued while a previous diskless child is
-        // awaiting reap; otherwise the in-process fallback blocks the event
-        // loop during large rdb-key-save-delay full-sync tests.
-        if self.ctx.persistence().has_active_child() {
-            return;
-        }
         let now = crate::foundation::io::sys::time::mstime();
         let ids = self
             .replication_runtime
@@ -1575,12 +1712,79 @@ impl ServerWorkerState {
         self.fire_deferred_full_resyncs(ids);
     }
 
+    /// Start one codec/version/filter cohort while leaving other deferred links
+    /// queued for their own child round.
+    pub(crate) fn fire_deferred_full_resyncs(
+        &mut self,
+        mut ids: Vec<crate::framework::distributed::replication::ReplicaId>,
+    ) {
+        if self.ctx.persistence().has_active_child() {
+            // Apply to cron and max-replicas alike: only keyless cohorts can
+            // progress while the All child is running or waiting for ACK.
+            ids.retain(|id| {
+                self.replication_runtime
+                    .primary_link(*id)
+                    .is_some_and(|link| link.replica().rdb_filter_mode != RdbFilterMode::All)
+            });
+        }
+        let Some(first_connection) = ids.iter().find_map(|id| {
+            self.replication_runtime
+                .primary_link(*id)
+                .map(|link| link.connection_id())
+        }) else {
+            return;
+        };
+        let Some(snapshot) = self.replication_snapshot_options(first_connection) else {
+            self.remove_connection(first_connection.0);
+            return;
+        };
+        let cohort_filter = self
+            .replication_runtime
+            .replica_sync_preferences(first_connection)
+            .0;
+        let cohort_version = self
+            .replication_runtime
+            .replica_snapshot_version(first_connection);
+        let ids: Vec<_> = ids
+            .into_iter()
+            .filter(|id| {
+                self.replication_runtime
+                    .primary_link(*id)
+                    .is_some_and(|link| {
+                        let connection = link.connection_id();
+                        self.replication_snapshot_options(connection) == Some(snapshot)
+                            && self
+                                .replication_runtime
+                                .replica_sync_preferences(connection)
+                                .0
+                                == cohort_filter
+                            && self
+                                .replication_runtime
+                                .replica_snapshot_version(connection)
+                                == cohort_version
+                    })
+            })
+            .collect();
+        for &id in &ids {
+            if let Some(connection) = self
+                .replication_runtime
+                .primary_link(id)
+                .map(|link| link.connection_id())
+            {
+                self.replication_runtime
+                    .freeze_full_sync_snapshot_options(connection, snapshot);
+            }
+        }
+        self.fire_full_resync_cohort(ids, snapshot);
+    }
+
     /// Serialize RDB snapshots for the given replica ids and enqueue their
     /// full-resync transfers.  Shared between the cron-driven delay path and
     /// the `repl-diskless-sync-max-replicas` short-circuit path.
-    pub(crate) fn fire_deferred_full_resyncs(
+    fn fire_full_resync_cohort(
         &mut self,
         ids: Vec<crate::framework::distributed::replication::ReplicaId>,
+        snapshot: crate::foundation::io::persistence::rdb::compression::RdbSnapshotOptions,
     ) {
         if ids.is_empty() {
             return;
@@ -1609,8 +1813,60 @@ impl ServerWorkerState {
         // in this batch — fork-once + multi-fd broadcast, aligning with C's
         // diskless full-sync). A fork failure or an already-active persistence
         // child falls back to today's in-process serialization for the batch.
-        let batch_is_diskless = self.ctx.config().replication.repl_diskless_sync;
-        let (fork_read_end, fork_marker, fork_release) = match self.try_begin_diskless_fork(&libs) {
+        let batch_is_diskless = self.ctx.config().replication.repl_diskless_sync
+            || (snapshot.compression
+                == crate::foundation::io::persistence::rdb::compression::RdbCompression::Lz4)
+                != (self.ctx.config().persistence.rdbcompression
+                    == crate::foundation::io::persistence::rdb::compression::RdbCompression::Lz4);
+        if !batch_is_diskless
+            && ids.iter().all(|id| {
+                self.replication_runtime
+                    .primary_link(*id)
+                    .is_some_and(|link| link.replica().rdb_filter_mode == RdbFilterMode::All)
+            })
+        {
+            if let Some(&first) = ids.first() {
+                if let Some(boundary) = self.begin_disk_sync_batch(first, &libs) {
+                    for id in ids {
+                        if id != first && self.join_disk_sync_batch(id).is_none() {
+                            continue;
+                        }
+                        let Some(link) = self.replication_runtime.primary_link_mut(id) else {
+                            continue;
+                        };
+                        let connection = link.connection_id();
+                        let send_header = link.deferred_send_fullresync();
+                        link.take_deferred();
+                        if send_header {
+                            let header = format!(
+                                "+FULLRESYNC {} {}\r\n",
+                                self.ctx.replication().backlog.replid(),
+                                boundary.reported_offset().get()
+                            );
+                            self.queue_client_reply(Token(connection.0), header.into_bytes());
+                        }
+                    }
+                    self.refresh_replication_view();
+                    return;
+                }
+            }
+        }
+        let has_all_target = ids.iter().any(|id| {
+            self.replication_runtime
+                .primary_link(*id)
+                .is_some_and(|link| {
+                    let (mode, eof) = self
+                        .replication_runtime
+                        .replica_sync_preferences(link.connection_id());
+                    mode == RdbFilterMode::All && eof
+                })
+        });
+        let fork = if batch_is_diskless && has_all_target {
+            self.try_begin_diskless_fork_with_options(&libs, snapshot)
+        } else {
+            None
+        };
+        let (fork_read_end, fork_marker, fork_release) = match fork {
             Some((read_end, marker, release)) => (Some(read_end), Some(marker), Some(release)),
             None => (None, None, None),
         };
@@ -1647,6 +1903,10 @@ impl ServerWorkerState {
             let token = self.connection_registry
                 [crate::framework::capabilities::io::Token(connection_token)]
             .token();
+            let filter_mode = self
+                .replication_runtime
+                .replica_sync_preferences(connection_id)
+                .0;
             let supports_eof = self
                 .replication_runtime
                 .primary_link(id)
@@ -1658,7 +1918,7 @@ impl ServerWorkerState {
                 })
                 .is_some();
 
-            if forked && supports_eof {
+            if forked && supports_eof && filter_mode == RdbFilterMode::All {
                 // Fork/relay path: enqueue only the header now. The RDB body
                 // streams from the child's pipe in `service_diskless_relay_source`, which
                 // also sends the trailing marker and drives the completion state
@@ -1676,9 +1936,6 @@ impl ServerWorkerState {
                 header.extend_from_slice(b"$EOF:");
                 header.extend_from_slice(marker);
                 header.extend_from_slice(b"\r\n");
-                self.ctx
-                    .stats_mut()
-                    .add_net_repl_output_bytes(header.len() as u64);
                 self.connection_registry
                     [crate::framework::capabilities::io::Token(connection_token)]
                 .queue_reply(header);
@@ -1691,23 +1948,41 @@ impl ServerWorkerState {
 
             // In-process path: classic `$<len>` bulk, or in-process `$EOF` when
             // the batch did not fork (fork failed / child active / not diskless).
-            let rdb = in_process_rdb.get_or_insert_with(|| {
+            let filtered_rdb;
+            let rdb = if filter_mode != RdbFilterMode::All {
+                let slot_imports = self.ctx.slot_import_dbs();
+                let functions = if filter_mode == RdbFilterMode::Empty {
+                    &[][..]
+                } else {
+                    libs.as_slice()
+                };
+                filtered_rdb =
+                    crate::foundation::io::persistence::rdb::serialize::serialize_replication_snapshot(
+                        self.ctx.dbs(),
+                        key_delay_us,
+                        functions,
+                        false,
+                        Some(&replication),
+                        &slot_imports,
+                        snapshot,
+                    );
+                filtered_rdb.as_slice()
+            } else {
+                in_process_rdb.get_or_insert_with(|| {
                 let slot_imports = self.ctx.slot_import_dbs();
                 std::rc::Rc::new(
-                    crate::foundation::io::persistence::serialize_all_with_functions_and_replication_with_options(
+                    crate::foundation::io::persistence::rdb::serialize::serialize_replication_snapshot(
                         self.ctx.dbs(),
                         key_delay_us,
                         &libs,
                         true,
                         Some(&replication),
                         &slot_imports,
-                        crate::foundation::io::persistence::RdbSerializeOptions {
-                            compression: self.ctx.config().persistence.rdbcompression.uses_lzf(),
-                            checksum: true,
-                        },
+                        snapshot,
                     ),
                 )
-            });
+                }).as_slice()
+            };
             let mut bytes: Vec<u8> = Vec::new();
             if send_fullresync {
                 let replid = self.ctx.replication().backlog.replid().to_string();
@@ -1715,7 +1990,8 @@ impl ServerWorkerState {
                     format!("+FULLRESYNC {} {}\r\n", replid, fire_offset).as_bytes(),
                 );
             }
-            if batch_is_diskless && supports_eof {
+            let uses_eof = supports_eof && (batch_is_diskless || filter_mode != RdbFilterMode::All);
+            if uses_eof {
                 let marker = crate::engine::distributed::replication::protocol::generate_replid();
                 bytes.extend_from_slice(format!("$EOF:{}\r\n", marker).as_bytes());
                 bytes.extend_from_slice(rdb);
@@ -1728,12 +2004,13 @@ impl ServerWorkerState {
                 .replication_runtime
                 .primary_link_mut(id)
                 .expect("primary link exists while firing deferred full resync");
-            link.begin_full_resync(bytes, total_keys.max(1), now);
+            if uses_eof {
+                link.begin_full_resync(bytes, total_keys.max(1), now);
+            } else {
+                link.begin_length_framed_full_resync(bytes, total_keys.max(1), now);
+            }
             let (first_chunk, _) = link.pump_full_resync(now);
             if !first_chunk.is_empty() {
-                self.ctx
-                    .stats_mut()
-                    .add_net_repl_output_bytes(first_chunk.len() as u64);
                 self.connection_registry
                     [crate::framework::capabilities::io::Token(connection_token)]
                 .queue_reply(first_chunk);

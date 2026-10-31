@@ -83,6 +83,7 @@ pub struct ServerContext {
     tracking: TrackingState,
     normal_client_memory: usize,
     io_thread_info: IoThreadInfo,
+    tls_info: crate::foundation::memory::tls::TlsInfo,
     pause_cron: u32,
     protected_clients: Vec<u64>,
     pending_tcp_rebind: Option<PendingTcpRebind>,
@@ -112,7 +113,7 @@ pub(crate) struct PendingTlsReconfigure {
     pub(crate) port_changed: bool,
     pub(crate) reconnect_replica: bool,
     pub(crate) rebind_cluster_bus: bool,
-    pub(crate) changed_parameter: &'static str,
+    pub(crate) changed_parameter: String,
 }
 
 #[derive(Clone)]

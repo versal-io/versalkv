@@ -1,38 +1,29 @@
-use crate::engine::core::{CommandEffects, CommandOutcome, CoreEvent, Value};
-use crate::framework::commands::command_runtime::CommandRuntime;
-use crate::framework::commands::stream::runtime_support::parse_stream_id;
-use crate::framework::{CommandArgs, CommandError};
+use crate::engine::core::{CommandEffects, CommandOutcome, Value};
 use crate::foundation::io::store::structure::stream::groups::ClaimedEntry;
 use crate::foundation::io::store::structure::stream::StreamID;
+use crate::framework::commands::command_runtime::CommandRuntime;
+use crate::framework::commands::stream::runtime_support::{
+    claim_effects, parse_signed_integer, parse_stream_id,
+};
+use crate::framework::{CommandArgs, CommandError};
 use bytes::Bytes;
 use command_macros::command;
 
 #[command("XCLAIM", runtime)]
 pub fn xclaim(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> CommandOutcome {
-    let db_idx = runtime.selected_db();
-    let key = args.args.first().cloned().unwrap_or_default();
-    let mut consumer_created = false;
-    let reply = xclaim_reply(runtime, args, &mut consumer_created);
-    CommandOutcome {
-        reply,
-        effects: CommandEffects {
-            events: consumer_created
-                .then(|| CoreEvent {
-                    kind: "xgroup-createconsumer",
-                    key,
-                })
-                .into_iter()
-                .collect(),
-            changed_keys: consumer_created.then(|| (db_idx, args.args[0].clone())).into_iter().collect(),
-            ..CommandEffects::default()
-        },
-    }
+    let mut effects = CommandEffects {
+        skip_propagate: true,
+        dirty_delta: Some(0),
+        ..CommandEffects::default()
+    };
+    let reply = xclaim_reply(runtime, args, &mut effects);
+    CommandOutcome { reply, effects }
 }
 
 fn xclaim_reply(
     runtime: &mut dyn CommandRuntime,
     args: &CommandArgs,
-    consumer_created: &mut bool,
+    effects: &mut CommandEffects,
 ) -> Value {
     // XCLAIM key group consumer min-idle-time id [id ...] [FORCE] [JUSTID] [LASTID id] [RETRYCOUNT retry_count]
     if args.args.len() < 4 {
@@ -76,14 +67,12 @@ fn xclaim_reply(
             if i + 1 >= args.args.len() {
                 return CommandError::syntax_error();
             }
-            let parsed: i64 = match args.parse(i + 1) {
-                Ok(v) => v,
-                Err(_) => return Value::error("ERR value is not an integer or out of range"),
+            let parsed = match parse_signed_integer(&args.args[i + 1]) {
+                Some(v) => v,
+                None => return Value::error("ERR Invalid RETRYCOUNT option argument for XCLAIM"),
             };
-            if parsed < 0 {
-                return Value::error("ERR value is not an integer or out of range");
-            }
-            retry_count = Some(parsed as u64);
+            // C treats every negative RETRYCOUNT as unspecified, including signed propagated counts.
+            retry_count = u64::try_from(parsed).ok();
             i += 2;
         } else if args.args[i].eq_ignore_ascii_case(b"TIME") {
             if i + 1 >= args.args.len() {
@@ -108,6 +97,7 @@ fn xclaim_reply(
     }
 
     let now_ms = runtime.now_ms() as i64;
+    let db_idx = runtime.selected_db();
     let db = match runtime.db_mut() {
         Some(d) => d,
         None => return CommandError::db_index_out_of_range(),
@@ -132,7 +122,16 @@ fn xclaim_reply(
         Ok(result) => result,
         Err(_) => return Value::error("NOGROUP No such key or consumer group"),
     };
-    *consumer_created = result.consumer_created;
+    if let Some(group_state) = stream.group(group) {
+        *effects = claim_effects(
+            db_idx,
+            key,
+            group,
+            group_state.last_id,
+            group_state.entries_read,
+            &result,
+        );
+    }
     Value::Array(
         result
             .claimed
@@ -167,4 +166,115 @@ fn entry_reply(id: StreamID, fields: &[(Bytes, Bytes)]) -> Value {
     }
     arr.push(Value::Array(fv));
     Value::Array(arr)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::framework::commands::command_runtime::TestCommandRuntime;
+
+    fn args(parts: &[&[u8]]) -> CommandArgs {
+        CommandArgs::from_parts(
+            parts
+                .iter()
+                .map(|part| Bytes::copy_from_slice(part))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn claims_dirty_existing_consumers_only_when_pending_or_last_id_changes() {
+        let cases: &[(&[&[u8]], bool)] = &[
+            (&[b"1-0"], true),
+            (&[b"1-0", b"JUSTID"], true),
+            (&[b"2-0"], false),
+            (&[b"2-0", b"LASTID", b"2-0"], true),
+            (&[b"2-0", b"LASTID", b"0-0"], false),
+            (&[b"2-0", b"FORCE"], true),
+        ];
+        for &(options, should_dirty) in cases {
+            let mut runtime = TestCommandRuntime::new(2, 10);
+            runtime.selected_db = 1;
+            let stream = runtime
+                .db_mut()
+                .unwrap()
+                .get_or_create_stream(b"s")
+                .unwrap();
+            stream
+                .create_group(Bytes::from_static(b"g"), StreamID::zero(), None)
+                .unwrap();
+            for ms in 1..=2 {
+                stream
+                    .append(StreamID::new(ms, 0), vec![], true, false, 0)
+                    .unwrap();
+            }
+            stream.read_group_new(b"g", b"c", 1, false, 0).unwrap();
+            let mut parts = vec![b"XCLAIM".as_slice(), b"s", b"g", b"c", b"0"];
+            parts.extend_from_slice(options);
+            let outcome = xclaim(&mut runtime, &args(&parts));
+            assert!(matches!(outcome.reply, Value::Array(_)));
+            assert_eq!(
+                outcome.effects.changed_keys,
+                if should_dirty {
+                    vec![(1, Bytes::from_static(b"s"))]
+                } else {
+                    vec![]
+                },
+                "options: {options:?}"
+            );
+            assert!(outcome.effects.events.is_empty());
+            assert!(outcome.effects.skip_propagate);
+            assert_eq!(
+                outcome.effects.custom_propagations.len(),
+                usize::from(should_dirty)
+            );
+
+            let outcome = xclaim(
+                &mut runtime,
+                &args(&[b"XCLAIM", b"s", b"g", b"c", b"100", b"1-0"]),
+            );
+            assert_eq!(outcome.reply, Value::Array(vec![]));
+            assert!(outcome.effects.changed_keys.is_empty());
+            assert!(outcome.effects.skip_propagate);
+        }
+    }
+
+    #[test]
+    fn claims_record_consumer_creation_but_not_invalid_arguments() {
+        let mut runtime = TestCommandRuntime::new(1, 0);
+        let stream = runtime
+            .db_mut()
+            .unwrap()
+            .get_or_create_stream(b"s")
+            .unwrap();
+        stream
+            .create_group(Bytes::from_static(b"g"), StreamID::zero(), None)
+            .unwrap();
+        let outcome = xclaim(
+            &mut runtime,
+            &args(&[b"XCLAIM", b"s", b"g", b"c", b"0", b"1-0"]),
+        );
+        assert_eq!(outcome.reply, Value::Array(vec![]));
+        assert_eq!(
+            outcome.effects.changed_keys,
+            vec![(0, Bytes::from_static(b"s"))]
+        );
+        assert_eq!(outcome.effects.events[0].kind, "xgroup-createconsumer");
+        let outcome = xclaim(
+            &mut runtime,
+            &args(&[b"XCLAIM", b"s", b"g", b"other", b"0", b"invalid"]),
+        );
+        assert!(matches!(outcome.reply, Value::Error(_)));
+        assert!(outcome.effects.changed_keys.is_empty());
+        assert!(!runtime
+            .db_mut()
+            .unwrap()
+            .get_stream(b"s")
+            .unwrap()
+            .unwrap()
+            .group(b"g")
+            .unwrap()
+            .consumers
+            .contains_key(b"other".as_slice()));
+    }
 }

@@ -279,11 +279,13 @@ impl ModuleRuntime for TrackingRuntime {
         &mut self,
         db_idx: u32,
         _key: &[u8],
-    ) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>)>, ()> {
-        Ok(vec![(
-            db_idx.to_string().into_bytes(),
-            Some(b"value".to_vec()),
-        )])
+    ) -> Result<crate::engine::extension::module::capability::ModuleKeyScan, ()> {
+        Ok(
+            crate::engine::extension::module::capability::ModuleKeyScan {
+                entries: vec![(db_idx.to_string().into_bytes(), Some(b"value".to_vec()))],
+                is_incremental: true,
+            },
+        )
     }
 
     fn record_internal_monitor(
@@ -918,6 +920,35 @@ fn reply_raw_forwards_the_exact_protocol_bytes() {
 
     assert_eq!(result, crate::engine::extension::module::VALKEYMODULE_OK);
     assert_eq!(runtime.raw_replies, vec![protocol.to_vec()]);
+}
+
+#[test]
+fn allowed_block_sync_read_tracks_original_client_identity() {
+    let mut runtime = lifecycle_runtime();
+    let mut handle = Box::new(ModuleRuntimeHandle::new(&mut runtime));
+    let ctx = lifecycle_context(&mut handle);
+    let mut argv = [b"GET".as_slice(), b"tracked"]
+        .map(|value| Box::into_raw(ValkeyModuleString::from_bytes(value)));
+    // SAFETY: the context and caller-owned argv remain live until the synchronous call ends.
+    unsafe {
+        assert_eq!(
+            VM_CallArgv(
+                ctx,
+                argv.as_mut_ptr(),
+                2,
+                1 << 11,
+                std::ptr::null(),
+                std::ptr::null_mut()
+            ),
+            crate::engine::extension::module::VALKEYMODULE_OK
+        );
+        for string in argv {
+            ValkeyModuleString::release(string);
+        }
+        free_module_ctx(ctx);
+    }
+    drop(handle);
+    assert_eq!(runtime.tracked, vec![(42, Bytes::from_static(b"tracked"))]);
 }
 
 #[test]

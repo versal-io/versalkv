@@ -35,6 +35,7 @@ impl CommandEffectSink for EmbeddedEffectSink {
             db_events,
             skip_propagate,
             custom_propagations,
+            dirty_delta: _,
             deferred_objects,
             expired_hash_fields,
             suppress_reply,

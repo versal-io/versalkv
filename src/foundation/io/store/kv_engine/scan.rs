@@ -229,6 +229,7 @@ impl Db {
             Robj::HashHashtable(_) | Robj::HashListpack(_) => Ok(value
                 .hash_entries()
                 .into_iter()
+                .filter(|(field, _)| !self.hash_field_expired(key, field))
                 .map(|(field, value)| (field.to_vec(), Some(value.to_vec())))
                 .collect()),
             Robj::SetHashtable(_) | Robj::SetIntset(_) | Robj::SetListpack(_) => Ok(value
@@ -252,6 +253,55 @@ mod module_scan_tests {
     use crate::foundation::io::store::structure::hash::HashLp;
     use crate::foundation::io::store::structure::set::SetLp;
     use crate::foundation::io::store::structure::zset::ZSetLp;
+
+    #[test]
+    #[cfg(not(feature = "wasm"))]
+    fn hfe_module_scan_and_stringref_preserve_live_and_ghost_storage() {
+        let _clock = crate::foundation::io::sys::time::enter_command_time_snapshot(100);
+        for max_entries in [128, 0] {
+            let mut db = Db::new();
+            db.hash_set_with_limits(b"h", b"live", b"v", max_entries, 64)
+                .unwrap();
+            db.hash_set_with_limits(b"h", b"ghost", b"v", max_entries, 64)
+                .unwrap();
+            db.set_hash_field_expire(b"h", b"live", 200);
+            db.set_hash_field_expire(b"h", b"ghost", 99);
+            assert_eq!(
+                db.module_scan_key(b"h").unwrap(),
+                vec![(b"live".to_vec(), Some(b"v".to_vec()))]
+            );
+            assert!(!db.set_hash_string_ref(b"h", b"missing", b"new"));
+            assert!(!db.set_hash_string_ref(b"h", b"ghost", b"new"));
+            assert!(db.set_hash_string_ref(b"h", b"live", b"new"));
+            assert!(db.hash_has_string_ref(b"h", b"live"));
+            assert!(!db.hash_has_string_ref(b"h", b"ghost"));
+            assert_eq!(db.get_hash_field_expire(b"h", b"live"), Some(200));
+            assert_eq!(db.get_hash_field_expire(b"h", b"ghost"), Some(99));
+            assert_eq!(db.get_hash_object(b"h").unwrap().unwrap().hash_len(), 2);
+            assert_eq!(db.lazy_expired_hash_fields, 0);
+        }
+    }
+
+    #[test]
+    #[cfg(not(feature = "wasm"))]
+    fn hfe_missing_stringref_does_not_convert_or_create_a_field() {
+        let _clock = crate::foundation::io::sys::time::enter_command_time_snapshot(100);
+        let mut db = Db::new();
+        db.hash_set_with_limits(b"h", b"live", b"v", 128, 64)
+            .unwrap();
+        db.set_hash_field_expire(b"h", b"live", 100);
+        assert!(!db.set_hash_string_ref(b"h", b"missing", b"new"));
+        assert!(matches!(
+            db.get_no_expire(b"h"),
+            Some(Robj::HashListpack(_))
+        ));
+        assert!(db.set_hash_string_ref(b"h", b"live", b"new"));
+        assert_eq!(db.get_hash_field_expire(b"h", b"live"), Some(100));
+        assert!(matches!(
+            db.get_no_expire(b"h"),
+            Some(Robj::HashHashtable(_))
+        ));
+    }
 
     #[test]
     fn module_scan_key_reads_compact_collection_encodings() {

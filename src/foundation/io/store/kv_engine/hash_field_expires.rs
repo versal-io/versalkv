@@ -1,10 +1,8 @@
 use super::now_ms;
 use crate::foundation::io::store::kv_engine::db::DbValue;
-use crate::foundation::io::store::structure::hash::HashHt;
 use crate::foundation::io::store::structure::kvstore::KVStore;
 use crate::foundation::io::store::structure::string::StoredKey;
 use crate::foundation::io::store::Robj;
-use bytes::Bytes;
 use std::collections::HashMap;
 
 pub(super) fn hfe_for_each_entry<
@@ -30,21 +28,75 @@ pub(super) fn hfe_for_each_entry<
     }
 }
 
-impl super::Db {
-    fn upgrade_hash_for_field_expiry(&mut self, key: &[u8]) {
-        let Some(value) = self.get_mut(key) else {
-            return;
-        };
-        let Robj::HashListpack(listpack) = value else {
-            return;
-        };
-        let mut hash = HashHt::new();
-        for (field, field_value) in listpack.all_pairs() {
-            hash.insert(Bytes::from(field), Bytes::from(field_value));
-        }
-        *value = Robj::HashHashtable(hash);
+#[cfg(all(test, not(feature = "wasm")))]
+mod tests {
+    use crate::foundation::io::store::kv_engine::Db;
+    use crate::foundation::io::store::Robj;
+    use crate::foundation::io::sys::time::enter_command_time_snapshot;
+    use std::collections::HashMap;
+
+    #[test]
+    fn field_expiry_preserves_real_listpack_and_volatile_tracking() {
+        let _clock = enter_command_time_snapshot(100);
+        let mut db = Db::new();
+        db.hash_set_with_limits(b"h", b"f", b"v", 512, 64).unwrap();
+        db.set_hash_field_expire(b"h", b"f", 100);
+        assert!(matches!(
+            db.get_no_expire(b"h"),
+            Some(Robj::HashListpack(_))
+        ));
+        assert_eq!(db.keys_with_volatile_items, 1);
+        db.set_hash_field_expire(b"h", b"f", 200);
+        assert_eq!(db.keys_with_volatile_items, 1);
+        assert!(db.remove_hash_field_expire(b"h", b"f"));
+        assert_eq!(db.keys_with_volatile_items, 0);
+        db.set_hash_field_expires_map(b"h".to_vec(), HashMap::from([(b"f".to_vec(), 100)]));
+        assert!(matches!(
+            db.get_no_expire(b"h"),
+            Some(Robj::HashListpack(_))
+        ));
+        assert_eq!(db.keys_with_volatile_items, 1);
     }
 
+    #[test]
+    fn visible_clock_equality_differs_from_active_reaping() {
+        let _clock = enter_command_time_snapshot(100);
+        let mut db = Db::new();
+        db.hash_set_with_limits(b"h", b"f", b"v", 512, 64).unwrap();
+        db.set_hash_field_expire(b"h", b"f", 100);
+        assert!(!db.hash_field_expired(b"h", b"f"));
+        assert_eq!(db.hash_field_ttl_ms(b"h", b"f"), 0);
+        assert_eq!(db.hash_field_expiretime_ms(b"h", b"f"), 100);
+        assert_eq!(db.cleanup_expired_hash_fields(b"h"), 1);
+        assert_eq!(db.keys_with_volatile_items, 0);
+        assert!(db.get_no_expire(b"h").is_none());
+    }
+
+    #[test]
+    fn converting_hash_retains_ghost_deadlines_without_expiry_effects() {
+        let _clock = enter_command_time_snapshot(100);
+        let mut db = Db::new();
+        db.hash_set_with_limits(b"h", b"ghost", b"v", 1, 64)
+            .unwrap();
+        db.set_hash_field_expire(b"h", b"ghost", 99);
+        assert!(matches!(
+            db.get_no_expire(b"h"),
+            Some(Robj::HashListpack(_))
+        ));
+        db.hash_set_with_limits(b"h", b"live", b"v", 1, 64).unwrap();
+        assert!(matches!(
+            db.get_no_expire(b"h"),
+            Some(Robj::HashHashtable(_))
+        ));
+        assert_eq!(db.get_hash_field_expire(b"h", b"ghost"), Some(99));
+        assert_eq!(db.get_hash_object(b"h").unwrap().unwrap().hash_len(), 2);
+        assert_eq!(db.lazy_expired_hash_fields, 0);
+        assert!(db.pending_hexpired.is_empty());
+        assert_eq!(db.keys_with_volatile_items, 1);
+    }
+}
+
+impl super::Db {
     pub(super) fn remove_hash_field_expire_internal(&mut self, key: &[u8], field: &[u8]) {
         if let Some(fields) = self.hash_field_expires.get_mut(key) {
             fields.remove(field);
@@ -146,7 +198,6 @@ impl super::Db {
     }
 
     pub fn set_hash_field_expire(&mut self, key: &[u8], field: &[u8], abs_ms: u64) {
-        self.upgrade_hash_for_field_expiry(key);
         let is_new = !self.hash_field_expires.contains_key(key);
         self.hash_field_expires
             .entry(key.to_vec())
@@ -174,11 +225,14 @@ impl super::Db {
     }
 
     pub fn hash_field_expired(&self, key: &[u8], field: &[u8]) -> bool {
-        let now = now_ms();
+        self.hash_field_expired_at(key, field, now_ms())
+    }
+
+    pub fn hash_field_expired_at(&self, key: &[u8], field: &[u8], now_ms: u64) -> bool {
         self.hash_field_expires
             .get(key)
             .and_then(|fields| fields.get(field))
-            .map(|&t| now >= t)
+            .map(|&t| now_ms > t)
             .unwrap_or(false)
     }
 
@@ -222,7 +276,6 @@ impl super::Db {
     pub fn set_hash_field_expires_map(&mut self, key: Vec<u8>, fields: HashMap<Vec<u8>, u64>) {
         self.clear_hash_field_expires(&key);
         if !fields.is_empty() {
-            self.upgrade_hash_for_field_expiry(&key);
             self.hash_field_expires.insert(key, fields);
             self.keys_with_volatile_items += 1;
         }
@@ -239,18 +292,21 @@ impl super::Db {
     }
 
     pub fn hash_field_ttl_ms(&mut self, key: &[u8], field: &[u8]) -> i64 {
-        if self.hash_field_expired(key, field) {
+        self.hash_field_ttl_ms_at(key, field, now_ms(), false)
+    }
+
+    pub fn hash_field_ttl_ms_at(
+        &self,
+        key: &[u8],
+        field: &[u8],
+        now_ms: u64,
+        ignore_expiry: bool,
+    ) -> i64 {
+        if !ignore_expiry && self.hash_field_expired_at(key, field, now_ms) {
             return -2;
         }
         match self.get_hash_field_expire(key, field) {
-            Some(t) => {
-                let now = now_ms();
-                if t > now {
-                    (t - now) as i64
-                } else {
-                    -2
-                }
-            }
+            Some(t) => t.saturating_sub(now_ms) as i64,
             None => -1,
         }
     }

@@ -1,75 +1,8 @@
+use super::runtime_support::parse_stream_id_strict;
 use crate::engine::core::{CommandEffects, CommandOutcome, CoreEvent, Value};
 use crate::framework::commands::command_runtime::CommandRuntime;
 use crate::framework::{CommandArgs, CommandError};
-use crate::foundation::io::store::structure::stream::StreamID;
 use command_macros::command;
-
-fn parse_stream_id_raw(s: &[u8], is_end: bool) -> Result<StreamID, Value> {
-    if s == b"-" {
-        return Ok(StreamID::zero());
-    }
-    if s == b"+" {
-        return Ok(StreamID::max());
-    }
-    let s_str = std::str::from_utf8(s)
-        .map_err(|_| Value::error("ERR Invalid stream ID specified as stream command argument"))?;
-    if s_str.contains('-') {
-        StreamID::parse(s).ok_or_else(|| {
-            Value::error("ERR Invalid stream ID specified as stream command argument")
-        })
-    } else {
-        let ms: u64 = s_str.parse().map_err(|_| {
-            Value::error("ERR Invalid stream ID specified as stream command argument")
-        })?;
-        if is_end {
-            Ok(StreamID::new(ms, u64::MAX))
-        } else {
-            Ok(StreamID::new(ms, 0))
-        }
-    }
-}
-
-fn parse_stream_id_ext(s: &[u8], is_end: bool) -> Result<(StreamID, bool), Value> {
-    let mut exclusive = false;
-    let id_str = if s.starts_with(b"(") {
-        exclusive = true;
-        &s[1..]
-    } else {
-        s
-    };
-    if id_str == b"-" {
-        if exclusive {
-            return Err(Value::error("ERR The - ID can't be exclusive"));
-        }
-        return Ok((StreamID::zero(), false));
-    }
-    if id_str == b"+" {
-        if exclusive {
-            return Err(Value::error("ERR The + ID can't be exclusive"));
-        }
-        return Ok((StreamID::max(), false));
-    }
-    let id = parse_stream_id_raw(id_str, is_end)?;
-    if exclusive && id == StreamID::zero() && is_end {
-        return Err(Value::error(
-            "ERR The 0-0 ID can't be exclusive as end interval",
-        ));
-    }
-    if exclusive && id == StreamID::max() && !is_end {
-        return Err(Value::error(
-            "ERR The greatest ID can't be exclusive as start interval",
-        ));
-    }
-    Ok((id, exclusive))
-}
-
-fn parse_stream_id(s: &[u8], is_end: bool) -> Result<StreamID, Value> {
-    parse_stream_id_ext(s, is_end).map(|(id, _)| id)
-}
-
-fn parse_stream_id_arg(s: &[u8]) -> Result<StreamID, Value> {
-    parse_stream_id(s, false)
-}
 
 #[command("XDEL", runtime)]
 pub fn xdel(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> CommandOutcome {
@@ -84,33 +17,103 @@ pub fn xdel(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> CommandOutc
     let key = args.args[0].clone();
     let stream = match db.get_stream_mut(&key) {
         Ok(Some(s)) => s,
-        Ok(None) => return CommandOutcome::reply(Value::integer(0)),
+        Ok(None) => return no_change(),
         Err(_) => return CommandOutcome::reply(CommandError::wrong_type()),
     };
 
-    let mut deleted = 0i64;
-    for id_bytes in &args.args[1..] {
-        let id = match parse_stream_id_arg(id_bytes) {
-            Ok(id) => id,
-            Err(e) => return CommandOutcome::reply(e),
-        };
-        if stream.delete(&id) {
-            deleted += 1;
-        }
-    }
+    let ids = match args.args[1..]
+        .iter()
+        .map(|raw| parse_stream_id_strict(raw))
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(ids) => ids,
+        Err(error) => return CommandOutcome::reply(error),
+    };
+    let deleted = stream.delete_multiple(&ids) as i64;
 
     if deleted == 0 {
-        return CommandOutcome::reply(Value::integer(0));
+        return no_change();
     }
     CommandOutcome {
         reply: Value::integer(deleted),
         effects: CommandEffects {
+            dirty_delta: Some(deleted),
             changed_keys: vec![(db_idx, key.clone())],
-            events: vec![CoreEvent {
-                kind: "xdel",
-                key,
-            }],
+            events: vec![CoreEvent { kind: "xdel", key }],
             ..CommandEffects::default()
         },
+    }
+}
+
+fn no_change() -> CommandOutcome {
+    CommandOutcome {
+        reply: Value::integer(0),
+        effects: CommandEffects {
+            skip_propagate: true,
+            dirty_delta: Some(0),
+            ..CommandEffects::default()
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::xdel;
+    use crate::foundation::io::protocol::Value;
+    use crate::foundation::io::store::structure::stream::StreamID;
+    use crate::framework::commands::command_runtime::{CommandRuntime, TestCommandRuntime};
+    use crate::framework::CommandArgs;
+    use bytes::Bytes;
+
+    #[test]
+    fn xdel_validates_all_ids_before_deleting() {
+        let mut runtime = TestCommandRuntime::new(1, 0);
+        let stream = runtime
+            .db_mut()
+            .unwrap()
+            .get_or_create_stream(b"s")
+            .unwrap();
+        for ms in 1..=3 {
+            stream
+                .append(StreamID::new(ms, 0), vec![], true, false, 0)
+                .unwrap();
+        }
+        let args = CommandArgs::from_parts(
+            [b"XDEL".as_slice(), b"s", b"1-0", b"bad"]
+                .into_iter()
+                .map(Bytes::copy_from_slice)
+                .collect(),
+        );
+        assert_eq!(
+            xdel(&mut runtime, &args).reply,
+            Value::error("ERR Invalid stream ID specified as stream command argument")
+        );
+        let stream = runtime.db_mut().unwrap().get_stream(b"s").unwrap().unwrap();
+        assert_eq!(stream.len(), 3);
+        assert_eq!(stream.max_deleted_entry_id, StreamID::zero());
+    }
+
+    #[test]
+    fn xdel_rejects_range_ids_and_missing_key_hides_bad_ids() {
+        let mut runtime = TestCommandRuntime::new(1, 0);
+        for id in [b"+".as_slice(), b"-", b"(1-0", b"1-*"] {
+            let args = CommandArgs::from_parts(
+                [b"XDEL".as_slice(), b"s", id]
+                    .into_iter()
+                    .map(Bytes::copy_from_slice)
+                    .collect(),
+            );
+            assert_eq!(xdel(&mut runtime, &args).reply, Value::integer(0));
+            runtime
+                .db_mut()
+                .unwrap()
+                .get_or_create_stream(b"s")
+                .unwrap();
+            assert_eq!(
+                xdel(&mut runtime, &args).reply,
+                Value::error("ERR Invalid stream ID specified as stream command argument")
+            );
+            runtime.db_mut().unwrap().del(b"s");
+        }
     }
 }

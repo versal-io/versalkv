@@ -51,6 +51,7 @@ function formatReply(reply, depth = 0) {
     case "integer":
       return [`(integer) ${reply.value}`];
     case "double":
+    case "decimal_double":
       return [`(double) ${reply.value}`];
     case "boolean":
       return [`(boolean) ${reply.value}`];

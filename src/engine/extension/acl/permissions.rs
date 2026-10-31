@@ -3,6 +3,7 @@
 //! the global ACL registry.
 
 use crate::engine::extension::acl::command::AclCommand;
+use bytes::Bytes;
 
 use super::user::{
     AclDenial, DbRequirement, ACL_ALL_PERMISSION, ACL_READ_PERMISSION, ACL_WRITE_PERMISSION,
@@ -14,18 +15,18 @@ use super::user::{
 #[derive(Clone)]
 pub(crate) struct KeyPattern {
     pub(crate) flags: u8,
-    pub(crate) pattern: String,
+    pub(crate) pattern: Bytes,
 }
 
 impl KeyPattern {
     /// Render as `~pat` / `%R~pat` / `%W~pat`, matching C `sdsCatPatternString`.
-    pub(crate) fn to_rule_string(&self) -> String {
-        match self.flags {
-            ACL_ALL_PERMISSION => format!("~{}", self.pattern),
-            ACL_READ_PERMISSION => format!("%R~{}", self.pattern),
-            ACL_WRITE_PERMISSION => format!("%W~{}", self.pattern),
-            _ => format!("~{}", self.pattern),
-        }
+    pub(crate) fn to_rule_bytes(&self) -> Vec<u8> {
+        let prefix: &[u8] = match self.flags {
+            ACL_READ_PERMISSION => b"%R~",
+            ACL_WRITE_PERMISSION => b"%W~",
+            _ => b"~",
+        };
+        [prefix, self.pattern.as_ref()].concat()
     }
 }
 
@@ -35,7 +36,7 @@ impl KeyPattern {
 pub(crate) struct AclSelector {
     /// Key patterns in insertion order, each carrying read/write flags.
     pub(crate) patterns: Vec<KeyPattern>,
-    pub(crate) pubsub_patterns: Vec<String>,
+    pub(crate) pubsub_patterns: Vec<Bytes>,
     pub(crate) categories: Vec<String>,
     pub(crate) allowed_dbs: Option<Vec<i64>>,
 }
@@ -53,18 +54,82 @@ impl AclSelector {
     /// Add a key pattern, OR-ing flags into an existing identical pattern so
     /// `%R~foo` followed by `%W~foo` becomes a single `~foo`. Mirrors C
     /// `ACLSetSelector` key handling.
-    fn add_key_pattern(&mut self, flags: u8, pattern: &str) {
+    fn add_key_pattern(&mut self, flags: u8, pattern: &[u8]) {
         if let Some(existing) = self.patterns.iter_mut().find(|p| p.pattern == pattern) {
             existing.flags |= flags;
         } else {
             self.patterns.push(KeyPattern {
                 flags,
-                pattern: pattern.to_string(),
+                pattern: Bytes::copy_from_slice(pattern),
             });
         }
     }
 
     pub(crate) fn apply_rule(&mut self, rule: &str) -> Result<(), &'static str> {
+        self.apply_rule_bytes(rule.as_bytes())
+    }
+
+    pub(crate) fn apply_rule_bytes(&mut self, rule: &[u8]) -> Result<(), &'static str> {
+        if matches!(rule.first(), Some(b'%' | b'~')) {
+            let (mut is_read, mut is_write) = (false, false);
+            let pattern = if rule[0] == b'%' {
+                let mut offset = 1;
+                let mut perm_ok = true;
+                while offset < rule.len() {
+                    let c = rule[offset];
+                    if (c == b'R' || c == b'r') && !is_read {
+                        is_read = true;
+                    } else if (c == b'W' || c == b'w') && !is_write {
+                        is_write = true;
+                    } else if c == b'~' {
+                        offset += 1;
+                        break;
+                    } else {
+                        perm_ok = false;
+                        break;
+                    }
+                    offset += 1;
+                }
+                if (!is_read && !is_write) || !perm_ok {
+                    return Err("Syntax error");
+                }
+                &rule[offset..]
+            } else {
+                is_read = true;
+                is_write = true;
+                &rule[1..]
+            };
+            validate_pattern(pattern)?;
+            let mut flags = 0u8;
+            if is_read {
+                flags |= ACL_READ_PERMISSION;
+            }
+            if is_write {
+                flags |= ACL_WRITE_PERMISSION;
+            }
+            self.add_key_pattern(flags, pattern);
+            return Ok(());
+        }
+        if rule.eq_ignore_ascii_case(b"allchannels") || rule == b"&*" {
+            self.pubsub_patterns.clear();
+            self.pubsub_patterns.push(Bytes::from_static(b"*"));
+            return Ok(());
+        }
+        if let Some(pattern) = rule.strip_prefix(b"&") {
+            if self.pubsub_patterns.iter().any(|p| p == b"*".as_slice()) {
+                return Err("Adding a pattern after the * pattern (or the 'allchannels' flag) is not valid and does not have any effect. Try 'resetchannels' to start with an empty list of channels");
+            }
+            validate_pattern(pattern)?;
+            self.pubsub_patterns.push(Bytes::copy_from_slice(pattern));
+            return Ok(());
+        }
+        let rule = std::str::from_utf8(rule).map_err(|_| {
+            if matches!(rule.first(), Some(b'+' | b'-')) {
+                "Unknown command or category name in ACL"
+            } else {
+                "Syntax error"
+            }
+        })?;
         match rule {
             _ if rule.starts_with("+@") => {
                 let cat = &rule[2..];
@@ -104,116 +169,19 @@ impl AclSelector {
                 self.categories.push(cat_str);
                 Ok(())
             }
-            _ if rule.starts_with('+') && rule.len() > 1 && !rule.starts_with("+@") => {
-                let rest = &rule[1..];
-                if let Some(pipe_pos) = rest.rfind('|') {
-                    let cmd_part = &rest[..pipe_pos];
-                    let sub_part = &rest[pipe_pos + 1..];
-                    if cmd_part.contains('|') {
-                        return Err("Unknown command or category name in ACL");
-                    }
-                    let cmd = cmd_part.to_ascii_lowercase();
-                    let rule_str = format!("+{}|{}", cmd, sub_part.to_ascii_lowercase());
-                    if self.categories.iter().any(|c| c == &format!("+{}", cmd)) {
-                        return Ok(());
-                    }
-                    if !self.categories.contains(&rule_str) {
-                        self.categories.push(rule_str);
-                    }
-                } else {
-                    let cmd = rest.to_ascii_lowercase();
-                    let rule_str = format!("+{}", cmd);
-                    self.categories.retain(|c| c != &rule_str);
-                    self.categories.push(rule_str);
-                    self.categories.retain(|c| {
-                        !c.starts_with(&format!("+{}|", cmd))
-                            && !c.starts_with(&format!("-{}|", cmd))
-                    });
-                    self.categories.retain(|c| c != &format!("-{}", cmd));
+            _ if (rule.starts_with('+') || rule.starts_with('-')) && rule.len() > 1 => {
+                let command = rule[1..].to_ascii_lowercase();
+                if command.matches('|').count() > 1 {
+                    return Err("Unknown command or category name in ACL");
                 }
-                Ok(())
-            }
-            _ if rule.starts_with('-') && rule.len() > 1 && !rule.starts_with("-@") => {
-                let rest = &rule[1..];
-                if let Some(pipe_pos) = rest.rfind('|') {
-                    let cmd_part = &rest[..pipe_pos];
-                    let sub_part = &rest[pipe_pos + 1..];
-                    if cmd_part.contains('|') {
-                        return Err("Unknown command or category name in ACL");
-                    }
-                    let cmd = cmd_part.to_ascii_lowercase();
-                    let rule_str = format!("-{}|{}", cmd, sub_part.to_ascii_lowercase());
-                    if self.categories.iter().any(|c| c == &format!("-{}", cmd)) {
-                        return Ok(());
-                    }
-                    if !self.categories.contains(&rule_str) {
-                        self.categories.push(rule_str);
-                    }
-                } else {
-                    let cmd = rest.to_ascii_lowercase();
-                    let rule_str = format!("-{}", cmd);
-                    self.categories.retain(|c| c != &rule_str);
-                    self.categories.push(rule_str);
-                    self.categories.retain(|c| {
-                        !c.starts_with(&format!("+{}|", cmd))
-                            && !c.starts_with(&format!("-{}|", cmd))
-                    });
-                    self.categories.retain(|c| c != &format!("+{}", cmd));
-                }
-                Ok(())
-            }
-            _ if rule.starts_with('%') || rule.starts_with('~') => {
-                // Parse optional %R/%W/%RW permission prefix, then the key
-                // pattern. Mirrors C ACLSetSelector: a bare `%`, `%~`, or an
-                // unrecognized permission char is a syntax error (CVE-2024-51741).
-                let bytes = rule.as_bytes();
-                let (mut is_read, mut is_write) = (false, false);
-                let pattern = if bytes[0] == b'%' {
-                    let mut offset = 1;
-                    let mut perm_ok = true;
-                    while offset < bytes.len() {
-                        let c = bytes[offset];
-                        if (c == b'R' || c == b'r') && !is_read {
-                            is_read = true;
-                        } else if (c == b'W' || c == b'w') && !is_write {
-                            is_write = true;
-                        } else if c == b'~' {
-                            offset += 1;
-                            break;
-                        } else {
-                            perm_ok = false;
-                            break;
-                        }
-                        offset += 1;
-                    }
-                    if (!is_read && !is_write) || !perm_ok {
-                        return Err("Syntax error");
-                    }
-                    &rule[offset..]
-                } else {
-                    is_read = true;
-                    is_write = true;
-                    &rule[1..]
-                };
-                if pattern.contains(char::is_whitespace) {
-                    return Err("Syntax error");
-                }
-                let mut flags = 0u8;
-                if is_read {
-                    flags |= ACL_READ_PERMISSION;
-                }
-                if is_write {
-                    flags |= ACL_WRITE_PERMISSION;
-                }
-                self.add_key_pattern(flags, pattern);
-                Ok(())
-            }
-            _ if rule.starts_with('&') => {
-                if self.pubsub_patterns.iter().any(|p| p == "*") {
-                    return Err("Adding a pattern after the * pattern (or the 'allchannels' flag) is not valid and does not have any effect. Try 'resetchannels' to start with an empty list of channels");
-                }
-                let pat = &rule[1..];
-                self.pubsub_patterns.push(pat.to_string());
+                // Retain relative order, replacing either sign of the same rule
+                // and any subcommand rules covered by a whole-command update.
+                let subcommand_prefix = format!("{command}|");
+                self.categories.retain(|existing| {
+                    let existing = &existing[1..];
+                    existing != command && !existing.starts_with(&subcommand_prefix)
+                });
+                self.categories.push(format!("{}{command}", &rule[..1]));
                 Ok(())
             }
             _ if rule == "resetkeys" => {
@@ -249,18 +217,8 @@ impl AclSelector {
                 self.allowed_dbs = Some(dbs);
                 Ok(())
             }
-            _ if rule == "allcommands" => {
-                self.categories
-                    .retain(|c| !c.starts_with("+@") && !c.starts_with("-@"));
-                self.categories.push("+@all".to_string());
-                Ok(())
-            }
-            _ if rule == "nocommands" => {
-                self.categories
-                    .retain(|c| !c.starts_with("+@") && !c.starts_with("-@"));
-                self.categories.push("-@all".to_string());
-                Ok(())
-            }
+            _ if rule == "allcommands" => self.apply_rule("+@all"),
+            _ if rule == "nocommands" => self.apply_rule("-@all"),
             _ if rule == "alldbs" => {
                 self.allowed_dbs = None;
                 Ok(())
@@ -271,12 +229,7 @@ impl AclSelector {
             }
             _ if rule == "allkeys" => {
                 self.patterns.clear();
-                self.add_key_pattern(ACL_ALL_PERMISSION, "*");
-                Ok(())
-            }
-            _ if rule == "allchannels" => {
-                self.pubsub_patterns.clear();
-                self.pubsub_patterns.push("*".to_string());
+                self.add_key_pattern(ACL_ALL_PERMISSION, b"*");
                 Ok(())
             }
             // Deprecated no-op modifiers, accepted for backwards compatibility.
@@ -289,17 +242,13 @@ impl AclSelector {
         }
     }
 
-    fn can_execute_command(&self, command: AclCommand<'_>) -> bool {
+    pub(crate) fn can_execute_command_with_args(&self, command: AclCommand<'_>) -> bool {
         let cmd_lower = command.name.to_ascii_lowercase();
-
-        if self
-            .categories
-            .iter()
-            .any(|c| c == &format!("+{}", cmd_lower))
-        {
-            return true;
-        }
-
+        let first_arg = command
+            .args
+            .first()
+            .and_then(|arg| std::str::from_utf8(arg).ok())
+            .map(str::to_ascii_lowercase);
         let mut allowed = false;
         for rule in &self.categories {
             if rule == "+@all" {
@@ -314,35 +263,21 @@ impl AclSelector {
                 if command.belongs_to(category) {
                     allowed = false;
                 }
-            } else if rule == &format!("-{}", cmd_lower) {
-                allowed = false;
+            } else {
+                let target = &rule[1..];
+                let matches_command = target == cmd_lower
+                    || cmd_lower
+                        .strip_prefix(target)
+                        .is_some_and(|suffix| suffix.starts_with('|'))
+                    || target.split_once('|').is_some_and(|(parent, subcommand)| {
+                        parent == cmd_lower && first_arg.as_deref() == Some(subcommand)
+                    });
+                if matches_command {
+                    allowed = rule.starts_with('+');
+                }
             }
         }
         allowed
-    }
-
-    pub(crate) fn can_execute_command_with_args(&self, command: AclCommand<'_>) -> bool {
-        let cmd_lower = command.name.to_ascii_lowercase();
-
-        if let Some(first_arg) = command.args.first() {
-            if let Ok(first_str) = std::str::from_utf8(first_arg) {
-                let allow_sub = format!("+{}|{}", cmd_lower, first_str.to_ascii_lowercase());
-                if self.categories.iter().any(|c| c == &allow_sub) {
-                    return true;
-                }
-            }
-        }
-
-        if let Some(first_arg) = command.args.first() {
-            if let Ok(first_str) = std::str::from_utf8(first_arg) {
-                let deny_sub = format!("-{}|{}", cmd_lower, first_str.to_ascii_lowercase());
-                if self.categories.iter().any(|c| c == &deny_sub) {
-                    return false;
-                }
-            }
-        }
-
-        self.can_execute_command(command)
     }
 
     pub(crate) fn can_access_key(&self, key: &[u8], is_write: bool) -> bool {
@@ -361,7 +296,7 @@ impl AclSelector {
     pub(crate) fn can_access_key_bits(&self, key: &[u8], required: u8) -> bool {
         self.patterns.iter().any(|pat| {
             (pat.flags & required) == required
-                && crate::engine::distributed::pubsub::pattern_match(pat.pattern.as_bytes(), key)
+                && crate::engine::distributed::pubsub::pattern_match(&pat.pattern, key)
         })
     }
 
@@ -371,7 +306,26 @@ impl AclSelector {
         }
         self.pubsub_patterns
             .iter()
-            .any(|pat| crate::engine::distributed::pubsub::pattern_match(pat.as_bytes(), channel))
+            .any(|pat| crate::engine::distributed::pubsub::pattern_match(pat, channel))
+    }
+
+    pub(crate) fn channel_denial(&self, command: AclCommand<'_>) -> Option<usize> {
+        let (count, is_pattern) = match command.name.to_ascii_lowercase().as_str() {
+            "publish" | "spublish" => (command.args.len().min(1), false),
+            "subscribe" | "ssubscribe" => (command.args.len(), false),
+            "psubscribe" => (command.args.len(), true),
+            _ => return None,
+        };
+        command.args.iter().take(count).position(|channel| {
+            if is_pattern {
+                !self
+                    .pubsub_patterns
+                    .iter()
+                    .any(|pattern| pattern == b"*".as_slice() || pattern == channel)
+            } else {
+                !self.can_access_channel(channel)
+            }
+        })
     }
 
     /// Whether this selector grants the given permission bits to *every* key in
@@ -381,7 +335,7 @@ impl AclSelector {
     pub(crate) fn has_unrestricted_key_access(&self, required: u8) -> bool {
         self.patterns
             .iter()
-            .any(|pat| (pat.flags & required) == required && pat.pattern == "*")
+            .any(|pat| (pat.flags & required) == required && pat.pattern == b"*".as_slice())
     }
 
     pub(crate) fn can_access_db(&self, dbid: i64) -> bool {
@@ -415,12 +369,12 @@ impl AclSelector {
     /// Render the selector's key patterns as a space-separated rule string in
     /// insertion order (`~pat` / `%R~pat` / `%W~pat`), matching C
     /// `ACLDescribeSelector`. Used by ACL GETUSER / LIST / SAVE.
-    pub(crate) fn keys_str(&self) -> String {
+    pub(crate) fn keys_str(&self) -> Vec<u8> {
         self.patterns
             .iter()
-            .map(KeyPattern::to_rule_string)
+            .map(KeyPattern::to_rule_bytes)
             .collect::<Vec<_>>()
-            .join(" ")
+            .join(&b' ')
     }
 
     /// Render the databases field for ACL GETUSER: `alldbs` when unrestricted,
@@ -441,54 +395,111 @@ impl AclSelector {
 
     /// Render channels field for ACL GETUSER: `&*` for allchannels, otherwise
     /// the `&pat` list.
-    pub(crate) fn channels_str(&self) -> String {
+    pub(crate) fn channels_str(&self) -> Vec<u8> {
         self.pubsub_patterns
             .iter()
-            .map(|p| {
-                if p == "*" {
-                    "&*".to_string()
-                } else {
-                    format!("&{}", p)
-                }
-            })
+            .map(|p| [b"&".as_slice(), p.as_ref()].concat())
             .collect::<Vec<_>>()
-            .join(" ")
+            .join(&b' ')
     }
 
     /// Render the full selector rule string (keys, channels, dbs, commands) in
     /// C `ACLDescribeSelector` order. Used by ACL LIST and ACL SAVE so the
     /// output round-trips through the parser.
-    pub(crate) fn describe(&self) -> String {
-        let mut parts: Vec<String> = Vec::new();
+    pub(crate) fn describe(&self) -> Vec<u8> {
+        let mut parts: Vec<Vec<u8>> = Vec::new();
         // Keys.
         for pat in &self.patterns {
-            parts.push(pat.to_rule_string());
+            parts.push(pat.to_rule_bytes());
         }
         // Channels: `&*` for allchannels, otherwise `resetchannels` + list.
-        if self.pubsub_patterns.iter().any(|p| p == "*") {
-            parts.push("&*".to_string());
+        if self.pubsub_patterns.iter().any(|p| p == b"*".as_slice()) {
+            parts.push(b"&*".to_vec());
         } else {
-            parts.push("resetchannels".to_string());
+            parts.push(b"resetchannels".to_vec());
             for pat in &self.pubsub_patterns {
-                parts.push(format!("&{}", pat));
+                parts.push([b"&".as_slice(), pat.as_ref()].concat());
             }
         }
         // Databases: alldbs is the default and omitted; empty is `resetdbs`.
         match &self.allowed_dbs {
             None => {}
-            Some(dbs) if dbs.is_empty() => parts.push("resetdbs".to_string()),
-            Some(dbs) => parts.push(format!(
-                "db={}",
-                dbs.iter()
-                    .map(|d| d.to_string())
-                    .collect::<Vec<_>>()
-                    .join(",")
-            )),
+            Some(dbs) if dbs.is_empty() => parts.push(b"resetdbs".to_vec()),
+            Some(dbs) => parts.push(
+                format!(
+                    "db={}",
+                    dbs.iter()
+                        .map(|d| d.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                )
+                .into_bytes(),
+            ),
         }
         // Command rules.
-        parts.push(self.categories_str());
-        parts.join(" ")
+        parts.push(self.categories_str().into_bytes());
+        parts.join(&b' ')
     }
+
+    /// Preserve pattern bytes through the config and selector lexers.
+    pub(crate) fn config_rule(&self, is_root: bool) -> String {
+        let description = self.describe();
+        if let Ok(text) = std::str::from_utf8(&description) {
+            let is_lexically_safe = description
+                .iter()
+                .all(|byte| matches!(byte, b' '..=b'~') && !matches!(byte, b'"' | b'\'' | b'\\'));
+            if is_lexically_safe {
+                return if is_root {
+                    text.to_string()
+                } else {
+                    format!("({text})")
+                };
+            }
+        }
+        let rules = description
+            .split(|byte| *byte == b' ')
+            .map(quote_acl_bytes)
+            .collect::<Vec<_>>()
+            .join(" ");
+        if is_root && std::str::from_utf8(&description).is_ok() {
+            // Text root rules need only the config lexer's quoting layer.
+            return rules;
+        }
+        // Additional selectors also retain quotes for their inner lexer.
+        let selector = quote_acl_bytes(format!("({rules})").as_bytes());
+        if is_root {
+            // Config arguments are UTF-8, so keep a binary root as one bundle.
+            format!("-@all {selector}")
+        } else {
+            selector
+        }
+    }
+}
+
+pub(crate) fn quote_acl_bytes(bytes: &[u8]) -> String {
+    let mut result = String::from("\"");
+    for byte in bytes {
+        match byte {
+            b'"' | b'\\' => {
+                result.push('\\');
+                result.push(char::from(*byte));
+            }
+            0x20..=0x7e => result.push(char::from(*byte)),
+            _ => result.push_str(&format!("\\x{byte:02x}")),
+        }
+    }
+    result.push('"');
+    result
+}
+
+fn validate_pattern(pattern: &[u8]) -> Result<(), &'static str> {
+    if pattern
+        .iter()
+        .any(|byte| matches!(byte, 0 | b' ' | b'\t'..=b'\r'))
+    {
+        return Err("Syntax error");
+    }
+    Ok(())
 }
 
 /// Return the first database in `req` that `selector` cannot access, as an

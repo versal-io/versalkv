@@ -1,3 +1,4 @@
+#[cfg(test)]
 use std::io::Read;
 
 use crate::engine::distributed::cluster::action::ClusterAction;
@@ -26,6 +27,7 @@ impl ClusterBusManager {
     }
 
     /// Handle incoming data on a cluster bus connection.
+    #[cfg(test)]
     pub fn readable(
         &mut self,
         state: &mut ClusterState,
@@ -64,6 +66,25 @@ impl ClusterBusManager {
     }
 
     /// Process the read buffer and handle complete messages.
+    pub(crate) fn process_read_bytes(
+        &mut self,
+        state: &mut ClusterState,
+        token_value: usize,
+        bytes: &[u8],
+        now: i64,
+    ) -> bool {
+        if let Some(connection) = self.connections.get_mut(&token_value) {
+            if !bytes.is_empty() {
+                connection.read_buf.extend_from_slice(bytes);
+                connection.last_recv = now;
+                connection.bytes_received =
+                    connection.bytes_received.saturating_add(bytes.len() as u64);
+                connection.bytes_sent_since_read = 0;
+            }
+        }
+        self.process_read_buffer(state, token_value, now)
+    }
+
     fn process_read_buffer(
         &mut self,
         state: &mut ClusterState,
@@ -518,7 +539,7 @@ impl ClusterBusManager {
                     )) {
                         let nack = crate::engine::distributed::cluster::msg::ClusterBusMessage::from_node(
                             ClusterMsgType::FailoverAuthNack, &state.myself, state.current_epoch,
-                            ClusterBusBody::FailoverAuthNack { reason },
+                            ClusterBusBody::FailoverAuthNack { request_epoch: facts.request_epoch, reason },
                         ).encode().expect("local cluster wire metadata must be valid");
                         if let Some(connection) = self.connections.get_mut(&reply_token) {
                             connection.write_buf.extend_from_slice(&nack);
@@ -536,9 +557,42 @@ impl ClusterBusManager {
                 if !ClusterState::is_voting_primary(voter) || voter.has_flag(CLUSTER_NODE_FAIL) {
                     return;
                 }
-                let ClusterBusBody::FailoverAuthNack { reason } = &msg.body else {
+                let voter_display_name = voter.display_name();
+                let ClusterBusBody::FailoverAuthNack {
+                    request_epoch,
+                    reason,
+                } = &msg.body
+                else {
                     return;
                 };
+                let election_epoch = state.automatic_failover.election_epoch();
+                if state.automatic_failover.phase()
+                    != crate::engine::distributed::cluster::state::failover::AutomaticFailoverPhase::RequestingVotes
+                    || *request_epoch != election_epoch
+                {
+                    return;
+                }
+                let reason_name = match reason {
+                    1 => "not-safe",
+                    2 => "req-epoch-old",
+                    3 => "already-voted",
+                    4 => "req-is-primary",
+                    5 => "no-primary",
+                    6 => "primary-up",
+                    7 => "stale-config",
+                    _ => "unknown",
+                };
+                if !matches!(reason, 2 | 3 | 7) {
+                    crate::server_log!(
+                        notice,
+                        "Ignoring failover auth NACK [{}] from {} ({}) for epoch {}: a new election would draw the same answer.",
+                        reason_name,
+                        msg.sender_id,
+                        voter_display_name,
+                        election_epoch,
+                    );
+                    return;
+                }
                 let Ok(voter_id) =
                     crate::engine::distributed::cluster::NodeId::parse(msg.sender_id.as_bytes())
                 else {
@@ -551,10 +605,9 @@ impl ClusterBusManager {
                         ClusterState::is_voting_primary(node) && node.has_flag(CLUSTER_NODE_FAIL)
                     })
                     .count();
-                let election_epoch = state.automatic_failover.election_epoch();
                 let Some(cannot_win) = state.automatic_failover.on_vote_nack(
                     voter_id,
-                    msg.current_epoch,
+                    *request_epoch,
                     voting_primaries,
                     dead_voters,
                 ) else {
@@ -562,21 +615,12 @@ impl ClusterBusManager {
                 };
                 let nack_count = state.automatic_failover.rejected_voter_count();
                 let quorum = voting_primaries / 2 + 1;
-                let reason = match reason {
-                    1 => "not-safe",
-                    2 => "req-epoch-old",
-                    3 => "already-voted",
-                    4 => "req-is-primary",
-                    5 => "no-primary",
-                    6 => "primary-up",
-                    7 => "stale-config",
-                    _ => "unknown",
-                };
                 crate::server_log!(
                     notice,
-                    "Failover auth NACK [{}] from {} for epoch {} (NACKs {}, quorum {})",
-                    reason,
+                    "Failover auth NACK [{}] from {} ({}) for epoch {} (NACKs {}, quorum {})",
+                    reason_name,
                     msg.sender_id,
+                    voter_display_name,
                     election_epoch,
                     nack_count,
                     quorum,

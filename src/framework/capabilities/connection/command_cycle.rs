@@ -16,6 +16,7 @@ pub(crate) struct CommandCycleState {
     custom_propagation: Vec<Vec<u8>>,
     script_propagation: Vec<PropagationOp>,
     skip_propagation: bool,
+    dirty_delta: Option<i64>,
     dirty_keys: Vec<(u32, Bytes)>,
     notifications: PendingNotifications,
     lazyfree_objects: Vec<Robj>,
@@ -37,6 +38,7 @@ pub(crate) struct ConnectionCommandEffects {
     custom_propagation: Vec<Vec<u8>>,
     script_propagation: Vec<PropagationOp>,
     skip_propagation: bool,
+    dirty_delta: Option<i64>,
     dirty_keys: Vec<(u32, Bytes)>,
     notifications: PendingNotifications,
     lazyfree_objects: Vec<Robj>,
@@ -96,6 +98,7 @@ impl CommandCycleState {
         self.custom_propagation.clear();
         self.script_propagation.clear();
         self.skip_propagation = false;
+        self.dirty_delta = None;
         self.dirty_keys.clear();
         self.notifications = PendingNotifications::default();
         self.lazyfree_objects.clear();
@@ -118,6 +121,7 @@ impl CommandCycleState {
 
     fn has_transient_effect_payload(&self) -> bool {
         self.skip_propagation
+            || self.dirty_delta.is_some()
             || !self.custom_propagation.is_empty()
             || !self.script_propagation.is_empty()
             || !self.dirty_keys.is_empty()
@@ -184,6 +188,7 @@ impl CommandCycleState {
             custom_propagation: std::mem::take(&mut self.custom_propagation),
             script_propagation: std::mem::take(&mut self.script_propagation),
             skip_propagation: std::mem::take(&mut self.skip_propagation),
+            dirty_delta: self.dirty_delta.take(),
             dirty_keys: std::mem::take(&mut self.dirty_keys),
             notifications: std::mem::take(&mut self.notifications),
             lazyfree_objects: std::mem::take(&mut self.lazyfree_objects),
@@ -239,6 +244,10 @@ impl ConnectionCommandEffects {
 
     pub(crate) fn skip_propagation(&self) -> bool {
         self.skip_propagation
+    }
+
+    pub(crate) fn take_dirty_delta(&mut self) -> Option<i64> {
+        self.dirty_delta.take()
     }
 
     pub(crate) fn custom_propagation(&self) -> &[Vec<u8>] {
@@ -493,6 +502,16 @@ impl Connection {
         self.command_cycle.dirty_keys.push(dirty_key);
     }
 
+    pub(crate) fn record_dirty_delta(&mut self, delta: i64) {
+        self.command_cycle.effects_pending = true;
+        self.command_cycle.dirty_delta = Some(
+            self.command_cycle
+                .dirty_delta
+                .unwrap_or(0)
+                .saturating_add(delta),
+        );
+    }
+
     pub(crate) fn replace_dirty_keys(&mut self, dirty_keys: Vec<(u32, Bytes)>) {
         self.command_cycle.effects_pending = true;
         self.command_cycle.dirty_keys = dirty_keys;
@@ -576,5 +595,44 @@ impl Connection {
 
     pub(crate) fn is_argument_redacted(&self, position: usize) -> bool {
         self.command_cycle.redacted_arguments.contains(&position)
+    }
+}
+
+#[cfg(test)]
+mod dirty_tests {
+    use super::*;
+
+    #[test]
+    fn dirty_delta_is_drained_once_across_nested_and_retired_attempts() {
+        let mut conn = Connection::new_fake();
+        conn.record_dirty_delta(2);
+        conn.record_dirty_delta(3);
+        let mut effects = conn
+            .take_command_effects(CommandEffectDrain::Nested)
+            .unwrap();
+        assert_eq!(effects.take_dirty_delta(), Some(5));
+        assert_eq!(effects.take_dirty_delta(), None);
+        assert!(conn
+            .take_command_effects(CommandEffectDrain::Nested)
+            .is_none());
+        conn.begin_nested_command_effects();
+        conn.record_dirty_delta(0);
+        let mut effects = conn
+            .take_command_effects(CommandEffectDrain::Nested)
+            .unwrap();
+        assert_eq!(effects.take_dirty_delta(), Some(0));
+        conn.begin_nested_command_effects();
+        conn.record_dirty_delta(8);
+        conn.retire_command_attempt_for_postpone();
+        conn.resume_postponed_command_effects();
+        let mut effects = conn
+            .take_command_effects(CommandEffectDrain::Completed)
+            .unwrap();
+        assert_eq!(effects.take_dirty_delta(), None);
+        conn.record_dirty_delta(4);
+        conn.discard_command_effects();
+        assert!(conn
+            .take_command_effects(CommandEffectDrain::Completed)
+            .is_none());
     }
 }

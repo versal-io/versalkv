@@ -1,5 +1,8 @@
 use super::Server;
-use crate::engine::extension::acl::acl_users;
+use crate::engine::extension::acl::{
+    acl_users, parse_acl_declarations, parse_acl_file, replace_acl_state,
+};
+use crate::framework::commands::server::acl::validate_acl_file;
 use crate::framework::commands::server::config::{apply_config_set_one, config_registry};
 use crate::framework::config::Config;
 use crate::runtime::server::worker::ServerWorkerState;
@@ -115,70 +118,67 @@ impl Server {
             )
         };
         crate::foundation::io::store::structure::hash_seed::install_process_seed(hash_seed);
-        if !backend.ctx.config_mut().server.aclfile.is_empty() {
-            if let Err(e) = Self::load_acl_file(&backend.ctx.config_mut().server.aclfile) {
-                crate::server_log!(
-                    warning,
-                    "Could not load ACL file '{}': {}",
-                    backend.ctx.config_mut().server.aclfile,
-                    e
-                );
-            }
-        }
     }
 
-    pub(super) fn load_acl_file(path: &str) -> Result<(), String> {
-        let content = std::fs::read_to_string(path).map_err(|e| format!("{}", e))?;
-        let users = acl_users();
-        let mut users = users.lock().unwrap();
-        users.clear();
-        for line in content.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
+    pub(super) fn load_configured_acl(
+        &mut self,
+        backend: &ServerWorkerState,
+    ) -> std::io::Result<()> {
+        let server = &backend.ctx.config().server;
+        let default_allchannels = server.acl_pubsub_default == "allchannels";
+        let declarations = std::mem::take(&mut self.config.acl_declarations);
+        let result = if !server.aclfile.is_empty() {
+            if !declarations.is_empty() {
+                Err("Declaring users or roles in valkey.conf while setting an ACL file path is invalid".to_string())
+            } else {
+                Self::load_acl_file(&server.aclfile, default_allchannels, &backend.ctx)
             }
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() < 2 || parts[0] != "user" {
-                continue;
-            }
-            let username = parts[1].to_string();
-            let mut user = crate::engine::extension::acl::AclUser::new_disabled();
-            let rules = match crate::engine::extension::acl::merge_acl_tokens(&parts[2..]) {
-                Ok(r) => r,
-                Err(()) => {
-                    crate::server_log!(
-                        warning,
-                        "ACL file '{}': unmatched parenthesis in rules for user '{}'",
-                        path,
-                        username
-                    );
-                    continue;
+        } else if declarations.is_empty() {
+            Ok(())
+        } else {
+            Self::load_acl_declarations(&declarations, default_allchannels, &backend.ctx)
+        };
+        result.map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
+    }
+
+    fn load_acl_declarations(
+        declarations: &[String],
+        default_allchannels: bool,
+        ctx: &crate::framework::context::ServerContext,
+    ) -> Result<(), String> {
+        let lines = declarations
+            .iter()
+            .map(|line| {
+                let mut arguments = crate::framework::config::parse_config_arguments(line)?;
+                if let Some(directive) = arguments.first_mut() {
+                    directive.make_ascii_lowercase();
                 }
-            };
-            for rule in &rules {
-                if let Err(e) = user.apply_rule(rule) {
-                    crate::server_log!(
-                        warning,
-                        "ACL file '{}': invalid rule '{}' for user '{}': {}",
-                        path,
-                        rule,
-                        username,
-                        e
-                    );
-                }
+                Ok(arguments)
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let mut state = parse_acl_declarations(lines, default_allchannels)
+            .map_err(|error| format!("Error in role declaration or user declaration: {error}"))?;
+        validate_acl_file(&state, ctx)
+            .map_err(|error| format!("Error in role declaration or user declaration: {error}"))?;
+        if !state.has_default_user {
+            let users = acl_users()
+                .lock()
+                .map_err(|_| "ACL user registry is unavailable".to_string())?;
+            if let Some(user) = users.get("default") {
+                state.users.insert("default".to_string(), user.clone());
             }
-            users.insert(username, user);
         }
-        // Ensure the default user always exists (C valkey guarantees this)
-        if !users.contains_key("default") {
-            let mut default_user = crate::engine::extension::acl::AclUser::new_disabled();
-            let _ = default_user.apply_rule("on");
-            let _ = default_user.apply_rule("+@all");
-            let _ = default_user.apply_rule("~*");
-            let _ = default_user.apply_rule("&*");
-            let _ = default_user.apply_rule("nopass");
-            users.insert("default".to_string(), default_user);
-        }
-        Ok(())
+        replace_acl_state(state).map(|_| ()).map_err(str::to_string)
+    }
+
+    fn load_acl_file(
+        path: &str,
+        default_allchannels: bool,
+        ctx: &crate::framework::context::ServerContext,
+    ) -> Result<(), String> {
+        let content = std::fs::read(path).map_err(|error| error.to_string())?;
+        let state = parse_acl_file(&content, default_allchannels)?;
+        validate_acl_file(&state, ctx)?;
+        replace_acl_state(state).map(|_| ()).map_err(str::to_string)
     }
 }

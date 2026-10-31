@@ -80,6 +80,7 @@ struct ExecContext<'a> {
     resp3: bool,
     cluster_metric_slot: Option<u16>,
     transaction_input_bytes: u64,
+    args: &'a crate::engine::command::CommandArgs,
 }
 
 impl ServerWorkerState {
@@ -96,12 +97,20 @@ impl ServerWorkerState {
         let Some(token) = target.resolve(self) else {
             return SpecialCommandResult::Handled(CommandDisposition::ConnectionGone);
         };
+        let args = crate::engine::command::CommandArgs {
+            name: Bytes::copy_from_slice(name_lower.as_bytes()),
+            args: self.connection_registry[token]
+                .transaction
+                .exec_arguments()
+                .to_vec(),
+        };
         let context = ExecContext {
             started: Instant::now(),
             target,
             name: "exec",
             log_name: name_lower,
             resp3,
+            args: &args,
             cluster_metric_slot: self.exec_cluster_metric_slot(token.0),
             transaction_input_bytes: self.connection_registry[token]
                 .transaction
@@ -110,10 +119,39 @@ impl ServerWorkerState {
                 )
                 .unwrap_or(0),
         };
-        let decision = self.prepare_exec_decision(token, effects);
+        let decision = self.exec_acl_admission(token, &args).map_or_else(
+            || self.prepare_exec_decision(token, effects),
+            ExecDecision::RouteRejected,
+        );
+        self.command_execution_depth += 1;
         let execution = self.apply_exec_decision(context, decision, effects);
+        self.command_execution_depth -= 1;
         let disposition = self.finish_exec(context, execution, effects);
         SpecialCommandResult::Handled(disposition)
+    }
+
+    fn exec_acl_admission(
+        &mut self,
+        token: Token,
+        args: &crate::engine::command::CommandArgs,
+    ) -> Option<Value> {
+        use super::super::dispatch::{CmdPreconditions, CommandClientFacts};
+
+        let spec = crate::framework::commands::transaction::exec::EXEC_SPEC;
+        let meta = CmdPreconditions {
+            name: spec.name,
+            arity: spec.arity,
+            flags: spec.flags,
+            first_key: spec.first_key,
+            last_key: spec.last_key,
+            key_step: spec.key_step,
+            key_flags: spec.key_flags,
+            acl_categories: spec.acl_categories,
+            get_keys: spec.get_keys,
+        };
+        let facts = CommandClientFacts::capture(&self.connection_registry[token]);
+        self.stage_acl_permissions(&facts, &meta, args, CmdCallFlags::default())
+            .and_then(|outcome| outcome.reject_reply)
     }
 
     fn prepare_exec_decision(
@@ -199,7 +237,9 @@ impl ServerWorkerState {
             ));
         }
         if self.ctx.is_script_busy() {
-            return Some(Value::error("EXECABORT Transaction discarded because of: BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE."));
+            return Some(Value::error(
+                "EXECABORT Transaction discarded because of: BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.",
+            ));
         }
         if prechecks.noreplicas_reject {
             return Some(Value::error(
@@ -225,7 +265,42 @@ impl ServerWorkerState {
         effects: &mut CommandEffects,
     ) -> ExecExecution {
         match decision {
-            ExecDecision::Execute => self.execute_queued_transaction(context, effects),
+            ExecDecision::Execute => {
+                let token = context.target.token();
+                let db_id = self.connection_registry[token].selected_db;
+                let result = self.ctx.db_mut(db_id).map_or(Ok(true), |db| {
+                    crate::framework::commands::transaction::exec::check_conditions(
+                        &context.args.args,
+                        db,
+                    )
+                });
+                let sinks = effects.exec_sinks();
+                self.exec_drain_expired_keys(
+                    token.0,
+                    sinks.watch_dirty,
+                    sinks.replication_only,
+                    sinks.aof_only,
+                );
+                match result {
+                    Ok(true) => self.execute_queued_transaction(context, effects),
+                    Ok(false) => {
+                        self.end_exec(token, TransactionEnd::AdmissionRejected);
+                        ExecExecution::completed(
+                            Value::null_array(),
+                            CommandExecutionStatus::Executed,
+                        )
+                    }
+                    Err(error) => {
+                        self.end_exec(token, TransactionEnd::AdmissionRejected);
+                        ExecExecution::completed(
+                            Value::error(format!(
+                                "EXECABORT Transaction discarded because of: {error}"
+                            )),
+                            CommandExecutionStatus::Executed,
+                        )
+                    }
+                }
+            }
             ExecDecision::Postpone => {
                 self.block_exec(
                     context.target.token(),
@@ -246,10 +321,7 @@ impl ServerWorkerState {
                 let token = context.target.token();
                 self.connection_registry[token].postpone_transaction_command_for(
                     crate::framework::capabilities::connection::BlockedCmd::Throttled,
-                    &crate::engine::command::CommandArgs {
-                        name: Bytes::from_static(b"EXEC"),
-                        args: Vec::new(),
-                    },
+                    context.args,
                 );
                 self.ctx.throttled_clients_mut().insert(token);
                 self.schedule_replication_throttle();
@@ -260,7 +332,12 @@ impl ServerWorkerState {
                 CommandExecutionStatus::Executed,
             ),
             ExecDecision::RouteRejected(reply) => {
-                self.end_exec(context.target.token(), TransactionEnd::AdmissionRejected);
+                if self.connection_registry[context.target.token()]
+                    .transaction
+                    .is_active()
+                {
+                    self.end_exec(context.target.token(), TransactionEnd::AdmissionRejected);
+                }
                 ExecExecution::completed(reply, CommandExecutionStatus::Rejected)
             }
             ExecDecision::WatchedKeyChanged => {
@@ -286,7 +363,7 @@ impl ServerWorkerState {
         let connection = &mut self.connection_registry[token];
         let args = crate::engine::command::CommandArgs {
             name: Bytes::from_static(b"EXEC"),
-            args: Vec::new(),
+            args: connection.transaction.exec_arguments().to_vec(),
         };
         if reason == crate::framework::capabilities::connection::BlockedCmd::Paused {
             connection.postpone_transaction_command(&args);
@@ -339,7 +416,7 @@ impl ServerWorkerState {
         let Some(token) = context.target.resolve(self) else {
             return CommandDisposition::ConnectionGone;
         };
-        self.capture_exec_monitor(token);
+        self.capture_exec_monitor(token, context.args);
         let accounting = self.record_exec_completion(context, &execution);
         if execution.disposition == CommandDisposition::Blocked {
             self.finish_blocked_exec(token);
@@ -349,12 +426,14 @@ impl ServerWorkerState {
         CommandDisposition::Completed
     }
 
-    fn capture_exec_monitor(&mut self, token: Token) {
+    fn capture_exec_monitor(&mut self, token: Token, args: &crate::engine::command::CommandArgs) {
         let connection = &self.connection_registry[token];
         if let Some(event) = self.ctx.monitor_event(
             connection.selected_db,
             connection.peer_addr.to_string(),
-            vec![Bytes::from_static(b"exec")],
+            std::iter::once(args.name.clone())
+                .chain(args.args.iter().cloned())
+                .collect(),
             crate::framework::generated::commands::EXEC_META.flags,
             false,
         ) {
@@ -368,11 +447,19 @@ impl ServerWorkerState {
         execution: &ExecExecution,
     ) -> ExecAccounting {
         let rejected = execution.status.is_rejected();
+        let should_sample_priority = self.command_execution_depth == 0
+            && execution.disposition != CommandDisposition::Blocked
+            && self.is_priority_connection(context.target.token());
+        let was_priority = self
+            .ctx
+            .stats_mut()
+            .set_priority_command(should_sample_priority);
         let duration_us = self.ctx.end_cmd_with_duration(
             context.name,
             rejected,
             context.started.elapsed().as_micros() as u64,
         );
+        self.ctx.stats_mut().set_priority_command(was_priority);
         super::super::dispatch::record_error_reply(
             &mut self.ctx,
             &execution.reply,
@@ -430,7 +517,9 @@ impl ServerWorkerState {
             }
         });
         self.ctx.push_cmd_logs(
-            vec![Bytes::copy_from_slice(context.log_name.as_bytes())],
+            std::iter::once(Bytes::copy_from_slice(context.log_name.as_bytes()))
+                .chain(context.args.args.iter().cloned())
+                .collect(),
             accounting.duration_us,
             &connection.peer_addr,
             connection.name.clone(),

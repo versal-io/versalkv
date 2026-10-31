@@ -1,5 +1,6 @@
 use crate::engine::command::CommandArgs;
 use crate::engine::distributed::replication::{protocol, ReplicationOffset};
+use crate::foundation::io::compression::{StreamDecoder, StreamKind, REPLICATION_BATCH_BYTES};
 use crate::foundation::io::protocol::parser::Parser;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -34,6 +35,12 @@ pub struct ReplicaLink {
     #[allow(dead_code)] // Wired into dual-channel negotiation in a later slice.
     rdb_channel_state: ReplicaRdbChannelState,
     input: Vec<u8>,
+    compression_mode: String,
+    compression_decoder: Option<StreamDecoder>,
+    pending_wire_input_bytes: u64,
+    main_wire_active: bool,
+    rdb_wire_active: bool,
+    pending_stream_decompression_error: bool,
     rdb_input: Vec<u8>,
     rdb_framing_state: Option<RdbFramingState>,
     rdb_eof_holdback: Vec<u8>,
@@ -43,6 +50,9 @@ pub struct ReplicaLink {
     /// Framing forwards RDB-body bytes here; the backend supplies the DbSet and
     /// drives the paced decode (see `rdb_recv_path.rs`).
     rdb_receive: Option<RdbReceive>,
+    rdb_snapshot_options:
+        Option<crate::foundation::io::persistence::rdb::compression::RdbSnapshotOptions>,
+    rdb_skip_checksums: bool,
     rdb_load_mode: Option<RdbLoadMode>,
     /// Trailing bytes withheld from the decoder during the diskless EOF-marker
     /// scan: any suffix that could be the start of a split marker. Never fed to
@@ -82,11 +92,19 @@ impl ReplicaLink {
             state: ReplicaLinkState::Connecting,
             rdb_channel_state: ReplicaRdbChannelState::None,
             input: Vec::new(),
+            compression_mode: "no".to_string(),
+            compression_decoder: None,
+            pending_wire_input_bytes: 0,
+            main_wire_active: false,
+            rdb_wire_active: false,
+            pending_stream_decompression_error: false,
             rdb_input: Vec::new(),
             rdb_framing_state: None,
             rdb_eof_holdback: Vec::new(),
             provisional_primary: None,
             rdb_receive: None,
+            rdb_snapshot_options: None,
+            rdb_skip_checksums: false,
             rdb_load_mode: None,
             eof_holdback: Vec::new(),
             parser: Parser::new(),
@@ -182,6 +200,61 @@ impl ReplicaLink {
         self.dual_channel_enabled = enabled;
     }
 
+    pub fn set_compression_mode(&mut self, mode: &str) {
+        self.compression_mode = mode.to_string();
+        self.compression_decoder =
+            (mode != "no").then(|| StreamDecoder::new(StreamKind::Replication, false));
+    }
+
+    pub fn advertised_compression_mode(&self) -> &str {
+        &self.compression_mode
+    }
+
+    pub fn compression_is_plaintext(&self) -> bool {
+        self.compression_decoder
+            .as_ref()
+            .is_some_and(StreamDecoder::is_plaintext)
+    }
+
+    pub fn take_wire_input_bytes(&mut self) -> u64 {
+        std::mem::take(&mut self.pending_wire_input_bytes)
+    }
+
+    pub fn has_stream_decompression_error(&self) -> bool {
+        self.pending_stream_decompression_error
+    }
+
+    pub fn prepare_rdb_snapshot_options(
+        &mut self,
+        options: crate::foundation::io::persistence::rdb::compression::RdbSnapshotOptions,
+        skip_checksums: bool,
+    ) {
+        if self.rdb_receive.is_none() {
+            self.rdb_snapshot_options = Some(options);
+            self.rdb_skip_checksums = skip_checksums;
+        }
+    }
+
+    pub fn has_pending_decompression(&self) -> bool {
+        self.compression_decoder
+            .as_ref()
+            .is_some_and(StreamDecoder::has_pending_decode)
+            || self
+                .rdb_receive
+                .as_ref()
+                .is_some_and(RdbReceive::has_pending_decompression)
+    }
+
+    pub fn compression_memory_bytes(&self) -> usize {
+        self.compression_decoder
+            .as_ref()
+            .map_or(0, StreamDecoder::memory_bytes)
+            + self
+                .rdb_receive
+                .as_ref()
+                .map_or(0, RdbReceive::compression_memory_bytes)
+    }
+
     pub fn set_failover_request(&mut self, enabled: bool) {
         self.failover_request = enabled;
     }
@@ -248,16 +321,20 @@ impl ReplicaLink {
         announce_ip: &str,
         defer_rdb: bool,
     ) -> Result<(Vec<ReplicaEvent>, Vec<ReplicaAction>), LinkError> {
-        let prevalidated_streaming_received_offset = if self.is_streaming() {
-            let input_len = self
-                .input
-                .len()
-                .checked_add(bytes.len())
-                .ok_or(LinkError::Protocol)?;
-            Some(self.prevalidate_streaming_input(input_len)?)
-        } else {
-            None
-        };
+        if self.main_wire_active {
+            self.pending_wire_input_bytes += bytes.len() as u64;
+        }
+        let prevalidated_streaming_received_offset =
+            if self.is_streaming() && self.compression_decoder.is_none() {
+                let input_len = self
+                    .input
+                    .len()
+                    .checked_add(bytes.len())
+                    .ok_or(LinkError::Protocol)?;
+                Some(self.prevalidate_streaming_input(input_len)?)
+            } else {
+                None
+            };
         self.last_io_time_ms = crate::foundation::io::sys::time::mstime();
         self.input.extend_from_slice(bytes);
         let mut events = Vec::new();
@@ -300,9 +377,10 @@ impl ReplicaLink {
                             announce_ip,
                         )));
                     }
-                    actions.push(ReplicaAction::Send(
-                        protocol::build_replconf_capa_with_dual_channel(self.dual_channel_enabled),
-                    ));
+                    actions.push(ReplicaAction::Send(protocol::build_replconf_capabilities(
+                        self.dual_channel_enabled,
+                        &self.compression_mode,
+                    )));
                     if let Some(node_id) = &self.cluster_node_id {
                         actions.push(ReplicaAction::Send(protocol::build_replconf_version()));
                         actions.push(ReplicaAction::Send(
@@ -401,10 +479,16 @@ impl ReplicaLink {
                             initial_frames
                                 .push(protocol::build_auth(self.primary_user.as_deref(), password));
                         }
-                        initial_frames.push(protocol::build_replconf_rdb_channel());
+                        initial_frames.push(protocol::build_replconf_rdb_channel_with_compression(
+                            &self.compression_mode,
+                        ));
                         actions.push(ReplicaAction::OpenRdbChannel { initial_frames });
                     } else if let Some(fullresync) = protocol::parse_fullresync(&line) {
                         self.mark_failover_accepted();
+                        if !self.main_wire_active {
+                            self.main_wire_active = true;
+                            self.pending_wire_input_bytes += self.input.len() as u64;
+                        }
                         self.begin_rdb()?;
                         self.full_resync_accepted = true;
                         self.master_replid = Some(fullresync.replid);
@@ -432,6 +516,10 @@ impl ReplicaLink {
                             self.master_replid = Some(rid);
                         }
                         self.state = ReplicaLinkState::Streaming;
+                        if !self.main_wire_active {
+                            self.main_wire_active = true;
+                            self.pending_wire_input_bytes += self.input.len() as u64;
+                        }
                     } else if self.failover_request {
                         self.failover_request = false;
                         return Err(LinkError::FailoverRejected);
@@ -506,6 +594,42 @@ impl ReplicaLink {
                     }
                 }
                 ReplicaLinkState::Streaming => {
+                    let is_dual = self.rdb_channel_state != ReplicaRdbChannelState::None;
+                    if self.pending_stream_decompression_error {
+                        self.input.clear();
+                        break;
+                    }
+                    if let Some(decoder) = self.compression_decoder.as_mut() {
+                        match decoder
+                            .feed(&std::mem::take(&mut self.input), REPLICATION_BATCH_BYTES)
+                        {
+                            Ok(decoded) => self.input = decoded,
+                            Err(_)
+                                if self.rdb_receive.is_some()
+                                    || (is_dual
+                                        && self.rdb_channel_state
+                                            != ReplicaRdbChannelState::RdbLoaded) =>
+                            {
+                                self.pending_stream_decompression_error = true;
+                                self.compression_decoder = None;
+                                break;
+                            }
+                            Err(_) => {
+                                if is_dual {
+                                    crate::server_log!(
+                                        warning,
+                                        "Dual-channel replication stream decompression failure"
+                                    );
+                                } else {
+                                    crate::server_log!(
+                                        warning,
+                                        "replication stream decompression failure"
+                                    );
+                                }
+                                return Err(LinkError::Protocol);
+                            }
+                        }
+                    }
                     if self.input.is_empty() {
                         break;
                     }
@@ -561,7 +685,7 @@ impl ReplicaLink {
     }
 
     pub(crate) fn has_buffered_input(&self) -> bool {
-        !self.input.is_empty()
+        !self.input.is_empty() || self.has_pending_decompression()
     }
 
     fn drive_rdb_framing_once(&mut self) -> Result<FramingAction, LinkError> {
@@ -668,6 +792,9 @@ impl ReplicaLink {
         &mut self,
         bytes: &[u8],
     ) -> Result<(Vec<ReplicaEvent>, Vec<ReplicaAction>), LinkError> {
+        if self.rdb_wire_active {
+            self.pending_wire_input_bytes += bytes.len() as u64;
+        }
         self.last_io_time_ms = crate::foundation::io::sys::time::mstime();
         self.rdb_input.extend_from_slice(bytes);
         let events = Vec::new();
@@ -694,6 +821,18 @@ impl ReplicaLink {
                     self.transition_rdb_channel_state(ReplicaRdbChannelState::WaitingForEndOffset)?;
                 }
                 ReplicaRdbChannelState::WaitingForEndOffset => {
+                    let mut keepalive_bytes = 0;
+                    loop {
+                        let pending = &self.rdb_input[keepalive_bytes..];
+                        if pending.starts_with(b"\n") {
+                            keepalive_bytes += 1;
+                        } else if pending.starts_with(b"\r\n") {
+                            keepalive_bytes += 2;
+                        } else {
+                            break;
+                        }
+                    }
+                    self.rdb_input.drain(..keepalive_bytes);
                     let Some(line) = take_line(&mut self.rdb_input) else {
                         return Ok((events, actions));
                     };
@@ -721,6 +860,10 @@ impl ReplicaLink {
                     self.selected_db = endoff.db_id;
                     self.state = ReplicaLinkState::WaitDualRdbClientIdReply;
                     self.rdb_framing_state = Some(RdbFramingState::Header);
+                    if !self.rdb_wire_active {
+                        self.rdb_wire_active = true;
+                        self.pending_wire_input_bytes += self.rdb_input.len() as u64;
+                    }
                     actions.push(ReplicaAction::Send(
                         protocol::build_replconf_set_rdb_client_id(endoff.client_id),
                     ));
@@ -839,7 +982,13 @@ impl ReplicaLink {
         let diskless = matches!(self.rdb_framing_state, Some(RdbFramingState::Eof { .. }))
             || matches!(self.state, ReplicaLinkState::ReceivingRdbEof { .. });
         let load_mode = *self.rdb_load_mode.get_or_insert(RdbLoadMode::Direct);
-        self.rdb_receive = Some(RdbReceive::new(diskless, load_mode));
+        self.rdb_receive =
+            Some(RdbReceive::new(diskless, load_mode).with_skip_checksums(self.rdb_skip_checksums));
+        if let (Some(receive), Some(options)) =
+            (self.rdb_receive.as_mut(), self.rdb_snapshot_options)
+        {
+            receive.set_snapshot_options(options);
+        }
     }
 
     /// Mutable access to the streaming receive state so the backend can drive the

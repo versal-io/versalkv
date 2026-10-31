@@ -158,6 +158,7 @@ fn redact_sensitive(argv: &[Bytes]) -> Vec<Bytes> {
                 | "masterauth"
                 | "primaryuser"
                 | "tls-key-file-pass"
+                | "tls-alt-key-file-pass"
                 | "tls-client-key-file-pass"
                 | "tls-client-key-file-password"
                 | "tls-key-file-password"
@@ -227,6 +228,20 @@ fn redact_sensitive(argv: &[Bytes]) -> Vec<Bytes> {
                 }
             }
         }
+        "cluster"
+            if argv
+                .get(1)
+                .is_some_and(|arg| arg.eq_ignore_ascii_case(b"migrateslots")) =>
+        {
+            out.extend(argv.iter().skip(1).cloned());
+            for (index, arg) in argv.iter().enumerate().skip(2) {
+                if arg.eq_ignore_ascii_case(b"auth") {
+                    for value in out.iter_mut().take(index + 3).skip(index + 1) {
+                        *value = Bytes::from_static(b"(redacted)");
+                    }
+                }
+            }
+        }
         "acl" => {
             if argv.len() >= 2 {
                 let sub = String::from_utf8_lossy(&argv[1]).to_ascii_lowercase();
@@ -270,6 +285,73 @@ fn redact_sensitive(argv: &[Bytes]) -> Vec<Bytes> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redact_migrateslots_auth_before_validation() {
+        for suffix in [
+            vec!["AUTH", "user", "password"],
+            vec!["aUtH", "onlyuser"],
+            vec!["AUTH", "user", "password", "AUTH", "user2", "password2"],
+            vec!["AUTH", "AUTH", "password", "password2"],
+        ] {
+            let mut argv: Vec<Bytes> = [
+                "CLUSTER",
+                "mIgRaTeSlOtS",
+                "SLOTSRANGE",
+                "0",
+                "0",
+                "NODE",
+                "invalid",
+            ]
+            .iter()
+            .map(|arg| Bytes::copy_from_slice(arg.as_bytes()))
+            .collect();
+            argv.extend(
+                suffix
+                    .iter()
+                    .map(|arg| Bytes::copy_from_slice(arg.as_bytes())),
+            );
+            let redacted = redact_sensitive(&argv);
+            assert_eq!(redacted.len(), argv.len());
+            for (index, arg) in argv.iter().enumerate().skip(2) {
+                if arg.eq_ignore_ascii_case(b"AUTH") {
+                    for value in redacted.iter().take(index + 3).skip(index + 1) {
+                        assert_eq!(value.as_ref(), b"(redacted)");
+                    }
+                }
+            }
+            assert_eq!(&redacted[..7], &argv[..7]);
+        }
+    }
+
+    #[test]
+    fn redact_all_tls_passwords_in_invalid_config_batches() {
+        for prefix in [
+            vec![],
+            vec![
+                Bytes::from_static(b"unknown-option"),
+                Bytes::from_static(b"value"),
+            ],
+            vec![
+                Bytes::from_static(b"tls-key-file-pass"),
+                Bytes::from_static(b"duplicate"),
+            ],
+        ] {
+            let mut argv = vec![Bytes::from_static(b"CONFIG"), Bytes::from_static(b"SET")];
+            argv.extend(prefix);
+            for name in [
+                "tls-key-file-pass",
+                "tls-alt-key-file-pass",
+                "tls-client-key-file-pass",
+            ] {
+                argv.push(Bytes::copy_from_slice(name.as_bytes()));
+                argv.push(Bytes::from_static(b"private-secret"));
+            }
+            let redacted = redact_sensitive(&argv);
+            assert_eq!(redacted.len(), argv.len());
+            assert!(!redacted.iter().any(|arg| arg.as_ref() == b"private-secret"));
+        }
+    }
 
     #[test]
     fn redact_auth() {

@@ -10,6 +10,8 @@ pub fn hgetall(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> CommandO
 
 fn hgetall_reply(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> Value {
     let resp3 = runtime.resp3();
+    let now_ms = runtime.now_ms();
+    let ignore_expiry = runtime.read_expired_values();
     let db = match runtime.db_mut() {
         Some(d) => d,
         None => return CommandError::db_index_out_of_range(),
@@ -29,7 +31,7 @@ fn hgetall_reply(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> Value 
     if resp3 {
         let mut out: Vec<(Value, Value)> = Vec::with_capacity(pairs.len());
         for (f, v) in pairs {
-            if db.hash_field_expired(key, &f) {
+            if !ignore_expiry && db.hash_field_expired_at(key, &f, now_ms) {
                 continue;
             }
             out.push((Value::bulk(f), Value::bulk(v)));
@@ -38,7 +40,7 @@ fn hgetall_reply(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> Value 
     } else {
         let mut out: Vec<Value> = Vec::with_capacity(pairs.len() * 2);
         for (f, v) in pairs {
-            if db.hash_field_expired(key, &f) {
+            if !ignore_expiry && db.hash_field_expired_at(key, &f, now_ms) {
                 continue;
             }
             out.push(Value::bulk(f));

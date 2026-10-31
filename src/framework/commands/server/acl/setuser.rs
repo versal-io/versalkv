@@ -11,23 +11,42 @@ fn users() -> std::sync::MutexGuard<'static, std::collections::HashMap<String, A
 /// Returns Ok(()) if the rule is valid, or an error message string.
 /// Matches valkey C `ACLSetSelector` validation logic.
 pub fn validate_acl_rule(rule: &str, ctx: &ServerContext) -> Result<(), &'static str> {
-    if rule.starts_with('(') && rule.ends_with(')') {
-        let inner = &rule[1..rule.len() - 1];
-        for selector_rule in inner.split_whitespace() {
-            validate_acl_rule(selector_rule, ctx)?;
+    validate_acl_rule_bytes(rule.as_bytes(), ctx)
+}
+
+pub(crate) fn validate_acl_rule_bytes(
+    rule: &[u8],
+    ctx: &ServerContext,
+) -> Result<(), &'static str> {
+    if rule.is_empty() {
+        return Ok(());
+    }
+    if rule.starts_with(b"(") && rule.ends_with(b")") {
+        for selector_rule in
+            crate::engine::extension::acl::user::parse_selector_rules(rule).unwrap_or_default()
+        {
+            validate_acl_rule_bytes(&selector_rule, ctx)?;
         }
         return Ok(());
     }
-    let op = rule.as_bytes()[0] as char;
+    let op = rule[0] as char;
     if op != '+' && op != '-' {
         return Ok(());
     }
     if rule.len() < 2 {
         return Ok(());
     }
+    let rule = std::str::from_utf8(rule).map_err(|_| "Unknown command or category name in ACL")?;
     let rest = &rule[1..];
-    if rest.starts_with('@') {
-        return Ok(());
+    if let Some(category) = rest.strip_prefix('@') {
+        return if category.eq_ignore_ascii_case("all")
+            || crate::engine::extension::acl::is_builtin_acl_category(category)
+            || crate::engine::extension::acl::module_acl_category_commands(category).is_some()
+        {
+            Ok(())
+        } else {
+            Err("Unknown command or category name in ACL")
+        };
     }
     if !rest.contains('|') {
         let lookup = rest.to_ascii_lowercase();
@@ -98,7 +117,7 @@ pub fn validate_acl_rule(rule: &str, ctx: &ServerContext) -> Result<(), &'static
 /// single `(...)` modifier. Mirrors C `ACLMergeSelectorArguments`. Returns the
 /// merged rule list, or `Err(idx)` with the index of the unmatched opening
 /// parenthesis argument.
-fn merge_selector_arguments(args: &[&str]) -> Result<Vec<String>, usize> {
+pub(super) fn merge_selector_arguments(args: &[&str]) -> Result<Vec<String>, usize> {
     let mut merged: Vec<String> = Vec::new();
     let mut open_start: Option<usize> = None;
     let mut selector = String::new();

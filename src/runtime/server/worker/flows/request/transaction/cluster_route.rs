@@ -187,6 +187,21 @@ fn transaction_existing_keys(
 }
 
 impl ServerWorkerState {
+    fn exec_route_commands(&self, connection_token: usize) -> Vec<CommandArgs> {
+        let conn =
+            &self.connection_registry[crate::framework::capabilities::io::Token(connection_token)];
+        let mut commands = Vec::with_capacity(conn.transaction.queued_commands().len() + 1);
+        // Conditions read the active DB, before any queued SELECT is executed.
+        if !conn.transaction.exec_arguments().is_empty() {
+            commands.push(CommandArgs {
+                name: bytes::Bytes::from_static(b"EXEC"),
+                args: conn.transaction.exec_arguments().to_vec(),
+            });
+        }
+        commands.extend_from_slice(conn.transaction.queued_commands());
+        commands
+    }
+
     pub(super) fn exec_cluster_metric_slot(&self, connection_token: usize) -> Option<u16> {
         if !self.ctx.config().server.cluster_enabled
             || !self.ctx.config().server.cluster_slot_stats_enabled
@@ -198,9 +213,7 @@ impl ServerWorkerState {
             return None;
         }
         let facts = transaction_route_facts(
-            self.connection_registry[crate::framework::capabilities::io::Token(connection_token)]
-                .transaction
-                .queued_commands(),
+            &self.exec_route_commands(connection_token),
             &self.registry,
             self.connection_registry[crate::framework::capabilities::io::Token(connection_token)]
                 .selected_db,
@@ -223,6 +236,9 @@ impl ServerWorkerState {
                 [crate::framework::capabilities::io::Token(connection_token)]
             .transaction
             .is_active()
+            || self.connection_registry[crate::framework::capabilities::io::Token(connection_token)]
+                .transaction
+                .has_queue_error()
         {
             return None;
         }
@@ -246,7 +262,7 @@ impl ServerWorkerState {
                 .is_some_and(|db| db.get_no_expire(key).is_some())
         };
         validate_transaction_route(
-            conn.transaction.queued_commands(),
+            &self.exec_route_commands(connection_token),
             TransactionRouteContext {
                 registry: &self.registry,
                 snapshot: &snapshot,

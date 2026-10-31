@@ -203,10 +203,7 @@ fn readable_hup_on_child_leased_direct_dual_socket_tears_down() {
             rdb_filter_mode: crate::framework::distributed::replication::RdbFilterMode::All,
         },
     );
-    backend
-        .replication_runtime
-        .register_rdb_channel(rdb, main)
-        .unwrap();
+    backend.associate_waiting_rdb_for_test(main, rdb);
     let child = backend.install_test_child(ChildOwner::DirectDualRdb, 123_504);
     backend
         .acquire_child_socket_leases(child, &[token])

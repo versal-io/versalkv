@@ -212,6 +212,7 @@ impl ServerWorkerState {
                         .try_fold(0usize, |total, frame| total.checked_add(frame.len()))
                         .unwrap_or(usize::MAX),
                 );
+                self.record_replication_wire_write(token.0, written);
                 let replication_written = {
                     let connection = &mut self.connection_registry[Token(connection_token)];
                     connection.restore_threaded_write_snapshot(frames);
@@ -429,6 +430,7 @@ impl ServerWorkerState {
             conn.output.queue = queue;
             (result, replication_written, written)
         };
+        self.record_replication_wire_write(token_value, written);
         let replication_written = match replication_written {
             Ok(replication_written) => replication_written,
             Err(_) => return WriteOutcome::Failed(replication_accounting_error()),
@@ -641,6 +643,7 @@ impl ServerWorkerState {
     }
 
     fn record_writable_flush(&mut self, context: &WritableContext, flush: &WritableFlush) -> bool {
+        self.record_replication_wire_write(context.token.0, flush.written);
         self.refresh_client_memory_usage(context.token, false);
         if context.is_slot_export() {
             self.writes
@@ -678,6 +681,17 @@ impl ServerWorkerState {
             .replication_runtime
             .primary_for_connection_mut(connection_id)
             .map(|link| link.mark_replication_written(bytes, backlog_end));
+        if let Some(stats) = self
+            .replication_runtime
+            .primary_for_connection(connection_id)
+            .and_then(|link| link.compression_stats())
+        {
+            self.ctx
+                .replication_mut()
+                .view
+                .compression_stats
+                .insert(token_value, stats);
+        }
         if !matches!(result, Some(Err(_))) {
             return true;
         }
@@ -810,6 +824,20 @@ impl ServerWorkerState {
             return false;
         }
         true
+    }
+
+    fn record_replication_wire_write(&mut self, token_value: usize, bytes: usize) {
+        use crate::framework::distributed::replication::{ConnectionId, ReplicationConnection};
+        if matches!(
+            self.replication_runtime.role(ConnectionId(token_value)),
+            Some(
+                ReplicationConnection::Primary(_)
+                    | ReplicationConnection::RdbChannelCandidate
+                    | ReplicationConnection::RdbChannel { .. }
+            )
+        ) {
+            self.ctx.stats_mut().add_net_repl_output_bytes(bytes as u64);
+        }
     }
 
     fn read_dual_rdb_ack_after_flush(&mut self, token: Token) {

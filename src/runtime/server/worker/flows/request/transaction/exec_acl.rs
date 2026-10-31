@@ -1,6 +1,6 @@
 use super::super::super::ServerWorkerState;
 use super::tx_db_object::tx_db_object_and_label;
-use crate::engine::command::{CommandArgs, CMD_ALL_DBS, CMD_WRITE};
+use crate::engine::command::{CommandArgs, CMD_ALL_DBS};
 use crate::engine::extension::acl::{
     add_acl_log_entry, AclCommand, AclDenial, AclUser, ACL_DENIED_CHANNEL, ACL_DENIED_CMD,
     ACL_DENIED_DB, ACL_DENIED_KEY, ACL_LOG_CTX_MULTI,
@@ -54,7 +54,7 @@ fn exec_acl_failure(
         request.spec.acl_categories,
         request.args.args.first().map(|arg| arg.as_ref()),
     );
-    let has_keys = request.spec.first_key != 0;
+    let has_keys = request.spec.first_key != 0 || request.spec.get_keys.is_some();
     let db_req = crate::engine::extension::acl::compute_db_requirement(
         request.spec.name.as_str(),
         &request.args.args,
@@ -75,6 +75,12 @@ fn exec_acl_failure(
 }
 
 fn exec_acl_key_requirements<'a>(spec: &CommandSpec, args: &'a CommandArgs) -> Vec<(&'a [u8], u8)> {
+    if let Some(get_keys) = spec.get_keys {
+        return get_keys(&args.args)
+            .into_iter()
+            .map(|(key, flags)| (key, key_permission_bits(&flags)))
+            .collect();
+    }
     if spec.first_key == 0 {
         return Vec::new();
     }
@@ -85,16 +91,22 @@ fn exec_acl_key_requirements<'a>(spec: &CommandSpec, args: &'a CommandArgs) -> V
         spec.last_key as isize - 1
     };
     let step = spec.key_step.max(1) as isize;
-    let required = if (spec.flags & CMD_WRITE) != 0 {
-        crate::engine::extension::acl::ACL_WRITE_PERMISSION
-    } else {
-        crate::engine::extension::acl::ACL_READ_PERMISSION
-    };
+    let required = key_permission_bits(spec.key_flags);
     (first..=last)
         .step_by(step as usize)
         .filter_map(|index| args.args.get(index as usize))
         .map(|key| (key.as_ref(), required))
         .collect()
+}
+
+fn key_permission_bits(flags: &[&str]) -> u8 {
+    flags.iter().fold(0, |bits, flag| {
+        bits | match *flag {
+            "access" => crate::engine::extension::acl::ACL_READ_PERMISSION,
+            "insert" | "update" | "delete" => crate::engine::extension::acl::ACL_WRITE_PERMISSION,
+            _ => 0,
+        }
+    })
 }
 
 fn acl_denial_failure(
@@ -125,6 +137,12 @@ fn acl_denial_failure(
                 .unwrap_or("<binary>")
                 .to_string(),
             message: "-NOPERM ACLs rules changed between the moment the transaction was accumulated and the EXEC call. This command is no longer allowed for the following reason: no permission to touch the specified keys",
+        },
+        AclDenial::Channel(index) => ExecAclFailure {
+            reason: ACL_DENIED_CHANNEL,
+            object: request.args.args.get(index)
+                .map(|channel| String::from_utf8_lossy(channel).into_owned()).unwrap_or_default(),
+            message: "-NOPERM ACLs rules changed between the moment the transaction was accumulated and the EXEC call. This command is no longer allowed for the following reason: no permission to access one of the channels used as arguments",
         },
     }
 }

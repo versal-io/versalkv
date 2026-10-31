@@ -13,6 +13,9 @@ use crate::runtime::server::worker::ServerWorkerState;
 use std::io::Write;
 use std::net::SocketAddr;
 
+#[path = "cluster/io.rs"]
+mod io;
+
 #[derive(Default)]
 pub(crate) struct ClusterConfigFile {
     pub path: Option<std::path::PathBuf>,
@@ -34,10 +37,6 @@ impl ServerWorkerState {
         } else {
             config.cluster_port
         };
-        if config.tls_cluster {
-            self.configure_tls_server_from_config()?;
-            self.configure_tls_client_from_config()?;
-        }
         let targets = crate::framework::config::bind_targets(&config.bind, cluster_port);
         let old_listeners = std::mem::take(&mut self.cluster_bus.listener_tokens);
         let old_fds: Vec<_> = old_listeners
@@ -309,7 +308,9 @@ impl ServerWorkerState {
         let mut state = self.ctx.cluster_state_mut().take();
         self.isolate_cluster_bus_connection(state.as_deref_mut(), token, schedule_reconnect);
         *self.ctx.cluster_state_mut() = state;
-        self.deregister_or_defer(token, PendingRemovalOwner::ClusterBus);
+        if !self.io_threads.begin_close(token) {
+            self.deregister_or_defer(token, PendingRemovalOwner::ClusterBus);
+        }
     }
 
     fn isolate_cluster_bus_connection(
@@ -363,7 +364,9 @@ impl ServerWorkerState {
         }
         self.retire_runtime_source(token);
         self.isolate_cluster_bus_connection(Some(state), token, schedule_reconnect);
-        self.deregister_or_defer(token, PendingRemovalOwner::ClusterBus);
+        if !self.io_threads.begin_close(token) {
+            self.deregister_or_defer(token, PendingRemovalOwner::ClusterBus);
+        }
     }
 
     pub(crate) fn refresh_cluster_link_views(&mut self) {
@@ -568,7 +571,7 @@ impl ServerWorkerState {
         }
     }
 
-    fn local_replica_failover_inputs(
+    pub(in crate::runtime::server::worker) fn local_replica_failover_inputs(
         &self,
         now: i64,
     ) -> (
@@ -577,6 +580,8 @@ impl ServerWorkerState {
     ) {
         let status =
             crate::engine::distributed::cluster::state::failover::LocalReplicaFailoverStatus {
+                no_failover_if_empty: self.ctx.config().server.cluster_replica_no_failover
+                    == crate::engine::extension::config::server::ClusterReplicaNoFailover::IfEmpty,
                 loading: self.ctx.is_loading() || self.ctx.replication().async_loading,
                 priority: self.ctx.config().replication.replica_priority,
                 data_age_ms: self.ctx.replication().primary_failover_data_age_ms(now),
@@ -624,9 +629,33 @@ impl ServerWorkerState {
         }
     }
 
-    pub(crate) fn handle_cluster_bus_readable(&mut self, token: Token) {
-        let tv = token.0;
+    pub(crate) fn handle_cluster_bus_readable(&mut self, token: Token) -> bool {
         if !self.cluster_bus.is_bus_token(token) {
+            return false;
+        }
+        if self.try_submit_cluster_bus_read(token) {
+            return false;
+        }
+        let Some((bytes, outcome)) = self.read_cluster_bus_bytes(token) else {
+            self.remove_cluster_bus_connection(token);
+            return false;
+        };
+        let is_budget_exhausted = matches!(
+            outcome,
+            crate::foundation::io::transport::ReadOutcome::BudgetExhausted
+        );
+        self.process_cluster_bus_read_result(token, bytes, outcome);
+        is_budget_exhausted
+    }
+
+    fn process_cluster_bus_read_result(
+        &mut self,
+        token: Token,
+        bytes: Vec<u8>,
+        outcome: crate::foundation::io::transport::ReadOutcome,
+    ) {
+        let tv = token.0;
+        if !self.cluster_bus.connections.contains_key(&tv) {
             return;
         }
         let now = mstime();
@@ -640,12 +669,12 @@ impl ServerWorkerState {
             state.set_failure_report_node_timeout_ms(node_timeout);
             state.set_manual_failover_timeout_ms(manual_failover_timeout);
             state.set_replica_migration_allowed(allow_replica_migration);
-            let Some(mut stream) = self.transport.stream(token) else {
-                self.teardown_cluster_bus_connection_with_state(state, token, true);
-                *self.ctx.cluster_state_mut() = state_opt;
-                return;
-            };
-            should_close = self.cluster_bus.readable(state, &mut stream, tv, now);
+            should_close = self.cluster_bus.process_read_bytes(state, tv, &bytes, now)
+                || matches!(
+                    outcome,
+                    crate::foundation::io::transport::ReadOutcome::PeerClosed
+                        | crate::foundation::io::transport::ReadOutcome::Failed(_)
+                );
             self.record_inbound_cluster_link_if_ready(state, token);
             // A reciprocal MEET retires its obsolete outgoing link inside
             // C packet processing. Complete receive-generated closures before
@@ -736,6 +765,12 @@ impl ServerWorkerState {
     }
 
     pub(crate) fn handle_cluster_bus_writable(&mut self, token: Token) {
+        if !self.cluster_bus.connections.contains_key(&token.0) {
+            return;
+        }
+        if self.try_submit_cluster_bus_write(token) {
+            return;
+        }
         let tv = token.0;
         let mut state_opt = self.ctx.cluster_state_mut().take();
         let Some(mut stream) = self.transport.stream(token) else {
@@ -836,6 +871,377 @@ mod tests {
 
     fn offset(value: i64) -> ReplicationOffset {
         ReplicationOffset::try_from(value).expect("valid test offset")
+    }
+
+    #[test]
+    fn cluster_bus_threaded_read_waits_for_main_thread_completion() {
+        use crate::engine::distributed::cluster::msg::{
+            ClusterBusBody, ClusterBusMessage, ClusterMsgType,
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut backend = ServerWorkerState::new(1).unwrap();
+        backend.ctx.config_mut().server.io_threads = 2;
+        backend.ctx.config_mut().server.io_threads_always_active = true;
+        backend.configure_io_threads_from_config().unwrap();
+        let peer = backend.transport.connect_tcp(addr).unwrap();
+        let (mut writer, _) = listener.accept().unwrap();
+        let state = ClusterState::new("127.0.0.1", 6379, 16379);
+        let remote = ClusterState::new("127.0.0.1", 6380, 16380);
+        let packet = ClusterBusMessage::from_node(
+            ClusterMsgType::Meet,
+            &remote.myself,
+            0,
+            ClusterBusBody::Gossip(Vec::new()),
+        )
+        .encode()
+        .unwrap();
+        *backend.ctx.cluster_state_mut() = Some(Box::new(state));
+        backend.cluster_bus.register_incoming(peer.token, addr);
+        writer.write_all(&packet).unwrap();
+        backend.transport.wait_readable_for_test(peer.token);
+        backend.handle_cluster_bus_readable(peer.token);
+        assert_eq!(
+            backend
+                .ctx
+                .cluster_state()
+                .as_ref()
+                .unwrap()
+                .total_bus_messages_received(),
+            0
+        );
+        assert_eq!(backend.ctx.stats().cluster_io_threaded_reads_processed, 0);
+        assert!(backend.io_threads.read_inflight_id(peer.token).is_some());
+        backend
+            .wait_for_io_completion_for_test(std::time::Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(
+            backend
+                .ctx
+                .cluster_state()
+                .as_ref()
+                .unwrap()
+                .total_bus_messages_received(),
+            1
+        );
+        assert_eq!(backend.ctx.stats().cluster_io_threaded_reads_processed, 1);
+        assert_eq!(backend.ctx.stats().cluster_io_main_thread_fallbacks, 0);
+    }
+
+    #[test]
+    fn cluster_if_empty_blocks_zero_applied_offset_and_resumes_when_disabled() {
+        use crate::engine::distributed::cluster::node::CLUSTER_NODE_FAIL;
+        use crate::engine::distributed::cluster::state::failover::AutomaticFailoverPhase;
+        use crate::engine::extension::config::server::ClusterReplicaNoFailover;
+        let mut backend = ServerWorkerState::new(1).unwrap();
+        backend.ctx.replication_mut().switch_to_replica();
+        backend.ctx.config_mut().server.cluster_replica_no_failover =
+            ClusterReplicaNoFailover::IfEmpty;
+        backend
+            .ctx
+            .config_mut()
+            .server
+            .cluster_replica_validity_factor = 0;
+        let mut state = ClusterState::new("127.0.0.1", 6380, 16380);
+        let primary_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let voter_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let mut primary =
+            ClusterNode::new(primary_id.into(), "127.0.0.1".into(), 6379, 16379, true);
+        primary.flags &= !CLUSTER_NODE_MYSELF;
+        primary.flags |= CLUSTER_NODE_FAIL;
+        primary.slots[7] = true;
+        primary.numslots = 1;
+        state.nodes.insert(primary_id.into(), primary);
+        let mut voter = ClusterNode::new(voter_id.into(), "127.0.0.1".into(), 6381, 16381, true);
+        voter.flags &= !CLUSTER_NODE_MYSELF;
+        voter.slots[8] = true;
+        voter.numslots = 1;
+        state.nodes.insert(voter_id.into(), voter);
+        state.myself.flags &= !CLUSTER_NODE_PRIMARY;
+        state.myself.flags |= CLUSTER_NODE_REPLICA;
+        state.myself.replicaof = primary_id.into();
+        backend.cluster_bus.register_outgoing_for_node(
+            Token(99),
+            "127.0.0.1:16381".parse().unwrap(),
+            false,
+            voter_id.into(),
+        );
+        // A stale bus projection must not override the live applied position.
+        state.myself.repl_offset = 1563;
+        for (now, policy, expected) in [
+            (
+                1000,
+                ClusterReplicaNoFailover::IfEmpty,
+                AutomaticFailoverPhase::Idle,
+            ),
+            (
+                2000,
+                ClusterReplicaNoFailover::No,
+                AutomaticFailoverPhase::WaitingRankDelay,
+            ),
+        ] {
+            backend.ctx.config_mut().server.cluster_replica_no_failover = policy;
+            let (status, applied) = backend.local_replica_failover_inputs(now);
+            state.observe_local_replication(applied, status.priority);
+            backend
+                .cluster_bus
+                .reevaluate_automatic_failover_after_receive(&mut state, now, 1000, &status);
+            assert_eq!(state.automatic_failover.phase(), expected);
+        }
+        backend.ctx.config_mut().server.cluster_replica_no_failover =
+            ClusterReplicaNoFailover::IfEmpty;
+        backend.ctx.replication_mut().slave_repl_offset = offset(42);
+        state.automatic_failover.reset();
+        let (status, applied) = backend.local_replica_failover_inputs(3000);
+        state.observe_local_replication(applied, status.priority);
+        backend
+            .cluster_bus
+            .reevaluate_automatic_failover_after_receive(&mut state, 3000, 1000, &status);
+        assert_eq!(
+            state.automatic_failover.phase(),
+            AutomaticFailoverPhase::WaitingRankDelay
+        );
+
+        use crate::engine::distributed::cluster::action::Promotion;
+        use crate::engine::distributed::cluster::state::failover::ManualFailoverMode;
+        use crate::engine::distributed::cluster::NodeId;
+        backend.ctx.replication_mut().slave_repl_offset = offset(0);
+        state.automatic_failover.reset();
+        let primary = &state.nodes[primary_id];
+        let primary_node_id = NodeId::parse(primary_id.as_bytes()).unwrap();
+        state.manual_failover.start_replica(
+            ManualFailoverMode::Force,
+            primary_node_id.clone(),
+            Promotion {
+                old_primary: primary_node_id,
+                shard_id: NodeId::parse(primary.shard_id.as_bytes()).unwrap(),
+                slots: primary.slots.clone(),
+                config_epoch: 1,
+            },
+            4000,
+            5000,
+        );
+        let (status, applied) = backend.local_replica_failover_inputs(4000);
+        state.observe_local_replication(applied, status.priority);
+        backend
+            .cluster_bus
+            .reevaluate_automatic_failover_after_receive(&mut state, 4000, 1000, &status);
+        assert_eq!(
+            state.automatic_failover.phase(),
+            AutomaticFailoverPhase::RequestingVotes
+        );
+        assert!(state.automatic_failover.is_manual());
+    }
+
+    #[test]
+    fn cluster_if_empty_fullresync_announcement_does_not_supply_applied_offset() {
+        use crate::framework::distributed::replication::{ConnectionId, MasterInfo, ReplicaLink};
+        let mut backend = ServerWorkerState::new(1).unwrap();
+        backend.ctx.replication_mut().switch_to_replica();
+        let mut link = ReplicaLink::new(
+            ConnectionId(41),
+            MasterInfo {
+                host: "127.0.0.1".to_string(),
+                port: 6379,
+            },
+        );
+        link.connected(None, None);
+        link.on_bytes(
+            b"+PONG\r\n+OK\r\n+OK\r\n+FULLRESYNC 0123456789abcdef0123456789abcdef01234567 1563\r\n",
+            6380,
+        )
+        .unwrap();
+        backend.replication_runtime.set_replica_link(link);
+        let (_, applied) = backend.local_replica_failover_inputs(1000);
+        assert_eq!(applied, 0);
+        backend.ctx.set_loading(true);
+        let (status, applied) = backend.local_replica_failover_inputs(1000);
+        assert!(status.loading);
+        assert_eq!(applied, 0);
+    }
+
+    #[test]
+    fn cluster_if_empty_revalidates_queued_promotion_after_config_change() {
+        use crate::engine::distributed::cluster::action::Promotion;
+        use crate::engine::distributed::cluster::msg::{
+            ClusterBusBody, ClusterBusMessage, ClusterMsgType,
+        };
+        use crate::engine::distributed::cluster::node::CLUSTER_NODE_FAIL;
+        use crate::engine::distributed::cluster::state::failover::{
+            AutomaticFailoverFacts, AutomaticFailoverPhase, FailedPrimaryFacts, ManualFailoverMode,
+            ReplicaEligibility,
+        };
+        use crate::engine::distributed::cluster::NodeId;
+        use crate::foundation::io::protocol::Value;
+        use crate::framework::capabilities::connection::Connection;
+        use crate::runtime::server::worker::reactor::ReadyEvent;
+
+        for (applied, is_manual, should_promote) in
+            [(0, false, false), (42, false, true), (0, true, true)]
+        {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let mut backend = ServerWorkerState::new(1).unwrap();
+            let peer = backend.transport.connect_tcp(addr).unwrap();
+            let (mut socket, _) = listener.accept().unwrap();
+            let primary_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+            let voter_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+            let mut state = ClusterState::new("127.0.0.1", 6380, 16380);
+            state.current_epoch = 9;
+            state.myself.config_epoch = 9;
+            state.myself.flags &= !CLUSTER_NODE_PRIMARY;
+            state.myself.flags |= CLUSTER_NODE_REPLICA;
+            state.myself.replicaof = primary_id.to_string();
+            let mut primary =
+                ClusterNode::new(primary_id.into(), "127.0.0.1".into(), 6379, 16379, true);
+            primary.flags &= !CLUSTER_NODE_MYSELF;
+            primary.flags |= CLUSTER_NODE_FAIL;
+            primary.slots[7] = true;
+            primary.numslots = 1;
+            let primary_node_id = NodeId::parse(primary_id.as_bytes()).unwrap();
+            let shard_id = NodeId::parse(primary.shard_id.as_bytes()).unwrap();
+            let slots = primary.slots.clone();
+            state.insert_node(primary);
+            let mut voter =
+                ClusterNode::new(voter_id.into(), "127.0.0.1".into(), 6381, 16381, true);
+            voter.flags &= !CLUSTER_NODE_MYSELF;
+            voter.slots[8] = true;
+            voter.numslots = 1;
+            state.insert_node(voter.clone());
+            if is_manual {
+                state.manual_failover.start_replica(
+                    ManualFailoverMode::Force,
+                    primary_node_id.clone(),
+                    Promotion {
+                        old_primary: primary_node_id.clone(),
+                        shard_id: shard_id.clone(),
+                        slots: slots.clone(),
+                        config_epoch: 10,
+                    },
+                    1000,
+                    5000,
+                );
+            }
+            let local = ReplicaEligibility {
+                node_id: NodeId::parse(state.myself.name.as_bytes()).unwrap(),
+                no_failover: false,
+                cluster_link_connected: true,
+                cluster_view_stale: false,
+                loading: false,
+                priority: 100,
+                cluster_replica_priority: 0,
+                replication_offset: 0,
+                data_age_ms: 0,
+                node_timeout_ms: 1000,
+                repl_ping_period_ms: 0,
+                replica_validity_factor: 0,
+            };
+            let mut facts = AutomaticFailoverFacts {
+                now_ms: 1000,
+                node_timeout_ms: 1000,
+                current_epoch: 9,
+                voting_primaries: 1,
+                failed_primary_rank: 0,
+                all_replicas_primary_failed: true,
+                local: Some(local.clone()),
+                siblings: vec![local],
+                manual: is_manual,
+                primary: Some(FailedPrimaryFacts {
+                    node_id: primary_node_id,
+                    shard_id,
+                    slots,
+                    is_failed: true,
+                }),
+            };
+            state.automatic_failover.set_debug_delay_ms(Some(0));
+            state.automatic_failover_on_tick(&facts);
+            facts.now_ms = state.automatic_failover.deadline_ms();
+            state.automatic_failover_on_tick(&facts);
+            assert_eq!(
+                state.automatic_failover.phase(),
+                AutomaticFailoverPhase::RequestingVotes
+            );
+            let packet = ClusterBusMessage::from_node(
+                ClusterMsgType::FailoverAuthAck,
+                &voter,
+                10,
+                ClusterBusBody::Empty,
+            )
+            .encode()
+            .unwrap();
+            *backend.ctx.cluster_state_mut() = Some(Box::new(state));
+            backend.ctx.replication_mut().switch_to_replica();
+            backend
+                .ctx
+                .config_mut()
+                .server
+                .cluster_replica_validity_factor = 0;
+            backend
+                .route_runtime_source(
+                    peer.token,
+                    crate::runtime::server::worker::reactor::sources::SourceOwner::ClusterBus,
+                )
+                .unwrap();
+            backend.cluster_bus.register_incoming(peer.token, addr);
+            socket.write_all(&packet).unwrap();
+            backend.transport.wait_readable_for_test(peer.token);
+            backend.begin_cluster_bus_receive_batch();
+            backend.dispatch_transport_event(
+                ReadyEvent {
+                    token: peer.token,
+                    readable: true,
+                    writable: false,
+                    error: false,
+                    read_hup: false,
+                },
+                false,
+            );
+            assert_eq!(
+                backend
+                    .ctx
+                    .cluster_state()
+                    .as_ref()
+                    .unwrap()
+                    .automatic_failover
+                    .phase(),
+                AutomaticFailoverPhase::Promoting,
+            );
+            let mut connection = Connection::new_fake();
+            let args = crate::engine::command::CommandArgs::from_parts(
+                ["CONFIG", "SET", "cluster-replica-no-failover", "if-empty"]
+                    .into_iter()
+                    .map(|part| bytes::Bytes::from_static(part.as_bytes()))
+                    .collect(),
+            );
+            assert_eq!(
+                crate::framework::commands::server::config::config_set(
+                    &mut connection,
+                    &args,
+                    &mut backend.ctx,
+                ),
+                Value::ok(),
+            );
+            backend.ctx.replication_mut().slave_repl_offset = offset(applied);
+            backend.finish_cluster_bus_receive_batch();
+            let state = backend.ctx.cluster_state().as_ref().unwrap();
+            assert_eq!(
+                state.myself.is_primary(),
+                should_promote,
+                "applied={applied}, manual={is_manual}"
+            );
+            assert_eq!(state.myself.slots[7], should_promote);
+            assert_eq!(
+                state.myself.config_epoch,
+                if should_promote { 10 } else { 9 }
+            );
+            if !should_promote {
+                assert_eq!(
+                    state.automatic_failover.phase(),
+                    AutomaticFailoverPhase::Idle
+                );
+                assert!(backend.ctx.replication().is_replica());
+            }
+        }
     }
 
     #[test]

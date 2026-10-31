@@ -49,6 +49,22 @@ impl ImportDataset {
     ) -> Result<(), MigrationApplyError> {
         self.preserve_expired_keys();
         let result = self.player.apply(args, registry, &mut self.context);
+        self.preserve_expired_keys();
+        result
+    }
+
+    pub(crate) fn apply_with_execution(
+        &mut self,
+        args: CommandArgs,
+        registry: &CommandRegistry,
+    ) -> (
+        Result<(), MigrationApplyError>,
+        crate::framework::aof_replay::ReplayExecution,
+    ) {
+        self.preserve_expired_keys();
+        let result = self
+            .player
+            .apply_with_execution(args, registry, &mut self.context);
         // Some handlers temporarily toggle this DB-local guard and restore it
         // for ordinary serving semantics. The isolated import dataset owns a
         // stronger lifetime invariant, so re-arm it after every command.

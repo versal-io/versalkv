@@ -84,6 +84,9 @@ impl MigrationRegistry {
             event: event.as_str(),
         })?;
         job.phase = next;
+        if next.is_terminal() || event == MigrationEvent::AuthCommandSent {
+            job.clear_auth();
+        }
         job.last_update_time = now;
         if event == MigrationEvent::Ack {
             job.last_ack_time = now.max(job.last_ack_time);
@@ -133,6 +136,7 @@ impl MigrationRegistry {
             .iter_mut()
             .find(|job| &job.id == id)
             .ok_or_else(|| MigrationError::UnknownJob(id.clone()))?;
+        job.clear_auth();
         if !job.is_active() {
             return Ok(Vec::new());
         }
@@ -231,6 +235,10 @@ impl MigrationRegistry {
 
     pub fn get(&self, id: &MigrationJobId) -> Option<&MigrationJob> {
         self.jobs.iter().find(|job| &job.id == id)
+    }
+
+    pub fn take_auth(&mut self, id: &MigrationJobId) -> Option<super::job::MigrationAuth> {
+        self.jobs.iter_mut().find(|job| &job.id == id)?.take_auth()
     }
 
     pub fn has_active_exports(&self) -> bool {
@@ -356,5 +364,118 @@ fn next_phase(
             Some((P::Terminal(TerminalPhase::Success), vec![A::Cleanup(id())]))
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod auth_tests {
+    use super::*;
+    use crate::engine::distributed::cluster::{NodeId, SlotRange};
+
+    fn export(slot: u16, username: &[u8], password: &[u8]) -> MigrationJob {
+        let mut job = MigrationJob::new(
+            MigrationJobId::generate(),
+            NodeId::parse(b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap(),
+            NodeId::parse(b"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap(),
+            super::super::SlotRanges::new(vec![SlotRange::new(slot, slot).unwrap()]).unwrap(),
+            super::super::MigrationOperation::Export,
+            1,
+        );
+        job.set_auth(username, password);
+        job
+    }
+
+    #[test]
+    fn each_job_transfers_auth_once_without_exposing_it_in_views() {
+        let mut registry = MigrationRegistry::default();
+        let first = export(0, b"first", b"password1");
+        let second = export(1, b"second", b"password2");
+        let first_id = first.id.clone();
+        let second_id = second.id.clone();
+        registry.start_all(vec![first, second]).unwrap();
+        let first = registry.take_auth(&first_id).unwrap();
+        assert_eq!(first.username(), b"first");
+        assert_eq!(first.password(), b"password1");
+        assert!(registry.take_auth(&first_id).is_none());
+        assert!(registry.get(&second_id).unwrap().has_auth());
+        let second = registry.take_auth(&second_id).unwrap();
+        assert_eq!(second.username(), b"second");
+        assert_eq!(second.password(), b"password2");
+        assert!(!format!("{:?}", registry.views()).contains("password"));
+    }
+
+    #[test]
+    fn all_terminal_paths_clear_credentials_before_retaining_history() {
+        for terminal in [
+            TerminalPhase::Success,
+            TerminalPhase::Failed,
+            TerminalPhase::Cancelled,
+        ] {
+            let mut registry = MigrationRegistry::default();
+            let job = export(0, b"user", b"password");
+            let id = job.id.clone();
+            registry.start(job).unwrap();
+            registry.finish(&id, terminal, None, 2).unwrap();
+            assert!(!registry.get(&id).unwrap().has_auth());
+            assert!(registry.take_auth(&id).is_none());
+            assert_eq!(registry.views().len(), 1);
+            registry.trim_history(0);
+            assert!(registry.views().is_empty());
+        }
+        for should_cancel in [false, true] {
+            let mut registry = MigrationRegistry::default();
+            let job = export(0, b"user", b"password");
+            let id = job.id.clone();
+            registry.start(job).unwrap();
+            if should_cancel {
+                registry.cancel_exports(2);
+            } else {
+                registry.fail_all("failed before AUTH", 2);
+            }
+            assert!(!registry.get(&id).unwrap().has_auth());
+        }
+    }
+
+    #[test]
+    fn auth_sent_transition_clears_credentials_without_waiting_for_response() {
+        let mut registry = MigrationRegistry::default();
+        let job = export(0, b"user", b"password");
+        let id = job.id.clone();
+        registry.start(job).unwrap();
+        assert_eq!(
+            registry
+                .transition(
+                    &id,
+                    MigrationEvent::Connected {
+                        auth_required: true
+                    },
+                    2
+                )
+                .unwrap(),
+            vec![MigrationAction::SendAuth(id.clone())]
+        );
+        registry
+            .transition(&id, MigrationEvent::AuthCommandSent, 3)
+            .unwrap();
+        assert!(!registry.get(&id).unwrap().has_auth());
+        assert_eq!(
+            registry.get(&id).unwrap().phase,
+            MigrationPhase::Export(ExportPhase::ReadingAuthResponse)
+        );
+        assert!(registry
+            .transition(&id, MigrationEvent::AuthCommandSent, 4)
+            .is_err());
+    }
+
+    #[test]
+    fn a_rejected_batch_never_publishes_earlier_credentialed_jobs() {
+        let mut registry = MigrationRegistry::default();
+        let first = export(0, b"first", b"password1");
+        let second = export(0, b"second", b"password2");
+        assert_eq!(
+            registry.start_all(vec![first, second]),
+            Err(MigrationError::ActiveSlotOverlap { slot: 0 })
+        );
+        assert!(registry.views().is_empty());
     }
 }

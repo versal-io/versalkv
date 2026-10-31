@@ -19,6 +19,8 @@ use crate::runtime::server::worker::reactor::blocked_events::BlockedOperation;
 
 use crate::runtime::server::worker::ServerWorkerState;
 
+mod module;
+
 #[derive(Clone, Copy, Default)]
 pub(crate) struct HostTaskScope {
     protected_client: Option<Token>,
@@ -52,6 +54,32 @@ impl ServerWorkerState {
         task: crate::framework::host_tasks::PreparedHostTask,
     ) -> crate::foundation::io::protocol::Value {
         match task {
+            crate::framework::host_tasks::PreparedHostTask::Module(mut task) => {
+                let session = task.session_id();
+                // Protect the real owner, not the boxed guest or a Slab address.
+                let previous_protected = self
+                    .connection_registry
+                    .get_mut(token)
+                    .filter(|connection| connection.session_id() == session)
+                    .map(|connection| std::mem::replace(&mut connection.protected, true));
+                let result = self
+                    .with_host_dispatcher(HostTaskScope::client(token), |dispatcher| {
+                        task.run(dispatcher)
+                    });
+                if let Some(connection) = self
+                    .connection_registry
+                    .get_mut(token)
+                    .filter(|connection| connection.session_id() == session)
+                {
+                    let result = task.finish(result, connection, &mut self.ctx);
+                    connection.protected = previous_protected.unwrap_or(false);
+                    result
+                } else {
+                    let mut guest = task.finish_disconnected(&mut self.ctx);
+                    self.commit_disconnected_module_effects(&mut guest);
+                    result
+                }
+            }
             crate::framework::host_tasks::PreparedHostTask::DrainClusterConfig => {
                 match self.drain_cluster_config_saves() {
                     Ok(()) => Value::ok(),
@@ -105,6 +133,52 @@ impl ServerWorkerState {
                         });
                 task.finish(result, &mut self.ctx)
             }
+        }
+    }
+
+    fn commit_disconnected_module_effects(&mut self, guest: &mut Connection) {
+        use crate::engine::extension::module::api::call::pending::ModuleCallEffects;
+        use crate::engine::extension::script::PropagationOp;
+        let Some(mut effects) = guest.take_command_effects(CommandEffectDrain::Nested) else {
+            return;
+        };
+        self.dispose_data_lazyfree_objects(effects.take_lazyfree_objects());
+        let swapdb = effects.take_swapdb();
+        let dirty_keys = effects.take_dirty_keys();
+        let mut propagation = effects.take_script_propagation();
+        if propagation.is_empty() {
+            propagation.extend(
+                effects
+                    .take_custom_propagation()
+                    .into_iter()
+                    .map(|frame| PropagationOp::both(guest.selected_db, frame)),
+            );
+        }
+        // These writes already happened. Losing the reply owner cannot discard
+        // their ordered propagation or keyspace effects.
+        let committed_keys = self.commit_pending_module_effects(
+            vec![ModuleCallEffects {
+                dirty_delta: effects.take_dirty_delta(),
+                dirty_keys: if swapdb.is_none() {
+                    dirty_keys.clone()
+                } else {
+                    Vec::new()
+                },
+                propagation,
+                notifications: effects.take_notifications(),
+                shard_notifications: effects.take_shard_notifications(),
+                cluster_notifications: effects.take_cluster_notifications(),
+                cluster_shard_notifications: effects.take_cluster_shard_notifications(),
+            }],
+            None,
+            None,
+            None,
+        );
+        if let Some((db1, db2)) = swapdb {
+            self.apply_swapdb_watch_state(db1, db2);
+            self.wakeup_blocked_on_keys(&dirty_keys, None, None);
+        } else if !committed_keys.is_empty() {
+            self.wakeup_blocked_on_keys(&committed_keys, None, None);
         }
     }
 
@@ -163,6 +237,10 @@ impl ServerWorkerState {
                     .config()
                     .persistence
                     .loading_process_events_interval_bytes,
+            )
+            .with_skip_codec_checksums(
+                !self.ctx.config().persistence.rdbchecksum
+                    || self.ctx.config().server.skip_checksum_validation,
             );
             let metadata = self
                 .with_host_dispatcher(scope, |dispatcher| rdb_task.run(dispatcher))
@@ -240,6 +318,11 @@ impl ServerWorkerState {
                     )
                 })
             }
+            HostRequest::Yield(HostYield::Module {
+                flags,
+                busy_reply,
+                elapsed_ms,
+            }) => self.dispatch_module_yield(scope, flags, busy_reply, elapsed_ms),
             HostRequest::Yield(HostYield::ScriptCheckpoint { run }) => {
                 self.dispatch_script_checkpoint(scope, run)
             }
@@ -365,6 +448,12 @@ impl ServerWorkerState {
         scope: HostTaskScope,
     ) -> Value {
         match task {
+            crate::framework::host_tasks::PreparedHostTask::Module(mut task) => {
+                let mut dispatcher =
+                    |request: HostRequest<'_>| self.dispatch_aof_host_request(scope, conn, request);
+                let result = task.run(&mut dispatcher);
+                task.finish(result, conn, &mut self.ctx)
+            }
             crate::framework::host_tasks::PreparedHostTask::Lua(mut task) => {
                 self.ctx.enter_script(task.control());
                 let mut dispatcher =
@@ -451,6 +540,11 @@ impl ServerWorkerState {
                 })?;
                 Ok(HostReply::Allowed(allowed))
             }
+            HostRequest::Yield(HostYield::Module {
+                flags,
+                busy_reply,
+                elapsed_ms,
+            }) => self.dispatch_module_yield(scope, flags, busy_reply, elapsed_ms),
             HostRequest::Yield(HostYield::ScriptCheckpoint { run }) => {
                 self.dispatch_script_checkpoint(scope, run)
             }
@@ -508,6 +602,21 @@ impl ServerWorkerState {
         }
     }
 
+    fn dispatch_module_yield(
+        &mut self,
+        scope: HostTaskScope,
+        flags: i32,
+        busy_reply: Option<&str>,
+        elapsed_ms: u64,
+    ) -> Result<HostReply, HostError> {
+        let threshold_ms = self.ctx.config().server.lua_time_limit;
+        let registry = self.ctx.module_registry_mut();
+        registry.busy_reply = Some(busy_reply.unwrap_or("Running a module command").to_owned());
+        registry.yield_clients = flags & (1 << 1) != 0 && elapsed_ms >= threshold_ms;
+        self.process_host_yield(scope);
+        self.host_control_reply()
+    }
+
     fn dispatch_script_checkpoint(
         &mut self,
         scope: HostTaskScope,
@@ -562,6 +671,299 @@ mod tests {
     use bytes::Bytes;
 
     use super::HostTaskScope;
+
+    thread_local! {
+        static DISCONNECT_SOCKET: std::cell::RefCell<Option<(
+            std::net::TcpStream,
+            crate::foundation::io::transport::ThreadIoHandle,
+        )>> = const { std::cell::RefCell::new(None) };
+        static DISCONNECT_ERROR: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+    }
+
+    extern "C" fn yield_disconnect_command(
+        _ctx: *mut crate::engine::extension::module::ValkeyModuleCtx,
+        _argv: *mut *mut crate::engine::extension::module::ValkeyModuleString,
+        _argc: libc::c_int,
+    ) -> libc::c_int {
+        if let Some((peer, mut stream)) = DISCONNECT_SOCKET.with(|slot| slot.borrow_mut().take()) {
+            use std::io::Read;
+            let _ = socket2::SockRef::from(&peer).set_linger(Some(std::time::Duration::ZERO));
+            drop(peer);
+            let end = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            while std::time::Instant::now() < end {
+                match stream.read(&mut [0_u8; 1]) {
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::yield_now();
+                    }
+                    Err(error) => {
+                        DISCONNECT_ERROR.with(|slot| slot.set(error.raw_os_error()));
+                        break;
+                    }
+                    Ok(_) => break,
+                }
+            }
+        }
+        crate::engine::extension::module::capability::yield_module_to_host(
+            1 << 1,
+            Some("finite disconnect test"),
+        );
+        crate::engine::extension::module::VALKEYMODULE_OK
+    }
+
+    extern "C" fn write_disconnect_command(
+        ctx: *mut crate::engine::extension::module::ValkeyModuleCtx,
+        argv: *mut *mut crate::engine::extension::module::ValkeyModuleString,
+        argc: libc::c_int,
+    ) -> libc::c_int {
+        use crate::engine::extension::module::api::call::pending::ModuleCallEffects;
+        use crate::engine::extension::module::capability::with_active_runtime;
+        use crate::engine::extension::script::PropagationOp;
+        let key = Bytes::from_static(b"disconnect:effect");
+        with_active_runtime(|runtime| {
+            runtime.db_mut(0).unwrap().set(
+                key.to_vec(),
+                crate::foundation::io::store::Robj::string(Bytes::from_static(b"written")),
+            );
+            runtime.apply_module_call_effects(ModuleCallEffects {
+                dirty_delta: Some(1),
+                dirty_keys: vec![(0, key)],
+                propagation: vec![PropagationOp::both(0, disconnect_effect_frame())],
+                ..ModuleCallEffects::default()
+            });
+            let client_id = runtime.module_client_id();
+            runtime.set_module_client_name(client_id, Bytes::from_static(b"guest-name"));
+        });
+        yield_disconnect_command(ctx, argv, argc)
+    }
+
+    fn disconnect_effect_frame() -> Vec<u8> {
+        crate::engine::distributed::replication::protocol::encode_command(&[
+            b"SET",
+            b"disconnect:effect",
+            b"written",
+        ])
+    }
+
+    fn prepare_disconnect_task(
+        runtime: &mut ServerWorkerState,
+        token: crate::framework::capabilities::io::Token,
+    ) -> crate::framework::host_tasks::PreparedHostTask {
+        use crate::engine::extension::module::registry::ModuleRef;
+        runtime
+            .ctx
+            .module_registry_mut()
+            .register(ModuleRef::new(
+                "disconnect-test",
+                std::ptr::null_mut(),
+                1,
+                true,
+            ))
+            .unwrap();
+        runtime
+            .ctx
+            .module_registry_mut()
+            .register_command(
+                "disconnect-test",
+                "disconnect-test.run",
+                Some(yield_disconnect_command),
+            )
+            .unwrap();
+        let args = CommandArgs::from_parts(vec![Bytes::from_static(b"disconnect-test.run")]);
+        crate::framework::host_tasks::prepare_module_task(
+            &mut runtime.connection_registry[token],
+            &args,
+            &mut runtime.ctx,
+        )
+        .unwrap()
+    }
+
+    fn disconnect_owner(
+        runtime: &mut ServerWorkerState,
+    ) -> (
+        crate::framework::capabilities::io::Token,
+        std::net::TcpStream,
+    ) {
+        use crate::runtime::server::worker::reactor::transport::RuntimeConnectedPeer;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let peer = runtime.transport.connect_tcp(addr).unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        runtime.add_connection(RuntimeConnectedPeer {
+            token: peer.token,
+            peer_addr: addr,
+        });
+        (peer.token, stream)
+    }
+
+    #[test]
+    fn module_hosted_terminal_error_retains_owner_until_finish() {
+        let mut runtime = ServerWorkerState::new(1).unwrap();
+        let (token, peer) = disconnect_owner(&mut runtime);
+        let stream = runtime.transport.duplicate_stream(token).unwrap();
+        DISCONNECT_SOCKET.with(|slot| *slot.borrow_mut() = Some((peer, stream)));
+        DISCONNECT_ERROR.with(|slot| slot.set(None));
+        let session = runtime.connection_registry[token].session_id();
+        let task = prepare_disconnect_task(&mut runtime, token);
+        runtime
+            .transport
+            .queue_test_transport_event_batch(&[(token, false, false, false, true)]);
+        runtime.run_prepared_host_task(token, task);
+        assert_eq!(
+            DISCONNECT_ERROR.with(|slot| slot.get()),
+            Some(libc::ECONNRESET)
+        );
+        assert_eq!(runtime.ctx.module_registry().busy_reply, None);
+        assert!(!runtime.ctx.module_registry().yield_clients);
+        let connection = runtime
+            .connection_registry
+            .get(token)
+            .expect("terminal error must defer removal until the command completes");
+        assert_eq!(connection.session_id(), session);
+        assert!(!connection.protected);
+        assert!(connection.is_async_close_pending);
+    }
+
+    #[test]
+    fn module_hosted_missing_session_commits_occurred_effects_once() {
+        use crate::engine::command::context::WatchedKey;
+        use crate::framework::capabilities::io::Token;
+        for (replace_session, is_backlog_active) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let mut runtime = ServerWorkerState::new(1).unwrap();
+            if is_backlog_active {
+                runtime.ctx.replication_mut().backlog.activate();
+            }
+            runtime.ctx.config_mut().persistence.aof_enabled = true;
+            runtime.ctx.aof_mut().fsynced_repl_offset = Some(0);
+            runtime.ctx.set_repl_seldb(0);
+            runtime
+                .ctx
+                .persistence_mut()
+                .begin_aof_rewrite_child(123, 1000)
+                .unwrap();
+            runtime.ctx.persistence_mut().set_aof_selected_db(0);
+            let mut owner = Connection::new_fake();
+            owner.set_token_for_test(Token(42));
+            let token = runtime.connection_registry.register_for_test(owner);
+            let task = prepare_disconnect_task(&mut runtime, token);
+            drop(task);
+            runtime
+                .ctx
+                .module_registry_mut()
+                .register_command(
+                    "disconnect-test",
+                    "disconnect-test.write",
+                    Some(write_disconnect_command),
+                )
+                .unwrap();
+            let args = CommandArgs::from_parts(vec![Bytes::from_static(b"disconnect-test.write")]);
+            let task = crate::framework::host_tasks::prepare_module_task(
+                &mut runtime.connection_registry[token],
+                &args,
+                &mut runtime.ctx,
+            )
+            .unwrap();
+            runtime.connection_registry.remove(token).unwrap();
+            if replace_session {
+                let mut replacement = Connection::new_fake();
+                replacement.set_token_for_test(token);
+                replacement.set_client_id_for_test(900);
+                replacement.set_name(Some(Bytes::from_static(b"replacement")));
+                replacement.protected = true;
+                runtime.connection_registry.register_for_test(replacement);
+            }
+            let mut watcher = Connection::new_fake();
+            watcher.set_token_for_test(Token(43));
+            watcher.set_resp_version(3);
+            watcher.set_tracking(true);
+            watcher.transaction.watch_many(vec![WatchedKey::new(
+                0,
+                Bytes::from_static(b"disconnect:effect"),
+                false,
+            )]);
+            let watcher_token = runtime.connection_registry.register_for_test(watcher);
+            runtime
+                .ctx
+                .tracking_mut()
+                .remember_key(watcher_token.0, &Bytes::from_static(b"disconnect:effect"));
+            let before = runtime.ctx.replication().backlog.next_stream_cursor();
+            let dirty = runtime.ctx.persistence().dirty();
+            let mut expected_aof =
+                crate::engine::distributed::replication::protocol::encode_command(&[
+                    b"SELECT", b"0",
+                ]);
+            expected_aof.extend(disconnect_effect_frame());
+            runtime.transport.queue_test_transport_event_batch(&[]);
+            runtime.run_prepared_host_task(token, task);
+            assert_eq!(runtime.ctx.module_registry().busy_reply, None);
+            assert_eq!(runtime.ctx.persistence().dirty(), dirty + 1);
+            let expected_position = if is_backlog_active {
+                disconnect_effect_frame().len() as i64
+            } else {
+                1
+            };
+            assert_eq!(
+                runtime.ctx.replication().primary_repl_offset().get(),
+                expected_position
+            );
+            assert_eq!(runtime.ctx.aof().fsynced_repl_offset, Some(0));
+            if is_backlog_active {
+                assert_eq!(
+                    runtime.ctx.replication().backlog.read_from(before),
+                    Some(disconnect_effect_frame())
+                );
+            }
+            assert_eq!(runtime.ctx.aof().rewrite.buffer, expected_aof);
+            assert!(runtime.connection_registry[watcher_token]
+                .transaction
+                .is_watch_dirty());
+            assert_eq!(runtime.ctx.tracking().total_keys(), 0);
+            let output = runtime.connection_registry[watcher_token].output_buffer_bytes();
+            assert!(output > 0);
+            if replace_session {
+                assert_eq!(
+                    runtime.connection_registry[token].name.as_deref(),
+                    Some(b"replacement".as_slice())
+                );
+                assert!(runtime.connection_registry[token].protected);
+                assert!(runtime.connection_registry[token]
+                    .script_propagation()
+                    .is_empty());
+            }
+            runtime.apply_pending_module_effects();
+            assert_eq!(runtime.ctx.persistence().dirty(), dirty + 1);
+            assert_eq!(runtime.ctx.aof().rewrite.buffer, expected_aof);
+            assert_eq!(
+                runtime.connection_registry[watcher_token].output_buffer_bytes(),
+                output
+            );
+            runtime.ctx.persistence_mut().abort_child();
+        }
+    }
+
+    #[test]
+    fn module_hosted_restores_existing_owner_protection() {
+        use crate::framework::capabilities::io::Token;
+        for was_protected in [false, true] {
+            let mut runtime = ServerWorkerState::new(1).unwrap();
+            let mut owner = Connection::new_fake();
+            owner.set_token_for_test(Token(43));
+            owner.protected = was_protected;
+            let token = runtime.connection_registry.register_for_test(owner);
+            runtime.ctx.module_registry_mut().busy_reply = Some("outer invocation".to_owned());
+            runtime.ctx.module_registry_mut().yield_clients = true;
+            let task = prepare_disconnect_task(&mut runtime, token);
+            runtime.transport.queue_test_transport_event_batch(&[]);
+            runtime.run_prepared_host_task(token, task);
+            assert_eq!(runtime.connection_registry[token].protected, was_protected);
+            assert_eq!(
+                runtime.ctx.module_registry().busy_reply.as_deref(),
+                Some("outer invocation")
+            );
+            assert!(runtime.ctx.module_registry().yield_clients);
+        }
+    }
 
     fn rejected_hosted_fallback(
         _conn: &mut dyn CommandConn,

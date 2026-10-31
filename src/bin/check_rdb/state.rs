@@ -4,7 +4,9 @@ use std::io::{self, Write};
 use versal::foundation::io::store::kv_engine::now_ms;
 use versal::foundation::memory::value::Type;
 
-pub const STATS_TYPE_NAMES: [&str; 6] = ["string", "list", "set", "zset", "hash", "stream"];
+pub const STATS_TYPE_NAMES: [&str; 7] = [
+    "string", "list", "set", "zset", "hash", "stream", "pathhash",
+];
 
 pub fn type_index(value_type: Type) -> usize {
     match value_type {
@@ -14,6 +16,7 @@ pub fn type_index(value_type: Type) -> usize {
         Type::ZSet => 3,
         Type::Hash => 4,
         Type::Stream => 5,
+        Type::PathHash => 6,
     }
 }
 
@@ -32,7 +35,7 @@ pub struct RdbState {
     pub rdbver: u64,
     pub final_offset: u64,
     pub physical_offset: Option<u64>,
-    pub type_counts: Vec<[u64; 6]>,
+    pub type_counts: Vec<[u64; 7]>,
 }
 
 impl RdbState {
@@ -47,13 +50,13 @@ impl RdbState {
             rdbver: 0,
             final_offset: 0,
             physical_offset: None,
-            type_counts: vec![[0; 6]],
+            type_counts: vec![[0; 7]],
         }
     }
 
     pub fn ensure_db(&mut self, database: u64) {
         if database as usize >= self.type_counts.len() {
-            self.type_counts.resize(database as usize + 1, [0; 6]);
+            self.type_counts.resize(database as usize + 1, [0; 7]);
         }
     }
 }

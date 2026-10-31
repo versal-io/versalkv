@@ -125,6 +125,7 @@ pub struct ClusterBusManager {
     /// drains these in the same readable turn; cron is the fallback owner if a
     /// lower-level caller invokes `readable` without the event-loop wrapper.
     pub(super) pending_failover_actions: Vec<ClusterAction>,
+    pub(super) last_zero_offset_warning_ms: Option<i64>,
     /// Cached local primary bitmap for PING/PONG/MEET construction. C keeps
     /// this bitmap in the node object; rebuilding it from `Vec<bool>` for
     /// every heartbeat is prohibitively expensive in large clusters.
@@ -143,6 +144,7 @@ impl ClusterBusManager {
             pending_publishes: Vec::new(),
             gossip_cursor: 0,
             pending_failover_actions: Vec::new(),
+            last_zero_offset_warning_ms: None,
             cached_advertised_slots_generation: Cell::new(None),
             cached_advertised_slots: RefCell::new(vec![0; SLOT_BYTES]),
         }

@@ -27,6 +27,7 @@ struct MultiQueue {
     input_bytes: u64,
     commands: Vec<CommandArgs>,
     queue_error: bool,
+    exec_arguments: Vec<bytes::Bytes>,
 }
 
 #[derive(Default)]
@@ -50,6 +51,7 @@ impl TransactionState {
             input_bytes,
             commands: Vec::new(),
             queue_error: false,
+            exec_arguments: Vec::new(),
         });
         true
     }
@@ -88,6 +90,18 @@ impl TransactionState {
 
     pub(crate) fn selected_db(&self) -> Option<i64> {
         self.multi.as_ref().map(|multi| multi.db_id)
+    }
+
+    pub(crate) fn set_exec_arguments(&mut self, arguments: Vec<bytes::Bytes>) {
+        if let Some(multi) = &mut self.multi {
+            multi.exec_arguments = arguments;
+        }
+    }
+
+    pub(crate) fn exec_arguments(&self) -> &[bytes::Bytes] {
+        self.multi
+            .as_ref()
+            .map_or(&[], |multi| &multi.exec_arguments)
     }
 
     pub(crate) fn queue(&mut self, num_dbs: usize, command: CommandArgs) -> bool {
@@ -215,6 +229,19 @@ impl TransactionState {
             .saturating_add(multi.commands.iter().fold(0usize, |total, command| {
                 total.saturating_add(command_memory_usage(command))
             }))
+            .saturating_add(
+                multi
+                    .exec_arguments
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<bytes::Bytes>()),
+            )
+            .saturating_add(
+                multi
+                    .exec_arguments
+                    .iter()
+                    .map(bytes::Bytes::len)
+                    .sum::<usize>(),
+            )
     }
 
     pub(crate) fn watch_memory_usage(&self) -> usize {

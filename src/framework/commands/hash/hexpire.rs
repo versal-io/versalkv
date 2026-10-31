@@ -1,7 +1,7 @@
 //! Shared typed pipeline for HEXPIRE/HPEXPIRE/HEXPIREAT/HPEXPIREAT.
 
 use super::runtime_support::{
-    hash_field_deletion_propagation, hash_field_expiry_propagation, parse_fields,
+    hash_field_deletion_propagation, parse_fields,
 };
 use crate::engine::core::{CommandEffects, CommandOutcome, CoreEvent, Value};
 use crate::foundation::io::store::kv_engine::Db;
@@ -92,6 +92,7 @@ pub(super) struct HashExpireRequest {
     value: i64,
     mode: HashExpireMode,
     condition: HashExpireCondition,
+    flags: Vec<Bytes>,
     fields: Vec<Bytes>,
 }
 
@@ -119,6 +120,7 @@ impl HashExpireRequest {
             value,
             mode,
             condition,
+            flags: args.args[2..fields_index].to_vec(),
             fields,
         })
     }
@@ -202,6 +204,8 @@ struct HashExpirePlan<'a> {
     when_ms: i64,
     now_ms: i64,
     ignore_expiry: bool,
+    read_expired_values: bool,
+    has_volatile_fields: bool,
 }
 
 #[derive(Default)]
@@ -209,6 +213,8 @@ struct HashExpireOutcome {
     results: Vec<Value>,
     updated_fields: Vec<Bytes>,
     expired_fields: Vec<Bytes>,
+    propagated_fields: Vec<Bytes>,
+    has_skipped: bool,
 }
 
 impl HashExpireOutcome {
@@ -217,22 +223,31 @@ impl HashExpireOutcome {
             Ok(Some(hash)) => hash,
             Ok(None) => {
                 self.results.push(Value::integer(-2));
+                self.has_skipped |= plan.has_volatile_fields;
                 return Ok(());
             }
             Err(_) => return Err(CommandError::wrong_type()),
         };
-        if !hash.hash_contains(field) {
+        if !hash.hash_contains(field)
+            || (!plan.read_expired_values
+                && db.hash_field_expired_at(&plan.request.key, field, plan.now_ms as u64))
+        {
             self.results.push(Value::integer(-2));
+            self.has_skipped |= plan.has_volatile_fields;
             return Ok(());
         }
         let current = db.get_hash_field_expire(&plan.request.key, field);
         if !plan.request.condition.allows(current, plan.when_ms) {
             self.results.push(Value::integer(0));
+            if !self.has_skipped {
+                self.propagated_fields.push(field.clone());
+            }
         } else if plan.when_ms <= plan.now_ms && !plan.ignore_expiry {
             self.expire_field(db, field, plan);
         } else {
             db.set_hash_field_expire(&plan.request.key, field, plan.when_ms as u64);
             self.updated_fields.push(field.clone());
+            self.propagated_fields.push(field.clone());
             self.results.push(Value::integer(1));
         }
         Ok(())
@@ -289,11 +304,16 @@ impl HashExpireCommit {
                 &self.outcome.expired_fields,
             ))
         } else if !self.outcome.updated_fields.is_empty() {
-            Some(hash_field_expiry_propagation(
-                &request.key,
-                self.when_ms as u64,
-                &self.outcome.updated_fields,
-            ))
+            let mut parts = vec![
+                Bytes::from_static(b"HPEXPIREAT"),
+                request.key.clone(),
+                self.when_ms.to_string().into(),
+            ];
+            parts.extend(request.flags.iter().cloned());
+            parts.push(Bytes::from_static(b"FIELDS"));
+            parts.push(self.outcome.propagated_fields.len().to_string().into());
+            parts.extend(self.outcome.propagated_fields.iter().cloned());
+            Some(parts)
         } else {
             None
         };
@@ -331,10 +351,11 @@ pub(super) fn hash_expire(
         Err(error) => return CommandOutcome::reply(error),
     };
     let ignore_expiry = runtime.suppress_lazy_expire();
+    let read_expired_values = runtime.read_expired_values();
     let Some(db) = runtime.db_mut() else {
         return CommandOutcome::reply(CommandError::db_index_out_of_range());
     };
-    let commit = match execute_hash_expire(db, &request, when_ms, now_ms as i64, ignore_expiry) {
+    let commit = match execute_hash_expire(db, &request, when_ms, now_ms as i64, ignore_expiry, read_expired_values) {
         Ok(commit) => commit,
         Err(error) => return CommandOutcome::reply(error),
     };
@@ -347,12 +368,15 @@ fn execute_hash_expire(
     when_ms: i64,
     now_ms: i64,
     ignore_expiry: bool,
+    read_expired_values: bool,
 ) -> Result<HashExpireCommit, Value> {
     let plan = HashExpirePlan {
         request,
         when_ms,
         now_ms,
         ignore_expiry,
+        read_expired_values,
+        has_volatile_fields: db.hash_key_has_volatile_fields(&request.key),
     };
     let mut outcome = HashExpireOutcome::default();
     for field in &request.fields {

@@ -16,6 +16,7 @@ pub struct CommandEffects {
     pub db_events: Vec<(u32, CoreEvent)>,
     pub skip_propagate: bool,
     pub custom_propagations: Vec<Vec<Bytes>>,
+    pub dirty_delta: Option<i64>,
     pub deferred_objects: Vec<Robj>,
     pub expired_hash_fields: u64,
     pub suppress_reply: bool,

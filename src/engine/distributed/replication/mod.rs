@@ -30,6 +30,7 @@ pub struct ReplicationChannelInfo {
 
 #[derive(Default)]
 pub struct ReplicationView {
+    pub compression_stats: HashMap<usize, (u64, u64)>,
     pub replica_ack_offsets: HashMap<usize, Option<ReplicationOffset>>,
     pub replica_aof_ack_offsets: HashMap<usize, Option<ReplicationOffset>>,
     pub replica_info: HashMap<usize, ReplicaStatus>,

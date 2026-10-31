@@ -126,6 +126,7 @@ fn logical_object_type(obj: &Robj) -> u8 {
         Robj::ZSetSkiplist(_) | Robj::ZSetListpack(_) => 3,          // OBJ_ZSET
         Robj::HashHashtable(_) | Robj::HashListpack(_) => 4,         // OBJ_HASH
         Robj::StreamListpack(_) | Robj::StreamRadix(_) => 6,         // OBJ_STREAM
+        Robj::PathHash(_) => 7,                                    // OBJ_PATH_HASH
     }
 }
 
@@ -184,6 +185,17 @@ fn xor_object_digest(obj: &Robj, expire: Option<u64>, digest: &mut [u8; 20]) {
         }
         Robj::StreamListpack(stream) => stream_digest(digest, stream),
         Robj::StreamRadix(_) => {}
+        Robj::PathHash(hash) => {
+            for (path, payload) in hash.iter() {
+                for (field, value) in payload.entries() {
+                    let mut element = [0u8; 20];
+                    mix_digest(&mut element, path);
+                    mix_digest(&mut element, &field);
+                    mix_digest(&mut element, &value);
+                    xor_digest(digest, &element);
+                }
+            }
+        }
     }
 
     if expire.is_some() {

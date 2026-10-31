@@ -115,7 +115,7 @@ impl ServerWorkerState {
             )),
             DispatchAction::Postpone(reason) => {
                 self.block_postponed_invocation(invocation, connection_token, reason);
-                Ok(CommandExecution::executed(Value::Null))
+                Ok(CommandExecution::executed(Value::Null, None))
             }
         }
     }
@@ -132,12 +132,14 @@ impl ServerWorkerState {
                 .asking = true;
         }
         self.capture_outer_script_monitor(invocation, connection_token);
+        let started = std::time::Instant::now();
         let reply = self.execute_registered_handler(
             invocation.dispatch_group,
             connection_token,
             executor,
             invocation.args,
         );
+        let duration_us = (started.elapsed().as_micros() as u64).max(1);
         let connection_token = invocation
             .target
             .resolve(self)
@@ -145,7 +147,7 @@ impl ServerWorkerState {
         if call_flags.client_asking && super::consumes_asking(invocation.name) {
             self.connection_registry[connection_token].asking = false;
         }
-        Ok(CommandExecution::executed(reply))
+        Ok(CommandExecution::executed(reply, Some(duration_us)))
     }
 
     fn capture_outer_script_monitor(
@@ -247,9 +249,18 @@ impl ServerWorkerState {
         let propagation_rejected =
             execution.status.is_rejected() || matches!(&reply, Value::Error(_));
         let stats_name = super::command_stats_name(invocation.name, invocation.args);
-        let duration_us = self
-            .ctx
-            .end_cmd(&stats_name, execution.status.is_rejected());
+        self.refresh_connection_priorities();
+        let duration_us = if let Some(duration_us) = execution.duration_us {
+            self.ctx
+                .end_cmd_with_duration(&stats_name, execution.status.is_rejected(), duration_us)
+        } else {
+            let was_priority = self.ctx.stats_mut().set_priority_command(false);
+            let duration_us = self
+                .ctx
+                .end_cmd(&stats_name, execution.status.is_rejected());
+            self.ctx.stats_mut().set_priority_command(was_priority);
+            duration_us
+        };
         let disposition = self.complete_command(
             CommandCompletion {
                 invocation,

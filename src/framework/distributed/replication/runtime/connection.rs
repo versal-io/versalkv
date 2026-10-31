@@ -4,6 +4,7 @@
 //! live elsewhere because they describe relationships or outlive a connection.
 
 use super::ReplicationRuntime;
+use crate::foundation::io::persistence::rdb::compression::{RdbCompression, RdbSnapshotOptions};
 use crate::framework::distributed::replication::{
     ConnectionId, RdbFilterMode, ReplicaConnectionInfo, ReplicationConnection,
 };
@@ -17,6 +18,7 @@ pub(super) struct ChannelRecord {
     pub(super) replica_node_id: Option<String>,
     pub(super) replica_version: u32,
     pub(super) rdb_only: bool,
+    pub(super) snapshot_options: Option<RdbSnapshotOptions>,
 }
 
 #[derive(Clone, Default)]
@@ -36,6 +38,83 @@ pub(super) struct PendingReplconfMetadata {
 }
 
 impl ReplicationRuntime {
+    pub fn full_sync_snapshot_options(
+        &self,
+        connection_id: ConnectionId,
+        mode: &str,
+        disk: RdbCompression,
+        checksum: bool,
+    ) -> Option<RdbSnapshotOptions> {
+        if let Some(options) = self
+            .channel_records
+            .get(&connection_id)
+            .and_then(|record| record.snapshot_options)
+        {
+            return Some(options);
+        }
+        let capabilities = self
+            .primary_for_connection(connection_id)
+            .map(|link| link.replica().capability.as_slice())
+            .or_else(|| self.channel_capabilities(connection_id))
+            .or_else(|| {
+                self.channel_records
+                    .get(&connection_id)
+                    .and_then(|record| record.pending_replconf.capabilities.as_deref())
+            })
+            .unwrap_or_default();
+        let eof = capabilities
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case("eof"));
+        let accepts_lz4 = capabilities
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case("lz4"));
+        let compression = if eof {
+            if crate::engine::distributed::replication::protocol::negotiate_lz4(mode, capabilities)
+            {
+                RdbCompression::Lz4
+            } else {
+                if disk.uses_lzf() {
+                    disk
+                } else {
+                    RdbCompression::No
+                }
+            }
+        } else if disk == RdbCompression::Lz4 {
+            if !accepts_lz4 {
+                return None;
+            }
+            disk
+        } else {
+            disk
+        };
+        Some(RdbSnapshotOptions {
+            compression,
+            checksum,
+        })
+    }
+
+    pub fn freeze_full_sync_snapshot_options(
+        &mut self,
+        connection_id: ConnectionId,
+        options: RdbSnapshotOptions,
+    ) {
+        self.channel_records
+            .entry(connection_id)
+            .or_default()
+            .snapshot_options = Some(options);
+    }
+
+    pub fn replica_snapshot_version(&self, connection_id: ConnectionId) -> u32 {
+        self.primary_for_connection(connection_id).map_or_else(
+            || {
+                self.channel_records
+                    .get(&connection_id)
+                    .map_or(0, |record| record.replica_version)
+            },
+            |link| link.replica_version(),
+        )
+    }
+
     pub fn set_channel_endpoint(&mut self, connection_id: ConnectionId, ip: String, port: u16) {
         let endpoint = self
             .channel_records
@@ -106,11 +185,6 @@ impl ReplicationRuntime {
                 .endpoint
                 .get_or_insert_with(ChannelEndpoint::default)
                 .rdb_filter_mode = mode;
-            if let Some(ReplicationConnection::RdbChannel { main }) = self.role(connection_id) {
-                if let Some(link) = self.primary_for_connection_mut(main) {
-                    link.set_replica_rdb_filter_mode(mode);
-                }
-            }
         } else {
             self.channel_records
                 .entry(connection_id)
@@ -128,6 +202,39 @@ impl ReplicationRuntime {
             .capabilities
             .get_or_insert_with(Vec::new)
             .push(capability);
+    }
+
+    pub fn replica_sync_preferences(&self, connection_id: ConnectionId) -> (RdbFilterMode, bool) {
+        let (filter_mode, capabilities) =
+            if let Some(link) = self.primary_for_connection(connection_id) {
+                (
+                    link.replica().rdb_filter_mode,
+                    link.replica().capability.as_slice(),
+                )
+            } else if let Some(record) = self.channel_records.get(&connection_id) {
+                if let Some(endpoint) = record.endpoint.as_ref() {
+                    (endpoint.rdb_filter_mode, endpoint.capabilities.as_slice())
+                } else if record.role.is_none() {
+                    (
+                        record.pending_replconf.rdb_filter_mode.unwrap_or_default(),
+                        record
+                            .pending_replconf
+                            .capabilities
+                            .as_deref()
+                            .unwrap_or_default(),
+                    )
+                } else {
+                    (RdbFilterMode::All, &[][..])
+                }
+            } else {
+                (RdbFilterMode::All, &[][..])
+            };
+        (
+            filter_mode,
+            capabilities
+                .iter()
+                .any(|capability| capability.eq_ignore_ascii_case("eof")),
+        )
     }
 
     #[allow(dead_code)] // Consumed by the Task 3 channel state machine.

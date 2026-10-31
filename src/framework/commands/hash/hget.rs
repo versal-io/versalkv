@@ -9,7 +9,7 @@ pub fn hget(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> CommandOutc
         return CommandOutcome::reply(CommandError::wrong_arity("hget"));
     };
     let read_expired_values = runtime.read_expired_values();
-    let active_expire_enabled = runtime.active_expire_enabled();
+    let now_ms = runtime.now_ms();
     let Some(db) = runtime.db_mut() else {
         return CommandOutcome::reply(CommandError::db_index_out_of_range());
     };
@@ -21,13 +21,7 @@ pub fn hget(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> CommandOutc
             None => return CommandOutcome::reply(Value::null()),
         },
     };
-    if !read_expired_values && db.hash_field_expired(key, field) {
-        if active_expire_enabled {
-            let _ = db.check_hash_field_expired(key, field);
-            if matches!(db.get_hash_object(key), Ok(Some(hash)) if hash.hash_is_empty()) {
-                db.del(key);
-            }
-        }
+    if !read_expired_values && db.hash_field_expired_at(key, field, now_ms) {
         return CommandOutcome::reply(Value::null());
     }
     CommandOutcome::reply(Value::bulk(value))

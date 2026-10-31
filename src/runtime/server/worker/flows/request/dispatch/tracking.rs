@@ -391,6 +391,17 @@ impl ServerWorkerState {
             }
         }
     }
+
+    pub(crate) fn resume_tracking_eviction(&mut self) {
+        if self.ctx.tracking().total_keys() <= self.ctx.tracking().max_keys {
+            return;
+        }
+        let mut pending_tracking = Vec::new();
+        self.evict_tracking_table_if_needed(&mut pending_tracking);
+        for (target_id, frame) in pending_tracking {
+            self.queue_client_reply(Token(target_id), frame);
+        }
+    }
 }
 
 #[cfg(test)]

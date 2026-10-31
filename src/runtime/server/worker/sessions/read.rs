@@ -147,6 +147,7 @@ impl ServerWorkerState {
         read_data: Vec<u8>,
         outcome: ReadOutcome,
     ) {
+        self.authenticate_tls_peer(token);
         let (close, yielded, error) = match outcome {
             ReadOutcome::Quiescent => (false, false, None),
             ReadOutcome::BudgetExhausted => (false, true, None),
@@ -264,6 +265,13 @@ impl ServerWorkerState {
     ) -> bool {
         let mut parsed_commands = 0;
         loop {
+            if !self
+                .connection_registry
+                .get(token)
+                .is_some_and(|connection| connection.state == ConnectionState::Connected)
+            {
+                return false;
+            }
             match self.parse_next_client_command(token) {
                 ClientParseResult::Command(args, name, resp3) => {
                     parsed_commands += 1;
@@ -344,6 +352,8 @@ impl ServerWorkerState {
         } else {
             serialize_to_vec_resp2(&reply)
         });
+        self.connection_registry[token].mark_closing();
+        fx.mark_closing = true;
     }
 
     fn schedule_client_read_continuation(&mut self, token: Token, yielded: bool) {

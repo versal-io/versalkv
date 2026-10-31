@@ -20,13 +20,22 @@ pub(crate) fn load_aof_rdb_preamble(
         return Ok(0);
     }
     let strict = !ctx.config().persistence.rdb_version_check_relaxed;
-    let (_keys, consumed, _expired, replication) =
-        crate::foundation::io::persistence::load_rdb_bytes_checked_with_delay_stats_and_replication_info(
-            bytes,
-            ctx.dbs_mut(),
-            strict,
-            0,
-        )?;
+    let policy = crate::foundation::io::persistence::RdbDecodePolicy::replication(strict, 0)
+        .with_hash_limits(
+            ctx.config().encoding.hash_max_listpack_entries as usize,
+            ctx.config().encoding.hash_max_listpack_value as usize,
+        )
+        .with_zset_limits(
+            ctx.config().encoding.zset_max_ziplist_entries as usize,
+            ctx.config().encoding.zset_max_ziplist_value as usize,
+        );
+    let metadata = crate::foundation::io::persistence::load_rdb_bytes_with_policy(
+        bytes,
+        ctx.dbs_mut(),
+        policy,
+    )?;
+    let consumed = metadata.consumed;
+    let replication = metadata.replication;
     let aux_fields = replication
         .as_ref()
         .map(|info| info.aux_fields.as_slice())
@@ -75,6 +84,45 @@ pub(crate) fn apply_replay_command(
     registry: &CommandRegistry,
     ctx: &mut ServerContext,
 ) -> Result<(), String> {
+    apply_replay_command_with_execution(conn, args, registry, ctx).0
+}
+
+/// Replay transaction controls run directly rather than through a command spec.
+pub(crate) enum ReplayExecution {
+    NotInvoked,
+    Handler { duration_us: u64 },
+    TransactionControl { duration_us: u64 },
+}
+
+impl ReplayExecution {
+    pub(crate) fn duration_us(self) -> Option<u64> {
+        match self {
+            Self::NotInvoked => None,
+            Self::Handler { duration_us } | Self::TransactionControl { duration_us } => {
+                Some(duration_us)
+            }
+        }
+    }
+}
+
+pub(crate) fn apply_replay_command_with_execution(
+    conn: &mut Connection,
+    args: CommandArgs,
+    registry: &CommandRegistry,
+    ctx: &mut ServerContext,
+) -> (Result<(), String>, ReplayExecution) {
+    let mut execution = ReplayExecution::NotInvoked;
+    let result = apply_replay_command_inner(conn, args, registry, ctx, &mut execution);
+    (result, execution)
+}
+
+fn apply_replay_command_inner(
+    conn: &mut Connection,
+    args: CommandArgs,
+    registry: &CommandRegistry,
+    ctx: &mut ServerContext,
+    execution: &mut ReplayExecution,
+) -> Result<(), String> {
     let name_lower = args.name.to_ascii_lowercase();
     let tracking_only = conn.import_source
         && conn.slot_migration_role.is_none()
@@ -84,28 +132,53 @@ pub(crate) fn apply_replay_command(
         )
         .map_err(|error| format!("{error:?}"))?;
     if name_lower == b"multi" {
+        let started = std::time::Instant::now();
         if !conn.transaction.begin(i64::from(conn.selected_db), 0) {
             return Err("ERR MULTI calls can not be nested".to_string());
         }
+        *execution = ReplayExecution::TransactionControl {
+            duration_us: (started.elapsed().as_micros() as u64).max(1),
+        };
         return Ok(());
     }
     if name_lower == b"discard" {
+        let started = std::time::Instant::now();
         if conn.transaction.is_active() {
             conn.transaction.end(TransactionEnd::Discard);
         }
+        *execution = ReplayExecution::TransactionControl {
+            duration_us: (started.elapsed().as_micros() as u64).max(1),
+        };
         return Ok(());
     }
     if name_lower == b"exec" {
         if !conn.transaction.is_active() {
-            return Err("ERR EXEC without MULTI".to_string());
+            let started = std::time::Instant::now();
+            let error = "ERR EXEC without MULTI".to_string();
+            *execution = ReplayExecution::TransactionControl {
+                duration_us: (started.elapsed().as_micros() as u64).max(1),
+            };
+            return Err(error);
         }
+        let started = std::time::Instant::now();
         let commands = conn.transaction.take_queued_commands();
         conn.transaction.end(TransactionEnd::ExecutionCompleted);
-        for queued in &commands {
-            execute_one_replay_command(conn, queued, registry, ctx)?;
+        let result = commands.iter().try_for_each(|queued| {
+            execute_one_replay_command(
+                conn,
+                queued,
+                registry,
+                ctx,
+                &mut ReplayExecution::NotInvoked,
+            )
+        });
+        *execution = ReplayExecution::TransactionControl {
+            duration_us: (started.elapsed().as_micros() as u64).max(1),
+        };
+        if result.is_ok() {
+            clear_replay_side_effects(conn, ctx);
         }
-        clear_replay_side_effects(conn, ctx);
-        return Ok(());
+        return result;
     }
     if conn.transaction.is_active() {
         if tracking_only {
@@ -118,7 +191,7 @@ pub(crate) fn apply_replay_command(
         clear_replay_side_effects(conn, ctx);
         return Ok(());
     }
-    let result = execute_one_replay_command(conn, &args, registry, ctx);
+    let result = execute_one_replay_command(conn, &args, registry, ctx, execution);
     clear_replay_side_effects(conn, ctx);
     result
 }
@@ -128,12 +201,17 @@ fn execute_one_replay_command(
     args: &CommandArgs,
     registry: &CommandRegistry,
     ctx: &mut ServerContext,
+    execution: &mut ReplayExecution,
 ) -> Result<(), String> {
     let spec = registry
         .lookup(&args.name)
         .ok_or_else(|| format!("unknown command '{}'", String::from_utf8_lossy(&args.name)))?;
     conn.begin_nested_command_effects();
+    let started = std::time::Instant::now();
     let result = spec.execute(conn, args, ctx);
+    *execution = ReplayExecution::Handler {
+        duration_us: (started.elapsed().as_micros() as u64).max(1),
+    };
     let mut effects = conn
         .take_command_effects(CommandEffectDrain::Nested)
         .expect("AOF replay command effects are drained exactly once");

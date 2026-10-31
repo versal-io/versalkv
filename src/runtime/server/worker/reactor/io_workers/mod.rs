@@ -266,6 +266,8 @@ impl<T> SubmitError<T> {
 }
 
 struct IoConnectionState {
+    is_cluster_bus: bool,
+    read_deferred: bool,
     generation: u64,
     next_sequence: u64,
     read_handle: Option<ThreadIoHandle>,
@@ -391,6 +393,8 @@ impl IoThreadRuntime {
         self.connections.insert(
             token,
             IoConnectionState {
+                is_cluster_bus: false,
+                read_deferred: false,
                 generation,
                 next_sequence: 0,
                 read_handle: Some(read_handle),
@@ -408,9 +412,32 @@ impl IoThreadRuntime {
         self.connections.get(&token).map(|state| state.generation)
     }
 
-    #[cfg(test)]
     pub(crate) fn has_connection(&self, token: Token) -> bool {
         self.connections.contains_key(&token)
+    }
+
+    pub(crate) fn register_cluster_bus(
+        &mut self,
+        token: Token,
+        read: ThreadIoHandle,
+        write: ThreadIoHandle,
+    ) {
+        self.register_connection(token, read, write);
+        if let Some(state) = self.connections.get_mut(&token) {
+            state.is_cluster_bus = true;
+        }
+    }
+
+    pub(crate) fn is_cluster_bus(&self, token: Token) -> bool {
+        self.connections
+            .get(&token)
+            .is_some_and(|state| state.is_cluster_bus)
+    }
+
+    pub(crate) fn cluster_read_deferred(&self, token: Token) -> bool {
+        self.connections
+            .get(&token)
+            .is_some_and(|state| state.is_cluster_bus && state.read_deferred)
     }
 
     pub(crate) fn take_read_job(
@@ -455,6 +482,13 @@ impl IoThreadRuntime {
         max_bytes: usize,
         drain_to_budget: bool,
     ) -> bool {
+        if let Some(state) = self.connections.get_mut(&token) {
+            if state.is_cluster_bus && state.write_inflight.is_some() {
+                state.read_deferred = true;
+                return true;
+            }
+            state.read_deferred = false;
+        }
         if self
             .connections
             .get(&token)
@@ -483,6 +517,11 @@ impl IoThreadRuntime {
         frames: std::collections::VecDeque<Vec<u8>>,
         byte_budget: usize,
     ) -> WriteSubmission {
+        if self.connections.get(&token).is_some_and(|state| {
+            state.is_cluster_bus && (state.read_inflight.is_some() || state.read_deferred)
+        }) {
+            return WriteSubmission::AlreadyPending(frames);
+        }
         if self
             .connections
             .get(&token)

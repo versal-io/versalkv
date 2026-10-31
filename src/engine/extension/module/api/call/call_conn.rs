@@ -2,15 +2,13 @@
 
 use bytes::Bytes;
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::engine::command::context::{BlockedState, CommandConn, Token};
-use crate::engine::command::CommandArgs;
+use crate::engine::command::{CommandArgs, CommandDescriptor, CMD_MAY_REPLICATE, CMD_WRITE};
 use crate::engine::extension::module::capability::ModuleClientTracking;
-use crate::engine::extension::script::PropagationOp;
+use crate::engine::extension::script::{PropagationOp, PropagationTargets};
 use crate::foundation::io::protocol::Value;
-
-static NEXT_MODULE_CALL_ID: AtomicU64 = AtomicU64::new(0x1000000);
+use crate::foundation::memory::client_id::next_client_id;
 
 pub(crate) struct ModuleCallConn {
     token: Token,
@@ -27,8 +25,12 @@ pub(crate) struct ModuleCallConn {
     custom_propagation: Vec<Vec<u8>>,
     script_propagation_ops: Vec<PropagationOp>,
     dirty_keys: Vec<(u32, Bytes)>,
+    dirty_delta: Option<i64>,
+    skip_propagate: bool,
+    last_write_offset: crate::engine::distributed::replication::ReplicationOffset,
     allow_oom: bool,
     deny_blocking: bool,
+    blocked: Option<BlockedState>,
     redacted_command_arguments: HashSet<usize>,
 }
 
@@ -39,9 +41,8 @@ impl ModuleCallConn {
     }
 
     pub fn with_tracking(db_idx: u32, tracking: Option<ModuleClientTracking>) -> Self {
-        let id = NEXT_MODULE_CALL_ID.fetch_add(1, Ordering::Relaxed);
         ModuleCallConn {
-            token: Token(tracking.map_or(id as usize, |state| state.id)),
+            token: Token(next_client_id()),
             selected_db: db_idx,
             resp_version: 2,
             username: "default".to_string(),
@@ -55,8 +56,12 @@ impl ModuleCallConn {
             custom_propagation: Vec::new(),
             script_propagation_ops: Vec::new(),
             dirty_keys: Vec::new(),
+            dirty_delta: None,
+            skip_propagate: false,
+            last_write_offset: crate::engine::distributed::replication::ReplicationOffset::ZERO,
             allow_oom: false,
             deny_blocking: true,
+            blocked: None,
             redacted_command_arguments: HashSet::new(),
         }
     }
@@ -66,12 +71,119 @@ impl ModuleCallConn {
             .then(|| std::mem::take(&mut self.raw_reply))
     }
 
-    pub fn take_pending_notifications(&mut self) -> Vec<(Bytes, Bytes)> {
-        std::mem::take(&mut self.pending_notifications)
+    pub(crate) fn use_temporary_identity(&mut self) {
+        self.token = Token(next_client_id());
     }
 
-    pub fn take_pending_shard_notifications(&mut self) -> Vec<(Bytes, Bytes)> {
-        std::mem::take(&mut self.pending_shard_notifications)
+    pub(crate) fn tracking_client_id(&self) -> usize {
+        self.tracking.map_or(self.token.0, |state| state.id)
+    }
+
+    pub(crate) fn take_pending_notifications(&mut self) -> Vec<(Bytes, Bytes)> {
+        let notifications = std::mem::take(&mut self.pending_notifications);
+        for notification in &notifications {
+            if let Some(position) = self
+                .pending_cluster_notifications
+                .iter()
+                .position(|value| value == notification)
+            {
+                self.pending_cluster_notifications.remove(position);
+            }
+        }
+        notifications
+    }
+
+    pub(crate) fn take_pending_shard_notifications(&mut self) -> Vec<(Bytes, Bytes)> {
+        let notifications = std::mem::take(&mut self.pending_shard_notifications);
+        for notification in &notifications {
+            if let Some(position) = self
+                .pending_cluster_shard_notifications
+                .iter()
+                .position(|value| value == notification)
+            {
+                self.pending_cluster_shard_notifications.remove(position);
+            }
+        }
+        notifications
+    }
+
+    pub(crate) fn take_recorded_effects(&mut self) -> super::pending::ModuleCallEffects {
+        let db_idx = self.selected_db;
+        self.script_propagation_ops.extend(
+            self.custom_propagation
+                .drain(..)
+                .map(|frame| PropagationOp::both(db_idx, frame)),
+        );
+        super::pending::ModuleCallEffects {
+            dirty_delta: self.dirty_delta.take(),
+            dirty_keys: std::mem::take(&mut self.dirty_keys),
+            propagation: std::mem::take(&mut self.script_propagation_ops),
+            notifications: std::mem::take(&mut self.pending_notifications),
+            shard_notifications: std::mem::take(&mut self.pending_shard_notifications),
+            cluster_notifications: std::mem::take(&mut self.pending_cluster_notifications),
+            cluster_shard_notifications: std::mem::take(
+                &mut self.pending_cluster_shard_notifications,
+            ),
+        }
+    }
+
+    pub(crate) fn take_call_effects(
+        &mut self,
+        command: &CommandDescriptor,
+        args: &CommandArgs,
+        targets: PropagationTargets,
+        is_success: bool,
+    ) -> super::pending::ModuleCallEffects {
+        let has_custom =
+            !self.custom_propagation.is_empty() || !self.script_propagation_ops.is_empty();
+        let may_change = command.flags & (CMD_WRITE | CMD_MAY_REPLICATE) != 0;
+        let should_infer_write = is_success
+            && self.blocked.is_none()
+            && command.flags & CMD_WRITE != 0
+            && !self.skip_propagate
+            && self.dirty_delta != Some(0);
+        if self.dirty_keys.is_empty() && should_infer_write {
+            self.dirty_keys = command
+                .extract_keys(args)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|key| (self.selected_db, key))
+                .collect();
+        }
+        if self.dirty_delta.is_none() && (has_custom || !self.dirty_keys.is_empty()) {
+            self.dirty_delta = Some(1);
+        }
+        if !has_custom
+            && may_change
+            && !self.skip_propagate
+            && self.blocked.is_none()
+            && is_success
+            && self.dirty_delta != Some(0)
+            && targets != PropagationTargets::None
+        {
+            let parts: Vec<&[u8]> = std::iter::once(args.name.as_ref())
+                .chain(args.args.iter().map(Bytes::as_ref))
+                .collect();
+            self.script_propagation_ops.push(PropagationOp::new(
+                self.selected_db,
+                targets,
+                crate::engine::distributed::replication::protocol::encode_command(&parts),
+            ));
+        }
+        let mut effects = self.take_recorded_effects();
+        effects.propagation.retain_mut(|op| {
+            let aof = op.targets.includes_aof() && targets.includes_aof();
+            let replication = op.targets.includes_replication() && targets.includes_replication();
+            op.targets = match (aof, replication) {
+                (true, true) => PropagationTargets::Both,
+                (true, false) => PropagationTargets::Aof,
+                (false, true) => PropagationTargets::Replication,
+                (false, false) => PropagationTargets::None,
+            };
+            op.targets != PropagationTargets::None
+        });
+        self.skip_propagate = false;
+        effects
     }
 }
 
@@ -79,8 +191,20 @@ impl CommandConn for ModuleCallConn {
     fn token(&self) -> Token {
         self.token
     }
+    fn tracking_token(&self) -> Token {
+        Token(self.tracking_client_id())
+    }
     fn file_descriptor(&self) -> i64 {
         -1
+    }
+    fn last_write_offset(&self) -> crate::engine::distributed::replication::ReplicationOffset {
+        self.last_write_offset
+    }
+    fn set_last_write_offset(
+        &mut self,
+        offset: crate::engine::distributed::replication::ReplicationOffset,
+    ) {
+        self.last_write_offset = offset;
     }
     fn peer_addr(&self) -> std::net::SocketAddr {
         "127.0.0.1:0".parse().unwrap()
@@ -285,9 +409,14 @@ impl CommandConn for ModuleCallConn {
         self.has_custom_reply = v;
     }
     fn skip_propagate(&self) -> bool {
-        false
+        self.skip_propagate
     }
-    fn set_skip_propagate(&mut self, _v: bool) {}
+    fn set_skip_propagate(&mut self, value: bool) {
+        self.skip_propagate = value;
+    }
+    fn record_dirty_delta(&mut self, delta: i64) {
+        self.dirty_delta = Some(self.dirty_delta.unwrap_or(0).saturating_add(delta));
+    }
     fn record_custom_propagation(&mut self, frame: Vec<u8>) {
         self.custom_propagation.push(frame);
     }
@@ -336,9 +465,11 @@ impl CommandConn for ModuleCallConn {
     }
     fn set_swapdb_dbs(&mut self, _v: Option<(u32, u32)>) {}
     fn blocked(&self) -> Option<&BlockedState> {
-        None
+        self.blocked.as_ref()
     }
-    fn set_blocked(&mut self, _state: Option<BlockedState>) {}
+    fn set_blocked(&mut self, state: Option<BlockedState>) {
+        self.blocked = state.filter(|_| !self.deny_blocking);
+    }
     fn reset_parser(&mut self) {}
     fn mark_closing(&mut self) {}
     fn set_module_auth_callback(
@@ -366,12 +497,54 @@ impl CommandConn for ModuleCallConn {
     }
     fn enter_blocking(
         &mut self,
-        _cmd: crate::engine::command::context::BlockedCmd,
-        _keys: Vec<Bytes>,
-        _timeout_ms: u64,
-        _orig_args: &CommandArgs,
-        _req_bytes: usize,
+        cmd: crate::engine::command::context::BlockedCmd,
+        keys: Vec<Bytes>,
+        timeout_ms: u64,
+        orig_args: &CommandArgs,
+        req_bytes: usize,
     ) -> Value {
-        Value::error("ERR blocking not supported in module call")
+        if self.deny_blocking {
+            return Value::Null;
+        }
+        self.set_blocked(Some(BlockedState {
+            cmd,
+            keys,
+            timeout_ms,
+            start_time_ms: crate::foundation::io::sys::time::mstime(),
+            orig_args: orig_args.clone(),
+            req_bytes,
+            orig_wrapped: None,
+        }));
+        Value::Null
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::command::context::BlockedCmd;
+
+    #[test]
+    fn allowed_module_call_retains_blocking_state() {
+        let mut conn = ModuleCallConn::new(0);
+        conn.set_deny_blocking(false);
+        let args = CommandArgs::from_parts(vec![
+            Bytes::from_static(b"BLPOP"),
+            Bytes::from_static(b"pending"),
+            Bytes::from_static(b"0"),
+        ]);
+        let reply = conn.enter_blocking(
+            BlockedCmd::Blpop,
+            vec![Bytes::from_static(b"pending")],
+            0,
+            &args,
+            0,
+        );
+        assert!(matches!(reply, Value::Null));
+        let blocked = conn.blocked().expect("allowed call must remain blocked");
+        assert_eq!(blocked.cmd, BlockedCmd::Blpop);
+        assert_eq!(blocked.keys, vec![Bytes::from_static(b"pending")]);
+        conn.set_blocked(None);
+        assert!(conn.blocked().is_none());
     }
 }

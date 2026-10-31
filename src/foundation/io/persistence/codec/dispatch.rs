@@ -4,7 +4,7 @@ use crate::foundation::io::persistence::codec::types::{
     RDB_TYPE_HASH, RDB_TYPE_HASH_2, RDB_TYPE_LIST, RDB_TYPE_SET, RDB_TYPE_SET_INTSET,
     RDB_TYPE_SET_LISTPACK, RDB_TYPE_STREAM_LISTPACKS_3, RDB_TYPE_STRING, RDB_TYPE_ZSET_2,
 };
-use crate::foundation::io::store::structure::hash::HashHt;
+use crate::foundation::io::store::structure::hash::{HashHt, HashLp};
 use crate::foundation::io::store::structure::set::SetEncoding;
 use crate::foundation::io::store::Robj;
 use crate::foundation::memory::value::ListOps;
@@ -23,8 +23,31 @@ pub enum ObjectLoadError {
 pub(crate) struct LoadedObject {
     pub(crate) object: Robj,
     pub(crate) hash_field_expires: HashMap<Vec<u8>, u64>,
+    hash_declared_length: Option<usize>,
     #[cfg(not(feature = "wasm"))]
     pub(crate) skipped_expired_hash_fields: Vec<Bytes>,
+}
+
+impl LoadedObject {
+    fn rebuild_hash_encoding(&mut self, max_entries: usize, max_value_size: usize) {
+        let Some(declared_length) = self.hash_declared_length else {
+            return;
+        };
+        if declared_length > max_entries {
+            return;
+        }
+        let pairs = self.object.hash_entries();
+        let mut hash = HashLp::new();
+        for (field, value) in pairs {
+            if hash
+                .set_with_threshold(&field, &value, max_entries, max_value_size)
+                .is_err()
+            {
+                return;
+            }
+        }
+        self.object = Robj::HashListpack(hash);
+    }
 }
 
 pub fn save_robj<W: RdbWriter>(obj: &Robj, w: &mut W) {
@@ -64,6 +87,7 @@ pub fn save_robj<W: RdbWriter>(obj: &Robj, w: &mut W) {
         }
         Robj::StreamListpack(s) => stream::StreamCodec::save(s, w),
         Robj::StreamRadix(_) => unreachable!("radix stream encoding not implemented"),
+        Robj::PathHash(hash) => super::path_hash::PathHashCodec::save(hash, w),
     }
 }
 
@@ -103,6 +127,7 @@ pub fn type_byte(obj: &Robj) -> u8 {
         Robj::ZSetSkiplist(_) => RDB_TYPE_ZSET_2,
         Robj::ZSetListpack(_) => super::types::RDB_TYPE_ZSET_LISTPACK,
         Robj::StreamListpack(_) | Robj::StreamRadix(_) => RDB_TYPE_STREAM_LISTPACKS_3,
+        Robj::PathHash(_) => super::types::RDB_TYPE_PATH_HASH,
     }
 }
 
@@ -149,18 +174,45 @@ pub(crate) fn load_robj_with_hash_field_expires_detailed(
     type_byte: u8,
     now_ms: Option<u64>,
 ) -> Option<LoadedObject> {
+    load_robj_with_hash_field_expires_and_limits(buf, pos, type_byte, now_ms, 512, 64)
+}
+
+pub(crate) fn load_robj_with_hash_field_expires_and_limits(
+    buf: &[u8],
+    pos: &mut usize,
+    type_byte: u8,
+    now_ms: Option<u64>,
+    max_entries: usize,
+    max_value_size: usize,
+) -> Option<LoadedObject> {
     if type_byte == RDB_TYPE_HASH_2 {
-        let loaded = hash::HashCodec::load_with_field_expires_detailed(buf, pos, now_ms)?;
-        return Some(LoadedObject {
+        let loaded = hash::HashCodec::load_with_field_expires_and_limits(
+            buf,
+            pos,
+            now_ms,
+            max_entries,
+            max_value_size,
+        )?;
+        let mut object = LoadedObject {
             object: Robj::HashHashtable(loaded.0),
             hash_field_expires: loaded.1,
+            hash_declared_length: Some(loaded.3),
             #[cfg(not(feature = "wasm"))]
             skipped_expired_hash_fields: loaded.2,
-        });
+        };
+        object.rebuild_hash_encoding(max_entries, max_value_size);
+        return Some(object);
     }
-    load_robj(buf, pos, type_byte).map(|object| LoadedObject {
+    let object = if type_byte == super::types::RDB_TYPE_PATH_HASH {
+        super::path_hash::PathHashCodec::load_with_limits(buf, pos, max_entries, max_value_size)
+            .map(|hash| Robj::PathHash(Box::new(hash)))
+    } else {
+        load_robj(buf, pos, type_byte)
+    };
+    object.map(|object| LoadedObject {
         object,
         hash_field_expires: HashMap::new(),
+        hash_declared_length: None,
         #[cfg(not(feature = "wasm"))]
         skipped_expired_hash_fields: Vec::new(),
     })
@@ -181,6 +233,16 @@ pub fn load_typed_object_with_hash_field_expires_detailed(
     pos: &mut usize,
     now_ms: Option<u64>,
 ) -> Result<(Robj, HashMap<Vec<u8>, u64>), ObjectLoadError> {
+    load_typed_object_with_hash_limits_detailed(buf, pos, now_ms, 512, 64)
+}
+
+pub fn load_typed_object_with_hash_limits_detailed(
+    buf: &[u8],
+    pos: &mut usize,
+    now_ms: Option<u64>,
+    max_entries: usize,
+    max_value_size: usize,
+) -> Result<(Robj, HashMap<Vec<u8>, u64>), ObjectLoadError> {
     let type_byte = *buf.get(*pos).ok_or(ObjectLoadError::Invalid)?;
     *pos += 1;
     if stream::StreamCodec::is_legacy_encoding(buf, *pos, type_byte) {
@@ -196,5 +258,14 @@ pub fn load_typed_object_with_hash_field_expires_detailed(
             })?;
         return Ok((Robj::StreamListpack(Box::new(stream)), HashMap::new()));
     }
-    load_robj_with_hash_field_expires(buf, pos, type_byte, now_ms).ok_or(ObjectLoadError::Invalid)
+    load_robj_with_hash_field_expires_and_limits(
+        buf,
+        pos,
+        type_byte,
+        now_ms,
+        max_entries,
+        max_value_size,
+    )
+    .map(|loaded| (loaded.object, loaded.hash_field_expires))
+    .ok_or(ObjectLoadError::Invalid)
 }

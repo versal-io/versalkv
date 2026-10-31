@@ -364,6 +364,13 @@ impl TrackingState {
         });
     }
 
+    pub fn sweep_disconnected_clients(&mut self) {
+        self.keys.retain(|_, clients| {
+            clients.retain(|client_id| self.clients.contains(client_id));
+            !clients.is_empty()
+        });
+    }
+
     pub fn total_keys(&self) -> usize {
         self.keys.len()
     }
@@ -386,6 +393,7 @@ impl TrackingState {
     }
 
     pub fn evict_over_limit(&mut self) -> Vec<(Bytes, Vec<usize>)> {
+        let started = std::time::Instant::now();
         let mut evicted = Vec::new();
         while self.keys.len() > self.max_keys {
             let Some(key) = self.keys.keys().next().cloned() else {
@@ -393,6 +401,9 @@ impl TrackingState {
             };
             if let Some(clients) = self.keys.remove(&key) {
                 evicted.push((key, clients.into_iter().collect()));
+            }
+            if started.elapsed() >= std::time::Duration::from_micros(500) {
+                break;
             }
         }
         evicted
@@ -403,6 +414,7 @@ pub struct ScriptExecutionState {
     pub script_cache: ScriptCache,
     pub function_registry: FunctionRegistry,
     pub running_script: Option<ScriptControlHandle>,
+    pub(crate) scripts_eviction_pending: bool,
     pub debug_session: Option<crate::engine::command::SessionId>,
     pub script_busy: bool,
     pub script_busy_is_function: bool,
@@ -422,6 +434,7 @@ impl ScriptExecutionState {
             script_cache: ScriptCache::new(),
             function_registry: FunctionRegistry::new(&LUA_ENGINE),
             running_script: None,
+            scripts_eviction_pending: false,
             debug_session: None,
             script_busy: false,
             script_busy_is_function: false,

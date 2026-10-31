@@ -25,7 +25,11 @@ pub(crate) struct LuaTask {
 }
 
 enum LuaProgram {
-    Eval(String),
+    Eval {
+        code: String,
+        keys: Vec<Bytes>,
+        args: Vec<Bytes>,
+    },
     Function {
         engine: &'static dyn ScriptEngine,
         compiled: CompiledFunction,
@@ -41,7 +45,9 @@ impl LuaTask {
 
     pub(crate) fn run(&mut self, dispatcher: &mut HostDispatcher<'_>) -> Value {
         match &self.program {
-            LuaProgram::Eval(code) => LuaEngine.eval(code, &mut self.run, dispatcher),
+            LuaProgram::Eval { code, keys, args } => {
+                LuaEngine.eval_cached_with_host(code, &mut self.run, keys, args, dispatcher)
+            }
             LuaProgram::Function {
                 engine,
                 compiled,
@@ -132,6 +138,12 @@ fn prepare_eval(
     }
     conn.set_skip_propagate(true);
 
+    let numkeys = parse_numkeys(&args.args[1])?;
+    if args.args.len() < 2 + numkeys {
+        return Err(Value::error(
+            "ERR Number of keys can't be greater than number of args",
+        ));
+    }
     let script = if sha {
         let digest = std::str::from_utf8(&args.args[0])
             .map_err(|_| Value::error("ERR SHA1 is not a valid UTF-8 string"))?;
@@ -141,20 +153,12 @@ fn prepare_eval(
             .map(str::to_owned)
             .ok_or_else(|| Value::error("NOSCRIPT No matching script. Please use EVAL."))?
     } else {
-        let script = std::str::from_utf8(&args.args[0])
+        std::str::from_utf8(&args.args[0])
             .map_err(|_| Value::error("ERR script is not a valid UTF-8 string"))?
-            .to_owned();
-        let digest = ScriptCache::compute_sha1(&script);
-        ctx.script_mut().script_cache.store(digest, script.clone());
-        script
+            .to_owned()
     };
 
-    let numkeys = parse_numkeys(&args.args[1])?;
-    if args.args.len() < 2 + numkeys {
-        return Err(Value::error(
-            "ERR Number of keys can't be greater than number of args",
-        ));
-    }
+    let digest = ScriptCache::compute_sha1(&script);
     let keys = args.args[2..2 + numkeys].to_vec();
     let argv = args.args[2 + numkeys..].to_vec();
     let mut run = ScriptRunCtx::new_eval_detached(
@@ -168,7 +172,7 @@ fn prepare_eval(
     }
     run.timeout_ms = ctx.config().server.lua_time_limit;
 
-    let (body, flags, has_shebang) =
+    let (_, flags, has_shebang) =
         parse_shebang(&script, run.flags).map_err(|error| error.into_value())?;
     run.flags = flags;
     check_eval_preconditions(EvalPreconditions {
@@ -199,6 +203,11 @@ fn prepare_eval(
         run.script_slot = Some(u16::MAX);
     }
     run.check_cluster_slots(&keys).map_err(Value::error)?;
+    LuaEngine
+        .prepare_cached_eval(&digest, &script, run.lua_enable_insecure_api)
+        .map_err(|error| error.into_value())?;
+    ctx.register_eval_script(digest.clone(), script.clone());
+    run.func_name = digest;
     run.start_timer();
     if crate::framework::commands::scripting::script_cmd::script_debug_enabled() {
         ctx.script_mut().debug_session = Some(conn.session_id());
@@ -215,9 +224,11 @@ fn prepare_eval(
     });
 
     Ok(PreparedHostTask::Lua(LuaTask {
-        program: LuaProgram::Eval(
-            crate::framework::commands::scripting::eval::build_wrapped_script(&body, &keys, &argv),
-        ),
+        program: LuaProgram::Eval {
+            code: script,
+            keys,
+            args: argv,
+        },
         run,
         original_db: conn.selected_db(),
         propagation_frame,
@@ -346,3 +357,6 @@ fn parse_numkeys(bytes: &[u8]) -> Result<usize, Value> {
     }
     Ok(value as usize)
 }
+
+#[cfg(test)]
+mod tests;

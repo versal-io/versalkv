@@ -348,6 +348,22 @@ impl EventBatch {
             .any(|event| matches!(event.payload, EventPayload::Readiness(_)))
     }
 
+    pub(crate) fn reclassify_readiness(&mut self, token: Token, lane: EventLane) {
+        for phase in [EventPhase::BeforePoll, EventPhase::Ready] {
+            let Some(&sequence) = self.readiness_index.get(&(phase, token)) else {
+                continue;
+            };
+            let target = self.event_targets[&sequence];
+            if let QueueTarget::Ready(previous) = target {
+                if previous != lane {
+                    self.move_queued_event(sequence, target, QueueTarget::Ready(lane));
+                }
+            } else if let Some(event) = self.events.get_mut(&sequence) {
+                event.lane = lane;
+            }
+        }
+    }
+
     pub(crate) fn has_due_time_events(&self) -> bool {
         !self.time.is_empty()
     }
@@ -546,12 +562,12 @@ impl EventBatch {
             }
         }
         if target.has_higher_priority_than(existing_target) {
-            self.promote_queued_event(sequence, existing_target, target);
+            self.move_queued_event(sequence, existing_target, target);
         }
         true
     }
 
-    fn promote_queued_event(
+    fn move_queued_event(
         &mut self,
         sequence: u64,
         old_target: QueueTarget,

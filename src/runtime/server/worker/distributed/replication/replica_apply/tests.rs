@@ -278,6 +278,77 @@ fn add_live_replay_connection(backend: &mut ServerWorkerState) -> (usize, Connec
     (connection_token, main, peer)
 }
 
+#[test]
+fn replication_priority_samples_cover_controls_and_outer_transaction() {
+    for is_priority in [false, true] {
+        let mut backend = ServerWorkerState::new(2).unwrap();
+        crate::framework::commands::register_all(&mut backend.registry);
+        let (token, main, _peer) = add_live_replay_connection(&mut backend);
+        let mut link = ReplicaLink::new(
+            main,
+            MasterInfo {
+                host: "127.0.0.1".to_string(),
+                port: 6379,
+            },
+        );
+        if is_priority {
+            backend.prioritize_connection(Token(token));
+        }
+        let sample = u64::from(is_priority);
+        for (index, apply) in [
+            ReplicationApply::Select(1),
+            ReplicationApply::Ping,
+            ReplicationApply::GetAck,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            backend
+                .apply_replication_command(token, &mut link, apply, CommandOrigin::Replication)
+                .unwrap();
+            assert_eq!(
+                backend.ctx.stats().priority_commands_processed,
+                (index as u64 + 1) * sample
+            );
+        }
+        for parts in [
+            vec!["MULTI"],
+            vec!["SET", "first", "one"],
+            vec!["SELECT", "0"],
+            vec!["SET", "second", "two"],
+            vec!["EXEC"],
+        ] {
+            let args = CommandArgs::from_parts(
+                parts
+                    .into_iter()
+                    .map(|part| Bytes::copy_from_slice(part.as_bytes()))
+                    .collect(),
+            );
+            backend
+                .apply_replication_command(
+                    token,
+                    &mut link,
+                    ReplicationApply::Command(args),
+                    CommandOrigin::Replication,
+                )
+                .unwrap();
+        }
+        assert_eq!(backend.ctx.stats().priority_commands_processed, 5 * sample);
+        assert!(backend
+            .ctx
+            .db(1)
+            .unwrap()
+            .get_allow_expired(b"first")
+            .is_some());
+        assert!(backend
+            .ctx
+            .db(0)
+            .unwrap()
+            .get_allow_expired(b"second")
+            .is_some());
+    }
+}
+
 fn loaded_replay_link(main: ConnectionId, received_offset: i64) -> ReplicaLink {
     let replid = "0123456789abcdef0123456789abcdef01234567".to_string();
     let mut link = ReplicaLink::streaming(
@@ -1077,11 +1148,17 @@ fn replica_hup_drain_applies_a_frame_larger_than_the_fair_read_budget() {
         b"hup-large",
         &value,
     ]);
-    peer.write_all(&frame).unwrap();
-    peer.shutdown(std::net::Shutdown::Write).unwrap();
     backend
         .transport
-        .wait_readable_for_test(Token(connection_token));
+        .reserve_test_receive_buffer(Token(connection_token), frame.len())
+        .unwrap();
+    peer.write_all(&frame).unwrap();
+    peer.shutdown(std::net::Shutdown::Write).unwrap();
+    // Wait for the complete frame without consuming it, so one HUP drain
+    // must apply bytes beyond the normal fair read budget.
+    backend
+        .transport
+        .wait_pending_bytes_for_test(Token(connection_token), frame.len());
 
     backend.recv_replication_stream_after_hup(connection_token, connection_token);
 
