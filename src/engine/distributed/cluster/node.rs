@@ -25,6 +25,8 @@ pub const CLUSTER_NODE_LIGHT_HDR_PUBLISH_SUPPORTED: u16 = 1 << 11;
 pub const CLUSTER_NODE_LIGHT_HDR_MODULE_SUPPORTED: u16 = 1 << 12;
 /// This replica currently considers its own primary to be in FAIL state.
 pub const CLUSTER_NODE_MY_PRIMARY_FAIL: u16 = 1 << 13;
+/// This peer understands negative failover authorization replies.
+pub const CLUSTER_NODE_FAILOVER_AUTH_NACK_SUPPORTED: u16 = 1 << 14;
 
 /// A node in the cluster.
 #[derive(Clone)]

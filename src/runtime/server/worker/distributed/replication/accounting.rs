@@ -322,8 +322,9 @@ impl ServerWorkerState {
             } else {
                 queued_bytes.max(shared_bytes)
             };
-            let limit_enforcement_active = link.dual_state() != PrimaryDualChannelState::Disabled
-                || !matches!(link.state(), PrimaryLinkState::Streaming);
+            // Classic streaming replicas also own queued replication output.
+            // Snapshot transfer bytes are excluded by the usage calculation above.
+            let limit_enforcement_active = true;
             entries.push(MainOutputBufferEntry {
                 connection_id,
                 owner_connection_id: connection_id,
@@ -431,6 +432,15 @@ impl ServerWorkerState {
         now_ms: i64,
     ) -> Vec<MainOutputBufferViolation> {
         let mut violations = Vec::new();
+        let config = &self.ctx.config().replication;
+        let target = crate::engine::distributed::replication::throttle::ReplicationThrottle::target(
+            config.replica_output_buffer_soft_limit,
+            config.replica_output_buffer_hard_limit,
+        );
+        let may_protect = config.repl_throttling_enabled
+            && !self.ctx.replication().is_replica()
+            && self.ctx.replication().throttle.is_active()
+            && !self.ctx.maxmemory_state().is_over_limit();
         for entry in entries {
             let hard_limit = limits.hard.filter(|_| entry.limit_enforcement_active);
             let soft_limit = limits.soft.filter(|_| entry.limit_enforcement_active);
@@ -440,11 +450,17 @@ impl ServerWorkerState {
                 .replication_runtime
                 .primary_for_connection_mut(entry.owner_connection_id)
                 .is_some_and(|link| {
-                    link.output_buffer_soft_limit_reached(
+                    let timed_out = link.output_buffer_soft_limit_reached(
                         soft_exceeded,
                         now_ms,
                         limits.soft_seconds,
-                    )
+                    );
+                    let protected = may_protect
+                        && entry.bytes >= target
+                        && link
+                            .output_buffer_soft_limit_age_ms(now_ms)
+                            .is_some_and(|age| age <= 120_000);
+                    timed_out && !protected
                 });
             if entry.cursor_error || hard_exceeded || soft_timed_out {
                 violations.push(MainOutputBufferViolation {
@@ -576,6 +592,75 @@ impl ServerWorkerState {
         let violations = self.evaluate_main_output_buffer_entries(entries, limits, now_ms);
         self.cleanup_main_output_buffer_violations(violations);
         self.enforce_retained_output_buffer_limits(backlog_tail, limits, now_ms);
+    }
+
+    pub(crate) fn adjust_replication_throttle(&mut self) {
+        let config = &self.ctx.config().replication;
+        let target = crate::engine::distributed::replication::throttle::ReplicationThrottle::target(
+            config.replica_output_buffer_soft_limit,
+            config.replica_output_buffer_hard_limit,
+        );
+        let is_enabled_primary =
+            config.repl_throttling_enabled && !self.ctx.replication().is_replica();
+        let entries =
+            Self::aggregate_main_output_buffer_entries(self.collect_main_output_buffer_entries(
+                self.ctx.replication().backlog.next_stream_cursor(),
+            ));
+        let online_buffers: Vec<_> = entries
+            .iter()
+            .filter_map(|entry| {
+                let link = self
+                    .replication_runtime
+                    .primary_for_connection(entry.owner_connection_id)?;
+                (link.state() == PrimaryLinkState::Streaming)
+                    .then_some((entry.owner_connection_id.0, entry.bytes))
+            })
+            .collect();
+        let has_replicas = !self.replication_runtime.primary_links().is_empty();
+        self.ctx.replication_mut().throttle.adjust(
+            is_enabled_primary,
+            target,
+            has_replicas,
+            &online_buffers,
+        );
+    }
+
+    pub(crate) fn schedule_replication_throttle(&mut self) {
+        use crate::runtime::server::worker::reactor::TimerEvent;
+        let kind = TimerEvent::ReplicationThrottle;
+        if self.ctx.throttled_clients().is_empty()
+            || self
+                .pending_due_time_events
+                .values()
+                .any(|event| event.kind == kind)
+            || self.event_batch.contains_timer(kind)
+        {
+            return;
+        }
+        let delay = self.ctx.replication_mut().throttle.release_delay();
+        self.time_events.schedule_unique(
+            crate::foundation::io::sys::time::MonotonicInstant::now(),
+            delay,
+            kind,
+        );
+    }
+
+    pub(crate) fn release_throttled_clients(&mut self) {
+        let start = std::time::Instant::now();
+        let mut dirty = Vec::new();
+        while start.elapsed() < std::time::Duration::from_millis(10) {
+            let Some(token) = self.ctx.throttled_clients().first().copied() else {
+                break;
+            };
+            if !self.ctx.replication_mut().throttle.try_release() {
+                break;
+            }
+            self.ctx.throttled_clients_mut().shift_remove(&token);
+            dirty.extend(self.wakeup_blocked_client(token, None, None));
+        }
+        if !dirty.is_empty() {
+            self.wakeup_blocked_on_keys(&dirty, None, None);
+        }
     }
 }
 

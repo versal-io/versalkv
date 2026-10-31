@@ -331,6 +331,14 @@ impl ServerWorkerState {
                 break;
             }
             for (index, action) in actions.iter().cloned().enumerate() {
+                if matches!(&action, MigrationAction::Cleanup(id) if self.ctx.has_slot_import(id))
+                    && self.ctx.persistence().forkless_save_in_progress()
+                {
+                    if let Some(state) = self.ctx.cluster_state_mut().as_deref_mut() {
+                        state.queue_migration_actions(actions[index..].iter().cloned());
+                    }
+                    return;
+                }
                 if let MigrationAction::StartSnapshot(_) = &action {
                     if self.slot_migration_snapshot.is_some()
                         || self.ctx.persistence().has_active_child()
@@ -1018,7 +1026,9 @@ impl ServerWorkerState {
             self.pause_for_slot_migration(now_ms);
             self.transition_slot_migration(&id, MigrationEvent::OutputDrained);
         }
-        if let Some(id) = commit_import {
+        if let Some(id) =
+            commit_import.filter(|_| !self.ctx.persistence().forkless_save_in_progress())
+        {
             self.commit_slot_import(&id);
         }
         for id in complete_exports {
@@ -1031,7 +1041,7 @@ impl ServerWorkerState {
             if let Some(ranges) = ranges {
                 for range in ranges.iter() {
                     for slot in range.start..=range.end {
-                        let entries = self.ctx.dbs_mut().take_slot(slot as usize);
+                        let entries = self.ctx.take_slot_entries(slot as usize);
                         if !entries.is_empty() {
                             self.ctx.persistence_mut().add_dirty(entries.len() as i64);
                         }

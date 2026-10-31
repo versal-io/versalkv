@@ -624,7 +624,8 @@ impl ServerWorkerState {
             .ctx
             .client_pause()
             .is_paused(crate::foundation::io::sys::time::mstime())
-            != crate::framework::context::PauseAction::None;
+            != crate::framework::context::PauseAction::None
+            || self.ctx.persistence().forkless_capture_in_progress();
         if paused {
             return;
         }
@@ -687,6 +688,13 @@ impl ServerWorkerState {
         }
         self.ctx.replication_mut().slave_repl_offset = link.applied_position();
         self.ctx.replication_mut().slave_read_repl_offset = link.received_position();
+        if !link.is_dual_rdb_mode_active()
+            && self.resume_replica_main_reads(connection_token).is_err()
+        {
+            self.ctx.config_mut().replication.master_link_status = "down".to_string();
+            self.remove_connection(connection_id.0);
+            return;
+        }
         self.replication_runtime.set_replica_link(link);
     }
 

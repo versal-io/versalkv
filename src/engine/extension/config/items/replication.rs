@@ -3,6 +3,23 @@ use crate::engine::extension::config::spec_registry::ConfigRegistry;
 
 pub(crate) fn register_replication_configs(reg: &mut ConfigRegistry) {
     reg.register(&ConfigSpec {
+        name: "repl-throttling-enabled",
+        type_: ConfigType::Bool,
+        enum_values: &[],
+        numeric_min: 0,
+        numeric_max: 0,
+        flags: &[],
+        alias: None,
+        get: |config| ConfigValue::Bool(config.replication.repl_throttling_enabled),
+        set: |config, value| {
+            let ConfigValue::Bool(value) = value else {
+                return Err("repl-throttling-enabled must be a boolean".to_string());
+            };
+            config.replication.repl_throttling_enabled = *value;
+            Ok(())
+        },
+    });
+    reg.register(&ConfigSpec {
         name: "replica-announce-ip",
         type_: ConfigType::String,
         enum_values: &[],

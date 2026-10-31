@@ -17,6 +17,7 @@ use std::net::SocketAddr;
 pub(crate) struct ClusterConfigFile {
     pub path: Option<std::path::PathBuf>,
     pub last_best_effort_warning_ms: i64,
+    pub writer: Option<crate::runtime::server::worker::flows::maintenance::ClusterConfigWriter>,
 }
 
 impl ServerWorkerState {
@@ -523,6 +524,18 @@ impl ServerWorkerState {
                     }
                     self.cluster_bus
                         .register_incoming(handle.token, handle.peer_addr);
+                    if self.transport.is_connection_ready(handle.token) {
+                        if let Some(connection) =
+                            self.cluster_bus.connections.get_mut(&handle.token.0)
+                        {
+                            connection.inbound_establishment_counted = true;
+                        }
+                        if let Some(state) = self.ctx.cluster_state_mut().as_deref_mut() {
+                            state.record_link_established(
+                                crate::engine::distributed::cluster::ClusterLinkDirection::From,
+                            );
+                        }
+                    }
                     if let Err(error) = self
                         .transport
                         .set_interest(handle.token, Interest::ReadWritable)
@@ -592,6 +605,25 @@ impl ServerWorkerState {
         (status, replication_offset)
     }
 
+    fn record_inbound_cluster_link_if_ready(
+        &mut self,
+        state: &mut crate::engine::distributed::cluster::ClusterState,
+        token: Token,
+    ) {
+        let Some(connection) = self.cluster_bus.connections.get_mut(&token.0) else {
+            return;
+        };
+        if !connection.is_outgoing
+            && !connection.inbound_establishment_counted
+            && self.transport.is_connection_ready(token)
+        {
+            connection.inbound_establishment_counted = true;
+            state.record_link_established(
+                crate::engine::distributed::cluster::ClusterLinkDirection::From,
+            );
+        }
+    }
+
     pub(crate) fn handle_cluster_bus_readable(&mut self, token: Token) {
         let tv = token.0;
         if !self.cluster_bus.is_bus_token(token) {
@@ -614,6 +646,7 @@ impl ServerWorkerState {
                 return;
             };
             should_close = self.cluster_bus.readable(state, &mut stream, tv, now);
+            self.record_inbound_cluster_link_if_ready(state, token);
             // A reciprocal MEET retires its obsolete outgoing link inside
             // C packet processing. Complete receive-generated closures before
             // another socket can confirm or replace that peer's link.
@@ -731,6 +764,9 @@ impl ServerWorkerState {
                 }
             })
         };
+        if let Some(state) = state_opt.as_deref_mut() {
+            self.record_inbound_cluster_link_if_ready(state, token);
+        }
         match result {
             Ok(_) => {
                 let interest = self.cluster_bus.connections.get(&tv).map(|connection| {
@@ -744,6 +780,9 @@ impl ServerWorkerState {
                     if self.transport.set_interest(token, interest).is_ok() {
                         if let Some(connection) = self.cluster_bus.connections.get_mut(&tv) {
                             connection.events = match interest {
+                                Interest::None => {
+                                    crate::engine::distributed::cluster::LinkEvents::default()
+                                }
                                 Interest::Readable => {
                                     crate::engine::distributed::cluster::LinkEvents::READABLE
                                 }

@@ -3,6 +3,7 @@ use crate::engine::extension::config::spec_registry::ConfigRegistry;
 mod cluster;
 mod cluster_metadata;
 mod encoding;
+mod hotkeys;
 mod logs;
 mod network;
 mod persistence;
@@ -14,6 +15,7 @@ pub fn register_all_configs(reg: &mut ConfigRegistry) {
     persistence::register_persistence_configs(reg);
     security::register_security_configs(reg);
     server::register_server_configs(reg);
+    hotkeys::register_hotkeys_configs(reg);
     encoding::register_encoding_configs(reg);
     logs::register_logs_configs(reg);
     network::register_network_configs(reg);

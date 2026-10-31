@@ -60,6 +60,9 @@ impl ServerWorkerState {
         if invocation.target.resolve(self).is_none() {
             return Err(CommandDisposition::ConnectionGone);
         }
+        if invocation.flags & crate::engine::command::CMD_WRITE != 0 {
+            self.ctx.set_suppress_eviction_until_write(false);
+        }
         let eviction = self.perform_evictions();
         self.apply_command_evictions(invocation.target.token_value(), eviction.evicted, effects);
         self.ctx.refresh_dict_resize_budget();
@@ -175,8 +178,12 @@ impl ServerWorkerState {
         connection_token: usize,
         reason: PostponeReason,
     ) {
+        let is_throttled = reason == PostponeReason::ReplicationThrottle;
+        let is_forkless = reason == PostponeReason::ForklessKey;
         let command = match reason {
             PostponeReason::ClientPause => BlockedCmd::Paused,
+            PostponeReason::ForklessKey => BlockedCmd::Forkless,
+            PostponeReason::ReplicationThrottle => BlockedCmd::Throttled,
             PostponeReason::SlotMigration(job_id) => BlockedCmd::SlotMigration(job_id),
         };
         let connection = &mut self.connection_registry
@@ -188,9 +195,21 @@ impl ServerWorkerState {
             invocation.args,
             connection.request_bytes_current_command(),
         );
-        self.ctx
-            .paused_clients_mut()
-            .insert(invocation.target.token());
+        if is_throttled {
+            self.ctx
+                .throttled_clients_mut()
+                .insert(invocation.target.token());
+            self.schedule_replication_throttle();
+        } else {
+            self.ctx
+                .paused_clients_mut()
+                .insert(invocation.target.token());
+            if is_forkless {
+                self.ctx
+                    .forkless_clients_mut()
+                    .insert(invocation.target.token());
+            }
+        }
     }
 
     fn finish_invocation(

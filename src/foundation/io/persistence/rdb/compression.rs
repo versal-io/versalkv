@@ -76,14 +76,18 @@ pub struct DecodedRdbStream {
 }
 
 pub fn encode_rdb_stream(bytes: &[u8], checksum: bool) -> std::io::Result<Vec<u8>> {
+    let mut encoder = new_rdb_frame_encoder(VCS_RDB_HEADER.to_vec(), checksum);
+    encoder.write_all(bytes)?;
+    encoder.finish().map_err(std::io::Error::other)
+}
+
+pub(crate) fn new_rdb_frame_encoder<W: Write>(writer: W, checksum: bool) -> FrameEncoder<W> {
     let info = FrameInfo::new()
         .block_size(BlockSize::Max64KB)
         .block_mode(BlockMode::Linked)
         .block_checksums(checksum)
         .content_checksum(checksum);
-    let mut encoder = FrameEncoder::with_frame_info(info, VCS_RDB_HEADER.to_vec());
-    encoder.write_all(bytes)?;
-    encoder.finish().map_err(std::io::Error::other)
+    FrameEncoder::with_frame_info(info, writer)
 }
 
 /// Decode one frame and ignore bytes beyond its boundary, like the plain RDB

@@ -79,6 +79,7 @@ pub struct ConnectedPeer {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Interest {
+    None,
     Readable,
     Writable,
     ReadWritable,
@@ -239,6 +240,12 @@ pub trait TransportRuntime {
         self.connect_tcp(addr)
     }
     fn accept(&mut self, listener: TransportId) -> io::Result<Option<ConnectedPeer>>;
+    /// Whether an accepted stream completed its transport handshake.
+    /// Plain transports are ready immediately; TLS must report certificate
+    /// validation and handshake completion before link establishment.
+    fn is_connection_ready(&self, _id: TransportId) -> bool {
+        true
+    }
     fn read(&mut self, id: TransportId, dst: &mut [u8]) -> io::Result<usize>;
     fn write(&mut self, id: TransportId, src: &[u8]) -> io::Result<usize>;
     fn write_vectored(&mut self, id: TransportId, src: &[IoSlice<'_>]) -> io::Result<usize>;

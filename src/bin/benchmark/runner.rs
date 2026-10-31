@@ -37,6 +37,9 @@ pub fn run_benchmark(
     command_plan: &CommandPlan,
     dataset: Option<&Dataset>,
 ) -> Result<RunOutput, String> {
+    if config.idle {
+        return run(config, command_plan, dataset).map(RunOutput::Legacy);
+    }
     if config.mode == BenchMode::MemtierRedis {
         return scheduler::run_memtier(config, benchmark_plan, dataset).map(RunOutput::Summary);
     }

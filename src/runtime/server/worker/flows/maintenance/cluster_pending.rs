@@ -198,7 +198,7 @@ impl ServerWorkerState {
     ) {
         for slot in state.take_dirty_slot_cleanup_requests() {
             self.ctx.slot_metrics_mut().reset_slot(slot);
-            let deleted_keys = self.ctx.dbs_mut().take_slot(slot);
+            let deleted_keys = self.ctx.take_slot_entries(slot);
             if !deleted_keys.is_empty() {
                 crate::server_log!(notice, "Deleting keys in dirty slot {}", slot);
                 self.ctx

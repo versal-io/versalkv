@@ -74,7 +74,7 @@ pub(super) fn gen_memory_section(ctx: &ServerContext) -> String {
     };
     let lua_vm = mem.get(MemoryCategory::LuaVm);
     let functions_vm = mem.get(MemoryCategory::FunctionsVm);
-    let scripts_eval = mem.get(MemoryCategory::ScriptsCaches);
+    let scripts_eval = ctx.script().script_cache.memory_usage();
     let cluster_links = ctx.cluster_state().as_deref().map_or_else(
         || mem.get(MemoryCategory::ClusterLinks),
         |state| state.cluster_link_memory(),

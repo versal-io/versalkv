@@ -784,6 +784,11 @@ impl PrimaryLink {
         )
     }
 
+    pub(crate) fn output_buffer_soft_limit_age_ms(&self, now_ms: i64) -> Option<i64> {
+        self.output_buffer_soft_limit_reached_at
+            .map(|since| now_ms.saturating_sub(since.0))
+    }
+
     pub(crate) fn merge_output_buffer_soft_limit_reached_at(
         &mut self,
         reached_at: Option<OutputBufferSoftLimitReachedAt>,

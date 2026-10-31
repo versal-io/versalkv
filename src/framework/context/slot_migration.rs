@@ -51,7 +51,7 @@ impl ServerContext {
         };
         for range in ranges.iter() {
             for slot in range.start..=range.end {
-                let entries = self.dbs_mut().take_slot(slot as usize);
+                let entries = self.take_slot_entries(slot as usize);
                 dataset.dbs_mut().restore_slot_entries(entries);
                 self.dbs_mut().set_slot_importing(slot as usize, true);
             }
@@ -65,6 +65,13 @@ impl ServerContext {
             .filter_map(|dataset| dataset.dbs().get(db_id))
             .map(|db| db.scan_slot_key_count(slot))
             .sum()
+    }
+
+    pub(crate) fn has_slot_import(
+        &self,
+        id: &crate::engine::distributed::cluster::migration::MigrationJobId,
+    ) -> bool {
+        self.slot_imports.contains_key(id)
     }
 
     pub fn slot_import_keys(&self, db_id: u32, slot: usize) -> Vec<Vec<u8>> {
@@ -178,6 +185,13 @@ impl ServerContext {
             .collect()
     }
 
+    pub(crate) fn slot_import_dbs_with_ids(&self) -> Vec<(Vec<u8>, &DbSet)> {
+        self.slot_imports
+            .iter()
+            .map(|(id, dataset)| (id.as_str().as_bytes().to_vec(), dataset.dbs()))
+            .collect()
+    }
+
     pub(crate) fn replace_slot_imports_from_rdb_aux(
         &mut self,
         aux_fields: &[(Vec<u8>, Vec<u8>)],
@@ -200,7 +214,7 @@ impl ServerContext {
             let mut dbs = self.dbs().empty_like();
             for range in import.ranges.iter() {
                 for slot in range.start..=range.end {
-                    let entries = self.dbs_mut().take_slot(slot as usize);
+                    let entries = self.take_slot_entries(slot as usize);
                     dbs.restore_slot_entries(entries);
                     self.dbs_mut().set_slot_importing(slot as usize, true);
                 }

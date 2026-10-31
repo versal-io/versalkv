@@ -240,6 +240,7 @@ impl ClusterState {
         );
         self.myself.flags &= !CLUSTER_NODE_REPLICA;
         self.myself.flags |= CLUSTER_NODE_PRIMARY;
+        self.clear_local_primary_failure_view();
         if self.nodes.values().any(|node| node.is_replica()) {
             self.myself.flags |= CLUSTER_NODE_MIGRATE_TO;
         }

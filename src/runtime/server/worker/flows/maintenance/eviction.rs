@@ -19,6 +19,13 @@ impl EvictionOutcome {
 
 impl ServerWorkerState {
     pub(crate) fn perform_evictions(&mut self) -> EvictionOutcome {
+        if self.ctx.suppress_eviction_until_write()
+            || self.ctx.is_host_task_loading()
+            || self.ctx.is_loading()
+        {
+            self.cancel_eviction_timer();
+            return EvictionOutcome::empty();
+        }
         let maxmemory = self.ctx.config().server.maxmemory;
         if maxmemory == 0 {
             self.cancel_eviction_timer();
@@ -67,20 +74,37 @@ impl ServerWorkerState {
 
         while freed < target {
             let mut candidate: Option<(u32, Vec<u8>, u64)> = None;
-            for db_idx in 0..self.ctx.num_dbs() {
-                let Some(db) = self.ctx.db(db_idx as u32) else {
-                    continue;
-                };
-                if let Some(sample) = db.sample_eviction_candidate(policy, samples) {
-                    if policy.is_random()
-                        || candidate
-                            .as_ref()
-                            .is_none_or(|(_, _, score)| sample.score > *score)
-                    {
-                        candidate = Some((db_idx as u32, sample.key, sample.score));
-                    }
-                    if policy.is_random() {
-                        break;
+            let mut attempts = 0;
+            while candidate.is_none()
+                && attempts
+                    < samples
+                        .saturating_mul(self.ctx.num_dbs().max(1))
+                        .saturating_mul(1_000)
+            {
+                attempts += 1;
+                for db_idx in 0..self.ctx.num_dbs() {
+                    let Some(db) = self.ctx.db(db_idx as u32) else {
+                        continue;
+                    };
+                    if let Some(sample) = db.sample_eviction_candidate(policy, samples) {
+                        if self.ctx.persistence().forkless_capture_in_progress()
+                            && !self
+                                .ctx
+                                .persistence()
+                                .forkless_key_captured(db_idx as u32, &sample.key)
+                        {
+                            continue;
+                        }
+                        if policy.is_random()
+                            || candidate
+                                .as_ref()
+                                .is_none_or(|(_, _, score)| sample.score > *score)
+                        {
+                            candidate = Some((db_idx as u32, sample.key, sample.score));
+                        }
+                        if policy.is_random() {
+                            break;
+                        }
                     }
                 }
             }
@@ -112,6 +136,7 @@ impl ServerWorkerState {
 
 #[cfg(test)]
 mod tests {
+    use crate::engine::extension::config::persistence::BgsaveMethod;
     use crate::foundation::io::store::Robj;
     use bytes::Bytes;
 
@@ -131,6 +156,87 @@ mod tests {
             .expect("run allocator-sensitive eviction test in isolation");
         assert_eq!(status.code(), Some(86));
         true
+    }
+
+    #[test]
+    fn eviction_during_forkless_capture_only_removes_handed_off_keys() {
+        let mut runtime = crate::runtime::server::worker::ServerWorkerState::new(1).unwrap();
+        for index in 0..256 {
+            runtime.ctx.db_mut(0).unwrap().set(
+                format!("key-{index}").into_bytes(),
+                Robj::string_raw(Bytes::from(vec![b'x'; 1_024])),
+            );
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "versal-forkless-eviction-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        runtime.ctx.config_mut().persistence.dir = dir.to_string_lossy().into_owned();
+        runtime.ctx.config_mut().persistence.dbfilename = "dump.rdb".to_string();
+        runtime.ctx.config_mut().persistence.bgsave_default_method = BgsaveMethod::Forkless;
+        runtime.ctx.config_mut().persistence.rdb_key_save_delay = 10_000_000;
+        crate::framework::commands::server::save::start_bgsave(&mut runtime.ctx).unwrap();
+        assert!(runtime.ctx.persistence().forkless_capture_in_progress());
+        runtime.ctx.config_mut().server.maxmemory = 1;
+        runtime.ctx.config_mut().server.maxmemory_policy = "allkeys-random".to_string();
+
+        let outcome = runtime.perform_evictions();
+
+        assert!(
+            outcome
+                .evicted
+                .iter()
+                .all(|(_, key)| runtime.ctx.persistence().forkless_key_captured(0, key)),
+            "eviction removed a key before snapshot handoff: {:?}",
+            outcome.evicted
+        );
+        runtime
+            .ctx
+            .abort_forkless_save(crate::foundation::io::sys::time::mstime() / 1_000);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn forkless_eviction_only_removes_keys_already_handed_to_snapshot() {
+        let mut runtime = crate::runtime::server::worker::ServerWorkerState::new(1).unwrap();
+        for index in 0..256 {
+            runtime.ctx.db_mut(0).unwrap().set(
+                format!("key-{index}").into_bytes(),
+                Robj::string_raw(Bytes::from(vec![b'x'; 1_024])),
+            );
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "versal-forkless-eviction-barrier-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        runtime.ctx.config_mut().persistence.dir = dir.to_string_lossy().into_owned();
+        runtime.ctx.config_mut().persistence.dbfilename = "dump.rdb".to_string();
+        runtime.ctx.config_mut().persistence.bgsave_default_method = BgsaveMethod::Forkless;
+        runtime.ctx.config_mut().persistence.rdb_key_save_delay = 10_000_000;
+        crate::framework::commands::server::save::start_bgsave(&mut runtime.ctx).unwrap();
+        runtime.ctx.config_mut().server.maxmemory = 1;
+        runtime.ctx.config_mut().server.maxmemory_policy = "allkeys-random".to_string();
+
+        let outcome = runtime.perform_evictions();
+
+        assert!(
+            outcome
+                .evicted
+                .iter()
+                .all(|(_, key)| { runtime.ctx.persistence().forkless_key_captured(0, key) }),
+            "eviction removed a key before snapshot handoff: {:?}",
+            outcome.evicted
+        );
+        runtime
+            .ctx
+            .abort_forkless_save(crate::foundation::io::sys::time::mstime() / 1_000);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

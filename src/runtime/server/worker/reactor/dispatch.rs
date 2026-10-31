@@ -1046,6 +1046,20 @@ impl ServerWorkerState {
             {
                 self.recv_rdb_channel_streaming_after_hup(token.0, connection_token);
             }
+        } else if ready.has_readable_hup()
+            && self.replication_runtime.replica_link().is_some_and(|link| {
+                link.connection_id().0 == token.0
+                    && link.is_streaming()
+                    && !link.has_pending_rdb_receive()
+            })
+        {
+            if let Some(connection_token) = self
+                .connection_registry
+                .contains(crate::framework::capabilities::io::Token(token.0))
+                .then_some(token.0)
+            {
+                self.recv_replication_stream_after_hup(token.0, connection_token);
+            }
         } else if ready.has_readable_hup() && !self.is_master_link(token.0) {
             self.drain_client_readable_after_hup(token.0);
             return self.source_dispatch_outcome(token, &SourceOwner::Connection, true);

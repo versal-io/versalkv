@@ -13,7 +13,7 @@ const SENTINEL_DEFAULT_SECTIONS: &[&str] =
 const ALL_SECTIONS: &[&str] = &[
     "server", "tls", "clients", "memory", "persistence", "stats", "replication", "cpu",
     "module_list", "commandstats", "errorstats", "latencystats", "cluster", "cluster_info",
-    "sentinel", "scriptingengines", "keyspace",
+    "sentinel", "scriptingengines", "keyspace", "hotkeys", "throttling",
 ];
 
 const SENTINEL_ALL_SECTIONS: &[&str] = SENTINEL_DEFAULT_SECTIONS;
@@ -71,6 +71,16 @@ pub(super) fn gen_one(ctx: &mut ServerContext, sec: &str) -> String {
         "cluster_info" => cluster::gen_cluster_info_section(ctx),
         "scriptingengines" => cluster::gen_scriptingengines_section(ctx),
         "debug" => stats::gen_debug_section(ctx),
+        "throttling" => {
+            let throttle = &ctx.replication().throttle;
+            format!("# Throttling\r\ntotal_throttled_commands:{}\r\nrepl_throttle_rate:{:.2}\r\nrepl_throttle_activation_events:{}\r\nrepl_throttle_below_guardrail_secs:{}\r\nrepl_throttle_total_commands:{}\r\n",
+                throttle.total_commands, throttle.rate(), throttle.activation_events,
+                throttle.guardrail_secs(), throttle.total_commands)
+        }
+        "hotkeys" => {
+            let (samples, duration_ms) = ctx.hotkeys().metrics();
+            format!("# Hotkeys\r\nhotkeys_last_window_samples:{samples}\r\nhotkeys_last_window_duration_ms:{duration_ms}\r\n")
+        }
         _ => String::new(),
     }
 }

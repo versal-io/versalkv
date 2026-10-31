@@ -144,6 +144,38 @@ fn add_fake_connection(backend: &mut ServerWorkerState) -> usize {
     backend.connection_registry.insert(conn)
 }
 
+fn start_test_forkless_capture(backend: &mut ServerWorkerState, name: &str) -> std::path::PathBuf {
+    use crate::engine::extension::config::persistence::BgsaveMethod;
+    use crate::foundation::io::store::Robj;
+
+    for index in 0..256 {
+        backend.ctx.db_mut(0).unwrap().set(
+            format!("capture-{index}").into_bytes(),
+            Robj::string_raw(Bytes::from_static(b"value")),
+        );
+    }
+    let dir = std::env::temp_dir().join(format!(
+        "versal-{name}-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    backend.ctx.config_mut().persistence.dir = dir.to_string_lossy().into_owned();
+    backend.ctx.config_mut().persistence.dbfilename = "dump.rdb".to_string();
+    backend.ctx.config_mut().persistence.bgsave_default_method = BgsaveMethod::Forkless;
+    crate::framework::commands::server::save::start_bgsave(&mut backend.ctx).unwrap();
+    assert!(backend.ctx.persistence().forkless_capture_in_progress());
+    dir
+}
+
+fn stop_test_forkless_capture(backend: &mut ServerWorkerState, dir: std::path::PathBuf) {
+    backend
+        .ctx
+        .abort_forkless_save(crate::foundation::io::sys::time::mstime() / 1_000);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 fn take_connection_command_effects(
     backend: &mut ServerWorkerState,
     connection_token: usize,
@@ -156,6 +188,62 @@ fn take_connection_command_effects(
     connection
         .take_command_effects(CommandEffectDrain::Completed)
         .expect("test command effects are drained once")
+}
+
+#[test]
+fn forkless_capture_postpones_potentially_writing_scripts_but_allows_read_only_scripts() {
+    let mut backend = ServerWorkerState::new(1).unwrap();
+    crate::framework::commands::register_all(&mut backend.registry);
+    let connection_token = add_fake_connection(&mut backend);
+    let dir = start_test_forkless_capture(&mut backend, "forkless-script-barrier");
+
+    let script_actions: Vec<_> = [
+        make_args(&[
+            b"EVAL",
+            b"return redis.call('SET', KEYS[1], ARGV[1])",
+            b"1",
+            b"key",
+            b"value",
+        ]),
+        make_args(&[b"FCALL", b"writer", b"1", b"key"]),
+    ]
+    .into_iter()
+    .map(|args| {
+        let spec = backend.registry.lookup(&args.name).unwrap();
+        backend
+            .pre_dispatch_exec(connection_token, meta_from_spec(spec), &args)
+            .action
+    })
+    .collect();
+
+    let args = make_args(&[
+        b"EVAL_RO",
+        b"#!lua flags=no-writes\nreturn redis.call('GET', KEYS[1])",
+        b"1",
+        b"key",
+    ]);
+    let spec = backend.registry.lookup(&args.name).unwrap();
+    let mut meta = meta_from_spec(spec);
+    meta.flags = super::subcmd_flags::effective_command_flags_for_call(
+        spec.name.as_str(),
+        spec.flags,
+        &args,
+        &backend.ctx,
+    );
+    let read_only_action = backend
+        .pre_dispatch_exec(connection_token, meta, &args)
+        .action;
+
+    stop_test_forkless_capture(&mut backend, dir);
+
+    assert_eq!(
+        script_actions,
+        vec![
+            DispatchAction::Postpone(PostponeReason::ForklessKey),
+            DispatchAction::Postpone(PostponeReason::ForklessKey),
+        ]
+    );
+    assert_eq!(read_only_action, DispatchAction::Execute);
 }
 
 #[test]

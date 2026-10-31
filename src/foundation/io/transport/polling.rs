@@ -243,6 +243,7 @@ impl PollingTransportRuntime {
 
     fn polling_event(id: TransportId, interest: Interest) -> Event {
         let event = match interest {
+            Interest::None => Event::none(id.get()),
             Interest::Readable => Event::readable(id.get()),
             Interest::Writable => Event::writable(id.get()),
             Interest::ReadWritable => Event::all(id.get()),
@@ -866,6 +867,15 @@ impl TransportRuntime for PollingTransportRuntime {
         self.registered
             .iter()
             .any(|(_, registered)| tls_has_pending_data(registered))
+    }
+
+    fn is_connection_ready(&self, id: TransportId) -> bool {
+        match self.registered.get(id.get() - 1) {
+            #[cfg(feature = "tls")]
+            Some(Registered::Stream(Stream::Tls(stream))) => stream.ssl().is_init_finished(),
+            Some(Registered::Stream(_)) => true,
+            _ => false,
+        }
     }
 
     fn process_pending_data(&mut self, out: &mut Vec<TransportEvent>) -> usize {

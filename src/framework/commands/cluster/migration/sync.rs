@@ -30,6 +30,16 @@ pub(crate) fn cluster_syncslots(
         return reply;
     }
     if subcommand.eq_ignore_ascii_case(b"finish") {
+        if !conn.import_source()
+            && !matches!(
+                conn.slot_migration_role(),
+                Some(SlotMigrationConnectionRole::Import(_))
+            )
+        {
+            return Value::error(
+                "ERR CLUSTER SYNCSLOTS FINISH should only be used by slot migration clients",
+            );
+        }
         let reply = finish(&args[1..], conn, ctx);
         if !matches!(reply, Value::Error(_)) {
             conn.set_skip_propagate(false);

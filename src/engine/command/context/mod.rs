@@ -58,6 +58,8 @@ pub enum BlockedCmd {
         target_offset: crate::engine::distributed::replication::ReplicationOffset,
     },
     Paused,
+    Forkless,
+    Throttled,
     SlotMigration(crate::engine::distributed::cluster::migration::MigrationJobId),
     Shutdown,
     #[allow(dead_code)]

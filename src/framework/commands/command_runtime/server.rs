@@ -235,6 +235,10 @@ impl CommandRuntime for ServerCommandRuntime<'_> {
         }
         drop(users);
         fail_slot_migrations_for_flush(self.ctx);
+        self.ctx.hotkeys().purge(|id, _| id == db_idx);
+        if self.ctx.db(db_idx).is_some_and(|db| db.dbsize() > 0) {
+            self.ctx.persistence().cancel_forkless_save();
+        }
         let lazyfree = match mode {
             FlushMode::Default => self.ctx.config().server.lazyfree_lazy_user_flush,
             FlushMode::Sync => false,
@@ -284,6 +288,8 @@ impl CommandRuntime for ServerCommandRuntime<'_> {
         }
         drop(users);
         fail_slot_migrations_for_flush(self.ctx);
+        self.ctx.hotkeys().reset();
+        self.ctx.persistence().cancel_forkless_save();
         let lazyfree = match mode {
             FlushMode::Default => self.ctx.config().server.lazyfree_lazy_user_flush,
             FlushMode::Sync => false,
@@ -436,6 +442,7 @@ pub(crate) fn prepare_server_command(
 ) -> (u32, CommandOutcome) {
     let db_idx = conn.selected_db();
     let outcome = {
+        let _scope = ctx.hotkeys_command_scope(args);
         let mut runtime = ServerCommandRuntime::new(conn, ctx);
         handler(&mut runtime, args)
     };

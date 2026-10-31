@@ -1,5 +1,6 @@
 pub mod compression;
 mod encoder;
+pub mod frozen;
 pub mod serialize;
 mod stream;
 #[cfg(test)]
@@ -7,6 +8,7 @@ mod tests;
 
 pub use encoder::{save_millisecond_time, save_string};
 pub(crate) use encoder::{save_raw_string, RdbVecWriter};
+pub(crate) use serialize::save_key_value;
 pub use serialize::{
     serialize_all, serialize_all_with_functions, serialize_all_with_functions_and_replication,
     serialize_all_with_functions_and_replication_and_checksum,

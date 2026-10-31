@@ -923,6 +923,180 @@ fn replicated_transaction_advances_resume_offset_only_after_exec() {
 }
 
 #[test]
+fn forkless_capture_defers_replica_writes_without_reordering_the_stream() {
+    use crate::engine::extension::config::persistence::BgsaveMethod;
+
+    let mut backend = ServerWorkerState::new(1).unwrap();
+    crate::framework::commands::register_all(&mut backend.registry);
+    backend.ctx.replication_mut().switch_to_replica();
+    for index in 0..256 {
+        backend.ctx.db_mut(0).unwrap().set(
+            format!("capture-{index}").into_bytes(),
+            Robj::string_raw(Bytes::from_static(b"value")),
+        );
+    }
+    let dir = std::env::temp_dir().join(format!(
+        "versal-forkless-replica-apply-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    backend.ctx.config_mut().persistence.dir = dir.to_string_lossy().into_owned();
+    backend.ctx.config_mut().persistence.dbfilename = "dump.rdb".to_string();
+    backend.ctx.config_mut().persistence.bgsave_default_method = BgsaveMethod::Forkless;
+    crate::framework::commands::server::save::start_bgsave(&mut backend.ctx).unwrap();
+    assert!(backend.ctx.persistence().forkless_capture_in_progress());
+
+    let (connection_token, main, _peer) = add_live_replay_connection(&mut backend);
+    let mut link = ReplicaLink::streaming(
+        main,
+        MasterInfo {
+            host: "127.0.0.1".to_string(),
+            port: 6379,
+        },
+        "replid".to_string(),
+        offset(0),
+    );
+    let stream = [
+        crate::engine::distributed::replication::protocol::encode_command(&[
+            b"SET",
+            b"replicated",
+            b"first",
+        ]),
+        crate::engine::distributed::replication::protocol::encode_command(&[
+            b"SET",
+            b"replicated",
+            b"second",
+        ]),
+    ]
+    .concat();
+    let (events, _) = link.on_bytes(&stream, 6379).unwrap();
+    let ReplicaEvent::Apply {
+        end_offset: expected_offset,
+        ..
+    } = events.last().cloned().unwrap();
+
+    backend
+        .apply_replica_events(connection_token, &mut link, events)
+        .unwrap();
+    let value_during_capture = backend
+        .ctx
+        .db(0)
+        .unwrap()
+        .get_no_expire(b"replicated")
+        .map(|value| value.as_bytes().to_vec());
+    let applied_during_capture = link.applied_position();
+    let reads_paused_during_capture = backend.replication_runtime.replica_main_read_paused();
+    let pause_interest = backend
+        .transport
+        .last_set_interest_calls_for_test()
+        .last()
+        .copied();
+    backend.replication_runtime.set_replica_link(link);
+    backend.queue_client_reply(Token(main.0), b"ack".to_vec());
+    let queued_ack_interest = backend
+        .transport
+        .last_set_interest_calls_for_test()
+        .last()
+        .copied();
+    backend.handle_writable(Token(main.0));
+    let drained_ack_interest = backend
+        .transport
+        .last_set_interest_calls_for_test()
+        .last()
+        .copied();
+
+    backend
+        .ctx
+        .abort_forkless_save(crate::foundation::io::sys::time::mstime() / 1_000);
+    backend.apply_deferred_replica_events();
+    let value_after_capture = backend
+        .ctx
+        .db(0)
+        .unwrap()
+        .get_no_expire(b"replicated")
+        .map(|value| value.as_bytes().to_vec());
+    let applied_after_capture = backend
+        .replication_runtime
+        .replica_link()
+        .unwrap()
+        .applied_position();
+    let reads_paused_after_capture = backend.replication_runtime.replica_main_read_paused();
+    let _ = std::fs::remove_dir_all(dir);
+
+    assert_eq!(value_during_capture, None);
+    assert_eq!(applied_during_capture, offset(0));
+    assert!(reads_paused_during_capture);
+    assert_eq!(
+        pause_interest,
+        Some((
+            Token(main.0),
+            crate::foundation::io::transport::Interest::None
+        ))
+    );
+    assert_eq!(
+        queued_ack_interest,
+        Some((
+            Token(main.0),
+            crate::foundation::io::transport::Interest::Writable
+        ))
+    );
+    assert_eq!(
+        drained_ack_interest,
+        Some((
+            Token(main.0),
+            crate::foundation::io::transport::Interest::None
+        ))
+    );
+    assert_eq!(value_after_capture, Some(b"second".to_vec()));
+    assert_eq!(applied_after_capture, expected_offset);
+    assert!(!reads_paused_after_capture);
+}
+
+#[test]
+fn replica_hup_drain_applies_a_frame_larger_than_the_fair_read_budget() {
+    let mut backend = ServerWorkerState::new(1).unwrap();
+    crate::framework::commands::register_all(&mut backend.registry);
+    backend.ctx.replication_mut().switch_to_replica();
+    let (connection_token, main, mut peer) = add_live_replay_connection(&mut backend);
+    backend
+        .replication_runtime
+        .set_replica_link(ReplicaLink::streaming(
+            main,
+            MasterInfo {
+                host: "127.0.0.1".to_string(),
+                port: 6379,
+            },
+            "replid".to_string(),
+            offset(0),
+        ));
+    let value = vec![b'x'; crate::runtime::server::worker::NORMAL_CLIENT_READ_BUDGET * 2];
+    let frame = crate::engine::distributed::replication::protocol::encode_command(&[
+        b"SET",
+        b"hup-large",
+        &value,
+    ]);
+    peer.write_all(&frame).unwrap();
+    peer.shutdown(std::net::Shutdown::Write).unwrap();
+    backend
+        .transport
+        .wait_readable_for_test(Token(connection_token));
+
+    backend.recv_replication_stream_after_hup(connection_token, connection_token);
+
+    assert_eq!(
+        backend
+            .ctx
+            .db(0)
+            .unwrap()
+            .get_no_expire(b"hup-large")
+            .map(|value| value.as_bytes().len()),
+        Some(value.len())
+    );
+}
+
+#[test]
 fn replicated_write_for_tracking_import_stays_hidden() {
     let mut backend = ServerWorkerState::new_with_slot_router(1, 14, |key| {
         crate::engine::distributed::cluster::node::key_hash_slot(key) as usize

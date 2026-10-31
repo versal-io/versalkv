@@ -20,7 +20,8 @@ impl ClusterBusManager {
             || node.has_flag(CLUSTER_NODE_HANDSHAKE | CLUSTER_NODE_NOADDR)
             || node.ping_sent == 0
             || now.saturating_sub(node.ping_sent) <= timeout_ms / 2
-            || now.saturating_sub(data_received) <= timeout_ms / 2
+            || (now.saturating_sub(node.ping_sent) <= timeout_ms
+                && now.saturating_sub(data_received) <= timeout_ms / 2)
         {
             return;
         }
@@ -156,6 +157,27 @@ mod tests {
         connection.last_recv = 1_000;
 
         bus.detect_failures(&mut state, 1_501, 1_000);
+
+        assert_eq!(
+            state.pending_link_closes,
+            vec![(node_id, ClusterLinkDirection::To)]
+        );
+    }
+
+    #[test]
+    fn overdue_ping_closes_old_outgoing_link_despite_fresh_inbound_traffic() {
+        let mut bus = ClusterBusManager::new();
+        let (mut state, node_id) = state_with_peer(1_000, 1);
+        bus.register_outgoing_for_node(
+            Token(44),
+            "127.0.0.1:16380".parse().unwrap(),
+            false,
+            node_id.clone(),
+        );
+        bus.connections.get_mut(&44).unwrap().created_at = 500;
+        state.nodes.get_mut(&node_id).unwrap().data_received = 2_000;
+
+        bus.detect_failures(&mut state, 2_001, 1_000);
 
         assert_eq!(
             state.pending_link_closes,

@@ -72,12 +72,14 @@ pub fn set(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> CommandOutco
         ConditionOption::None => true,
         ConditionOption::Nx => old_value.is_none(),
         ConditionOption::Xx => old_value.is_some(),
-        ConditionOption::IfEq => match &old_value {
+        ConditionOption::IfEq | ConditionOption::IfNe => match &old_value {
             Some(object) if object.is_string() => {
-                object.as_bytes() == opts.ifeq_value.as_deref().unwrap_or_default()
+                let is_equal =
+                    object.as_bytes() == opts.comparison_value.as_deref().unwrap_or_default();
+                is_equal == matches!(opts.condition, ConditionOption::IfEq)
             }
             Some(_) => return CommandOutcome::reply(CommandError::wrong_type()),
-            None => false,
+            None => matches!(opts.condition, ConditionOption::IfNe),
         },
     };
     if opts.get && old_value.as_ref().is_some_and(|object| !object.is_string()) {
@@ -153,13 +155,14 @@ enum ConditionOption {
     Nx,
     Xx,
     IfEq,
+    IfNe,
 }
 struct SetOptions {
     expire: ExpireOption,
     expire_needs_propagation_conversion: bool,
     condition: ConditionOption,
     get: bool,
-    ifeq_value: Option<Vec<u8>>,
+    comparison_value: Option<Vec<u8>>,
 }
 
 fn parse_set_options(options: &[Bytes], now_ms: u64) -> Result<SetOptions, Value> {
@@ -168,7 +171,7 @@ fn parse_set_options(options: &[Bytes], now_ms: u64) -> Result<SetOptions, Value
         expire_needs_propagation_conversion: false,
         condition: ConditionOption::None,
         get: false,
-        ifeq_value: None,
+        comparison_value: None,
     };
     let mut index = 0;
     while index < options.len() {
@@ -222,13 +225,17 @@ fn parse_set_options(options: &[Bytes], now_ms: u64) -> Result<SetOptions, Value
                 parsed.get = true;
                 index += 1;
             }
-            "IFEQ" => {
+            "IFEQ" | "IFNE" => {
                 if !matches!(parsed.condition, ConditionOption::None) || index + 1 >= options.len()
                 {
                     return Err(CommandError::syntax_error());
                 }
-                parsed.condition = ConditionOption::IfEq;
-                parsed.ifeq_value = Some(options[index + 1].to_vec());
+                parsed.condition = if option == "IFEQ" {
+                    ConditionOption::IfEq
+                } else {
+                    ConditionOption::IfNe
+                };
+                parsed.comparison_value = Some(options[index + 1].to_vec());
                 index += 2;
             }
             _ => return Err(CommandError::syntax_error()),

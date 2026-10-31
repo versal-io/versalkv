@@ -100,6 +100,10 @@ impl Server {
                 std::process::exit(1);
             }
         }
+        if let Err(error) = backend.ctx.config().persistence.validate_bgsave_method() {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
         crate::engine::extension::acl::set_acl_log_max_len(
             backend.ctx.config().server.acllog_max_len,
         );

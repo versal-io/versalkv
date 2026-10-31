@@ -338,7 +338,7 @@ fn restarting_primary_waits_before_it_can_vote() {
 fn promoted_replica_keeps_master_shard_id() {
     let mut state = ClusterState::new("127.0.0.1", 6380, 16380);
     state.myself.flags &= !CLUSTER_NODE_PRIMARY;
-    state.myself.flags |= CLUSTER_NODE_REPLICA;
+    state.myself.flags |= CLUSTER_NODE_REPLICA | CLUSTER_NODE_MY_PRIMARY_FAIL;
     let master_id = "mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm";
     let shard_id = "ssssssssssssssssssssssssssssssssssssssss";
     state.myself.replicaof = master_id.to_string();
@@ -360,6 +360,7 @@ fn promoted_replica_keeps_master_shard_id() {
     assert!(state.promote_self_to_primary(1_000));
     assert_eq!(state.myself.shard_id, shard_id);
     assert!(state.myself.is_primary());
+    assert!(!state.myself.has_flag(CLUSTER_NODE_MY_PRIMARY_FAIL));
     assert!(state.myself.slots[7]);
 }
 
@@ -445,6 +446,64 @@ mod automatic {
             siblings: vec![local],
             manual: false,
         }
+    }
+
+    #[test]
+    fn negative_votes_deduplicate_and_ignore_older_epochs() {
+        let mut failover = AutomaticFailover::default();
+        let mut election = facts(1_000);
+        election.voting_primaries = 7;
+        failover.on_tick(&election);
+        failover.on_tick(&election);
+        assert_eq!(failover.on_vote_nack(node_id(b'a'), 9, 7, 1), None);
+        assert_eq!(failover.on_vote_nack(node_id(b'a'), 10, 7, 1), Some(false));
+        assert_eq!(failover.on_vote_nack(node_id(b'a'), 10, 7, 1), None);
+        assert_eq!(failover.on_vote_nack(node_id(b'b'), 10, 7, 1), Some(false));
+        assert_eq!(failover.on_vote_nack(node_id(b'c'), 10, 7, 1), Some(true));
+        assert_eq!(failover.phase(), AutomaticFailoverPhase::Idle);
+        assert_eq!(failover.election_epoch(), 0);
+        election.current_epoch = 10;
+        failover.on_tick(&election);
+        failover.on_tick(&election);
+        assert_eq!(failover.election_epoch(), 11);
+        assert_eq!(failover.rejected_voter_count(), 0);
+    }
+
+    #[test]
+    fn failed_voters_reduce_achievable_votes_without_reducing_quorum() {
+        let mut failover = AutomaticFailover::default();
+        let mut election = facts(1_000);
+        election.voting_primaries = 7;
+        failover.on_tick(&election);
+        failover.on_tick(&election);
+        assert_eq!(failover.on_vote_nack(node_id(b'a'), 10, 7, 3), Some(true));
+        assert_eq!(failover.phase(), AutomaticFailoverPhase::Idle);
+    }
+
+    #[test]
+    fn hard_reset_preserves_a_pending_forced_election_epoch() {
+        let mut state =
+            crate::engine::distributed::cluster::ClusterState::new("127.0.0.1", 6379, 16379);
+        state.automatic_failover.set_debug_epoch(Some(99));
+        state.reset_hard("127.0.0.1", 6379, 16379);
+        state.automatic_failover.on_tick(&facts(1_000));
+        state.automatic_failover.on_tick(&facts(1_000));
+        assert_eq!(state.automatic_failover.election_epoch(), 99);
+    }
+
+    #[test]
+    fn forced_election_epoch_is_consumed_once() {
+        let mut failover = AutomaticFailover::default();
+        failover.set_debug_epoch(Some(99));
+        failover.on_tick(&facts(1_000));
+        failover.on_tick(&facts(1_000));
+        assert_eq!(failover.election_epoch(), 99);
+        failover.reset();
+        let mut next = facts(2_000);
+        next.current_epoch = 100;
+        failover.on_tick(&next);
+        failover.on_tick(&next);
+        assert_eq!(failover.election_epoch(), 101);
     }
 
     #[test]

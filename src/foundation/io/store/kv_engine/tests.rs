@@ -19,6 +19,32 @@ fn first_byte_slot(key: &[u8]) -> usize {
 }
 
 #[test]
+fn lazy_flush_does_not_clone_value_owned_by_background_snapshot() {
+    let mut db = Db::new();
+    db.set(
+        b"large".to_vec(),
+        Robj::ListQuicklist(ListValue::from_vecdeque(VecDeque::from(vec![
+            Bytes::from(
+                vec![b'x'; 128]
+            );
+            1_024
+        ]))),
+    );
+    let snapshot = db
+        .snapshot_value_for_background(b"large", 64 * 1024)
+        .unwrap();
+    assert!(snapshot.is_shared());
+
+    let deferred = db.drain_values_for_lazyfree();
+
+    assert!(
+        deferred.is_empty(),
+        "the existing background owner must release the shared value off-thread"
+    );
+    assert!(matches!(snapshot.as_ref(), Robj::ListQuicklist(_)));
+}
+
+#[test]
 fn dbset_resize_budget_is_one_shared_allowance() {
     let mut dbs = DbSet::new(2);
     for db_idx in 0..2 {
@@ -705,4 +731,38 @@ fn flush_discards_pending_expired_deletions() {
     db.flush();
 
     assert!(db.expired_deletions.is_empty());
+}
+
+#[test]
+fn snapshot_handoff_shares_only_large_values_at_the_boundary() {
+    let mut db = Db::new();
+    db.set(
+        b"large".to_vec(),
+        Robj::ListQuicklist(ListValue::from_vecdeque(
+            (0..8_192).map(|_| Bytes::from_static(b"value")).collect(),
+        )),
+    );
+    db.set(b"small".to_vec(), Robj::string("value"));
+
+    let large = db.snapshot_value_for_background(b"large", 1_024).unwrap();
+    let small = db.snapshot_value_for_background(b"small", 1_024).unwrap();
+
+    assert!(
+        large.is_shared(),
+        "large values must be shared only at handoff"
+    );
+    assert!(!small.is_shared(), "small values must remain owned copies");
+    let live = db.get_allow_expired(b"large").unwrap();
+    assert_eq!(
+        large.collection_storage_ptr(),
+        collection_storage_ptr(live),
+        "handoff must not copy the large collection"
+    );
+}
+
+fn collection_storage_ptr(value: &Robj) -> *const () {
+    match value {
+        Robj::ListQuicklist(list) => list.as_slices().0.as_ptr().cast(),
+        _ => std::ptr::null(),
+    }
 }

@@ -4,6 +4,7 @@ use std::collections::HashMap;
 pub mod backlog;
 mod offset;
 pub(crate) mod protocol;
+pub mod throttle;
 pub(crate) use offset::PsyncRequestOffset;
 pub use offset::{BacklogCursor, InvalidReplicationPosition, ReplicationOffset, SnapshotBoundary};
 
@@ -54,6 +55,7 @@ pub enum ReplicationRole {
 
 pub struct ReplicationState {
     pub role: ReplicationRole,
+    pub throttle: throttle::ReplicationThrottle,
     pub repl_seldb: i64,
     pub pending_failover_target: Option<(String, u16)>,
     pub failover_sync_offset: Option<ReplicationOffset>,
@@ -90,6 +92,7 @@ impl ReplicationState {
         let zero = ReplicationOffset::try_from(0).expect("zero is a valid replication offset");
         Self {
             role: ReplicationRole::Primary,
+            throttle: throttle::ReplicationThrottle::default(),
             repl_seldb: -1,
             pending_failover_target: None,
             failover_sync_offset: None,

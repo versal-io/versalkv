@@ -60,6 +60,8 @@ pub struct BusConnection {
     pub handshake_sent: bool,
     /// Whether the connection is established (TCP connected).
     pub connected: bool,
+    /// The accepted transport handshake has been counted exactly once.
+    pub inbound_establishment_counted: bool,
 }
 
 impl BusConnection {
@@ -88,6 +90,7 @@ impl BusConnection {
             events: LinkEvents::READABLE,
             handshake_sent: false,
             connected: false,
+            inbound_establishment_counted: false,
         }
     }
 

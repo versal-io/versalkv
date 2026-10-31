@@ -8,6 +8,7 @@ fn cmd_may_timeout(cmd: &BlockedCmd) -> bool {
     !matches!(
         cmd,
         BlockedCmd::Paused
+            | BlockedCmd::Throttled
             | BlockedCmd::SlotMigration(_)
             | BlockedCmd::Shutdown
             | BlockedCmd::Script

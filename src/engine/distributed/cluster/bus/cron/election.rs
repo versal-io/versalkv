@@ -239,7 +239,13 @@ impl ClusterBusManager {
                     election_epoch,
                     force_ack,
                 } => {
-                    state.advance_current_epoch(election_epoch);
+                    state.current_epoch = election_epoch;
+                    crate::server_log!(
+                        notice,
+                        "Starting a failover election for epoch {}, node config epoch is {}",
+                        election_epoch,
+                        state.myself.config_epoch,
+                    );
                     state.request_config_save();
                     let request =
                         self.build_failover_auth_request(state, election_epoch, force_ack);

@@ -21,6 +21,32 @@ fn make_temp_dir(tag: &str) -> PathBuf {
     dir
 }
 
+fn rdb_key_value_uses_lzf(bytes: &[u8]) -> bool {
+    let key_frame = [0_u8, 3, b'k', b'e', b'y'];
+    bytes
+        .windows(key_frame.len())
+        .position(|window| window == key_frame)
+        .and_then(|offset| bytes.get(offset + key_frame.len()))
+        == Some(&0xC3)
+}
+
+fn dump_value_uses_lzf(reply: &[u8]) -> bool {
+    let Some(header_end) = reply.windows(2).position(|window| window == b"\r\n") else {
+        return false;
+    };
+    let Ok(length) = std::str::from_utf8(&reply[1..header_end])
+        .unwrap_or_default()
+        .parse::<usize>()
+    else {
+        return false;
+    };
+    let payload_start = header_end + 2;
+    reply
+        .get(payload_start..payload_start.saturating_add(length))
+        .and_then(|payload| payload.get(1))
+        == Some(&0xC3)
+}
+
 #[test]
 fn rdb_save_and_recover() {
     let dir = make_temp_dir("recover");
@@ -128,7 +154,7 @@ fn rdbcompression_config_changes_bgsave_lzf_encoding() {
         }
         let bytes = std::fs::read(server.data_dir().join("dump.rdb")).expect("read saved RDB");
         assert_eq!(
-            bytes[..bytes.len() - 8].contains(&0xC3),
+            rdb_key_value_uses_lzf(&bytes[..bytes.len() - 8]),
             expect_lzf,
             "rdbcompression {compression:?} produced an unexpected RDB encoding"
         );
@@ -155,7 +181,7 @@ fn rdbcompression_config_changes_dump_encoding() {
         );
         let dump = client.command(&[b"DUMP", b"key"]);
         assert_eq!(
-            dump.contains(&0xC3),
+            dump_value_uses_lzf(&dump),
             expect_lzf,
             "rdbcompression {compression:?} produced an unexpected DUMP encoding"
         );

@@ -11,7 +11,7 @@ pub struct RdbSnapshot;
 /// C Valkey's RIO autosync threshold used by both RDB save and AOF rewrite.
 pub const RDB_AUTOSYNC_BYTES: usize = 32 * 1024 * 1024;
 
-fn write_with_incremental_sync<W, F>(
+pub(super) fn write_with_incremental_sync<W, F>(
     writer: &mut W,
     bytes: &[u8],
     incremental_sync: bool,

@@ -56,6 +56,7 @@ impl ServerWorkerState {
         // ready and time phases. Settle them at the same beforeSleep boundary
         // C uses for CLUSTER_TODO_HANDLE_FAILOVER.
         self.finish_cluster_bus_receive_batch();
+        self.poll_cluster_config_saves();
         if let Some(state) = self.ctx.cluster_state_mut().as_deref_mut() {
             state.recompute_state_if_dirty();
         }
@@ -76,6 +77,7 @@ impl ServerWorkerState {
     pub(crate) fn run_before_poll_phase(&mut self) -> std::io::Result<LoopControl> {
         #[cfg(test)]
         self.trace_turn_for_test(TurnTracePoint::BeforePoll);
+        self.poll_cluster_config_saves();
         self.register_active_persistence_child();
         self.collect_child_completion_events();
         if self.drain_pending_input() {
@@ -186,6 +188,17 @@ impl ServerWorkerState {
             RuntimeTimeEvent::EvictionContinuation => {
                 self.run_eviction();
                 TimeEventAction::Delete
+            }
+            RuntimeTimeEvent::ReplicationThrottle => {
+                self.adjust_replication_throttle();
+                self.release_throttled_clients();
+                if self.ctx.throttled_clients().is_empty() {
+                    TimeEventAction::Delete
+                } else {
+                    TimeEventAction::RescheduleAfter(
+                        self.ctx.replication_mut().throttle.release_delay(),
+                    )
+                }
             }
             RuntimeTimeEvent::BlockedTimeout | RuntimeTimeEvent::ReplicationReconnect => {
                 TimeEventAction::Delete

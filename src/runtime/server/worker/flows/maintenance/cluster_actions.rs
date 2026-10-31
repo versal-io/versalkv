@@ -618,6 +618,7 @@ mod tests {
 
         runtime.apply_pending_cluster_role_actions();
 
+        runtime.drain_cluster_config_saves().unwrap();
         assert!(runtime.cluster_config.last_best_effort_warning_ms > 0);
         std::fs::remove_dir_all(dir).unwrap();
     }

@@ -5,7 +5,7 @@ use crate::foundation::io::protocol::Value;
 use crate::framework::capabilities::io::Token;
 use crate::framework::CommandSpec;
 use crate::runtime::server::worker::flows::request::dispatch::{
-    CmdPreconditions, DispatchAction, DispatchOutcome,
+    CmdPreconditions, DispatchAction, DispatchOutcome, PostponeReason,
 };
 use bytes::Bytes;
 
@@ -139,17 +139,37 @@ impl ServerWorkerState {
                 outcome.reject_reply.unwrap_or_else(Value::null),
                 true,
             ),
-            DispatchAction::Postpone(_) => {
+            DispatchAction::Postpone(reason) => {
+                use crate::framework::capabilities::connection::BlockedCmd;
+                let is_throttled = reason == PostponeReason::ReplicationThrottle;
+                let is_forkless = reason == PostponeReason::ForklessKey;
+                let cmd = match reason {
+                    PostponeReason::ClientPause => BlockedCmd::Paused,
+                    PostponeReason::ForklessKey => BlockedCmd::Forkless,
+                    PostponeReason::ReplicationThrottle => BlockedCmd::Throttled,
+                    PostponeReason::SlotMigration(job_id) => BlockedCmd::SlotMigration(job_id),
+                };
                 let conn = &mut self.connection_registry[input.token];
-                conn.postpone_transaction_command(input.args);
-                self.ctx.paused_clients_mut().insert(input.token);
+                conn.postpone_transaction_command_for(cmd, input.args);
+                if is_throttled {
+                    self.ctx.throttled_clients_mut().insert(input.token);
+                } else {
+                    self.ctx.paused_clients_mut().insert(input.token);
+                    if is_forkless {
+                        self.ctx.forkless_clients_mut().insert(input.token);
+                    }
+                }
                 if let Some(info) = self.ctx.client_info_mut(input.token.0) {
+                    let flag = if is_throttled { 'h' } else { 'b' };
                     info.flags.retain(|flag| flag != 'N');
-                    if !info.flags.contains('b') {
-                        info.flags.push('b');
+                    if !info.flags.contains(flag) {
+                        info.flags.push(flag);
                     }
                 }
                 conn.cmd_count = conn.cmd_count.saturating_sub(1);
+                if is_throttled {
+                    self.schedule_replication_throttle();
+                }
                 false
             }
             DispatchAction::Execute => false,

@@ -20,6 +20,8 @@ use std::time::Instant;
 enum ExecDecision {
     Execute,
     Postpone,
+    ForklessPostpone,
+    Throttled,
     WithoutTransaction,
     RouteRejected(Value),
     WatchedKeyChanged,
@@ -37,6 +39,7 @@ struct ExecDecisionInputs {
     standalone: StandaloneExecDecision,
     prechecks: ExecPrechecks,
     should_pause: bool,
+    should_pause_for_forkless: bool,
 }
 
 struct ExecExecution {
@@ -132,15 +135,24 @@ impl ServerWorkerState {
         }
         let prechecks = self.exec_compute_prechecks(token.0);
         let should_pause = self.exec_should_pause(token.0);
-        self.decide_exec(
+        let should_pause_for_forkless = self.exec_should_pause_for_forkless(token);
+        let decision = self.decide_exec(
             token,
             ExecDecisionInputs {
                 cluster_route_error,
                 standalone,
                 prechecks,
                 should_pause,
+                should_pause_for_forkless,
             },
-        )
+        );
+        if matches!(decision, ExecDecision::Execute)
+            && self.should_throttle_command(token, self.exec_command_flags(token.0))
+        {
+            ExecDecision::Throttled
+        } else {
+            decision
+        }
     }
 
     fn decide_exec(&self, token: Token, inputs: ExecDecisionInputs) -> ExecDecision {
@@ -173,6 +185,9 @@ impl ServerWorkerState {
         }
         if inputs.should_pause {
             return ExecDecision::Postpone;
+        }
+        if inputs.should_pause_for_forkless {
+            return ExecDecision::ForklessPostpone;
         }
         ExecDecision::Execute
     }
@@ -212,7 +227,32 @@ impl ServerWorkerState {
         match decision {
             ExecDecision::Execute => self.execute_queued_transaction(context, effects),
             ExecDecision::Postpone => {
-                self.block_exec(context.target.token());
+                self.block_exec(
+                    context.target.token(),
+                    crate::framework::capabilities::connection::BlockedCmd::Paused,
+                );
+                ExecExecution::blocked()
+            }
+            ExecDecision::ForklessPostpone => {
+                let token = context.target.token();
+                self.block_exec(
+                    token,
+                    crate::framework::capabilities::connection::BlockedCmd::Forkless,
+                );
+                self.ctx.forkless_clients_mut().insert(token);
+                ExecExecution::blocked()
+            }
+            ExecDecision::Throttled => {
+                let token = context.target.token();
+                self.connection_registry[token].postpone_transaction_command_for(
+                    crate::framework::capabilities::connection::BlockedCmd::Throttled,
+                    &crate::engine::command::CommandArgs {
+                        name: Bytes::from_static(b"EXEC"),
+                        args: Vec::new(),
+                    },
+                );
+                self.ctx.throttled_clients_mut().insert(token);
+                self.schedule_replication_throttle();
                 ExecExecution::blocked()
             }
             ExecDecision::WithoutTransaction => ExecExecution::completed(
@@ -238,12 +278,21 @@ impl ServerWorkerState {
         self.connection_registry[token].transaction.end(end);
     }
 
-    fn block_exec(&mut self, token: Token) {
+    fn block_exec(
+        &mut self,
+        token: Token,
+        reason: crate::framework::capabilities::connection::BlockedCmd,
+    ) {
         let connection = &mut self.connection_registry[token];
-        connection.postpone_transaction_command(&crate::engine::command::CommandArgs {
+        let args = crate::engine::command::CommandArgs {
             name: Bytes::from_static(b"EXEC"),
             args: Vec::new(),
-        });
+        };
+        if reason == crate::framework::capabilities::connection::BlockedCmd::Paused {
+            connection.postpone_transaction_command(&args);
+        } else {
+            connection.postpone_transaction_command_for(reason, &args);
+        }
         self.ctx.paused_clients_mut().insert(token);
     }
 
@@ -412,22 +461,7 @@ impl ServerWorkerState {
         {
             return StandaloneExecDecision::Allow;
         }
-        let command_flags = self.connection_registry
-            [crate::framework::capabilities::io::Token(connection_token)]
-        .transaction
-        .queued_commands()
-        .iter()
-        .fold(0, |flags, command| {
-            flags
-                | self.registry.lookup(&command.name).map_or(0, |spec| {
-                    super::super::dispatch::subcmd_flags::effective_command_flags_for_call(
-                        spec.name.as_str(),
-                        spec.flags,
-                        command,
-                        &self.ctx,
-                    )
-                })
-        });
+        let command_flags = self.exec_command_flags(connection_token);
         let outcome = self.standalone_replica_redirect_outcome(
             connection_token,
             command_flags,
@@ -439,5 +473,23 @@ impl ServerWorkerState {
             Some((DispatchAction::Postpone(_), _)) => StandaloneExecDecision::Postpone,
             Some((DispatchAction::Execute, _)) | None => StandaloneExecDecision::Allow,
         }
+    }
+
+    fn exec_command_flags(&self, connection_token: usize) -> u64 {
+        self.connection_registry[crate::framework::capabilities::io::Token(connection_token)]
+            .transaction
+            .queued_commands()
+            .iter()
+            .fold(0, |flags, command| {
+                flags
+                    | self.registry.lookup(&command.name).map_or(0, |spec| {
+                        super::super::dispatch::subcmd_flags::effective_command_flags_for_call(
+                            spec.name.as_str(),
+                            spec.flags,
+                            command,
+                            &self.ctx,
+                        )
+                    })
+            })
     }
 }

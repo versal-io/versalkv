@@ -113,6 +113,15 @@ fn apply_config_set_one_with_exec(
         return Ok(());
     }
     let old_dual_channel = ctx.config().replication.dual_channel_replication;
+    if param == "bgsave-default-method"
+        && val_trimmed.eq_ignore_ascii_case("forkless")
+        && !ctx.config().persistence.forkless_infrastructure_enabled
+    {
+        return Err(
+            "'forkless' can only be selected when the server was started with 'forkless-infrastructure-enabled yes'"
+                .to_string(),
+        );
+    }
     if param == "loglevel" {
         let level = match val_trimmed.to_lowercase().as_str() {
             "debug" => log::LevelFilter::Debug,
@@ -129,6 +138,9 @@ fn apply_config_set_one_with_exec(
     }
     if let Some(result) = config_registry().try_set(ctx.config_mut(), param, val_trimmed) {
         result?;
+        if param.starts_with("hotkeys-") {
+            ctx.configure_hotkeys(true);
+        }
         if matches!(
             param,
             "maxmemory-policy" | "lfu-log-factor" | "lfu-decay-time"

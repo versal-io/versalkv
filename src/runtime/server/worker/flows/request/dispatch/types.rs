@@ -56,6 +56,8 @@ pub(crate) enum DispatchAction {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PostponeReason {
     ClientPause,
+    ForklessKey,
+    ReplicationThrottle,
     SlotMigration(crate::engine::distributed::cluster::migration::MigrationJobId),
 }
 

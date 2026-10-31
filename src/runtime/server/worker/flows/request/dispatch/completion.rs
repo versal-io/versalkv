@@ -257,7 +257,13 @@ impl ServerWorkerState {
                 BlockedCmd::Wait { .. } | BlockedCmd::WaitAof { .. }
             );
         }
-        if !matches!(blocked.cmd, BlockedCmd::Paused | BlockedCmd::Shutdown) {
+        if !matches!(
+            blocked.cmd,
+            BlockedCmd::Paused
+                | BlockedCmd::Forkless
+                | BlockedCmd::Throttled
+                | BlockedCmd::Shutdown
+        ) {
             self.ctx.blocking_registry_mut().register_client(
                 connection.selected_db,
                 &blocked.keys,
@@ -487,7 +493,13 @@ fn connection_info_flags(
     if connection.monitoring {
         flags.push('O');
     }
-    if connection.blocked.is_some() {
+    if connection
+        .blocked
+        .as_ref()
+        .is_some_and(|blocked| matches!(blocked.cmd, BlockedCmd::Throttled))
+    {
+        flags.push('h');
+    } else if connection.blocked.is_some() {
         flags.push('b');
     }
     if connection.no_touch || flags.is_empty() {

@@ -131,6 +131,7 @@ pub struct Connection {
     pub deny_blocking: bool,
     /// One-shot permission armed by ASKING for the next command.
     pub asking: bool,
+    pub(crate) throttle_checked: bool,
     /// Cumulative network input bytes (tot-net-in)
     pub tot_net_in: u64,
     /// Cumulative network output bytes (tot-net-out)
@@ -221,6 +222,7 @@ impl Connection {
             readonly: false,
             deny_blocking: false,
             asking: false,
+            throttle_checked: false,
             tot_net_in: 0,
             tot_net_out: 0,
             cmd_count: 0,
@@ -263,6 +265,7 @@ impl Connection {
         if self.blocked.is_none() {
             self.command_cycle.discard_effects();
             self.command_cycle.finish_accounting();
+            self.throttle_checked = false;
         }
     }
 
@@ -835,9 +838,17 @@ impl Connection {
     }
 
     pub(crate) fn postpone_transaction_command(&mut self, orig_args: &CommandArgs) {
+        self.postpone_transaction_command_for(BlockedCmd::Paused, orig_args);
+    }
+
+    pub(crate) fn postpone_transaction_command_for(
+        &mut self,
+        cmd: BlockedCmd,
+        orig_args: &CommandArgs,
+    ) {
         let req_bytes = self.request_bytes_current_command();
         self.retire_command_attempt_for_postpone();
-        self.install_blocked_state(BlockedCmd::Paused, Vec::new(), 0, orig_args, req_bytes);
+        self.install_blocked_state(cmd, Vec::new(), 0, orig_args, req_bytes);
     }
 
     fn install_blocked_state(
@@ -916,6 +927,7 @@ impl Connection {
             readonly: false,
             deny_blocking: false,
             asking: false,
+            throttle_checked: false,
             tot_net_in: 0,
             tot_net_out: 0,
             cmd_count: 0,

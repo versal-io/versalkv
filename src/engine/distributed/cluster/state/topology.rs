@@ -342,7 +342,7 @@ impl ClusterState {
         let debug = self.debug_snapshot();
         let cluster_size = self.size;
         let (npfail, nfail, vpfail, vfail) = self.node_failure_counts();
-        format!(
+        let mut info = format!(
             "cluster_state:{}\r\n\
              cluster_slots_assigned:{}\r\n\
              cluster_slots_ok:{}\r\n\
@@ -352,6 +352,8 @@ impl ClusterState {
              cluster_size:{}\r\n\
              cluster_current_epoch:{}\r\n\
              cluster_my_epoch:{}\r\n\
+             cluster_config_save_status:{}\r\n\
+             cluster_config_last_save_time:{}\r\n\
              cluster_stats_messages_ping_sent:{}\r\n\
              cluster_stats_messages_pong_sent:{}\r\n\
              cluster_stats_messages_meet_sent:{}\r\n\
@@ -374,7 +376,9 @@ impl ClusterState {
              cluster_nodes_fail:{}\r\n\
              cluster_voting_nodes_pfail:{}\r\n\
              cluster_voting_nodes_fail:{}\r\n\
-             total_cluster_links_buffer_limit_exceeded:{}\r\n",
+             total_cluster_links_buffer_limit_exceeded:{}\r\n\
+             total_cluster_links_established_inbound:{}\r\n\
+             total_cluster_links_established_outbound:{}\r\n",
             match debug.health {
                 ClusterHealth::Ok => "ok",
                 ClusterHealth::Fail => "fail",
@@ -385,6 +389,12 @@ impl ClusterState {
             cluster_size,
             debug.current_epoch,
             self.myself.config_epoch,
+            if self.config_save_succeeded {
+                "ok"
+            } else {
+                "err"
+            },
+            self.config_last_save_time_sec,
             self.bus_messages_sent(crate::engine::distributed::cluster::msg::ClusterMsgType::Ping,),
             self.bus_messages_sent(crate::engine::distributed::cluster::msg::ClusterMsgType::Pong,),
             self.bus_messages_sent(crate::engine::distributed::cluster::msg::ClusterMsgType::Meet,),
@@ -422,7 +432,21 @@ impl ClusterState {
             vpfail,
             vfail,
             self.links_buffer_limit_exceeded(),
-        )
+            self.bus_stats.links_established_inbound,
+            self.bus_stats.links_established_outbound,
+        );
+        let kind = crate::engine::distributed::cluster::msg::ClusterMsgType::FailoverAuthNack;
+        for (direction, count) in [
+            ("sent", self.bus_messages_sent(kind)),
+            ("received", self.bus_messages_received(kind)),
+        ] {
+            if count != 0 {
+                info.push_str(&format!(
+                    "cluster_stats_messages_auth-nack_{direction}:{count}\r\n"
+                ));
+            }
+        }
+        info
     }
 
     /// Bump the local config epoch without consensus, always remaining above
@@ -492,6 +516,8 @@ impl ClusterState {
         let master_ip = master.ip().to_string();
         let master_port = master.port();
         let master_shard_id = master.shard_id.clone();
+        let is_primary_failed =
+            master.has_flag(crate::engine::distributed::cluster::node::CLUSTER_NODE_FAIL);
         let previous_primary = self.myself.replicaof.clone();
 
         let me = short_name(&self.myself.name);
@@ -515,6 +541,11 @@ impl ClusterState {
         self.myself.flags |= CLUSTER_NODE_REPLICA;
         self.myself.replicaof = master_id_str.clone();
         self.myself.shard_id = master_shard_id;
+        self.clear_local_primary_failure_view();
+        if is_primary_failed {
+            self.myself.flags |=
+                crate::engine::distributed::cluster::node::CLUSTER_NODE_MY_PRIMARY_FAIL;
+        }
         // C clusterSetPrimary zeroes failover_auth_time whenever the node
         // follows a primary: a quorum collected for the old lineage must not
         // promote this node after the reparent commits.
@@ -599,6 +630,7 @@ impl ClusterState {
         let previously_served = self.served_shard_slots();
         self.myself.flags &= !(CLUSTER_NODE_REPLICA | CLUSTER_NODE_MIGRATE_TO);
         self.myself.flags |= CLUSTER_NODE_PRIMARY;
+        self.clear_local_primary_failure_view();
         self.myself.replicaof.clear();
         self.myself.shard_id = generate_node_id();
         let local_id = self.myself.name.clone();

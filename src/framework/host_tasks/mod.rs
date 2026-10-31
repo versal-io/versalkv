@@ -15,4 +15,5 @@ pub(crate) enum PreparedHostTask {
     Lua(LuaTask),
     DebugRdb(DebugRdbTask),
     DebugAof(DebugAofTask),
+    DrainClusterConfig,
 }

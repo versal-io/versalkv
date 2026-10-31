@@ -64,8 +64,8 @@ pub const CLUSTER_FAIL: i32 = 1;
 
 #[derive(Default)]
 pub(super) struct ClusterBusStats {
-    pub(super) messages_sent: [u64; 11],
-    pub(super) messages_received: [u64; 11],
+    pub(super) messages_sent: [u64; 12],
+    pub(super) messages_received: [u64; 12],
     pub(super) total_bytes_sent: u64,
     pub(super) total_bytes_received: u64,
     pub(super) pubsub_bytes_sent: u64,
@@ -74,6 +74,8 @@ pub(super) struct ClusterBusStats {
     pub(super) module_bytes_received: u64,
     pub(super) link_memory: usize,
     pub(super) links_buffer_limit_exceeded: u64,
+    pub(super) links_established_inbound: u64,
+    pub(super) links_established_outbound: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,6 +98,8 @@ pub struct ClusterState {
     pub(crate) state: i32,
     /// Number of primary nodes with at least one slot.
     pub(crate) size: usize,
+    pub(crate) config_save_succeeded: bool,
+    pub(crate) config_last_save_time_sec: i64,
     /// Assigned slots bitmask.
     pub(crate) slots: Vec<bool>,
     /// Canonical ownership, deletion barriers, withdrawals and open-slot links.
@@ -178,6 +182,8 @@ impl ClusterState {
             last_vote_epoch: 0,
             state: CLUSTER_FAIL,
             size: 0,
+            config_save_succeeded: true,
+            config_last_save_time_sec: crate::foundation::io::sys::time::mstime() / 1_000,
             slots,
             slot_ownership: SlotOwnershipTable::new(),
             migrations: MigrationRegistry::default(),
@@ -359,6 +365,15 @@ impl ClusterState {
             .saturating_add(count as u64);
     }
 
+    pub(crate) fn record_link_established(&mut self, direction: ClusterLinkDirection) {
+        let counter = match direction {
+            ClusterLinkDirection::From => &mut self.bus_stats.links_established_inbound,
+            ClusterLinkDirection::To => &mut self.bus_stats.links_established_outbound,
+            ClusterLinkDirection::All => return,
+        };
+        *counter = counter.saturating_add(1);
+    }
+
     pub(crate) fn insert_node(&mut self, node: ClusterNode) -> Option<ClusterNode> {
         let node_id = node.name.clone();
         let previous = self.nodes.insert(node_id.clone(), node);
@@ -396,6 +411,12 @@ impl ClusterState {
     }
 
     pub(crate) fn commit_direct_sender_observation(&mut self, node: ClusterNode) {
+        if self.myself.is_replica()
+            && self.myself.replicaof == node.name
+            && !node.has_flag(crate::engine::distributed::cluster::node::CLUSTER_NODE_FAIL)
+        {
+            self.clear_local_primary_failure_view();
+        }
         self.replace_known_node(node);
     }
 
@@ -441,6 +462,9 @@ impl ClusterState {
         };
         if let Some(node) = self.nodes.get_mut(node_id) {
             node.flags &= !(CLUSTER_NODE_NOADDR | CLUSTER_NODE_FAIL | CLUSTER_NODE_PFAIL);
+        }
+        if self.myself.is_replica() && self.myself.replicaof == node_id {
+            self.clear_local_primary_failure_view();
         }
     }
 
@@ -840,6 +864,9 @@ impl ClusterState {
         new_self.myself.cluster_replica_priority = self.myself.cluster_replica_priority;
         new_self.gossip_percentage = self.gossip_percentage;
         new_self.bus_stats.link_memory = self.bus_stats.link_memory;
+        new_self.config_save_succeeded = self.config_save_succeeded;
+        new_self.config_last_save_time_sec = self.config_last_save_time_sec;
+        new_self.automatic_failover = self.automatic_failover.create_reset_state();
         new_self.topology_generation = next_generation;
         *self = new_self;
         self.pending_link_closes = previous_nodes
@@ -1459,6 +1486,7 @@ fn debug_packet_type(message_type: ClusterMsgType) -> i64 {
         ClusterMsgType::MfStart => 8,
         ClusterMsgType::Module => 9,
         ClusterMsgType::PublishShard => 10,
+        ClusterMsgType::FailoverAuthNack => 11,
     }
 }
 
@@ -1863,6 +1891,18 @@ mod tests {
         assert!(state.pending_connects.is_empty());
         assert!(state.expire_handshake_nodes(3_002, 1_000).is_empty());
         assert!(state.pending_connects.is_empty());
+    }
+
+    #[test]
+    fn hard_reset_preserves_config_save_status_until_an_actual_save_completes() {
+        let mut state = ClusterState::new("127.0.0.1", 6379, 16379);
+        state.config_save_succeeded = false;
+        state.config_last_save_time_sec = 123456;
+
+        state.reset_hard("127.0.0.1", 6379, 16379);
+
+        assert!(!state.config_save_succeeded);
+        assert_eq!(state.config_last_save_time_sec, 123456);
     }
 
     #[test]

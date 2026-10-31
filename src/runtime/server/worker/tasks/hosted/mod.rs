@@ -52,6 +52,12 @@ impl ServerWorkerState {
         task: crate::framework::host_tasks::PreparedHostTask,
     ) -> crate::foundation::io::protocol::Value {
         match task {
+            crate::framework::host_tasks::PreparedHostTask::DrainClusterConfig => {
+                match self.drain_cluster_config_saves() {
+                    Ok(()) => Value::ok(),
+                    Err(error) => Value::error(format!("ERR {error}")),
+                }
+            }
             crate::framework::host_tasks::PreparedHostTask::Lua(mut task) => {
                 self.ctx.enter_script(task.control());
                 let result = self
@@ -265,6 +271,7 @@ impl ServerWorkerState {
         args: crate::framework::CommandArgs,
         scope: HostTaskScope,
     ) -> Result<(), String> {
+        let _suppression = crate::foundation::memory::key_access::KeyAccessSuppression::enter();
         let name = args.name.to_ascii_lowercase();
         let tracking_only = conn.import_source
             && conn.slot_migration_role.is_none()
@@ -369,7 +376,8 @@ impl ServerWorkerState {
             crate::framework::host_tasks::PreparedHostTask::DebugRdb(_) => {
                 Value::error("ERR DEBUG is not valid while loading AOF")
             }
-            crate::framework::host_tasks::PreparedHostTask::DebugAof(_) => {
+            crate::framework::host_tasks::PreparedHostTask::DebugAof(_)
+            | crate::framework::host_tasks::PreparedHostTask::DrainClusterConfig => {
                 Value::error("ERR DEBUG is not valid while loading AOF")
             }
         }

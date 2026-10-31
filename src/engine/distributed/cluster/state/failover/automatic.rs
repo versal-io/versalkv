@@ -86,6 +86,9 @@ pub struct AutomaticFailover {
     propagation_jitter_ms: u64,
     all_replicas_primary_failed: bool,
     voters: HashSet<NodeId>,
+    rejected_voters: HashSet<NodeId>,
+    debug_delay_ms: Option<u64>,
+    debug_epoch: Option<u64>,
     last_vote_epoch: u64,
     deferred_for_competing_epoch: u64,
     phase: AutomaticFailoverPhase,
@@ -101,13 +104,22 @@ impl AutomaticFailover {
         manual: bool,
         all_replicas_primary_failed: bool,
         propagation_jitter_ms: u64,
+        debug_delay_ms: Option<u64>,
     ) -> u64 {
         if manual {
             return 0;
         }
-        let base_delay = (node_timeout_ms / 30).min(500);
-        let delay = failover_election_delay_ms(node_timeout_ms, rank, replication_offset, false)
-            .saturating_add(base_delay.saturating_mul(failed_primary_rank as u64));
+        let base_delay = debug_delay_ms.unwrap_or((node_timeout_ms / 30).min(500));
+        let rank_delay = if debug_delay_ms.is_some() {
+            base_delay
+                .saturating_mul(2)
+                .saturating_mul(rank as u64)
+                .saturating_add(if replication_offset == 0 { 500 } else { 0 })
+        } else {
+            failover_election_delay_ms(node_timeout_ms, rank, replication_offset, false)
+        };
+        let delay =
+            rank_delay.saturating_add(base_delay.saturating_mul(failed_primary_rank as u64));
         let may_start_immediately = rank == 0
             && failed_primary_rank == 0
             && replication_offset != 0
@@ -155,6 +167,14 @@ impl AutomaticFailover {
         self.deadline_ms
     }
 
+    pub fn set_debug_delay_ms(&mut self, delay_ms: Option<u64>) {
+        self.debug_delay_ms = delay_ms;
+    }
+
+    pub fn set_debug_epoch(&mut self, epoch: Option<u64>) {
+        self.debug_epoch = epoch;
+    }
+
     pub fn on_tick(&mut self, facts: &AutomaticFailoverFacts) -> Vec<ClusterAction> {
         if self.phase == AutomaticFailoverPhase::Broadcasting {
             self.reset();
@@ -191,6 +211,8 @@ impl AutomaticFailover {
 
         match self.phase {
             AutomaticFailoverPhase::Idle => {
+                self.voters.clear();
+                self.rejected_voters.clear();
                 let ranked = rank_replicas(&facts.siblings);
                 self.rank = if facts.manual {
                     0
@@ -201,7 +223,11 @@ impl AutomaticFailover {
                         .unwrap_or(ranked.len())
                 };
                 self.propagation_jitter_ms = crate::foundation::io::sys::rand::random_usize(
-                    (facts.node_timeout_ms / 30).min(500) as usize,
+                    if self.debug_delay_ms.is_some() {
+                        0
+                    } else {
+                        (facts.node_timeout_ms / 30).min(500) as usize
+                    },
                 ) as u64;
                 let delay = Self::election_delay_ms(
                     facts.node_timeout_ms,
@@ -211,6 +237,7 @@ impl AutomaticFailover {
                     facts.manual,
                     facts.all_replicas_primary_failed,
                     self.propagation_jitter_ms,
+                    self.debug_delay_ms,
                 );
                 self.deadline_ms = facts
                     .now_ms
@@ -245,6 +272,7 @@ impl AutomaticFailover {
                             false,
                             self.all_replicas_primary_failed,
                             self.propagation_jitter_ms,
+                            self.debug_delay_ms,
                         );
                         let new_delay = Self::election_delay_ms(
                             facts.node_timeout_ms,
@@ -254,6 +282,7 @@ impl AutomaticFailover {
                             false,
                             facts.all_replicas_primary_failed,
                             self.propagation_jitter_ms,
+                            self.debug_delay_ms,
                         );
                         self.deadline_ms = self
                             .deadline_ms
@@ -266,15 +295,18 @@ impl AutomaticFailover {
                 if facts.now_ms < self.deadline_ms {
                     return Vec::new();
                 }
-                let next_epoch = facts.current_epoch.checked_add(1);
-                let Some(next_epoch) = next_epoch.filter(|epoch| *epoch > facts.current_epoch)
-                else {
+                let next_epoch = self
+                    .debug_epoch
+                    .take()
+                    .or_else(|| facts.current_epoch.checked_add(1));
+                let Some(next_epoch) = next_epoch else {
                     self.reset();
                     return Vec::new();
                 };
                 self.election_epoch = next_epoch;
                 self.started_at_ms = facts.now_ms;
                 self.voters.clear();
+                self.rejected_voters.clear();
                 self.phase = AutomaticFailoverPhase::RequestingVotes;
                 vec![ClusterAction::BroadcastFailoverAuthRequest {
                     election_epoch: self.election_epoch,
@@ -302,7 +334,11 @@ impl AutomaticFailover {
                     self.failed_primary_rank = facts.failed_primary_rank;
                     self.all_replicas_primary_failed = facts.all_replicas_primary_failed;
                     self.propagation_jitter_ms = crate::foundation::io::sys::rand::random_usize(
-                        (facts.node_timeout_ms / 30).min(500) as usize,
+                        if self.debug_delay_ms.is_some() {
+                            0
+                        } else {
+                            (facts.node_timeout_ms / 30).min(500) as usize
+                        },
                     ) as u64;
                     let retry_delay = Self::election_delay_ms(
                         facts.node_timeout_ms,
@@ -312,6 +348,7 @@ impl AutomaticFailover {
                         facts.manual,
                         self.all_replicas_primary_failed,
                         self.propagation_jitter_ms,
+                        self.debug_delay_ms,
                     );
                     self.election_epoch = 0;
                     self.voters.clear();
@@ -379,6 +416,60 @@ impl AutomaticFailover {
         ]
     }
 
+    pub fn on_vote_nack(
+        &mut self,
+        voter: NodeId,
+        epoch: u64,
+        voting_primaries: usize,
+        failed_voting_primaries: usize,
+    ) -> Option<bool> {
+        if self.phase != AutomaticFailoverPhase::RequestingVotes
+            || epoch < self.election_epoch
+            || self.voters.contains(&voter)
+            || !self.rejected_voters.insert(voter)
+        {
+            return None;
+        }
+        let quorum = voting_primaries / 2 + 1;
+        let cannot_win = voting_primaries
+            .saturating_sub(failed_voting_primaries)
+            .saturating_sub(self.rejected_voters.len())
+            < quorum;
+        if cannot_win {
+            self.phase = AutomaticFailoverPhase::Idle;
+            self.deadline_ms = 0;
+            self.election_epoch = 0;
+        }
+        Some(cannot_win)
+    }
+
+    pub fn rejected_voter_count(&self) -> usize {
+        self.rejected_voters.len()
+    }
+
+    pub fn vote_rejection_reason(&self, facts: &VoteRequestFacts) -> Option<u8> {
+        if !facts.local_is_voting_primary {
+            return None;
+        }
+        Some(if !facts.safe_to_vote {
+            1
+        } else if facts.request_epoch < facts.current_epoch {
+            2
+        } else if facts.request_epoch <= self.last_vote_epoch.max(facts.persisted_last_vote_epoch) {
+            3
+        } else if !facts.requester_is_replica {
+            4
+        } else if !facts.requester_primary_known {
+            5
+        } else if !facts.requester_primary_failed && !facts.force_ack {
+            6
+        } else if facts.maximum_claimed_slot_epoch > facts.request_config_epoch {
+            7
+        } else {
+            return None;
+        })
+    }
+
     pub fn defer_for_better_replica_election(
         &mut self,
         request_epoch: u64,
@@ -443,10 +534,20 @@ impl AutomaticFailover {
         Vec::new()
     }
 
+    /// Election identity and votes belong to a node; debug controls belong
+    /// to the server and survive a cluster identity reset.
+    pub(crate) fn create_reset_state(&self) -> Self {
+        Self {
+            debug_delay_ms: self.debug_delay_ms,
+            debug_epoch: self.debug_epoch,
+            ..Self::default()
+        }
+    }
+
     pub fn reset(&mut self) {
         *self = Self {
             last_vote_epoch: self.last_vote_epoch,
-            ..Self::default()
+            ..self.create_reset_state()
         };
     }
 }

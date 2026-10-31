@@ -499,7 +499,9 @@ impl ClusterBusManager {
         msg: &ClusterMsg,
         now_ms: i64,
     ) {
-        use crate::engine::distributed::cluster::node::CLUSTER_NODE_MY_PRIMARY_FAIL;
+        use crate::engine::distributed::cluster::node::{
+            CLUSTER_NODE_FAILOVER_AUTH_NACK_SUPPORTED, CLUSTER_NODE_MY_PRIMARY_FAIL,
+        };
 
         let Some(sender) = state.nodes.get_mut(&msg.sender_id) else {
             return;
@@ -507,8 +509,9 @@ impl ClusterBusManager {
         // C updates these fields before dispatching every full-header packet,
         // including FAIL, auth ACK, and publish messages. They describe live
         // observations, not a topology or role transition.
-        sender.flags = (sender.flags & !CLUSTER_NODE_MY_PRIMARY_FAIL)
-            | (msg.flags & CLUSTER_NODE_MY_PRIMARY_FAIL);
+        let observed_flags =
+            CLUSTER_NODE_MY_PRIMARY_FAIL | CLUSTER_NODE_FAILOVER_AUTH_NACK_SUPPORTED;
+        sender.flags = (sender.flags & !observed_flags) | (msg.flags & observed_flags);
         sender.data_received = now_ms;
         if sender.has_flag(CLUSTER_NODE_HANDSHAKE) {
             return;
@@ -595,6 +598,7 @@ impl ClusterBusManager {
         node.repl_offset = msg.repl_offset;
         let dynamic_mask = crate::engine::distributed::cluster::node::CLUSTER_NODE_NOFAILOVER
             | crate::engine::distributed::cluster::node::CLUSTER_NODE_MIGRATE_TO
+            | crate::engine::distributed::cluster::node::CLUSTER_NODE_FAILOVER_AUTH_NACK_SUPPORTED
             | crate::engine::distributed::cluster::node::CLUSTER_NODE_MY_PRIMARY_FAIL;
         node.flags = (node.flags & !dynamic_mask) | (msg.flags & dynamic_mask);
         node.flags != previous_flags || node.endpoints != previous_endpoints
@@ -728,6 +732,7 @@ impl ClusterBusManager {
         let msg = plan.observation.message;
         node.flags |= msg.flags
             & (crate::engine::distributed::cluster::node::CLUSTER_NODE_MY_PRIMARY_FAIL
+                | crate::engine::distributed::cluster::node::CLUSTER_NODE_FAILOVER_AUTH_NACK_SUPPORTED
                 | crate::engine::distributed::cluster::node::CLUSTER_NODE_NOFAILOVER);
         node.endpoints.set_tls_port(msg.tls_port);
         if let Some(shard) = state

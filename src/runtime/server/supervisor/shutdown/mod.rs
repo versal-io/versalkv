@@ -444,6 +444,7 @@ impl crate::runtime::server::worker::ServerWorkerState {
 }
 
 fn kill_children(ctx: &mut ServerContext, now: bool, force: bool) {
+    ctx.abort_forkless_save(crate::foundation::io::sys::time::mstime() / 1_000);
     let dir = ctx.config().persistence.dir.clone();
     match ctx.persistence().child() {
         Some(PersistenceChild::Rdb { pid, .. }) => {

@@ -403,6 +403,13 @@ impl ClusterBusManager {
                 }
                 Err(error) => return Err(error),
             };
+            if conn.is_outgoing && conn.bytes_sent == 0 {
+                // A successful write proves that the nonblocking TCP/TLS
+                // connection completed, including immediate MEET writes.
+                state.record_link_established(
+                    crate::engine::distributed::cluster::ClusterLinkDirection::To,
+                );
+            }
             conn.write_buf.drain(..written);
             if conn.write_buf.is_empty() && conn.write_buf.capacity() > 4096 {
                 conn.write_buf = Vec::with_capacity(4096);

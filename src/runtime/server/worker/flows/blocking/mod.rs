@@ -281,6 +281,7 @@ impl ServerWorkerState {
         db_id: u32,
         blocked: &crate::engine::command::context::BlockedState,
     ) {
+        self.ctx.forkless_clients_mut().shift_remove(&token);
         if matches!(
             blocked.cmd,
             BlockedCmd::Wait { .. } | BlockedCmd::WaitAof { .. } | BlockedCmd::SetSlot { .. }
@@ -288,7 +289,12 @@ impl ServerWorkerState {
             self.ctx
                 .blocking_registry_mut()
                 .unregister_keyless_client(&session);
-        } else if !matches!(blocked.cmd, BlockedCmd::Paused) {
+        } else if matches!(blocked.cmd, BlockedCmd::Throttled) {
+            self.ctx.throttled_clients_mut().shift_remove(&token);
+        } else if !matches!(
+            blocked.cmd,
+            BlockedCmd::Paused | BlockedCmd::Forkless | BlockedCmd::SlotMigration(_)
+        ) {
             self.ctx
                 .blocking_registry_mut()
                 .unregister_client(db_id, &blocked.keys, &session);
@@ -301,7 +307,13 @@ impl ServerWorkerState {
         &mut self,
         blocked: &crate::engine::command::context::BlockedState,
     ) -> Option<CompletedBlockedCommand> {
-        if matches!(blocked.cmd, BlockedCmd::Paused) {
+        if matches!(
+            blocked.cmd,
+            BlockedCmd::Paused
+                | BlockedCmd::Forkless
+                | BlockedCmd::Throttled
+                | BlockedCmd::SlotMigration(_)
+        ) {
             return None;
         }
         let name = String::from_utf8_lossy(&blocked.orig_args.name).to_ascii_lowercase();
