@@ -3,14 +3,35 @@ use crate::foundation::io::store::kv_engine::db::DbValue;
 use crate::foundation::io::store::structure::kvstore::KVStore;
 use crate::foundation::io::store::structure::string::StoredKey;
 use crate::foundation::io::store::Robj;
+use bytes::Bytes;
 use std::collections::HashMap;
+use std::ops::Bound;
+
+/// Exact deadline index: replacing or removing a TTL removes its old entry.
+/// Field-level batches can resume without rescanning hashes or cloning all keys.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct HashFieldExpiry {
+    deadline_ms: u64,
+    key: Bytes,
+    field: Vec<u8>,
+}
+
+impl HashFieldExpiry {
+    fn new(deadline_ms: u64, key: Bytes, field: &[u8]) -> Self {
+        Self {
+            deadline_ms,
+            key,
+            field: field.to_vec(),
+        }
+    }
+}
 
 pub(super) fn hfe_for_each_entry<
     F: FnMut(&[u8], &Robj, Option<u64>, Option<&HashMap<Vec<u8>, u64>>),
 >(
     store: &KVStore<StoredKey, DbValue>,
     expires: &KVStore<StoredKey, u64>,
-    hash_field_expires: &HashMap<Vec<u8>, HashMap<Vec<u8>, u64>>,
+    hash_field_expires: &HashMap<Bytes, HashMap<Vec<u8>, u64>>,
     key_slot: impl Fn(&[u8]) -> usize,
     no_lazy_expire: bool,
     pause_skip_expire: bool,
@@ -98,8 +119,18 @@ mod tests {
 
 impl super::Db {
     pub(super) fn remove_hash_field_expire_internal(&mut self, key: &[u8], field: &[u8]) {
+        let Some((stored_key, _)) = self.hash_field_expires.get_key_value(key) else {
+            return;
+        };
+        let stored_key = stored_key.clone();
         if let Some(fields) = self.hash_field_expires.get_mut(key) {
-            fields.remove(field);
+            if let Some(deadline_ms) = fields.remove(field) {
+                self.hash_field_expiry_index.remove(&HashFieldExpiry::new(
+                    deadline_ms,
+                    stored_key,
+                    field,
+                ));
+            }
             if fields.is_empty() {
                 self.hash_field_expires.remove(key);
                 self.keys_with_volatile_items = self.keys_with_volatile_items.saturating_sub(1);
@@ -108,9 +139,7 @@ impl super::Db {
     }
 
     pub(super) fn clear_hash_field_expires(&mut self, key: &[u8]) {
-        if self.hash_field_expires.remove(key).is_some() {
-            self.keys_with_volatile_items = self.keys_with_volatile_items.saturating_sub(1);
-        }
+        let _ = self.take_hash_field_expires(key);
     }
 
     pub fn check_hash_field_expired(&mut self, key: &[u8], field: &[u8]) -> bool {
@@ -145,9 +174,7 @@ impl super::Db {
             if count_stat {
                 self.lazy_expired_hash_fields += 1;
                 let event = (key.to_vec(), field.to_vec());
-                if !self.pending_hexpired.contains(&event) {
-                    self.pending_hexpired.push(event);
-                }
+                self.pending_hexpired.insert(event);
             }
         }
         expired
@@ -184,9 +211,7 @@ impl super::Db {
             self.lazy_expired_hash_fields += removed;
             for field in expired {
                 let event = (key.to_vec(), field);
-                if !self.pending_hexpired.contains(&event) {
-                    self.pending_hexpired.push(event);
-                }
+                self.pending_hexpired.insert(event);
             }
             let delete_empty =
                 matches!(self.get_hash_object(key), Ok(Some(hash)) if hash.hash_is_empty());
@@ -199,10 +224,18 @@ impl super::Db {
 
     pub fn set_hash_field_expire(&mut self, key: &[u8], field: &[u8], abs_ms: u64) {
         let is_new = !self.hash_field_expires.contains_key(key);
-        self.hash_field_expires
-            .entry(key.to_vec())
-            .or_default()
-            .insert(field.to_vec(), abs_ms);
+        let entry = self.hash_field_expires.entry(Bytes::copy_from_slice(key));
+        // Reuse the canonical map key so every deadline shares its storage.
+        let stored_key = entry.key().clone();
+        if let Some(previous_ms) = entry.or_default().insert(field.to_vec(), abs_ms) {
+            self.hash_field_expiry_index.remove(&HashFieldExpiry::new(
+                previous_ms,
+                stored_key.clone(),
+                field,
+            ));
+        }
+        self.hash_field_expiry_index
+            .insert(HashFieldExpiry::new(abs_ms, stored_key, field));
         if is_new {
             self.keys_with_volatile_items += 1;
         }
@@ -221,7 +254,10 @@ impl super::Db {
 
     /// Return hash keys that currently have at least one field-level TTL.
     pub fn hash_keys_with_volatile_fields(&self) -> Vec<Vec<u8>> {
-        self.hash_field_expires.keys().cloned().collect()
+        self.hash_field_expires
+            .keys()
+            .map(|key| key.to_vec())
+            .collect()
     }
 
     pub fn hash_field_expired(&self, key: &[u8], field: &[u8]) -> bool {
@@ -263,8 +299,15 @@ impl super::Db {
 
     /// Remove and return all field-level TTL metadata for a hash key.
     pub fn take_hash_field_expires(&mut self, key: &[u8]) -> HashMap<Vec<u8>, u64> {
-        match self.hash_field_expires.remove(key) {
-            Some(fields) => {
+        match self.hash_field_expires.remove_entry(key) {
+            Some((stored_key, fields)) => {
+                for (field, &deadline_ms) in &fields {
+                    self.hash_field_expiry_index.remove(&HashFieldExpiry::new(
+                        deadline_ms,
+                        stored_key.clone(),
+                        field,
+                    ));
+                }
                 self.keys_with_volatile_items = self.keys_with_volatile_items.saturating_sub(1);
                 fields
             }
@@ -276,9 +319,62 @@ impl super::Db {
     pub fn set_hash_field_expires_map(&mut self, key: Vec<u8>, fields: HashMap<Vec<u8>, u64>) {
         self.clear_hash_field_expires(&key);
         if !fields.is_empty() {
+            let key = Bytes::from(key);
+            for (field, &deadline_ms) in &fields {
+                self.hash_field_expiry_index.insert(HashFieldExpiry::new(
+                    deadline_ms,
+                    key.clone(),
+                    field,
+                ));
+            }
             self.hash_field_expires.insert(key, fields);
             self.keys_with_volatile_items += 1;
         }
+    }
+
+    /// Visit at most `max_fields` due deadlines and return removed/visited counts.
+    /// Resume across batches so protected keys cannot starve eligible fields.
+    pub(super) fn expire_hash_fields_batch(
+        &mut self,
+        max_fields: usize,
+        should_expire_key: impl Fn(&[u8]) -> bool,
+    ) -> (u64, usize) {
+        if self.no_lazy_expire || self.pause_skip_expire {
+            return (0, 0);
+        }
+        let current_ms = now_ms();
+        let mut removed = 0;
+        let mut visited = 0;
+        for _ in 0..max_fields {
+            let next = match self.hash_field_expiry_cursor.as_ref() {
+                Some(cursor) => self
+                    .hash_field_expiry_index
+                    .range::<HashFieldExpiry, _>((Bound::Excluded(cursor), Bound::Unbounded))
+                    .next(),
+                None => self.hash_field_expiry_index.first(),
+            };
+            let Some(expiry) = next.cloned() else {
+                self.hash_field_expiry_cursor = None;
+                break;
+            };
+            if expiry.deadline_ms > current_ms {
+                self.hash_field_expiry_cursor = None;
+                break;
+            }
+            self.hash_field_expiry_cursor = Some(expiry.clone());
+            visited += 1;
+            if !should_expire_key(&expiry.key) {
+                continue;
+            }
+            if self.check_hash_field_expired(&expiry.key, &expiry.field) {
+                removed += 1;
+                if matches!(self.get_hash_object(&expiry.key), Ok(Some(hash)) if hash.hash_is_empty())
+                {
+                    self.del(&expiry.key);
+                }
+            }
+        }
+        (removed, visited)
     }
 
     pub fn hash_field_expiretime_ms(&mut self, key: &[u8], field: &[u8]) -> i64 {
@@ -311,3 +407,7 @@ impl super::Db {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "hash_field_expiry_tests.rs"]
+mod expiry_index_tests;
