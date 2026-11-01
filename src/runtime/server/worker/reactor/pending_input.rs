@@ -7,14 +7,13 @@ use super::{DispatchContext, DispatchOutcome, ReadinessEvent, ReadinessOrigin, R
 
 impl ServerWorkerState {
     pub(crate) fn processable_classic_replica_input_token(&self) -> Option<Token> {
-        if self.ctx.is_script_busy() {
-            return None;
-        }
         let link = self.replication_runtime.replica_link()?;
         let token = Token(link.connection_id().0);
         (link.has_buffered_input()
-            && link.has_pending_rdb_receive()
-            && !link.is_dual_rdb_mode_active()
+            && (link.has_pending_decompression()
+                || (!self.ctx.is_script_busy()
+                    && link.has_pending_rdb_receive()
+                    && !link.is_dual_rdb_mode_active()))
             && matches!(
                 self.replication_runtime.role(ConnectionId(token.0)),
                 Some(ReplicationConnection::Replica)
@@ -40,7 +39,7 @@ impl ServerWorkerState {
                 });
             }
         }
-        events.sort_by_key(|event| !self.is_master_link(event.token.0));
+        events.sort_by_key(|event| !self.is_priority_connection(event.token));
         events
     }
 

@@ -62,6 +62,7 @@ impl ServerWorkerState {
             duration_us,
             was_blocked_before,
             connection_token,
+            effects,
         ) {
             return CommandDisposition::Blocked;
         }
@@ -178,6 +179,7 @@ impl ServerWorkerState {
         duration_us: u64,
         was_blocked_before: bool,
         connection_token: usize,
+        effects: &mut CommandEffects,
     ) -> bool {
         if self.connection_registry[crate::framework::capabilities::io::Token(connection_token)]
             .blocked
@@ -188,6 +190,7 @@ impl ServerWorkerState {
         if !was_blocked_before {
             self.rollback_incomplete_command_stats(invocation.name, invocation.args, duration_us);
         }
+        self.commit_blocked_stream_read_effects(connection_token, None, None, Some(effects));
         let request_wait_ack = self.register_blocked_command(connection_token);
         let monitor = (!was_blocked_before).then(|| {
             let connection = &self.connection_registry
@@ -323,6 +326,21 @@ impl ServerWorkerState {
         if !is_replica_link {
             return false;
         }
+        if self
+            .replication_runtime
+            .primary_for_connection(crate::framework::distributed::replication::ConnectionId(
+                connection_token,
+            ))
+            .is_some_and(|link| {
+                link.state()
+                    == crate::framework::distributed::replication::PrimaryLinkState::AwaitingPsync
+                    && link.dual_state()
+                        == crate::framework::distributed::replication::PrimaryDualChannelState::Disabled
+                    && link.accept_seq().is_none()
+            })
+        {
+            return false;
+        }
         if let Value::Error(error) = reply {
             crate::server_log!(
                 warning,
@@ -360,7 +378,6 @@ impl ServerWorkerState {
             && !connection.tracking_bcast()
             && (!connection.tracking_optin() || connection.tracking_caching())
             && (!connection.tracking_optout() || !connection.tracking_caching());
-        connection.set_tracking_caching(false);
         let keys = should_track
             .then(|| {
                 self.registry
@@ -502,7 +519,13 @@ fn connection_info_flags(
     } else if connection.blocked.is_some() {
         flags.push('b');
     }
-    if connection.no_touch || flags.is_empty() {
+    if connection.no_touch {
+        flags.push('N');
+    }
+    if connection.is_priority {
+        flags.push('H');
+    }
+    if flags.is_empty() {
         flags.push('N');
     }
     flags

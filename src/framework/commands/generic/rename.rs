@@ -3,7 +3,11 @@ use crate::framework::commands::command_runtime::CommandRuntime;
 use crate::framework::{CommandArgs, CommandError};
 use command_macros::command;
 
-#[command("RENAME", runtime)]
+#[command(
+    "RENAME",
+    get_keys = crate::framework::commands::key_extractors::rename_get_keys,
+    runtime
+)]
 pub fn rename(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> CommandOutcome {
     let src = &args.args[0];
     let dst = &args.args[1];

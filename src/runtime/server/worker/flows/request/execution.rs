@@ -19,21 +19,51 @@ impl ServerWorkerState {
         executor: CommandExecutor,
         args: &CommandArgs,
     ) -> Value {
-        if let Some(prepare) = executor.hosted() {
-            return match prepare(&mut self.connection_registry[token], args, &mut self.ctx) {
+        let had_migration_role = self.connection_registry[token]
+            .slot_migration_role
+            .is_some();
+        let samples_independently =
+            self.command_execution_depth == 0 && self.priority_command_token != Some(token);
+        let owns_priority_cycle = samples_independently
+            && self.is_priority_connection(token)
+            && self.begin_priority_cycle();
+        let started = std::time::Instant::now();
+        self.command_execution_depth += 1;
+        let reply = if let Some(prepare) = executor.hosted() {
+            match prepare(&mut self.connection_registry[token], args, &mut self.ctx) {
                 Ok(task) => self.run_prepared_host_task(token, task),
                 Err(reply) => reply,
-            };
-        }
-        if let Some(handler) = executor.runtime_handler() {
-            return execute_runtime_command(
+            }
+        } else if let Some(handler) = executor.runtime_handler() {
+            execute_runtime_command(
                 &mut self.connection_registry[token],
                 args,
                 &mut self.ctx,
                 handler,
-            );
+            )
+        } else {
+            executor.execute(&mut self.connection_registry[token], args, &mut self.ctx)
+        };
+        self.kill_acl_subscribers();
+        self.drain_acl_kills_for_command(Some(token));
+        self.command_execution_depth -= 1;
+        let duration_us = (started.elapsed().as_micros() as u64).max(1);
+        self.refresh_connection_priorities();
+        if !had_migration_role
+            && self.connection_registry.get(token).is_some_and(|connection| {
+                matches!(
+                    connection.slot_migration_role,
+                    Some(crate::engine::distributed::cluster::migration::SlotMigrationConnectionRole::Import(_))
+                )
+            })
+        {
+            self.prioritize_connection(token);
         }
-        executor.execute(&mut self.connection_registry[token], args, &mut self.ctx)
+        if samples_independently && self.is_priority_connection(token) {
+            self.ctx.stats_mut().record_priority_command(duration_us);
+        }
+        self.finish_priority_cycle(owns_priority_cycle);
+        reply
     }
 
     pub(crate) fn apply_post_command_intents(

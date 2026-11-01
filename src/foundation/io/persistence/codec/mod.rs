@@ -4,6 +4,7 @@ mod dispatch;
 mod hash;
 mod list;
 pub(crate) mod lzf;
+mod path_hash;
 mod registry;
 mod set;
 mod stream;
@@ -14,12 +15,12 @@ mod zset;
 use crate::foundation::io::store::Robj;
 
 #[cfg(not(feature = "wasm"))]
-pub(crate) use dispatch::load_robj_with_hash_field_expires_detailed;
+pub(crate) use dispatch::load_robj_with_hash_field_expires_and_limits;
 pub use dispatch::{
     load_robj, load_robj_with_hash_field_expires, load_typed_object,
     load_typed_object_with_hash_field_expires, load_typed_object_with_hash_field_expires_detailed,
-    save_robj, save_robj_with_hash_field_expires, type_byte, type_byte_with_hash_field_expires,
-    ObjectLoadError,
+    load_typed_object_with_hash_limits_detailed, save_robj, save_robj_with_hash_field_expires,
+    type_byte, type_byte_with_hash_field_expires, ObjectLoadError,
 };
 
 pub trait RdbWriter {

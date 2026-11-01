@@ -16,6 +16,13 @@ pub fn hmset(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> CommandOut
         None => return CommandOutcome::reply(CommandError::db_index_out_of_range()),
     };
     let key = &args.args[0];
+    let pairs = args.args[1..]
+        .as_chunks::<2>().0.iter()
+        .map(|pair| (pair[0].clone(), pair[1].clone()))
+        .collect::<Vec<_>>();
+    if db.hash_prepare_pairs_with_limits(key, &pairs, max_entries, max_value_size).is_err() {
+        return CommandOutcome::reply(CommandError::wrong_type());
+    }
     let mut i = 1;
     let mut expired_overwritten = 0u64;
     while i + 1 < args.args.len() {

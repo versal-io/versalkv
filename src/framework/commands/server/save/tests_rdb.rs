@@ -328,7 +328,10 @@ fn disk_sync_file_child_reports_failed_for_missing_parent() {
 fn rdb_header_and_footer() {
     let dbs = DbSet::new(16);
     let bytes = crate::foundation::io::persistence::serialize_all(&dbs, 0);
-    assert_eq!(&bytes[..9], b"VALKEY080");
+    assert_eq!(
+        &bytes[..9],
+        format!("VALKEY{:03}", persistence::RDB_VERSION).as_bytes()
+    );
     let n = bytes.len();
     let crc = crate::foundation::io::persistence::crc64(0, &bytes[..n - 8]);
     assert_eq!(crc.to_le_bytes(), bytes[n - 8..]);
@@ -421,7 +424,10 @@ fn rdb_full_roundtrip() {
     }
     let bytes = crate::foundation::io::persistence::serialize_all(&dbs, 0);
 
-    assert_eq!(&bytes[..9], b"VALKEY080");
+    assert_eq!(
+        &bytes[..9],
+        format!("VALKEY{:03}", persistence::RDB_VERSION).as_bytes()
+    );
     let n = bytes.len();
     let crc = persistence::crc64(0, &bytes[..n - 8]);
     assert_eq!(crc.to_le_bytes(), bytes[n - 8..]);

@@ -40,7 +40,7 @@ impl<'a> AclRequest<'a> {
 }
 
 impl ServerWorkerState {
-    pub(super) fn stage_acl_permissions(
+    pub(crate) fn stage_acl_permissions(
         &mut self,
         facts: &CommandClientFacts,
         meta: &CmdPreconditions,
@@ -103,7 +103,7 @@ fn command_denial(
     num_dbs: usize,
 ) -> Option<AclDenial> {
     let meta = request.meta;
-    let db_id = if request.facts.transaction {
+    let db_id = if request.facts.transaction && !meta.name.as_str().eq_ignore_ascii_case("exec") {
         request.facts.transaction_db
     } else {
         request.facts.selected_db as i64
@@ -185,6 +185,22 @@ fn acl_denial_outcome(
         }
         AclDenial::Command => command_denial_details(request),
         AclDenial::Key(index) => key_denial_details(request, key_requirements, index),
+        AclDenial::Channel(index) => {
+            let object = request
+                .args
+                .args
+                .get(index)
+                .map(|channel| String::from_utf8_lossy(channel).into_owned())
+                .unwrap_or_default();
+            (
+                ACL_DENIED_CHANNEL,
+                object,
+                format!(
+                    "NOPERM User {} has no permissions to access a channel",
+                    request.facts.username
+                ),
+            )
+        }
     };
     let client_info = format!("addr={} cmd={object}", request.facts.peer_addr);
     add_acl_log_entry(

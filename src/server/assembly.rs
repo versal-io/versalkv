@@ -7,7 +7,6 @@ use crate::framework::config::merge_persisted_cluster_endpoint_defaults;
 use crate::runtime::server::worker::ServerWorkerState;
 use crate::runtime::server::ServerRuntime;
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::str::FromStr;
 
 impl Server {
@@ -105,8 +104,8 @@ impl Server {
             }
         }
         let tls_port = backend.ctx.config().server.tls_port;
+        Self::configure_tls_server(backend)?;
         if tls_port != 0 {
-            Self::configure_tls_server(backend)?;
             for target in &targets {
                 let mut addr = SocketAddr::from_str(&target.addr)
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
@@ -149,29 +148,7 @@ impl Server {
     }
 
     fn configure_tls_server(backend: &mut ServerWorkerState) -> std::io::Result<()> {
-        let server = &backend.ctx.config().server;
-        let config = crate::foundation::io::transport::TlsConfig {
-            cert_file: (!server.tls_cert_file.is_empty())
-                .then(|| PathBuf::from(&server.tls_cert_file)),
-            key_file: (!server.tls_key_file.is_empty())
-                .then(|| PathBuf::from(&server.tls_key_file)),
-            ca_cert_file: (!server.tls_ca_cert_file.is_empty())
-                .then(|| PathBuf::from(&server.tls_ca_cert_file)),
-            ca_cert_dir: (!server.tls_ca_cert_dir.is_empty())
-                .then(|| PathBuf::from(&server.tls_ca_cert_dir)),
-            client_auth: crate::foundation::io::transport::TlsClientAuth::parse(
-                &server.tls_auth_clients,
-            )?,
-            policy: crate::foundation::io::transport::TlsContextPolicy {
-                protocols: server.tls_protocols.clone(),
-                ciphers: server.tls_ciphers.clone(),
-                ciphersuites: server.tls_ciphersuites.clone(),
-            },
-            prefer_server_ciphers: server.tls_prefer_server_ciphers,
-            session_caching: server.tls_session_caching,
-            session_cache_size: server.tls_session_cache_size,
-        };
-        backend.configure_tls_server(config)
+        backend.configure_tls_contexts_from_config()
     }
 
     pub(super) fn init_observability(&mut self, backend: &mut ServerWorkerState) {

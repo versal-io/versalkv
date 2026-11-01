@@ -18,6 +18,7 @@ use errors::{
 #[cfg(test)]
 pub(crate) use runtime::registered_function_count;
 pub(crate) use runtime::reset_lua_runtime;
+pub(crate) use runtime::{clear_eval_scripts, release_eval_script};
 pub(crate) use shebang::parse_shebang;
 
 use crate::engine::extension::script::ScriptRunCtx;

@@ -42,6 +42,34 @@ impl ServerContext {
     pub fn drain_active_expired_deletions(&mut self) -> Vec<(u32, Vec<u8>)> {
         self.db.dbs.drain_active_expired_deletions()
     }
+    pub(crate) fn run_active_expire_cycle(
+        &mut self,
+        db_idx: u32,
+        effort: u8,
+        replica_local_only: bool,
+    ) {
+        let persistence = &self.persistence;
+        let is_capturing = persistence.forkless_capture_in_progress();
+        if let Some(db) = self.db.dbs.get_mut(db_idx) {
+            db.set_replica_local_expire_only(replica_local_only);
+            crate::foundation::io::store::kv_engine::expire::active_expire_cycle_with_effort_and_filter(
+                db,
+                false,
+                effort,
+                |key| !is_capturing || persistence.forkless_key_captured(db_idx, key),
+            );
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn finish_primary_forkless_save_for_test(
+        &mut self,
+    ) -> Option<crate::foundation::io::persistence::snapshot::background::RdbSaveOutcome> {
+        let outcome = self
+            .persistence
+            .finish_primary_forkless_save_for_test(&mut self.db.dbs);
+        self.set_forkless_capture_expiration_paused(false);
+        outcome
+    }
     pub fn drain_lazy_expired_hash_fields(&mut self) -> u64 {
         self.db.dbs.drain_lazy_expired_hash_fields()
     }

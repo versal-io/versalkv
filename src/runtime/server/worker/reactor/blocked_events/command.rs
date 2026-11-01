@@ -83,7 +83,7 @@ impl ServerWorkerState {
                 self.rearm_client_read_interests(protected_token);
             }
             self.record_blocked_round_phase(BlockedRoundPhase::PendingData);
-            let pending_events = self.transport.process_pending_data();
+            let pending_events = self.collect_before_sleep_pending_events();
             let mut saw_dispatchable_pending = false;
             let mut stop_after_epilogue = false;
             for event in pending_events {

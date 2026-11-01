@@ -3,7 +3,11 @@ use crate::framework::commands::command_runtime::CommandRuntime;
 use crate::framework::{CommandArgs, CommandError};
 use command_macros::command;
 
-#[command("RENAMENX", runtime)]
+#[command(
+    "RENAMENX",
+    get_keys = crate::framework::commands::key_extractors::renamenx_get_keys,
+    runtime
+)]
 pub fn renamenx(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> CommandOutcome {
     let src = &args.args[0];
     let dst = &args.args[1];

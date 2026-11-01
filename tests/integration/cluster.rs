@@ -655,8 +655,26 @@ fn cluster_config_sync_auto_save_failure_exits_nonzero() {
 
 #[test]
 fn cluster_config_best_effort_auto_save_failure_stays_alive() {
-    let server = cluster_config_server("best-effort-error", "best-effort");
-    replace_nodes_config_with_directory(&server);
+    let data_dir = cluster_config_test_dir("best-effort-error");
+    let state_dir = data_dir.join("cluster-state");
+    std::fs::create_dir(&state_dir).expect("create cluster config parent directory");
+    let config_path = data_dir.join("valkey.conf");
+    std::fs::write(
+        &config_path,
+        concat!(
+            "cluster-enabled yes\n",
+            "cluster-config-file cluster-state/nodes.conf\n",
+            "cluster-config-save-behavior best-effort\n",
+            "logfile cluster.log\n",
+        ),
+    )
+    .expect("write cluster config test config");
+    let config_path = config_path.to_string_lossy().into_owned();
+    let server = TestServer::start_in_dir(data_dir, &[&config_path]);
+    std::fs::rename(&state_dir, server.data_dir().join("cluster-state.saved"))
+        .expect("move cluster config parent directory");
+    // The save worker never creates parents, so it cannot replace this stable obstacle.
+    std::fs::write(&state_dir, b"not a directory").expect("block cluster config parent path");
     let mut client = server.connect();
 
     assert_eq!(
@@ -668,20 +686,19 @@ fn cluster_config_best_effort_auto_save_failure_stays_alive() {
         ]),
         b"+OK\r\n"
     );
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        let log =
-            std::fs::read_to_string(server.data_dir().join("cluster.log")).unwrap_or_default();
-        if log.contains(
-            "Cluster config updated even though writing the cluster config file to disk failed.",
-        ) {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "save failure was not logged: {log}"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    // SAVECONFIG drains prior automatic saves and records their completion before replying.
+    let reply = client.command_str(&[b"CLUSTER", b"SAVECONFIG"]);
+    assert!(
+        reply.starts_with("-ERR error saving the cluster node config:"),
+        "{reply}"
+    );
+    let log =
+        std::fs::read_to_string(server.data_dir().join("cluster.log")).expect("read server log");
+    assert!(
+        log.contains(
+            "Cluster config updated even though writing the cluster config file to disk failed."
+        ),
+        "save failure was not logged: {log}"
+    );
     assert_eq!(client.command(&[b"PING"]), b"+PONG\r\n");
 }

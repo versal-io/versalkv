@@ -15,6 +15,8 @@ pub fn hrandfield(
     let hard_output_limit = runtime.normal_output_buffer_hard_limit();
     let output_buffer_memory_usage = runtime.output_buffer_memory_usage();
     let resp3 = runtime.resp3();
+    let now_ms = runtime.now_ms();
+    let ignore_expiry = runtime.read_expired_values();
     let db = match runtime.db_mut() {
         Some(d) => d,
         None => return CommandOutcome::reply(CommandError::db_index_out_of_range()),
@@ -25,6 +27,8 @@ pub fn hrandfield(
         resp3,
         hard_output_limit,
         output_buffer_memory_usage,
+        now_ms,
+        ignore_expiry,
     );
     CommandOutcome {
         reply,
@@ -42,10 +46,13 @@ fn hrandfield_reply(
     resp3: bool,
     hard_output_limit: usize,
     output_buffer_memory_usage: usize,
+    now_ms: u64,
+    ignore_expiry: bool,
 ) -> (Value, bool) {
     let key = &args.args[0];
 
     if args.args.len() == 1 {
+        let is_hashtable = matches!(db.get_no_expire(key), Some(crate::foundation::io::store::Robj::HashHashtable(_)));
         let fields: Vec<Bytes> = match db.get_hash_object(key) {
             Err(_) => return (CommandError::wrong_type(), false),
             Ok(None) => return (Value::null(), false),
@@ -55,9 +62,19 @@ fn hrandfield_reply(
                 .map(|(field, _)| field)
                 .collect(),
         };
+        // C first probes physical hashtable entries for a live field, then
+        // falls back to a policy-aware reservoir when all probes miss.
+        if is_hashtable && !fields.is_empty() {
+            for _ in 0..100 {
+                let field = &fields[rand::random_usize(fields.len())];
+                if !db.hash_field_expired_at(key, field, now_ms) {
+                    return (Value::bulk(field.clone()), false);
+                }
+            }
+        }
         let valid: Vec<&Bytes> = fields
             .iter()
-            .filter(|f| !db.hash_field_expired(key, f))
+            .filter(|f| ignore_expiry || !db.hash_field_expired_at(key, f, now_ms))
             .collect();
         if valid.is_empty() {
             return (Value::null(), false);
@@ -97,7 +114,7 @@ fn hrandfield_reply(
 
     let entries: Vec<(Bytes, Bytes)> = all_pairs
         .into_iter()
-        .filter(|(f, _)| !db.hash_field_expired(key, f))
+        .filter(|(f, _)| ignore_expiry || !db.hash_field_expired_at(key, f, now_ms))
         .collect();
 
     let mut out: Vec<Value> = Vec::new();

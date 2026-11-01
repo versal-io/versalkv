@@ -30,6 +30,24 @@ pub fn debug_cmd(conn: &mut dyn CommandConn, args: &CommandArgs, ctx: &mut Serve
     let sub = String::from_utf8_lossy(&args.args[0]).to_ascii_lowercase();
     match sub.as_str() {
         "help" => help::debug_help(),
+        "force-tls-write-error" => {
+            if args.args.len() != 2 {
+                return CommandError::syntax_error();
+            }
+            if !cfg!(feature = "tls") {
+                return Value::error("ERR TLS is not enabled");
+            }
+            let should_fail = match args.args[1].as_ref() {
+                b"0" => false,
+                b"1" => true,
+                _ => return Value::error("ERR Value must be 0 or 1"),
+            };
+            #[cfg(not(feature = "wasm"))]
+            crate::foundation::io::transport::set_tls_write_error(should_fail);
+            #[cfg(feature = "wasm")]
+            let _ = should_fail;
+            Value::ok()
+        }
         "client-enforce-reply-list" => {
             if args.args.len() != 2 {
                 return CommandError::syntax_error();
@@ -46,6 +64,13 @@ pub fn debug_cmd(conn: &mut dyn CommandConn, args: &CommandArgs, ctx: &mut Serve
             let val = String::from_utf8_lossy(&args.args[1]);
             ctx.config_mut().server.active_expire_enabled =
                 matches!(val.as_ref(), "1" | "yes" | "true");
+            Value::ok()
+        }
+        "sweep-tracking-table" => {
+            if args.args.len() != 1 {
+                return CommandError::syntax_error();
+            }
+            ctx.tracking_mut().sweep_disconnected_clients();
             Value::ok()
         }
         "dict-resizing" => {
@@ -306,7 +331,9 @@ pub(crate) fn prepare_debug_task(
         ctx.config()
             .persistence
             .loading_process_events_interval_bytes,
-    ).with_skip_codec_checksums(ctx.config().server.skip_checksum_validation);
+    ).with_skip_codec_checksums(
+        !ctx.config().persistence.rdbchecksum || ctx.config().server.skip_checksum_validation,
+    );
     ctx.set_host_task_loading(true);
     Ok(crate::framework::host_tasks::PreparedHostTask::DebugRdb(
         crate::framework::host_tasks::DebugRdbTask::new(

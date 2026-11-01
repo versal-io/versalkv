@@ -1,6 +1,7 @@
 pub mod encoding;
 pub mod items;
 pub mod persistence;
+pub mod qos;
 pub mod replication;
 pub mod security;
 pub mod server;

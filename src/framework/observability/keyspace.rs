@@ -8,6 +8,7 @@ pub const NOTIFY_SET: char = 's';
 pub const NOTIFY_HASH: char = 'h';
 pub const NOTIFY_ZSET: char = 'z';
 pub const NOTIFY_STREAM: char = 't';
+pub const NOTIFY_PATH_HASH: char = 'p';
 pub const NOTIFY_EXPIRED: char = 'x';
 pub const NOTIFY_EVICTED: char = 'e';
 pub const NOTIFY_NEW: char = 'n';
@@ -29,6 +30,7 @@ pub fn notify_keyspace_event(
         NOTIFY_HASH => 'h',
         NOTIFY_ZSET => 'z',
         NOTIFY_STREAM => 't',
+        NOTIFY_PATH_HASH => 'p',
         NOTIFY_EXPIRED => 'x',
         NOTIFY_EVICTED => 'e',
         NOTIFY_NEW => 'n',

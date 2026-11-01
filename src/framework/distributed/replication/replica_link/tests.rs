@@ -20,6 +20,264 @@ fn offset(value: i64) -> ReplicationOffset {
     ReplicationOffset::try_from(value).expect("test offset must be non-negative")
 }
 
+fn boundary_waiting_endoff_link() -> ReplicaLink {
+    let mut link = link();
+    link.transition_rdb_channel_state(ReplicaRdbChannelState::Connecting)
+        .unwrap();
+    link.transition_rdb_channel_state(ReplicaRdbChannelState::Handshake)
+        .unwrap();
+    let (events, actions) = link.on_rdb_bytes(b"+OK\r\n").unwrap();
+    assert!(events.is_empty());
+    assert!(actions.is_empty());
+    assert_eq!(
+        link.rdb_channel_state(),
+        ReplicaRdbChannelState::WaitingForEndOffset
+    );
+    link
+}
+
+#[test]
+fn boundary_endoff_unselected_database_sends_dual_psync_and_selects_later() {
+    let replid = "0123456789abcdef0123456789abcdef01234567";
+    for db in ["-2", "-2147483648", "4294967296"] {
+        let mut link = boundary_waiting_endoff_link();
+        assert!(matches!(
+            link.on_rdb_bytes(format!("$ENDOFF:123 {replid} {db} 91\r\n").as_bytes()),
+            Err(LinkError::Protocol)
+        ));
+        assert_eq!(
+            link.rdb_channel_state(),
+            ReplicaRdbChannelState::WaitingForEndOffset
+        );
+        assert!(link.provisional_primary().is_none());
+        assert_eq!(link.received_position(), offset(0));
+        assert_eq!(link.applied_position(), offset(0));
+    }
+    for cached_offset in [0, 42] {
+        let mut link = boundary_waiting_endoff_link();
+        if cached_offset != 0 {
+            link.set_resume_position("previous".to_string(), offset(cached_offset), 9);
+        }
+        let frame = format!("$ENDOFF:123 {replid} -1 91\r\n");
+        let (events, actions) = link
+            .on_rdb_bytes(frame.as_bytes())
+            .expect("C's unselected database is a valid snapshot boundary");
+        assert!(events.is_empty());
+        assert_eq!(
+            actions,
+            vec![ReplicaAction::Send(
+                protocol::build_replconf_set_rdb_client_id(91)
+            )]
+        );
+        assert_eq!(link.state(), ReplicaLinkState::WaitDualRdbClientIdReply);
+        assert_eq!(
+            link.rdb_channel_state(),
+            ReplicaRdbChannelState::ReceivingRdb
+        );
+        assert_eq!(link.provisional_primary().unwrap().db_id, 0);
+        assert_eq!(link.provisional_primary().unwrap().end_offset, offset(123));
+        assert_eq!(link.selected_db(), 0);
+        assert_eq!(
+            (link.received_position(), link.decoded_offset),
+            (offset(123), offset(123))
+        );
+        assert_eq!(
+            (link.applied_position(), link.acknowledged_position()),
+            (offset(cached_offset), offset(cached_offset))
+        );
+
+        let (events, actions) = link.on_bytes(b"+OK\r\n", 6380).unwrap();
+        assert!(events.is_empty());
+        assert_eq!(
+            actions,
+            vec![ReplicaAction::SendDualPsync(protocol::build_psync(
+                replid, 124
+            ))]
+        );
+        let select = protocol::encode_command(&[b"SELECT", b"2"]);
+        let set = protocol::encode_command(&[b"SET", b"key", b"value"]);
+        let mut stream = b"+CONTINUE\r\n".to_vec();
+        stream.extend_from_slice(&select);
+        stream.extend_from_slice(&set);
+        let (events, actions) = link.on_bytes(&stream, 6380).unwrap();
+        assert!(actions.is_empty());
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            events[0],
+            ReplicaEvent::Apply {
+                apply: ReplicationApply::Select(2),
+                ..
+            }
+        ));
+        assert!(matches!(
+            events[1],
+            ReplicaEvent::Apply {
+                apply: ReplicationApply::Command(_),
+                ..
+            }
+        ));
+        // The decoded SELECT waits for application; decoding does not change the selected DB.
+        assert_eq!(link.selected_db(), 0);
+        let end = offset(123 + select.len() as i64 + set.len() as i64);
+        assert_eq!((link.received_position(), link.decoded_offset), (end, end));
+        assert_eq!(
+            (link.applied_position(), link.acknowledged_position()),
+            (offset(cached_offset), offset(cached_offset))
+        );
+        assert_eq!(link.prevalidate_rdb_apply_position(), Ok(offset(123)));
+    }
+}
+
+#[test]
+fn boundary_endoff_keepalives_are_consumed_across_text_fragments_once() {
+    let cases: &[(&str, &[&[u8]])] = &[
+        ("LF", &[b"\n"]),
+        ("CRLF", &[b"\r\n"]),
+        ("repeated", &[b"\n\r\n\n"]),
+        ("split CR", &[b"\r", b"\n"]),
+        ("mixed fragments", &[b"\n\r", b"\n\n"]),
+        ("coalesced", &[b"\n\r\n"]),
+    ];
+    let endoff = protocol::encode_end_offset(
+        offset(123),
+        "0123456789abcdef0123456789abcdef01234567",
+        0,
+        91,
+    );
+    let mut results = Vec::new();
+    for (label, chunks) in cases {
+        let mut link = boundary_waiting_endoff_link();
+        let mut actions = Vec::new();
+        let mut error = None;
+        for (index, chunk) in chunks.iter().enumerate() {
+            let mut input = chunk.to_vec();
+            if *label == "coalesced" {
+                input.extend_from_slice(&endoff);
+            }
+            match link.on_rdb_bytes(&input) {
+                Ok((events, emitted)) => {
+                    assert!(events.is_empty(), "{label}/{index}");
+                    actions.extend(emitted);
+                    if input == b"\r" {
+                        assert_eq!(link.rdb_input, b"\r", "fragmented CR must remain buffered");
+                    }
+                }
+                Err(cause) => {
+                    error = Some(cause);
+                    break;
+                }
+            }
+        }
+        if error.is_none() && *label != "coalesced" {
+            match link.on_rdb_bytes(&endoff) {
+                Ok((events, emitted)) => {
+                    assert!(events.is_empty());
+                    actions.extend(emitted);
+                }
+                Err(cause) => error = Some(cause),
+            }
+        }
+        if error.is_none() {
+            let (events, actions) = link.on_rdb_bytes(b"$6\r\n\nx\r\ny\n").unwrap();
+            assert!(events.is_empty());
+            assert!(actions.is_empty());
+            assert_eq!(link.rdb_receive_mut().unwrap().buffered(), b"\nx\r\ny\n");
+        }
+        results.push((*label, error, actions, link.rdb_channel_state()));
+    }
+    for (label, error, actions, state) in results {
+        assert_eq!(
+            error, None,
+            "complete empty keepalives must be consumed: {label}"
+        );
+        assert_eq!(
+            actions,
+            vec![ReplicaAction::Send(
+                protocol::build_replconf_set_rdb_client_id(91)
+            )],
+            "{label}"
+        );
+        assert_eq!(state, ReplicaRdbChannelState::ReceivingRdb, "{label}");
+    }
+}
+
+#[test]
+fn boundary_endoff_rejects_nonempty_lines_and_preserves_binary_newlines() {
+    use crate::foundation::io::persistence::rdb::{
+        load_rdb_bytes_checked, serialize_all_with_options, RdbSerializeOptions,
+    };
+    use crate::foundation::io::store::{kv_engine::DbSet, Robj};
+
+    for input in [
+        b"unknown\r\n".as_slice(),
+        b"+OK\r\n".as_slice(),
+        b"unknown\n$ENDOFF:123 0123456789abcdef0123456789abcdef01234567 0 91\r\n".as_slice(),
+    ] {
+        let mut link = boundary_waiting_endoff_link();
+        assert!(
+            matches!(link.on_rdb_bytes(input), Err(LinkError::Protocol)),
+            "{input:?}"
+        );
+        assert_eq!(
+            link.rdb_channel_state(),
+            ReplicaRdbChannelState::WaitingForEndOffset
+        );
+        assert!(link.provisional_primary().is_none());
+    }
+    let mut source = DbSet::new(1);
+    let value = b"\nline\r\nend\n";
+    source
+        .get_mut(0)
+        .unwrap()
+        .set(b"newlines".to_vec(), Robj::string(value.as_slice()));
+    let body = serialize_all_with_options(
+        &source,
+        0,
+        RdbSerializeOptions {
+            compression: false,
+            checksum: true,
+        },
+    );
+    assert!(body.windows(value.len()).any(|bytes| bytes == value));
+    let marker = b"0123456789abcdef0123456789abcdef01234567";
+    let mut link = boundary_waiting_endoff_link();
+    link.on_rdb_bytes(&protocol::encode_end_offset(
+        offset(123),
+        std::str::from_utf8(marker).unwrap(),
+        0,
+        91,
+    ))
+    .unwrap();
+    let mut header = b"$EOF:".to_vec();
+    header.extend_from_slice(marker);
+    header.extend_from_slice(b"\r\n");
+    let (events, actions) = link.on_rdb_bytes(&header).unwrap();
+    assert!(events.is_empty());
+    assert!(actions.is_empty());
+    for chunk in body.chunks(3) {
+        let (events, actions) = link.on_rdb_bytes(chunk).unwrap();
+        assert!(events.is_empty());
+        assert!(actions.is_empty());
+    }
+    let (events, actions) = link.on_rdb_bytes(marker).unwrap();
+    assert!(events.is_empty());
+    assert!(actions.is_empty());
+    let received = link.rdb_receive_mut().unwrap().buffered().to_vec();
+    assert_eq!(
+        received, body,
+        "text keepalive rules must not alter any RDB body byte"
+    );
+    let mut loaded = DbSet::new(1);
+    assert_eq!(
+        load_rdb_bytes_checked(&received, &mut loaded, true).unwrap(),
+        (1, received.len())
+    );
+    assert_eq!(
+        loaded.get_mut(0).unwrap().get_string(b"newlines").unwrap(),
+        Some(value.as_slice())
+    );
+}
+
 #[test]
 fn replica_rdb_state_rejects_illegal_jumps() {
     assert_eq!(

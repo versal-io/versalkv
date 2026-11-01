@@ -8,6 +8,10 @@
 //! the link), so the actual `drive`/commit happens in the backend receive path
 //! (`runtime/distributed/replication/rdb_recv_path.rs`); the link only `feed`s bytes.
 
+use crate::foundation::io::compression::{StreamDecoder, StreamKind, REPLICATION_BATCH_BYTES};
+use crate::foundation::io::persistence::rdb::compression::{
+    decode_rdb_stream, encode_rdb_stream, RdbCompression, RdbSnapshotOptions,
+};
 use crate::foundation::io::persistence::{LoadError, RdbStep, RdbStreamDecoder, StreamStep};
 use crate::foundation::io::store::kv_engine::DbSet;
 use crate::framework::distributed::replication::RdbLoadMode;
@@ -41,6 +45,11 @@ pub struct RdbCommit {
 
 pub struct RdbReceive {
     decoder: RdbStreamDecoder,
+    compression: StreamDecoder,
+    wire: Vec<u8>,
+    snapshot_options: Option<RdbSnapshotOptions>,
+    skip_checksums: bool,
+    decode_budget: usize,
     diskless: bool,
     raw: Option<Vec<u8>>,
     load_mode: RdbLoadMode,
@@ -48,6 +57,8 @@ pub struct RdbReceive {
     received_payload: bool,
     transfer_started: bool,
     payload_bytes: u64,
+    compression_logged: bool,
+    input_complete: bool,
 }
 
 impl RdbReceive {
@@ -56,6 +67,11 @@ impl RdbReceive {
             // Replica full-sync load uses non-strict version acceptance, matching
             // the buffer path (`load_..._and_delay(.., false, ..)`).
             decoder: RdbStreamDecoder::new(false),
+            compression: StreamDecoder::new(StreamKind::Rdb, false),
+            wire: Vec::new(),
+            snapshot_options: None,
+            skip_checksums: false,
+            decode_budget: REPLICATION_BATCH_BYTES,
             diskless,
             raw: if load_mode == RdbLoadMode::DiskBacked || !diskless {
                 Some(Vec::new())
@@ -67,6 +83,8 @@ impl RdbReceive {
             received_payload: false,
             transfer_started: false,
             payload_bytes: 0,
+            compression_logged: false,
+            input_complete: false,
         }
     }
 
@@ -77,7 +95,118 @@ impl RdbReceive {
         if let Some(raw) = self.raw.as_mut() {
             raw.extend_from_slice(bytes);
         }
-        self.decoder.feed(bytes);
+        self.wire.extend_from_slice(bytes);
+    }
+
+    pub fn set_snapshot_options(&mut self, options: RdbSnapshotOptions) {
+        self.snapshot_options.get_or_insert(options);
+    }
+
+    pub fn with_skip_checksums(mut self, skip_checksums: bool) -> Self {
+        self.skip_checksums = skip_checksums;
+        self.compression = StreamDecoder::new(StreamKind::Rdb, skip_checksums);
+        if skip_checksums {
+            self.decoder.skip_checksum();
+        }
+        self
+    }
+
+    pub fn has_pending_decompression(&self) -> bool {
+        !self.wire.is_empty() || self.compression.has_pending_decode()
+    }
+
+    pub fn compression_memory_bytes(&self) -> usize {
+        self.compression.memory_bytes() + self.wire.capacity()
+    }
+
+    fn decompress(&mut self) -> Result<(), LoadError> {
+        let input = std::mem::take(&mut self.wire);
+        let decoded =
+            self.compression
+                .feed(&input, self.decode_budget)
+                .map_err(|error| match error {
+                    crate::foundation::io::compression::DecodeError::Incompatible => {
+                        LoadError::IncompatibleVersion(-1)
+                    }
+                    _ => LoadError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "Corrupt compressed RDB stream",
+                    )),
+                })?;
+        self.decode_budget = self.decode_budget.saturating_sub(decoded.len());
+        if self.compression.is_compressed() {
+            if !self.compression_logged {
+                self.compression_logged = true;
+                if self.load_mode == RdbLoadMode::DiskBacked {
+                    crate::server_log!(
+                        notice,
+                        "Loading compressed RDB (algo=lz4) from temp-replication.rdb"
+                    );
+                } else {
+                    crate::server_log!(notice, "Loading compressed RDB (algo=lz4) from primary");
+                }
+            }
+            self.decoder.skip_checksum();
+        }
+        self.decoder.feed(&decoded);
+        Ok(())
+    }
+
+    pub fn begin_decode_turn(&mut self) {
+        self.decode_budget = REPLICATION_BATCH_BYTES;
+    }
+
+    pub fn finish_input(&mut self) {
+        self.input_complete = true;
+    }
+
+    pub fn validate_complete(&mut self) -> Result<(), LoadError> {
+        self.compression.finish().map_err(|_| {
+            LoadError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "Compressed RDB stream ended before the announced transfer size",
+            ))
+        })?;
+        if self.compression.is_compressed()
+            && (self.decoder.unconsumed_bytes() != 0
+                || self.compression.physical_bytes() as u64 != self.payload_bytes)
+        {
+            return Err(LoadError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "Compressed RDB stream ended before the announced transfer size",
+            )));
+        }
+        let Some(raw) = self.raw.as_mut() else {
+            return Ok(());
+        };
+        let Some(options) = self.snapshot_options else {
+            return Ok(());
+        };
+        let incoming_lz4 = raw.starts_with(b"VCS");
+        if incoming_lz4 == (options.compression == RdbCompression::Lz4) {
+            return Ok(());
+        }
+        let mut logical = if incoming_lz4 {
+            decode_rdb_stream(raw, self.skip_checksums)
+                .map_err(|_| LoadError::Corrupt)?
+                .ok_or(LoadError::Corrupt)?
+                .bytes
+        } else {
+            std::mem::take(raw)
+        };
+        let end = logical.len().checked_sub(8).ok_or(LoadError::Corrupt)?;
+        let checksum = if options.checksum && options.compression != RdbCompression::Lz4 {
+            crate::foundation::io::persistence::crc64(0, &logical[..end])
+        } else {
+            0
+        };
+        logical[end..].copy_from_slice(&checksum.to_le_bytes());
+        *raw = if options.compression == RdbCompression::Lz4 {
+            encode_rdb_stream(&logical, options.checksum).map_err(LoadError::Io)?
+        } else {
+            logical
+        };
+        Ok(())
     }
 
     pub fn payload_bytes(&self) -> u64 {
@@ -128,10 +257,41 @@ impl RdbReceive {
         key_load_delay_us: i64,
     ) -> Result<RdbStep, LoadError> {
         self.decoder.set_key_load_delay(key_load_delay_us);
-        match &mut self.target {
-            RdbTarget::Swap(temp) => self.decoder.step(temp),
-            RdbTarget::Direct => self.decoder.step(serving),
-            RdbTarget::Uninit => Ok(RdbStep::NeedInput),
+        loop {
+            let step = match &mut self.target {
+                RdbTarget::Swap(temp) => self.decoder.step(temp),
+                RdbTarget::Direct => self.decoder.step(serving),
+                RdbTarget::Uninit => return Ok(RdbStep::NeedInput),
+            }?;
+            if matches!(step, RdbStep::Finished(_)) && self.compression.is_compressed() {
+                if self.decoder.unconsumed_bytes() != 0 {
+                    return Err(LoadError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "Corrupt compressed RDB stream",
+                    )));
+                }
+                if self.compression.is_done() {
+                    return Ok(step);
+                }
+            } else if !matches!(step, RdbStep::NeedInput) {
+                return Ok(step);
+            }
+            if !self.has_pending_decompression() {
+                if self.input_complete {
+                    self.compression.finish().map_err(|_| {
+                        LoadError::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Corrupt compressed RDB stream",
+                        ))
+                    })?;
+                    return Err(LoadError::Corrupt);
+                }
+                return Ok(RdbStep::NeedInput);
+            }
+            if self.decode_budget == 0 {
+                return Ok(RdbStep::NeedInput);
+            }
+            self.decompress()?;
         }
     }
 
@@ -146,14 +306,13 @@ impl RdbReceive {
         serving: &mut DbSet,
         key_load_delay_us: i64,
     ) -> Result<StreamStep, LoadError> {
-        let Self {
-            decoder, target, ..
-        } = self;
-        match target {
-            RdbTarget::Swap(temp) => decoder.drive(temp, key_load_delay_us),
-            RdbTarget::Direct => decoder.drive(serving, key_load_delay_us),
-            // Uninit means the backend has not chosen a target yet; nothing to do.
-            RdbTarget::Uninit => Ok(StreamStep::NeedMore),
+        self.begin_decode_turn();
+        loop {
+            match self.step(serving, key_load_delay_us)? {
+                RdbStep::NeedInput => return Ok(StreamStep::NeedMore),
+                RdbStep::RecordApplied => {}
+                RdbStep::Finished(_) => return Ok(StreamStep::Finished),
+            }
         }
     }
 
@@ -188,7 +347,7 @@ impl RdbReceive {
     /// the decoder.
     #[cfg(test)]
     pub fn buffered(&self) -> &[u8] {
-        self.decoder.buffered()
+        &self.wire
     }
 }
 
@@ -258,5 +417,90 @@ mod tests {
             StreamStep::Finished
         );
         assert_eq!(receive.finish().repl_stream_db, 9);
+    }
+
+    #[test]
+    fn codec_fix_complete_input_preserves_budget_and_frame_boundaries() {
+        use crate::foundation::io::store::Robj;
+
+        let mut source = DbSet::new(1);
+        source.get_mut(0).unwrap().set(
+            b"large".to_vec(),
+            Robj::string_raw(vec![
+                b'x';
+                crate::foundation::io::compression::REPLICATION_BATCH_BYTES
+                    + 64
+            ]),
+        );
+        let logical = crate::foundation::io::persistence::serialize_all_with_options(
+            &source,
+            0,
+            crate::foundation::io::persistence::RdbSerializeOptions {
+                compression: false,
+                checksum: true,
+            },
+        );
+        assert!(logical.len() > crate::foundation::io::compression::REPLICATION_BATCH_BYTES);
+        let wire = super::encode_rdb_stream(&logical, true).unwrap();
+        let mut receive = RdbReceive::new(true, RdbLoadMode::Direct).with_skip_checksums(true);
+        receive.set_direct();
+        receive.feed(&wire);
+        receive.finish_input();
+        let mut destination = DbSet::new(1);
+        assert_eq!(
+            receive.drive(&mut destination, 0).unwrap(),
+            StreamStep::NeedMore
+        );
+        assert!(receive.has_pending_decompression());
+        assert_eq!(
+            receive.drive(&mut destination, 0).unwrap(),
+            StreamStep::Finished
+        );
+        receive.validate_complete().unwrap();
+        assert_eq!(
+            destination
+                .get(0)
+                .unwrap()
+                .get_no_expire(b"large")
+                .unwrap()
+                .as_bytes()
+                .len(),
+            crate::foundation::io::compression::REPLICATION_BATCH_BYTES + 64
+        );
+
+        let mut receive = RdbReceive::new(true, RdbLoadMode::Direct).with_skip_checksums(true);
+        receive.set_direct();
+        receive.feed(&wire[..wire.len() - 1]);
+        assert_eq!(
+            receive.drive(&mut DbSet::new(1), 0).unwrap(),
+            StreamStep::NeedMore
+        );
+        assert_eq!(
+            receive.drive(&mut DbSet::new(1), 0).unwrap(),
+            StreamStep::NeedMore
+        );
+        receive.finish_input();
+        assert!(receive.drive(&mut DbSet::new(1), 0).is_err());
+
+        let mut outside = wire;
+        outside.push(b'X');
+        let mut receive = RdbReceive::new(true, RdbLoadMode::Direct).with_skip_checksums(true);
+        receive.set_direct();
+        receive.feed(&outside);
+        receive.finish_input();
+        let mut destination = DbSet::new(1);
+        assert_eq!(
+            receive.drive(&mut destination, 0).unwrap(),
+            StreamStep::NeedMore
+        );
+        assert_eq!(
+            receive.drive(&mut destination, 0).unwrap(),
+            StreamStep::Finished
+        );
+        let error = receive.validate_complete().unwrap_err();
+        assert!(
+            matches!(error, crate::foundation::io::persistence::LoadError::Io(error)
+            if error.kind() == std::io::ErrorKind::UnexpectedEof)
+        );
     }
 }

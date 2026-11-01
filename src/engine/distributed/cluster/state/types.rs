@@ -540,6 +540,11 @@ impl ClusterState {
         if !self.nodes.contains_key(node_id) {
             return None;
         }
+        for node in self.nodes.values_mut() {
+            if node.replicaof == node_id {
+                node.replicaof.clear();
+            }
+        }
         let changed = self.unassign_slots_owned_by(node_id) > 0;
         let removed = self
             .nodes
@@ -1659,6 +1664,42 @@ mod tests {
 
         state.request_topology_broadcast();
         assert!(state.take_config_save_request());
+    }
+
+    #[test]
+    fn removing_primary_orphans_its_known_replicas() {
+        use crate::engine::distributed::cluster::node::{
+            CLUSTER_NODE_MYSELF, CLUSTER_NODE_PRIMARY, CLUSTER_NODE_REPLICA,
+        };
+
+        let mut state = ClusterState::new("127.0.0.1", 6379, 16379);
+        let primary_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let replica_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+        let mut primary = ClusterNode::new(
+            primary_id.to_string(),
+            "127.0.0.1".to_string(),
+            6380,
+            16380,
+            true,
+        );
+        primary.flags &= !CLUSTER_NODE_MYSELF;
+        let mut replica = ClusterNode::new(
+            replica_id.to_string(),
+            "127.0.0.1".to_string(),
+            6381,
+            16381,
+            false,
+        );
+        replica.flags &= !(CLUSTER_NODE_MYSELF | CLUSTER_NODE_PRIMARY);
+        replica.flags |= CLUSTER_NODE_REPLICA;
+        replica.replicaof = primary_id.to_string();
+        state.nodes.insert(primary_id.to_string(), primary);
+        state.nodes.insert(replica_id.to_string(), replica);
+
+        assert!(state.remove_node(primary_id).is_some());
+
+        assert!(state.nodes[replica_id].replicaof.is_empty());
     }
 
     #[test]

@@ -3,15 +3,70 @@
 use libc::{c_int, c_void, size_t};
 
 use super::super::{ValkeyModuleKey, ValkeyModuleString};
+#[cfg(test)]
 use bytes::Bytes;
 
 const HASH_NX: c_int = 1 << 0;
 const HASH_XX: c_int = 1 << 1;
 const HASH_CFIELDS: c_int = 1 << 2;
 const HASH_COUNT_ALL: c_int = 1 << 4;
+const HASH_EXISTS: c_int = 1 << 3;
 const HASH_ALLOWED_FLAGS: c_int = HASH_NX | HASH_XX | HASH_CFIELDS | HASH_COUNT_ALL;
 const MODULE_WRITE: c_int = 1 << 1;
 const HASH_DELETE: usize = 1;
+
+// SAFETY: the variadic shim provides live key/field handles and an output slot
+// matching HASH_EXISTS. A null field is used only to validate the key type.
+#[export_name = "VM_HashGetField"]
+pub unsafe extern "C" fn hash_get_field(
+    key: *mut ValkeyModuleKey,
+    flags: c_int,
+    field: *mut c_void,
+    output: *mut c_void,
+) -> c_int {
+    // SAFETY: validate handles before dereferencing; all borrows end before return.
+    unsafe {
+        let Some(handle) = ValkeyModuleKey::as_handle(key) else {
+            return super::super::VALKEYMODULE_ERR;
+        };
+        if handle.db.is_null() {
+            return super::super::VALKEYMODULE_ERR;
+        }
+        let db = &mut *(handle.db as *mut crate::foundation::io::store::kv_engine::Db);
+        if db.get_hash_object(&handle.key).is_err() {
+            return super::super::VALKEYMODULE_ERR;
+        }
+        if field.is_null() {
+            return super::super::VALKEYMODULE_OK;
+        }
+        if output.is_null() {
+            return super::super::VALKEYMODULE_ERR;
+        }
+        let field = if flags & HASH_CFIELDS != 0 {
+            std::ffi::CStr::from_ptr(field.cast()).to_bytes()
+        } else {
+            (*(field as *mut ValkeyModuleString)).as_bytes()
+        };
+        let value = if db.hash_field_expired(&handle.key, field) {
+            None
+        } else {
+            db.get_hash_object(&handle.key)
+                .ok()
+                .flatten()
+                .and_then(|hash| hash.hash_get(field))
+        };
+        if flags & HASH_EXISTS != 0 {
+            *(output as *mut c_int) = c_int::from(value.is_some());
+        } else {
+            *(output as *mut *mut ValkeyModuleString) = value
+                .map(|bytes| {
+                    super::super::auto_memory::create_string_for_owner(handle.owner, &bytes)
+                })
+                .unwrap_or(std::ptr::null_mut());
+        }
+        super::super::VALKEYMODULE_OK
+    }
+}
 
 /// Non-variadic entrypoint used by the C shim after collecting field/value pairs.
 /// Returns a non-negative field count on success or a negative errno value.
@@ -43,7 +98,7 @@ pub unsafe extern "C" fn hash_set_pairs(
             return -libc::EINVAL;
         }
         let db = &mut *(handle.db as *mut crate::foundation::io::store::kv_engine::Db);
-        if db.get_no_expire(&handle.key).is_some() && db.get_hash_mut(&handle.key).is_err() {
+        if db.get_hash_object(&handle.key).is_err() {
             return -libc::ENOTSUP;
         }
 
@@ -61,17 +116,22 @@ pub unsafe extern "C" fn hash_set_pairs(
             };
 
             let exists = db
-                .get_hash(&handle.key)
+                .get_hash_object(&handle.key)
                 .ok()
                 .flatten()
-                .is_some_and(|hash| hash.contains_key(field));
+                .is_some_and(|hash| hash.hash_contains(field))
+                && !db.hash_field_expired(&handle.key, field);
             if flags & HASH_XX != 0 && !exists || flags & HASH_NX != 0 && exists {
                 continue;
             }
 
             if value_ptr as usize == HASH_DELETE {
-                if let Ok(Some(hash)) = db.get_hash_mut(&handle.key) {
-                    count += c_int::from(hash.shift_remove(field).is_some());
+                if exists {
+                    if let Ok(Some(hash)) = db.get_hash_object_mut(&handle.key) {
+                        count += c_int::from(hash.hash_del(field));
+                    }
+                    db.remove_hash_field_expire(&handle.key, field);
+                    db.clear_hash_string_ref(&handle.key, field);
                 }
                 continue;
             }
@@ -80,21 +140,20 @@ pub unsafe extern "C" fn hash_set_pairs(
             }
 
             let value = (*value_ptr).as_bytes();
-            let hash = match db.get_or_create_hash(&handle.key) {
-                Ok(hash) => hash,
+            let inserted = match db.hash_set_with_limits(&handle.key, field, value, 512, 64) {
+                Ok(inserted) => inserted,
                 Err(()) => return -libc::ENOTSUP,
             };
-            let inserted = hash
-                .insert(Bytes::copy_from_slice(field), Bytes::copy_from_slice(value))
-                .is_none();
-            count += c_int::from(!inserted || flags & HASH_COUNT_ALL != 0);
+            db.remove_hash_field_expire(&handle.key, field);
+            db.clear_hash_string_ref(&handle.key, field);
+            count += c_int::from(!inserted && exists || flags & HASH_COUNT_ALL != 0);
         }
 
         if db
-            .get_hash_mut(&handle.key)
+            .get_hash_object(&handle.key)
             .ok()
             .flatten()
-            .is_some_and(|hash| hash.is_empty())
+            .is_some_and(|hash| hash.hash_is_empty())
         {
             db.del(&handle.key);
         }
@@ -138,20 +197,17 @@ pub unsafe extern "C" fn ValkeyModule_HashHasStringRef(
 ) -> c_int {
     unsafe {
         if key.is_null() || field.is_null() {
-            return super::super::VALKEYMODULE_ERR;
+            return 0;
         }
         let Some(handle) = ValkeyModuleKey::as_handle(key) else {
-            return super::super::VALKEYMODULE_ERR;
+            return 0;
         };
         if handle.db.is_null() {
-            return super::super::VALKEYMODULE_ERR;
+            return 0;
         }
         let db = &mut *(handle.db as *mut crate::foundation::io::store::kv_engine::Db);
         let field = (*field).as_bytes();
-        match db.get_hash(&handle.key) {
-            Ok(Some(_)) => c_int::from(db.hash_has_string_ref(&handle.key, field)),
-            Ok(None) | Err(()) => super::super::VALKEYMODULE_ERR,
-        }
+        c_int::from(db.hash_has_string_ref(&handle.key, field))
     }
 }
 
@@ -201,6 +257,75 @@ mod tests {
             let _ = Box::from_raw(key as *mut ModuleKeyHandle);
             result
         }
+    }
+
+    #[test]
+    fn hash_stringref_queries_preserve_physical_encoding_and_field_expiry() {
+        use crate::foundation::io::store::Robj;
+
+        let _clock = crate::foundation::io::sys::time::enter_command_time_snapshot(100);
+        let mut db = Db::new();
+        db.hash_set_with_limits(b"hash", b"field", b"value", 512, 64)
+            .unwrap();
+        assert!(!db.hash_has_string_ref(b"hash", b"missing"));
+        assert!(matches!(
+            db.get_no_expire(b"hash"),
+            Some(Robj::HashListpack(_))
+        ));
+        assert!(!db.set_hash_string_ref(b"hash", b"missing", b"other"));
+        assert!(matches!(
+            db.get_no_expire(b"hash"),
+            Some(Robj::HashListpack(_))
+        ));
+
+        db.set_hash_field_expire(b"hash", b"field", 200);
+        assert!(db.set_hash_string_ref(b"hash", b"field", b"other"));
+        assert!(db.hash_has_string_ref(b"hash", b"field"));
+        assert!(!db.hash_has_string_ref(b"hash", b"missing"));
+        assert!(matches!(
+            db.get_no_expire(b"hash"),
+            Some(Robj::HashHashtable(_))
+        ));
+        assert_eq!(db.get_hash_field_expire(b"hash", b"field"), Some(200));
+        assert_eq!(
+            db.get_hash_object(b"hash")
+                .unwrap()
+                .unwrap()
+                .hash_get(b"field"),
+            Some(b"other".to_vec())
+        );
+
+        db.set_hash_field_expire(b"hash", b"field", 99);
+        assert!(!db.hash_has_string_ref(b"hash", b"field"));
+        assert!(!db.set_hash_string_ref(b"hash", b"field", b"expired"));
+        assert!(!db.hash_has_string_ref(b"missing", b"field"));
+        db.set(b"string".to_vec(), Robj::string("value"));
+        assert!(!db.hash_has_string_ref(b"string", b"field"));
+    }
+
+    #[test]
+    fn hfe_module_hash_pairs_keep_listpack_and_hide_ghosts() {
+        let _clock = crate::foundation::io::sys::time::enter_command_time_snapshot(100);
+        let mut db = Db::new();
+        db.hash_set_with_limits(b"hash", b"live", b"v", 128, 64)
+            .unwrap();
+        db.hash_set_with_limits(b"hash", b"ghost", b"v", 128, 64)
+            .unwrap();
+        db.set_hash_field_expire(b"hash", b"live", 200);
+        db.set_hash_field_expire(b"hash", b"ghost", 99);
+        // SAFETY: set_pairs owns its synchronous ABI allocations and db is live.
+        unsafe {
+            assert_eq!(set_pairs(&mut db, 0, &[(b"ghost", None)]), 0);
+            assert_eq!(set_pairs(&mut db, HASH_XX, &[(b"ghost", Some(b"new"))]), 0);
+            assert_eq!(set_pairs(&mut db, 0, &[(b"live", Some(b"new"))]), 1);
+        }
+        assert!(matches!(
+            db.get_no_expire(b"hash"),
+            Some(crate::foundation::io::store::Robj::HashListpack(_))
+        ));
+        assert_eq!(db.get_hash_field_expire(b"hash", b"live"), None);
+        assert_eq!(db.get_hash_field_expire(b"hash", b"ghost"), Some(99));
+        assert_eq!(db.get_hash_object(b"hash").unwrap().unwrap().hash_len(), 2);
     }
 
     #[test]

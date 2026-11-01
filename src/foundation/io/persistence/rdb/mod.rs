@@ -223,7 +223,13 @@ pub fn load_rdb_bytes_with_policy(
         match decoder.step(dbs)? {
             RdbStep::NeedInput => return Err(LoadError::Corrupt),
             RdbStep::RecordApplied => {}
-            RdbStep::Finished(metadata) => {
+            RdbStep::Finished(mut metadata) => {
+                if let Some(decoded) = &decoded {
+                    if metadata.consumed != decoded.bytes.len() {
+                        return Err(LoadError::Corrupt);
+                    }
+                    metadata.consumed = decoded.physical_bytes;
+                }
                 if metadata.empty_keys > 0 {
                     log::warn!("empty keys skipped: {}", metadata.empty_keys);
                 }
@@ -280,7 +286,8 @@ fn is_foreign_version(rdbver: i32) -> bool {
 }
 
 pub fn is_rdb_magic(bytes: &[u8]) -> bool {
-    bytes.len() >= 6 && (&bytes[..6] == b"REDIS0" || &bytes[..6] == b"VALKEY")
+    bytes.starts_with(b"VCS")
+        || (bytes.len() >= 6 && (&bytes[..6] == b"REDIS0" || &bytes[..6] == b"VALKEY"))
 }
 
 #[allow(clippy::result_unit_err)]

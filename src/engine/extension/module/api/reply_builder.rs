@@ -158,6 +158,13 @@ impl ReplyBuilder {
         self.append(Value::Double(d));
     }
 
+    pub fn add_decimal_double(
+        &mut self,
+        value: crate::foundation::io::protocol::DecimalDoubleText,
+    ) {
+        self.append(Value::DecimalDouble(value));
+    }
+
     pub fn add_big_number(&mut self, value: Bytes) {
         self.append(Value::BigNumber(value));
     }

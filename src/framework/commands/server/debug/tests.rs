@@ -190,6 +190,41 @@ fn debug_change_repl_id_replaces_primary_id_and_clears_secondary_id() {
 }
 
 #[test]
+fn debug_sweep_tracking_table_removes_only_disconnected_clients() {
+    use crate::engine::extension::config::server::ProtectedAction;
+
+    let mut ctx = ServerContext::new(1);
+    ctx.config_mut().server.enable_debug_command = ProtectedAction::Yes;
+    ctx.tracking_mut().clients.insert(7);
+    ctx.tracking_mut()
+        .remember_key(7, &Bytes::from_static(b"shared"));
+    ctx.tracking_mut()
+        .remember_key(8, &Bytes::from_static(b"shared"));
+    ctx.tracking_mut()
+        .remember_key(8, &Bytes::from_static(b"dead-only"));
+    let mut conn = Connection::new_fake();
+
+    assert_eq!(
+        super::debug_cmd(
+            &mut conn,
+            &args(&["sweep-tracking-table"]),
+            &mut ctx
+        ),
+        Value::ok()
+    );
+    assert_eq!(ctx.tracking().total_keys(), 1);
+    assert_eq!(ctx.tracking().total_items(), 1);
+    assert_eq!(
+        super::debug_cmd(
+            &mut conn,
+            &args(&["sweep-tracking-table", "extra"]),
+            &mut ctx
+        ),
+        Value::error("ERR syntax error")
+    );
+}
+
+#[test]
 fn debug_restart_defers_process_replacement_without_replying() {
     use crate::engine::command::context::CommandConn;
 

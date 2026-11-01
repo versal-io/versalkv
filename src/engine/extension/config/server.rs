@@ -1,3 +1,24 @@
+#[path = "scripts_memory.rs"]
+pub(crate) mod scripts_memory;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ClusterReplicaNoFailover {
+    #[default]
+    No,
+    Yes,
+    IfEmpty,
+}
+
+impl ClusterReplicaNoFailover {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::No => "no",
+            Self::Yes => "yes",
+            Self::IfEmpty => "if-empty",
+        }
+    }
+}
+
 pub const CONFIG_OOM_PRIMARY: usize = 0;
 pub const CONFIG_OOM_REPLICA: usize = 1;
 pub const CONFIG_OOM_BGCHILD: usize = 2;
@@ -66,9 +87,15 @@ pub struct ServerConfig {
     pub tls_port: u16,
     pub tls_cert_file: String,
     pub tls_key_file: String,
+    pub tls_key_file_pass: crate::foundation::memory::tls::TlsPassword,
+    pub tls_alt_cert_file: String,
+    pub tls_alt_key_file: String,
+    pub tls_alt_key_file_pass: crate::foundation::memory::tls::TlsPassword,
+    pub tls_auto_reload_interval: i32,
     pub tls_ca_cert_file: String,
     pub tls_ca_cert_dir: String,
     pub tls_auth_clients: String,
+    pub tls_auth_clients_user: String,
     /// Whitespace-separated allowed TLS protocol versions; empty selects the
     /// C-compatible TLS 1.2/1.3 default policy.
     pub tls_protocols: String,
@@ -83,6 +110,7 @@ pub struct ServerConfig {
     pub tls_cluster: bool,
     pub tls_client_cert_file: String,
     pub tls_client_key_file: String,
+    pub tls_client_key_file_pass: crate::foundation::memory::tls::TlsPassword,
     pub daemonize: bool,
     pub supervised: String,
     pub supervised_active: bool,
@@ -151,6 +179,7 @@ pub struct ServerConfig {
     pub lua_time_limit: u64,
     pub lua_enable_insecure_api: bool,
     pub maxmemory: u64,
+    pub maxmemory_scripts: i64,
     pub maxmemory_policy: String,
     pub maxmemory_samples: i64,
     pub maxmemory_eviction_tenacity: i64,
@@ -168,6 +197,11 @@ pub struct ServerConfig {
     /// DEBUG DELAY-RDB-CLIENT-FREE-SECONDS, used by dual-channel grace tests.
     pub debug_delay_rdb_client_free_seconds: i64,
     pub maxclients: u32,
+    pub maxclients_reserved: u32,
+    pub priority_subnets: String,
+    pub compiled_priority_subnets: Vec<super::qos::PrioritySubnet>,
+    pub priority_subnets_generation: u64,
+    pub priority_preemptive_poll_interval_us: u64,
     /// C `max-new-connections-per-cycle`, shared per TCP listener callback.
     pub max_new_connections_per_cycle: u16,
     /// C `max-new-tls-connections-per-cycle`, applied per TLS listener callback.
@@ -216,7 +250,7 @@ pub struct ServerConfig {
     pub cluster_message_gossip_perc: i64,
     pub cluster_slot_stats_enabled: bool,
     pub cluster_databases: u16,
-    pub cluster_replica_no_failover: bool,
+    pub cluster_replica_no_failover: ClusterReplicaNoFailover,
     pub cluster_replica_priority: u32,
     pub cluster_require_full_coverage: bool,
     pub cluster_allow_reads_when_down: bool,
@@ -260,9 +294,15 @@ impl ServerConfig {
             tls_port: 0,
             tls_cert_file: String::new(),
             tls_key_file: String::new(),
+            tls_key_file_pass: Default::default(),
+            tls_alt_cert_file: String::new(),
+            tls_alt_key_file: String::new(),
+            tls_alt_key_file_pass: Default::default(),
+            tls_auto_reload_interval: 0,
             tls_ca_cert_file: String::new(),
             tls_ca_cert_dir: String::new(),
             tls_auth_clients: "yes".to_string(),
+            tls_auth_clients_user: "off".to_string(),
             tls_protocols: String::new(),
             tls_ciphers: String::new(),
             tls_ciphersuites: String::new(),
@@ -273,6 +313,7 @@ impl ServerConfig {
             tls_cluster: false,
             tls_client_cert_file: String::new(),
             tls_client_key_file: String::new(),
+            tls_client_key_file_pass: Default::default(),
             daemonize: false,
             supervised: "no".to_string(),
             supervised_active: false,
@@ -335,6 +376,7 @@ impl ServerConfig {
             lua_time_limit: 5000,
             lua_enable_insecure_api: false,
             maxmemory: 0,
+            maxmemory_scripts: 0,
             maxmemory_policy: "noeviction".to_string(),
             maxmemory_samples: 5,
             maxmemory_eviction_tenacity: 10,
@@ -350,6 +392,11 @@ impl ServerConfig {
             debug_pause_before_psync: false,
             debug_delay_rdb_client_free_seconds: 0,
             maxclients: 10000,
+            maxclients_reserved: 0,
+            priority_subnets: String::new(),
+            compiled_priority_subnets: Vec::new(),
+            priority_subnets_generation: 0,
+            priority_preemptive_poll_interval_us: 2000,
             max_new_connections_per_cycle: 10,
             max_new_tls_connections_per_cycle: 1,
             client_timeout: 0,
@@ -389,7 +436,7 @@ impl ServerConfig {
             cluster_message_gossip_perc: 10,
             cluster_slot_stats_enabled: false,
             cluster_databases: 1,
-            cluster_replica_no_failover: false,
+            cluster_replica_no_failover: ClusterReplicaNoFailover::No,
             cluster_replica_priority: 0,
             cluster_require_full_coverage: true,
             cluster_allow_reads_when_down: false,

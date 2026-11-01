@@ -2,15 +2,18 @@ use crate::framework::context::ServerContext;
 
 use super::util::emit_line;
 
-pub(super) fn gen_tls_section() -> String {
+pub(super) fn gen_tls_section(ctx: &ServerContext) -> String {
     let mut s = String::new();
     s.push_str("# TLS\r\n");
-    emit_line(&mut s, "tls_server_cert_serial", "none");
-    emit_line(&mut s, "tls_client_cert_serial", "none");
-    emit_line(&mut s, "tls_ca_cert_serial", "none");
-    emit_line(&mut s, "tls_server_cert_expires_in_seconds", 0);
-    emit_line(&mut s, "tls_client_cert_expires_in_seconds", 0);
-    emit_line(&mut s, "tls_ca_cert_expires_in_seconds", 0);
+    let info = ctx.tls_info();
+    let now_sec = crate::foundation::io::sys::time::mstime() / 1000;
+    for (prefix, cert) in [
+        ("tls_server", &info.server), ("tls_server_alt", &info.alternate),
+        ("tls_client", &info.client), ("tls_ca", &info.ca),
+    ] {
+        emit_line(&mut s, &format!("{prefix}_cert_serial"), cert.serial.as_deref().unwrap_or("none"));
+        emit_line(&mut s, &format!("{prefix}_cert_expires_in_seconds"), cert.expires_in_seconds(now_sec));
+    }
     s
 }
 
@@ -87,3 +90,12 @@ pub(super) fn gen_sentinel_section(ctx: &ServerContext) -> String {
     s
 }
 
+#[cfg(test)]
+mod tls_tests {
+    #[test]
+    fn tls_info_has_independent_alternate_certificate_fields() {
+        let info = super::gen_tls_section(&crate::framework::context::ServerContext::new(1));
+        assert!(info.contains("tls_server_alt_cert_serial:none\r\n"));
+        assert!(info.contains("tls_server_alt_cert_expires_in_seconds:0\r\n"));
+    }
+}

@@ -3,6 +3,26 @@ use crate::engine::extension::config::spec_registry::ConfigRegistry;
 
 pub(crate) fn register_replication_configs(reg: &mut ConfigRegistry) {
     reg.register(&ConfigSpec {
+        name: "repl-compression",
+        type_: ConfigType::Enum,
+        enum_values: &["no", "yes", "lz4", "zstd"],
+        numeric_min: 0,
+        numeric_max: 0,
+        flags: &[],
+        alias: None,
+        get: |config| ConfigValue::String(config.replication.repl_compression.clone()),
+        set: |config, value| {
+            let ConfigValue::String(value) = value else {
+                return Err("repl-compression must be an enum".to_string());
+            };
+            if value.eq_ignore_ascii_case("zstd") {
+                return Err("Zstandard compression is not available in this build".to_string());
+            }
+            config.replication.repl_compression = value.to_ascii_lowercase();
+            Ok(())
+        },
+    });
+    reg.register(&ConfigSpec {
         name: "repl-throttling-enabled",
         type_: ConfigType::Bool,
         enum_values: &[],
@@ -368,4 +388,38 @@ pub(crate) fn register_replication_configs(reg: &mut ConfigRegistry) {
             }
         },
     });
+}
+
+#[cfg(test)]
+mod compression_tests {
+    use crate::engine::extension::config::spec_registry::ConfigRegistry;
+    use crate::engine::extension::config::RuntimeConfig;
+
+    #[test]
+    fn compression_config_preserves_modes_and_rejects_unsupported_codec() {
+        let registry = ConfigRegistry::new();
+        let mut config = RuntimeConfig::new();
+        let spec = registry
+            .lookup("repl-compression")
+            .expect("compression config exists");
+        for mode in ["no", "yes", "lz4"] {
+            registry
+                .try_set(&mut config, "repl-compression", mode)
+                .expect("registered config")
+                .expect("supported mode");
+            assert_eq!((spec.get)(&config).as_str(), mode);
+        }
+        let previous = (spec.get)(&config).as_str();
+        let error = registry
+            .try_set(&mut config, "repl-compression", "zstd")
+            .expect("registered config")
+            .expect_err("unsupported codec");
+        assert!(error.contains("Zstandard compression is not available in this build"));
+        assert_eq!((spec.get)(&config).as_str(), previous);
+        assert!(registry
+            .try_set(&mut config, "repl-compression", "snappy")
+            .expect("registered config")
+            .is_err());
+        assert_eq!((spec.get)(&config).as_str(), previous);
+    }
 }

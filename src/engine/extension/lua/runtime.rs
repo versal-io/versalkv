@@ -184,6 +184,22 @@ fn set_repl(lua: &Lua, args: LuaMultiValue, run: &mut ScriptRunCtx) -> LuaResult
     Ok(LuaValue::Boolean(true))
 }
 
+pub(super) fn bind_eval_arguments(
+    lua: &Lua,
+    keys: &[bytes::Bytes],
+    args: &[bytes::Bytes],
+) -> LuaResult<()> {
+    let globals = lua.globals();
+    for (name, values) in [("KEYS", keys), ("ARGV", args)] {
+        let table = lua.create_table_with_capacity(values.len(), 0)?;
+        for (index, value) in values.iter().enumerate() {
+            table.raw_set(index + 1, lua.create_string(value.as_ref())?)?;
+        }
+        globals.raw_set(name, table)?;
+    }
+    Ok(())
+}
+
 thread_local! {
     static LUA_RUNTIME: RefCell<Option<LuaRuntime>> = const { RefCell::new(None) };
 }
@@ -191,6 +207,7 @@ thread_local! {
 pub(super) struct LuaRuntime {
     pub(super) lua: Lua,
     pub(super) compiled_scripts: HashMap<String, RegistryKey>,
+    pub(super) compiled_eval_scripts: HashMap<String, RegistryKey>,
 }
 
 impl LuaRuntime {
@@ -206,8 +223,43 @@ impl LuaRuntime {
         Ok(Self {
             lua,
             compiled_scripts: HashMap::new(),
+            compiled_eval_scripts: HashMap::new(),
         })
     }
+}
+
+pub(crate) fn release_eval_script(digest: &str) {
+    LUA_RUNTIME.with(|runtime| {
+        let mut runtime = runtime.borrow_mut();
+        let Some(runtime) = runtime.as_mut() else {
+            return;
+        };
+        if let Some(key) = runtime.compiled_eval_scripts.remove(digest) {
+            if let Err(error) = runtime.lua.remove_registry_value(key) {
+                log::warn!("Failed to release compiled EVAL script {digest}: {error}");
+            }
+            if let Err(error) = runtime.lua.gc_step() {
+                log::warn!("Failed to advance Lua GC after EVAL eviction: {error}");
+            }
+        }
+    });
+}
+
+pub(crate) fn clear_eval_scripts() {
+    LUA_RUNTIME.with(|runtime| {
+        let mut runtime = runtime.borrow_mut();
+        let Some(runtime) = runtime.as_mut() else {
+            return;
+        };
+        for (_, key) in runtime.compiled_eval_scripts.drain() {
+            if let Err(error) = runtime.lua.remove_registry_value(key) {
+                log::warn!("Failed to release compiled EVAL script: {error}");
+            }
+        }
+        if let Err(error) = runtime.lua.gc_collect() {
+            log::warn!("Failed to collect Lua GC after SCRIPT FLUSH: {error}");
+        }
+    });
 }
 
 pub(crate) fn reset_lua_runtime() {
@@ -271,4 +323,112 @@ pub(crate) fn registered_function_count() -> usize {
             Err(_) => 0,
         }
     })
+}
+
+#[cfg(test)]
+pub(crate) fn compiled_eval_count() -> usize {
+    with_lua_runtime(false, |runtime| Ok(runtime.compiled_eval_scripts.len())).unwrap()
+}
+
+#[cfg(test)]
+pub(crate) fn eval_argument_tables() -> Result<(LuaTable, LuaTable), ScriptError> {
+    with_lua_runtime(false, |runtime| {
+        let globals = runtime.lua.globals();
+        Ok((
+            globals.raw_get::<LuaTable>("KEYS").unwrap(),
+            globals.raw_get::<LuaTable>("ARGV").unwrap(),
+        ))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::extension::lua::LuaEngine;
+
+    fn compiled_eval_function(runtime: &LuaRuntime, digest: &str) -> LuaFunction {
+        let key = &runtime.compiled_eval_scripts[digest];
+        runtime.lua.registry_value(key).unwrap()
+    }
+
+    #[test]
+    fn compiled_eval_scripts_release_by_original_digest() {
+        reset_lua_runtime();
+        LuaEngine
+            .prepare_cached_eval("original", "return ARGV[1]", false)
+            .unwrap();
+        LuaEngine
+            .prepare_cached_eval("original", "return ARGV[1]", false)
+            .unwrap();
+        LuaEngine
+            .prepare_cached_eval("pinned", "return 3", false)
+            .unwrap();
+        assert!(LuaEngine
+            .prepare_cached_eval("invalid", "this is not Lua", false)
+            .is_err());
+        let weak_functions = with_lua_runtime(false, |runtime| {
+            assert_eq!(runtime.compiled_eval_scripts.len(), 2);
+            assert!(!runtime.compiled_eval_scripts.contains_key("invalid"));
+            let function: LuaFunction = runtime
+                .lua
+                .load("return function() return 42 end")
+                .eval()
+                .unwrap();
+            let key = runtime.lua.create_registry_value(function.clone()).unwrap();
+            runtime.compiled_scripts.insert("library".to_string(), key);
+            let table = runtime.lua.create_table().unwrap();
+            table.raw_set("library_function", function).unwrap();
+            runtime
+                .lua
+                .globals()
+                .raw_set(super::super::REGISTERED_FUNCS_TABLE, table)
+                .unwrap();
+            let weak = runtime.lua.create_table().unwrap();
+            let meta = runtime.lua.create_table().unwrap();
+            meta.raw_set("__mode", "v").unwrap();
+            weak.set_metatable(Some(meta)).unwrap();
+            weak.raw_set("original", compiled_eval_function(runtime, "original"))
+                .unwrap();
+            weak.raw_set("pinned", compiled_eval_function(runtime, "pinned"))
+                .unwrap();
+            Ok(weak)
+        })
+        .unwrap();
+
+        release_eval_script("original");
+        release_eval_script("missing");
+        with_lua_runtime(false, |runtime| {
+            runtime.lua.gc_collect().unwrap();
+            assert!(matches!(
+                weak_functions.raw_get::<LuaValue>("original").unwrap(),
+                LuaValue::Nil
+            ));
+            assert!(matches!(
+                weak_functions.raw_get::<LuaValue>("pinned").unwrap(),
+                LuaValue::Function(_)
+            ));
+            assert!(!runtime.compiled_eval_scripts.contains_key("original"));
+            assert!(runtime.compiled_eval_scripts.contains_key("pinned"));
+            let function: LuaFunction = runtime
+                .lua
+                .registry_value(&runtime.compiled_scripts["library"])
+                .unwrap();
+            assert_eq!(function.call::<i64>(()).unwrap(), 42);
+            Ok(())
+        })
+        .unwrap();
+        clear_eval_scripts();
+        with_lua_runtime(false, |runtime| {
+            assert!(matches!(
+                weak_functions.raw_get::<LuaValue>("pinned").unwrap(),
+                LuaValue::Nil
+            ));
+            assert!(runtime.compiled_eval_scripts.is_empty());
+            assert!(runtime.compiled_scripts.contains_key("library"));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(registered_function_count(), 1);
+        reset_lua_runtime();
+    }
 }

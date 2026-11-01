@@ -12,6 +12,7 @@ impl AclUser {
             || !self.nopass
             || !self.passwords.is_empty()
             || !self.selectors.is_empty()
+            || !self.roles.is_empty()
             || self.root_selector.allowed_dbs.is_some()
         {
             return false;
@@ -20,9 +21,10 @@ impl AclUser {
         let has_star_key = root.patterns.len() == 1
             && matches!(
                 root.patterns.first(),
-                Some(p) if p.pattern == "*" && p.flags == ACL_ALL_PERMISSION
+                Some(p) if p.pattern == b"*".as_slice() && p.flags == ACL_ALL_PERMISSION
             );
-        let has_star_channel = root.pubsub_patterns.len() == 1 && root.pubsub_patterns[0] == "*";
+        let has_star_channel =
+            root.pubsub_patterns.len() == 1 && root.pubsub_patterns[0] == b"*".as_slice();
         let has_all_cat = root.categories.len() == 1 && root.categories[0] == "+@all";
         has_star_key && has_star_channel && has_all_cat
     }

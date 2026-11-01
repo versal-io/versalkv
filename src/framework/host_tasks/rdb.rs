@@ -40,6 +40,7 @@ pub(crate) struct RdbLoadTask {
     visibility: DatasetVisibility,
     progress_interval_bytes: u64,
     skip_codec_checksums: bool,
+    compressed_physical_bytes: Option<usize>,
 }
 
 pub(crate) struct DebugRdbTask {
@@ -147,12 +148,16 @@ impl RdbLoadTask {
             dataset,
             visibility,
             progress_interval_bytes,
-            skip_codec_checksums: false,
+            skip_codec_checksums: policy.skip_checksum,
+            compressed_physical_bytes: None,
         }
     }
 
     pub(crate) fn with_skip_codec_checksums(mut self, skip: bool) -> Self {
         self.skip_codec_checksums = skip;
+        if skip {
+            self.decoder.skip_checksum();
+        }
         self
     }
 
@@ -175,12 +180,19 @@ impl RdbLoadTask {
                     "Logical RDB CRC64 skipped for streaming-compressed input"
                 );
                 self.decoder.skip_checksum();
+                self.compressed_physical_bytes = Some(decoded.physical_bytes);
                 self.bytes = decoded.bytes;
             }
         }
         loop {
             match self.decoder.step(&mut self.dataset)? {
-                RdbStep::Finished(metadata) => {
+                RdbStep::Finished(mut metadata) => {
+                    if let Some(physical_bytes) = self.compressed_physical_bytes {
+                        if metadata.consumed != self.bytes.len() {
+                            return Err(RdbTaskError::Load(LoadError::Corrupt));
+                        }
+                        metadata.consumed = physical_bytes;
+                    }
                     if metadata.empty_keys > 0 {
                         log::warn!("empty keys skipped: {}", metadata.empty_keys);
                     }
@@ -305,5 +317,51 @@ mod tests {
                 .len(),
             8192
         );
+    }
+
+    #[test]
+    fn codec_fix_checksum_skip_preserves_rdb_structure_validation() {
+        use crate::foundation::io::persistence::rdb::compression::{
+            decode_rdb_stream, encode_rdb_stream,
+        };
+        let logical = serialize_all_with_options(
+            &DbSet::new(1),
+            0,
+            RdbSerializeOptions {
+                compression: false,
+                checksum: true,
+            },
+        );
+        let wire = encode_rdb_stream(&logical, true).unwrap();
+        let mut checksum_only = wire.clone();
+        *checksum_only.last_mut().unwrap() ^= 1;
+        let mut truncated = wire.clone();
+        truncated.pop();
+        let mut envelope = wire.clone();
+        envelope[5] = 1;
+        let mut invalid_eof = decode_rdb_stream(&wire, false).unwrap().unwrap().bytes;
+        let eof = invalid_eof.len() - 9;
+        invalid_eof[eof] = 0;
+        let invalid_eof = encode_rdb_stream(&invalid_eof, true).unwrap();
+        let mut extra = logical.clone();
+        extra.push(b'X');
+        let extra = encode_rdb_stream(&extra, true).unwrap();
+        for (bytes, should_load) in [
+            (checksum_only, true),
+            (truncated, false),
+            (envelope, false),
+            (invalid_eof, false),
+            (extra, false),
+        ] {
+            let mut task = RdbLoadTask::new(
+                bytes,
+                DbSet::new(1),
+                RdbDecodePolicy::persisted(true, 0),
+                DatasetVisibility::Visible,
+                0,
+            )
+            .with_skip_codec_checksums(true);
+            assert_eq!(task.run(&mut count_rdb_yield).is_ok(), should_load);
+        }
     }
 }

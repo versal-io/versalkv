@@ -1,10 +1,12 @@
 mod file;
 mod log;
 mod misc;
+mod role;
 mod setuser;
 mod user;
 
 use self::file::{acl_load, acl_save};
+pub(crate) use self::file::validate_acl_file;
 use self::log::acl_log_list;
 use self::misc::{acl_cat, acl_dryrun, acl_genpass};
 use self::setuser::acl_setuser;
@@ -38,6 +40,10 @@ pub fn acl_cmd(conn: &mut dyn CommandConn, args: &CommandArgs, ctx: &mut ServerC
         }
         "whoami" => Value::bulk(Bytes::from(conn.username().as_bytes().to_vec())),
         "users" => acl_users_list(),
+        "setrole" => role::acl_setrole(args, ctx),
+        "delrole" => role::acl_delrole(args),
+        "getrole" => role::acl_getrole(args),
+        "roles" => role::acl_roles_list(args),
         "getuser" => {
             if args.args.len() < 2 {
                 return CommandError::wrong_arity("acl getuser");
@@ -65,6 +71,10 @@ pub fn acl_cmd(conn: &mut dyn CommandConn, args: &CommandArgs, ctx: &mut ServerC
                 "GETUSER <username>",
                 "SETUSER <username> [rule [rule ...]]",
                 "DELUSER <username> [<username> ...]",
+                "SETROLE <rolename> [rule [rule ...]]",
+                "DELROLE <rolename> [<rolename> ...]",
+                "GETROLE <rolename>",
+                "ROLES",
                 "DIGEST",
                 "CAT",
                 "CAT <category>",

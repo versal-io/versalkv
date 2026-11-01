@@ -92,25 +92,27 @@ pub(super) fn gen_replication_section(
                 .map(|info| (info.offset.map_or(-1, |offset| offset.get()), info.lag_ms))
                 .unwrap_or((0, 0));
             s.push_str(&format!(
-                "slave{}:ip={},port={},state={},offset={},lag={},type={}\r\n",
+                "slave{}:ip={},port={},state={},offset={},lag={},type={}{}\r\n",
                 slave_index,
                 channel.ip,
                 channel.port,
                 channel.state,
                 offset,
                 lag_ms,
-                channel.channel_type
+                channel.channel_type,
+                compression_suffix(replication, key)
             ));
             slave_index += 1;
         } else if let Some(info) = replica_info.get(key) {
             s.push_str(&format!(
-                "slave{}:ip={},port={},state={},offset={},lag={},type=replica\r\n",
+                "slave{}:ip={},port={},state={},offset={},lag={},type=replica{}\r\n",
                 slave_index,
                 info.ip,
                 info.port,
                 info.state,
                 info.offset.map_or(-1, |offset| offset.get()),
-                info.lag_ms
+                info.lag_ms,
+                compression_suffix(replication, key)
             ));
             slave_index += 1;
         }
@@ -170,6 +172,15 @@ pub(super) fn gen_replication_section(
         replication.view.replicas_waiting_psync,
     );
     s
+}
+
+fn compression_suffix(
+    replication: &crate::engine::distributed::replication::ReplicationState,
+    key: &usize,
+) -> String {
+    replication.view.compression_stats.get(key).map_or_else(String::new, |(wire, logical)| {
+        format!(",repl_compression=lz4,repl_compressed_bytes={wire},repl_uncompressed_bytes={logical}")
+    })
 }
 
 pub(super) fn gen_keyspace_section(dbs: &DbSet) -> String {

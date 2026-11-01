@@ -196,6 +196,9 @@ impl ReplicationRuntime {
                     },
                 );
             }
+            if let Some(stats) = link.compression_stats() {
+                view.compression_stats.insert(connection_id, stats);
+            }
         }
         for (&connection_id, record) in &self.channel_records {
             if !matches!(

@@ -404,6 +404,37 @@ impl ServerWorkerState {
         {
             return false;
         }
+        let Some(&first_connection) = rdb_connections.first() else {
+            return false;
+        };
+        let filter_mode = self
+            .replication_runtime
+            .replica_sync_preferences(first_connection)
+            .0;
+        let Some(snapshot) = self.replication_snapshot_options(first_connection) else {
+            return false;
+        };
+        let version = self
+            .replication_runtime
+            .replica_snapshot_version(first_connection);
+        if rdb_connections.iter().any(|connection| {
+            self.replication_snapshot_options(*connection) != Some(snapshot)
+                || self
+                    .replication_runtime
+                    .replica_snapshot_version(*connection)
+                    != version
+                || self
+                    .replication_runtime
+                    .replica_sync_preferences(*connection)
+                    .0
+                    != filter_mode
+        }) {
+            return false;
+        }
+        for &connection in rdb_connections {
+            self.replication_runtime
+                .freeze_full_sync_snapshot_options(connection, snapshot);
+        }
         let leased_tokens: Vec<_> = rdb_connections
             .iter()
             .filter_map(|connection_id| {
@@ -439,10 +470,15 @@ impl ServerWorkerState {
                 libs,
                 &fds,
                 &marker,
+                filter_mode == crate::framework::distributed::replication::RdbFilterMode::All,
+                snapshot,
             )
         else {
             return false;
         };
+        crate::server_log!(notice,
+            "Starting BGSAVE for SYNC with target: replicas sockets using: dual-channel, compression: {}",
+            if snapshot.compression == crate::foundation::io::persistence::rdb::compression::RdbCompression::Lz4 { "lz4" } else { "none" });
         if self
             .ctx
             .persistence_mut()
@@ -621,16 +657,15 @@ impl ServerWorkerState {
         let completed_socket_close = child
             .completion_state
             .completed_socket_close_satisfied_child_exit();
+        use std::io::Read;
+        let mut metric = [0u8; 8];
+        let bytes = child
+            .metric_read_end
+            .read_exact(&mut metric)
+            .map(|_| u64::from_ne_bytes(metric))
+            .unwrap_or(0);
+        self.ctx.stats_mut().add_net_repl_output_bytes(bytes);
         if succeeded || completed_socket_close {
-            use std::io::Read;
-            let mut metric = [0u8; 8];
-            let bytes = child
-                .metric_read_end
-                .read(&mut metric)
-                .ok()
-                .filter(|&n| n == metric.len())
-                .map(|_| u64::from_ne_bytes(metric))
-                .unwrap_or(0);
             crate::server_log!(
                 debug,
                 "direct dual RDB child reaped: pid={} succeeded={} metric_bytes={} phases={:?} targets={:?}",
@@ -640,7 +675,6 @@ impl ServerWorkerState {
                 child.phases,
                 child.targets
             );
-            self.ctx.stats_mut().add_net_repl_output_bytes(bytes);
             child
                 .completion_state
                 .apply_fact(DirectDualFact::ChildSucceeded);
@@ -1065,17 +1099,34 @@ impl ServerWorkerState {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn try_begin_diskless_fork(
         &mut self,
         libs: &[Vec<u8>],
     ) -> Option<(std::fs::File, Vec<u8>, std::fs::File)> {
-        if !self.ctx.config().replication.repl_diskless_sync
-            || self.ctx.persistence().has_active_child()
-        {
+        let snapshot = crate::foundation::io::persistence::rdb::compression::RdbSnapshotOptions {
+            compression: self.ctx.config().persistence.rdbcompression,
+            checksum: self.ctx.config().persistence.rdbchecksum,
+        };
+        self.try_begin_diskless_fork_with_options(libs, snapshot)
+    }
+
+    pub(crate) fn try_begin_diskless_fork_with_options(
+        &mut self,
+        libs: &[Vec<u8>],
+        snapshot: crate::foundation::io::persistence::rdb::compression::RdbSnapshotOptions,
+    ) -> Option<(std::fs::File, Vec<u8>, std::fs::File)> {
+        if self.ctx.persistence().has_active_child() {
             return None;
         }
-        let child =
-            crate::framework::commands::server::save::fork_diskless_rdb_child(&mut self.ctx, libs)?;
+        let child = crate::framework::commands::server::save::fork_diskless_rdb_child_with_options(
+            &mut self.ctx,
+            libs,
+            snapshot,
+        )?;
+        crate::server_log!(notice,
+            "Starting BGSAVE for SYNC with target: replicas sockets using: normal sync, compression: {}",
+            if snapshot.compression == crate::foundation::io::persistence::rdb::compression::RdbCompression::Lz4 { "lz4" } else { "none" });
         self.ctx
             .persistence_mut()
             .begin_diskless_child(child.pid)
@@ -1788,7 +1839,6 @@ impl ServerWorkerState {
             }
             Ok(n) => {
                 let chunk = buf[..n].to_vec();
-                self.ctx.stats_mut().add_net_repl_output_bytes(n as u64);
                 if let Some(relay) = self.full_sync.diskless_relay.as_ref() {
                     let ids: Vec<ReplicaId> = relay.targets.clone();
                     for id in ids {

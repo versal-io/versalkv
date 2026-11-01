@@ -6,7 +6,7 @@ use libc::{c_int, c_void};
 
 use super::super::{
     ValkeyModuleCtx, ValkeyModuleKey, ValkeyModuleScanCB, ValkeyModuleScanKeyCB,
-    ValkeyModuleString, VALKEYMODULE_OK,
+    ValkeyModuleScanKeyRawBorrowedCB, ValkeyModuleString, VALKEYMODULE_OK,
 };
 use crate::engine::extension::module::capability::runtime_from_opaque;
 
@@ -108,8 +108,64 @@ pub unsafe extern "C" fn ValkeyModule_ScanKey(
     callback: Option<ValkeyModuleScanKeyCB>,
     privdata: *mut c_void,
 ) -> c_int {
+    // SAFETY: the caller keeps all handles and the callback valid for this scan.
     unsafe {
-        if key.is_null() || cursor.is_null() || callback.is_none() {
+        let Some(callback) = callback else {
+            set_errno(libc::EINVAL);
+            return 0;
+        };
+        scan_key_entries(key, cursor, |field, value| {
+            let field_ptr = Box::into_raw(ValkeyModuleString::from_bytes(field));
+            let value_ptr = value
+                .map(|bytes| Box::into_raw(ValkeyModuleString::from_bytes(bytes)))
+                .unwrap_or(std::ptr::null_mut());
+            callback(key, field_ptr, value_ptr, privdata);
+            ValkeyModuleString::release(field_ptr);
+            ValkeyModuleString::release(value_ptr);
+        })
+    }
+}
+
+// SAFETY: handles and callback remain live for this synchronous scan. Byte
+// pointers are borrowed only for the duration of each callback.
+pub unsafe extern "C" fn ValkeyModule_ScanKeyRawBorrowed(
+    key: *mut ValkeyModuleKey,
+    cursor: *mut ValkeyModuleScanCursor,
+    callback: Option<ValkeyModuleScanKeyRawBorrowedCB>,
+    privdata: *mut c_void,
+) -> c_int {
+    // SAFETY: scan_key_entries owns the byte vectors throughout each callback.
+    unsafe {
+        let Some(callback) = callback else {
+            set_errno(libc::EINVAL);
+            return 0;
+        };
+        scan_key_entries(key, cursor, |field, value| {
+            let (value_ptr, value_len) = value
+                .map(|bytes| (bytes.as_ptr().cast(), bytes.len()))
+                .unwrap_or((std::ptr::null(), 0));
+            callback(
+                key,
+                field.as_ptr().cast(),
+                field.len(),
+                value_ptr,
+                value_len,
+                privdata,
+            );
+        })
+    }
+}
+
+// SAFETY: key and cursor are live module handles when non-null; delivery is
+// synchronous and cannot retain a reference to the callback-scoped byte slices.
+unsafe fn scan_key_entries(
+    key: *mut ValkeyModuleKey,
+    cursor: *mut ValkeyModuleScanCursor,
+    mut deliver: impl FnMut(&[u8], Option<&[u8]>),
+) -> c_int {
+    // SAFETY: validate handles before dereferencing and end the Db borrow before callbacks.
+    unsafe {
+        if key.is_null() || cursor.is_null() {
             set_errno(libc::EINVAL);
             return 0;
         }
@@ -128,44 +184,55 @@ pub unsafe extern "C" fn ValkeyModule_ScanKey(
         } else {
             std::ptr::null_mut()
         };
-        if internal.is_null() {
-            set_errno(libc::EINVAL);
-            return 0;
-        }
-        let Some(runtime) = runtime_from_opaque((*internal).runtime_handle) else {
-            set_errno(libc::EINVAL);
-            return 0;
-        };
-        let entries = match runtime.module_scan_key((*internal).db_idx as u32, &handle.key) {
-            Ok(entries) => entries,
-            Err(()) => {
+        let (entries, is_incremental) = if !internal.is_null() {
+            let Some(runtime) = runtime_from_opaque((*internal).runtime_handle) else {
+                set_errno(libc::EINVAL);
+                return 0;
+            };
+            let entries = match runtime.module_scan_key((*internal).db_idx as u32, &handle.key) {
+                Ok(entries) => entries,
+                Err(()) => {
+                    set_errno(libc::EINVAL);
+                    return 0;
+                }
+            };
+            (entries.entries, entries.is_incremental)
+        } else {
+            if handle.db.is_null() {
                 set_errno(libc::EINVAL);
                 return 0;
             }
+            let db = &mut *(handle.db as *mut crate::foundation::io::store::kv_engine::Db);
+            use crate::foundation::io::store::Robj;
+            let Some(object) = db.get_no_expire(&handle.key) else {
+                set_errno(libc::EINVAL);
+                return 0;
+            };
+            let is_incremental = matches!(
+                object,
+                Robj::HashHashtable(_) | Robj::SetHashtable(_) | Robj::ZSetSkiplist(_)
+            );
+            let entries = match db.module_scan_key(&handle.key) {
+                Ok(entries) => entries,
+                Err(()) => {
+                    set_errno(libc::EINVAL);
+                    return 0;
+                }
+            };
+            (entries, is_incremental)
         };
-        if (*cursor).index >= entries.len() {
-            (*cursor).done = true;
-            set_errno(0);
-            return VALKEYMODULE_OK;
-        }
-        let (field, value) = entries[(*cursor).index].clone();
-        (*cursor).index += 1;
-        let field_ptr = Box::into_raw(ValkeyModuleString::from_bytes(&field));
-        let value_ptr = value
-            .as_deref()
-            .map(|bytes| Box::into_raw(ValkeyModuleString::from_bytes(bytes)))
-            .unwrap_or(std::ptr::null_mut());
-        callback.expect("callback checked above")(key, field_ptr, value_ptr, privdata);
-        ValkeyModuleString::release(field_ptr);
-        ValkeyModuleString::release(value_ptr);
-        if (*cursor).index >= entries.len() {
-            (*cursor).done = true;
-            set_errno(0);
-            VALKEYMODULE_OK
+        let end = if is_incremental {
+            (*cursor).index.saturating_add(1).min(entries.len())
         } else {
-            set_errno(0);
-            1
+            entries.len()
+        };
+        for (field, value) in entries.iter().take(end).skip((*cursor).index) {
+            deliver(field, value.as_deref());
         }
+        (*cursor).index = end;
+        (*cursor).done = end >= entries.len();
+        set_errno(0);
+        c_int::from(!(*cursor).done)
     }
 }
 

@@ -11,6 +11,8 @@ pub fn httl(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> CommandOutc
 }
 
 fn httl_reply(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> Value {
+    let now_ms = runtime.now_ms();
+    let ignore_expiry = runtime.read_expired_values();
     if args.args.len() < 2 {
         return CommandError::wrong_arity("httl");
     }
@@ -52,11 +54,11 @@ fn httl_reply(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> Value {
         if !key_exists[i] {
             out.push(Value::integer(-2));
         } else {
-            let ms = db.hash_field_ttl_ms(key, field.as_ref());
+            let ms = db.hash_field_ttl_ms_at(key, field.as_ref(), now_ms, ignore_expiry);
             if ms < 0 {
                 out.push(Value::integer(ms));
             } else {
-                out.push(Value::integer((ms + 500) / 1000));
+                out.push(Value::integer(((ms as u64 + 500) / 1000) as i64));
             }
         }
     }

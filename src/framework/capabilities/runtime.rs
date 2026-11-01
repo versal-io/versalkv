@@ -144,6 +144,7 @@ fn module_acl_error(
         conn.username(),
         denial,
         &key_requirements,
+        &args.args,
     );
     crate::engine::extension::acl::add_acl_log_entry(
         reason,
@@ -160,6 +161,7 @@ fn module_acl_denial(
     username: &str,
     denial: crate::engine::extension::acl::AclDenial,
     keys: &[(&[u8], u8)],
+    args: &[Bytes],
 ) -> (i32, String, String) {
     use crate::engine::extension::acl::{AclDenial, ACL_DENIED_CMD, ACL_DENIED_DB, ACL_DENIED_KEY};
     match denial {
@@ -182,6 +184,13 @@ fn module_acl_denial(
                 .map(|(key, _)| String::from_utf8_lossy(key).into_owned())
                 .unwrap_or_else(|| command_name.to_string()),
             "NOPERM No permissions to access a key".to_string(),
+        ),
+        AclDenial::Channel(index) => (
+            crate::engine::extension::acl::ACL_DENIED_CHANNEL,
+            args.get(index)
+                .map(|channel| String::from_utf8_lossy(channel).into_owned())
+                .unwrap_or_else(|| command_name.to_string()),
+            "NOPERM No permissions to access a channel".to_string(),
         ),
     }
 }
@@ -412,6 +421,78 @@ impl ScriptRuntime for ServerContext {
 }
 
 impl ModuleRuntime for ServerContext {
+    fn apply_module_call_effects(
+        &mut self,
+        mut effects: crate::engine::extension::module::api::call::pending::ModuleCallEffects,
+    ) {
+        if with_current_module_conn(|conn| {
+            if let Some(delta) = effects.dirty_delta.take() {
+                conn.record_dirty_delta(delta);
+            }
+            for key in effects.dirty_keys.drain(..) {
+                conn.record_dirty_key(key);
+            }
+            conn.extend_script_propagation(std::mem::take(&mut effects.propagation));
+            conn.extend_notifications(std::mem::take(&mut effects.notifications));
+            for notification in effects.shard_notifications.drain(..) {
+                conn.record_shard_notification(notification);
+            }
+            for notification in effects.cluster_notifications.drain(..) {
+                conn.record_cluster_notification(notification);
+            }
+            for notification in effects.cluster_shard_notifications.drain(..) {
+                conn.record_cluster_shard_notification(notification);
+            }
+        })
+        .is_none()
+        {
+            self.module_registry_mut().pending_effects.push(effects);
+        }
+    }
+    fn module_server_info(&mut self, section: Option<&str>) -> String {
+        let args = CommandArgs {
+            name: Bytes::from_static(b"INFO"),
+            args: section
+                .map(|section| vec![Bytes::copy_from_slice(section.as_bytes())])
+                .unwrap_or_default(),
+        };
+        let mut conn =
+            crate::engine::extension::module::api::call::call_conn::ModuleCallConn::with_tracking(
+                0, None,
+            );
+        match crate::framework::commands::server::info::info(&mut conn, &args, self) {
+            Value::Bulk(text) => String::from_utf8_lossy(&text).into_owned(),
+            _ => String::new(),
+        }
+    }
+    fn retain_pending_module_call(
+        &mut self,
+        call: crate::engine::extension::module::api::call::pending::PendingModuleCall,
+    ) -> Option<usize> {
+        let blocked = call.conn.blocked()?;
+        let session = crate::engine::command::SessionId(call.conn.token().0 as u64);
+        if blocked.keys.is_empty() {
+            self.blocking_registry_mut()
+                .register_keyless_client(session);
+        } else {
+            self.blocking_registry_mut().register_client(
+                call.conn.selected_db(),
+                &blocked.keys,
+                session,
+            );
+        }
+        Some(self.module_registry_mut().retain_pending_call(call))
+    }
+
+    fn abort_pending_module_call(&mut self, handle: usize) -> bool {
+        let Some(mut call) = self.module_registry_mut().pending_calls.remove(&handle) else {
+            return false;
+        };
+        call.suppress_callbacks();
+        unregister_pending_module_call(self, &call.conn);
+        call.conn.set_blocked(None);
+        true
+    }
     fn num_dbs(&self) -> usize {
         self.num_dbs()
     }
@@ -430,6 +511,12 @@ impl ModuleRuntime for ServerContext {
 
     fn is_oom(&self) -> bool {
         self.maxmemory_state().is_over_limit()
+    }
+
+    fn has_paused_writes(&self) -> bool {
+        self.client_pause()
+            .is_paused(crate::foundation::io::sys::time::mstime())
+            != crate::framework::context::PauseAction::None
     }
 
     fn has_enough_replicas_to_write(&self) -> bool {
@@ -564,7 +651,7 @@ impl ModuleRuntime for ServerContext {
             // SAFETY: the scope keeps the connection live for this callback.
             let conn = unsafe { &*conn.0 };
             Some(ModuleClientTracking {
-                id: conn.token().0,
+                id: conn.tracking_token().0,
                 is_tracking: conn.tracking(),
                 is_broadcast: conn.tracking_bcast(),
                 is_optin: conn.tracking_optin(),
@@ -671,11 +758,23 @@ impl ModuleRuntime for ServerContext {
         &mut self,
         db_idx: u32,
         key: &[u8],
-    ) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>)>, ()> {
-        self.dbs_mut()
-            .get_mut(db_idx)
-            .ok_or(())?
-            .module_scan_key(key)
+    ) -> Result<crate::engine::extension::module::capability::ModuleKeyScan, ()> {
+        let db = self.dbs_mut().get_mut(db_idx).ok_or(())?;
+        let is_incremental = matches!(
+            db.get_no_expire(key),
+            Some(
+                crate::foundation::io::store::Robj::HashHashtable(_)
+                    | crate::foundation::io::store::Robj::SetHashtable(_)
+                    | crate::foundation::io::store::Robj::ZSetSkiplist(_)
+            )
+        );
+        let entries = db.module_scan_key(key)?;
+        Ok(
+            crate::engine::extension::module::capability::ModuleKeyScan {
+                entries,
+                is_incremental,
+            },
+        )
     }
 
     fn record_latency_sample(&mut self, event: &str, latency_ms: i64) {
@@ -716,9 +815,10 @@ impl ModuleRuntime for ServerContext {
             container: None,
             key_flags: &[],
             acl_categories: &[],
-            executor: crate::framework::CommandExecutor::Immediate(
-                crate::framework::capabilities::module::module_cmd_dispatcher,
-            ),
+            executor: crate::framework::CommandExecutor::Hosted {
+                fallback: crate::framework::capabilities::module::module_cmd_dispatcher,
+                prepare: crate::framework::host_tasks::prepare_module_task,
+            },
             get_keys: None,
         };
         // SAFETY: registration is synchronous on the event-loop thread and the
@@ -806,12 +906,34 @@ impl ModuleRuntime for ServerContext {
     }
 }
 
+pub(crate) fn unregister_pending_module_call(ctx: &mut ServerContext, conn: &dyn CommandConn) {
+    let Some(blocked) = conn.blocked() else {
+        return;
+    };
+    let session = crate::engine::command::SessionId(conn.token().0 as u64);
+    if blocked.keys.is_empty() {
+        ctx.blocking_registry_mut()
+            .unregister_keyless_client(&session);
+    } else {
+        ctx.blocking_registry_mut()
+            .unregister_client(conn.selected_db(), &blocked.keys, &session);
+    }
+}
+
 fn erase_conn_lifetime(conn: &mut dyn CommandConn) -> *mut dyn CommandConn {
     // SAFETY: ModuleCommandConnPtr is installed only inside
     // ModuleCommandConnScope and restored before the borrowed connection can be
     // released.
     unsafe { std::mem::transmute::<&mut dyn CommandConn, *mut dyn CommandConn>(conn) }
 }
+
+#[cfg(test)]
+#[path = "runtime_scan_tests.rs"]
+mod scan_tests;
+
+#[cfg(test)]
+#[path = "runtime_pause_tests.rs"]
+mod pause_tests;
 
 #[cfg(test)]
 mod tests {

@@ -118,9 +118,8 @@ impl ReplicationRuntime {
         Ok(())
     }
 
-    /// Register and associate an RDB channel when the owning main channel is
-    /// already known to the caller.
-    #[allow(dead_code)] // Used by the primary dual-channel setup in a later slice.
+    /// Legacy negative-test entry: registration alone cannot publish ENDOFF.
+    #[cfg(test)]
     pub fn register_rdb_channel(
         &mut self,
         connection_id: ConnectionId,
@@ -133,6 +132,7 @@ impl ReplicationRuntime {
             )
             || self.channel_pairs.contains_key(&main_connection_id)
             || self.role(connection_id).is_some()
+            || !self.rdb_psync_waits.contains_key(&connection_id)
         {
             return Err(LinkError::Protocol);
         }
@@ -156,15 +156,17 @@ impl ReplicationRuntime {
                 Some(ReplicationConnection::RdbChannelCandidate)
             )
             || self.channel_pairs.contains_key(&main_connection_id)
+            || self.channel_pairs.contains_key(&rdb_connection_id)
         {
             return Err(LinkError::Protocol);
         }
-        let rdb_filter_mode = self
-            .channel_records
-            .get(&rdb_connection_id)
-            .and_then(|record| record.endpoint.as_ref())
-            .map(|endpoint| endpoint.rdb_filter_mode)
-            .unwrap_or_default();
+        let Some(wait) = self.rdb_psync_waits.get(&rdb_connection_id) else {
+            return Err(LinkError::Protocol);
+        };
+        if wait.main.is_some() {
+            return Err(LinkError::Protocol);
+        }
+        let boundary = wait.boundary;
         self.channel_records
             .entry(rdb_connection_id)
             .or_default()
@@ -175,18 +177,11 @@ impl ReplicationRuntime {
             .insert(main_connection_id, rdb_connection_id);
         self.channel_pairs
             .insert(rdb_connection_id, main_connection_id);
-        let boundary = self
-            .rdb_psync_waits
-            .get_mut(&rdb_connection_id)
-            .map(|wait| {
-                wait.main = Some(main_connection_id);
-                wait.boundary
-            });
+        if let Some(wait) = self.rdb_psync_waits.get_mut(&rdb_connection_id) {
+            wait.main = Some(main_connection_id);
+        }
         if let Some(link) = self.primary_for_connection_mut(main_connection_id) {
-            link.set_replica_rdb_filter_mode(rdb_filter_mode);
-            if let Some(boundary) = boundary {
-                link.record_dual_channel_endoff_boundary(boundary);
-            }
+            link.record_dual_channel_endoff_boundary(boundary);
         }
         Ok(())
     }

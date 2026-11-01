@@ -4,7 +4,7 @@ use crate::engine::distributed::cluster::migration::{
     MigrationProtocolMessage, SlotMigrationConnectionRole,
 };
 use crate::engine::distributed::replication::protocol::encode_command;
-use crate::foundation::io::transport::{Interest, ReadOutcome};
+use crate::foundation::io::transport::{Interest, ReadOutcome, WriteOutcome};
 use crate::framework::capabilities::connection::Connection;
 use crate::framework::context::PauseAction;
 use crate::framework::distributed::migration::{SlotExportLink, SlotExportReply};
@@ -413,6 +413,7 @@ impl ServerWorkerState {
         self.connection_registry
             .register(connection)
             .expect("a newly connected migration transport token must be unique");
+        self.prioritize_connection(peer.token);
         let connection_token = peer.token.0;
         self.ctx.incr_connection();
         self.slot_migration_runtime
@@ -509,8 +510,31 @@ impl ServerWorkerState {
             if !self.ensure_slot_migration_test_tcp_buffers(connection_token) {
                 return true;
             }
-            let auth_required = self.ctx.config().security.primaryauth.is_some();
+            let auth_required = self.ctx.config().security.primaryauth.is_some()
+                || self
+                    .ctx
+                    .cluster_state()
+                    .as_deref()
+                    .and_then(|state| state.migrations.get(&id))
+                    .is_some_and(|job| job.has_auth());
             self.transition_slot_migration(&id, MigrationEvent::Connected { auth_required });
+        }
+        // Reuse the socket owner's turn budget while retaining AUTH-specific errors.
+        if self.migration_phase(&id)
+            == Some(MigrationPhase::Export(ExportPhase::ReadingAuthResponse))
+            && self
+                .connection_registry
+                .get(crate::framework::capabilities::io::Token(connection_token))
+                .is_some_and(Connection::has_pending_output)
+        {
+            if let WriteOutcome::Failed(error) = self.flush_connection_output(connection_token) {
+                self.fail_slot_migration(
+                    &id,
+                    &format!("Failed to send AUTH command to target node: {error}"),
+                );
+                self.remove_connection(token_value);
+                return true;
+            }
         }
         false
     }
@@ -598,23 +622,12 @@ impl ServerWorkerState {
                     let event = if phase
                         == Some(MigrationPhase::Export(ExportPhase::ReadingAuthResponse))
                     {
-                        let username = self
-                            .ctx
-                            .config()
-                            .security
-                            .primaryuser
-                            .as_ref()
-                            .map(|user| String::from_utf8_lossy(user).into_owned())
-                            .unwrap_or_else(|| "default".to_string());
                         self.connection_registry
                             [crate::framework::capabilities::io::Token(connection_token)]
                         .authenticated = true;
                         self.connection_registry
                             [crate::framework::capabilities::io::Token(connection_token)]
                         .ever_authenticated = true;
-                        self.connection_registry
-                            [crate::framework::capabilities::io::Token(connection_token)]
-                        .username = username;
                         MigrationEvent::AuthAccepted
                     } else {
                         MigrationEvent::Established
@@ -636,6 +649,11 @@ impl ServerWorkerState {
         }
         match outcome {
             ReadOutcome::PeerClosed => {
+                if self.migration_phase(&id)
+                    == Some(MigrationPhase::Export(ExportPhase::ReadingAuthResponse))
+                {
+                    self.fail_slot_migration(&id, "Target node did not respond to AUTH command");
+                }
                 if self
                     .connection_registry
                     .contains(crate::framework::capabilities::io::Token(connection_token))
@@ -644,6 +662,11 @@ impl ServerWorkerState {
                 }
             }
             ReadOutcome::Failed(error) => {
+                if self.migration_phase(&id)
+                    == Some(MigrationPhase::Export(ExportPhase::ReadingAuthResponse))
+                {
+                    self.fail_slot_migration(&id, "Target node did not respond to AUTH command");
+                }
                 crate::server_log!(
                     verbose,
                     "slot migration read failed on token {}: {}",
@@ -673,14 +696,39 @@ impl ServerWorkerState {
         else {
             return;
         };
-        let Some(password) = self.ctx.config().security.primaryauth.clone() else {
-            return;
-        };
-        let frame = if let Some(user) = self.ctx.config().security.primaryuser.as_deref() {
-            encode_command(&[b"AUTH", user, &password])
+        let auth = self
+            .ctx
+            .cluster_state_mut()
+            .as_deref_mut()
+            .and_then(|state| state.migrations.take_auth(id));
+        // Remote explicit credentials must not become retained local ACL identity.
+        let username = if auth.is_some() {
+            "default".to_string()
         } else {
-            encode_command(&[b"AUTH", &password])
+            self.ctx
+                .config()
+                .security
+                .primaryuser
+                .as_ref()
+                .map(|user| String::from_utf8_lossy(user).into_owned())
+                .unwrap_or_else(|| "default".to_string())
         };
+        let frame = match auth.as_ref() {
+            Some(auth) => encode_command(&[b"AUTH", auth.username(), auth.password()]),
+            None => {
+                let Some(password) = self.ctx.config().security.primaryauth.as_deref() else {
+                    return;
+                };
+                if let Some(user) = self.ctx.config().security.primaryuser.as_deref() {
+                    encode_command(&[b"AUTH", user, password])
+                } else {
+                    encode_command(&[b"AUTH", password])
+                }
+            }
+        };
+        drop(auth);
+        self.connection_registry[crate::framework::capabilities::io::Token(connection_token)]
+            .username = username;
         self.connection_registry[crate::framework::capabilities::io::Token(connection_token)]
             .queue_pre_client_handshake_reply(frame);
         self.reconcile_slot_export_output_allocation(connection_id);
@@ -1205,4 +1253,263 @@ fn resolve_target(host: &str, port: u16) -> Option<SocketAddr> {
         format!("{host}:{port}")
     };
     authority.to_socket_addrs().ok()?.next()
+}
+
+#[cfg(test)]
+mod auth_tests {
+    use super::*;
+    use crate::engine::distributed::cluster::migration::{
+        MigrationJob, MigrationOperation, SlotRanges, TerminalPhase,
+    };
+    use crate::engine::distributed::cluster::node::{ClusterNode, CLUSTER_NODE_MYSELF};
+    use crate::engine::distributed::cluster::{ClusterState, NodeId, SlotRange};
+    use crate::framework::capabilities::io::Token;
+    use std::io::{Read, Write};
+    use std::net::{Shutdown, TcpListener, TcpStream};
+    use std::time::Duration;
+
+    fn runtime(
+        explicit: Option<(&[u8], &[u8])>,
+        fallback_user: Option<&[u8]>,
+        fallback_password: Option<&[u8]>,
+    ) -> (ServerWorkerState, TcpStream, MigrationJobId, Token) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut runtime = ServerWorkerState::new(1).unwrap();
+        let mut state = ClusterState::new("127.0.0.1", 6379, 16_379);
+        let target = NodeId::parse(b"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
+        let mut node = ClusterNode::new(
+            target.as_str().to_string(),
+            address.ip().to_string(),
+            address.port(),
+            16_380,
+            true,
+        );
+        node.flags &= !CLUSTER_NODE_MYSELF;
+        state.nodes.insert(node.name.clone(), node);
+        state.add_slot(0).unwrap();
+        let id = MigrationJobId::generate();
+        let mut job = MigrationJob::new(
+            id.clone(),
+            NodeId::parse(state.myself.name.as_bytes()).unwrap(),
+            target,
+            SlotRanges::new(vec![SlotRange::new(0, 0).unwrap()]).unwrap(),
+            MigrationOperation::Export,
+            1,
+        );
+        if let Some((user, password)) = explicit {
+            job.set_auth(user, password);
+        }
+        let actions = state.migrations.start(job).unwrap();
+        state.queue_migration_actions(actions);
+        *runtime.ctx.cluster_state_mut() = Some(Box::new(state));
+        runtime.ctx.config_mut().security.primaryuser = fallback_user.map(<[u8]>::to_vec);
+        runtime.ctx.config_mut().security.primaryauth = fallback_password.map(<[u8]>::to_vec);
+        runtime.drive_slot_migration_actions();
+        let (peer, _) = listener.accept().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let token = Token(
+            runtime
+                .slot_migration_runtime
+                .export_connection(&id)
+                .unwrap(),
+        );
+        (runtime, peer, id, token)
+    }
+
+    fn request(runtime: &mut ServerWorkerState, peer: &mut TcpStream, token: Token) -> Vec<u8> {
+        runtime.writes.slot_exports.begin_turn();
+        runtime.handle_writable(token);
+        runtime.handle_writable(token);
+        let mut buffer = [0; 4096];
+        let count = peer.read(&mut buffer).unwrap();
+        buffer[..count].to_vec()
+    }
+
+    fn reply(runtime: &mut ServerWorkerState, peer: &mut TcpStream, token: Token, bytes: &[u8]) {
+        peer.write_all(bytes).unwrap();
+        runtime.transport.wait_readable_for_test(token);
+        runtime.handle_slot_export_readable(token.0);
+    }
+
+    #[test]
+    fn explicit_auth_overrides_both_config_fields_and_waits_for_success() {
+        for (user, password) in [
+            (b"user\0\xff".as_slice(), b"password\r\n\0\xfe".as_slice()),
+            (b"".as_slice(), b"".as_slice()),
+        ] {
+            let (mut runtime, mut peer, id, token) = runtime(
+                Some((user, password)),
+                Some(b"wrong-user"),
+                Some(b"wrong-password"),
+            );
+            assert_eq!(
+                request(&mut runtime, &mut peer, token),
+                encode_command(&[b"AUTH", user, password])
+            );
+            let job = runtime
+                .ctx
+                .cluster_state()
+                .as_ref()
+                .unwrap()
+                .migrations
+                .get(&id)
+                .unwrap();
+            assert!(!job.has_auth());
+            assert_eq!(
+                job.phase,
+                MigrationPhase::Export(ExportPhase::ReadingAuthResponse)
+            );
+            assert_eq!(job.remaining_repl_size, 0);
+            assert!(!format!("{:?}", job.view()).contains("password"));
+            assert!(!runtime.connection_registry[token].username.contains("user"));
+            reply(&mut runtime, &mut peer, token, b"+O");
+            assert_eq!(
+                runtime.migration_phase(&id),
+                Some(MigrationPhase::Export(ExportPhase::ReadingAuthResponse))
+            );
+            assert!(!runtime.connection_registry[token].has_pending_output());
+            reply(&mut runtime, &mut peer, token, b"K\r\n");
+            assert_eq!(
+                runtime.migration_phase(&id),
+                Some(MigrationPhase::Export(
+                    ExportPhase::ReadingEstablishResponse
+                ))
+            );
+            let establish = request(&mut runtime, &mut peer, token);
+            assert!(establish
+                .windows(b"ESTABLISH".len())
+                .any(|bytes| bytes == b"ESTABLISH"));
+            assert!(!establish
+                .windows(b"AUTH".len())
+                .any(|bytes| bytes == b"AUTH"));
+        }
+    }
+
+    #[test]
+    fn explicit_auth_runs_without_primaryauth_and_wrongpass_never_retries() {
+        let (mut runtime, mut peer, id, token) =
+            runtime(Some((b"named-user", b"wrong")), None, None);
+        assert_eq!(
+            request(&mut runtime, &mut peer, token),
+            encode_command(&[b"AUTH", b"named-user", b"wrong"])
+        );
+        runtime.ctx.config_mut().security.primaryauth = Some(b"valid-fallback".to_vec());
+        reply(
+            &mut runtime,
+            &mut peer,
+            token,
+            b"-WRONGPASS invalid username-password pair or user is disabled.\r\n",
+        );
+        runtime.drive_slot_migration_actions();
+        let job = runtime
+            .ctx
+            .cluster_state()
+            .as_ref()
+            .unwrap()
+            .migrations
+            .get(&id)
+            .unwrap();
+        assert_eq!(job.phase, MigrationPhase::Terminal(TerminalPhase::Failed));
+        assert_eq!(job.message.as_deref(), Some("Failed to AUTH to target node: WRONGPASS invalid username-password pair or user is disabled."));
+        assert!(!job.has_auth());
+        assert!(!runtime.connection_registry.contains(token));
+        let mut remainder = Vec::new();
+        peer.read_to_end(&mut remainder).unwrap();
+        assert!(remainder.is_empty());
+    }
+
+    #[test]
+    fn auth_eof_records_specific_failure_after_credentials_are_released() {
+        let (mut runtime, mut peer, id, token) = runtime(Some((b"user", b"password")), None, None);
+        request(&mut runtime, &mut peer, token);
+        peer.shutdown(Shutdown::Write).unwrap();
+        runtime.transport.wait_readable_for_test(token);
+        runtime.handle_slot_export_readable(token.0);
+        let job = runtime
+            .ctx
+            .cluster_state()
+            .as_ref()
+            .unwrap()
+            .migrations
+            .get(&id)
+            .unwrap();
+        assert_eq!(
+            job.message.as_deref(),
+            Some("Target node did not respond to AUTH command")
+        );
+        assert!(!job.has_auth());
+    }
+
+    #[test]
+    fn no_explicit_auth_preserves_config_fallback_and_no_auth_establish() {
+        for user in [None, Some(b"admin".as_slice())] {
+            let (mut runtime, mut peer, id, token) = runtime(None, user, Some(b"password"));
+            let expected = match user {
+                Some(user) => encode_command(&[b"AUTH", user, b"password"]),
+                None => encode_command(&[b"AUTH", b"password"]),
+            };
+            assert_eq!(request(&mut runtime, &mut peer, token), expected);
+            reply(&mut runtime, &mut peer, token, b"+OK\r\n");
+            assert_eq!(
+                runtime.connection_registry[token].username,
+                if user.is_some() { "admin" } else { "default" }
+            );
+            assert_eq!(
+                runtime.migration_phase(&id),
+                Some(MigrationPhase::Export(
+                    ExportPhase::ReadingEstablishResponse
+                ))
+            );
+        }
+        let (mut runtime, mut peer, id, token) = runtime(None, Some(b"ignored-user"), None);
+        let establish = request(&mut runtime, &mut peer, token);
+        assert!(establish
+            .windows(b"ESTABLISH".len())
+            .any(|bytes| bytes == b"ESTABLISH"));
+        assert_eq!(
+            runtime.migration_phase(&id),
+            Some(MigrationPhase::Export(
+                ExportPhase::ReadingEstablishResponse
+            ))
+        );
+    }
+
+    #[test]
+    fn cancel_before_auth_clears_credentials_and_closes_without_sending() {
+        let (mut runtime, mut peer, id, token) = runtime(Some((b"user", b"password")), None, None);
+        let state = runtime.ctx.cluster_state_mut().as_deref_mut().unwrap();
+        let actions = state.migrations.cancel_exports(2);
+        assert!(!state.migrations.get(&id).unwrap().has_auth());
+        state.queue_migration_actions(actions);
+        runtime.drive_slot_migration_actions();
+        runtime.cleanup_closed();
+        assert!(!runtime.connection_registry.contains(token));
+        let mut bytes = Vec::new();
+        peer.read_to_end(&mut bytes).unwrap();
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn auth_write_failure_uses_send_specific_message_and_clears_credentials() {
+        let (mut runtime, _peer, id, token) = runtime(Some((b"user", b"password")), None, None);
+        runtime.transport.shutdown(token).unwrap();
+        runtime.handle_writable(token);
+        let job = runtime
+            .ctx
+            .cluster_state()
+            .as_ref()
+            .unwrap()
+            .migrations
+            .get(&id)
+            .unwrap();
+        assert_eq!(job.phase, MigrationPhase::Terminal(TerminalPhase::Failed));
+        assert!(job
+            .message
+            .as_deref()
+            .unwrap()
+            .starts_with("Failed to send AUTH command to target node: "));
+        assert!(!job.has_auth());
+        assert!(!runtime.connection_registry.contains(token));
+    }
 }

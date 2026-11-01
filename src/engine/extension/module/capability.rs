@@ -33,12 +33,37 @@ pub struct ModuleClientTracking {
     pub is_caching: bool,
 }
 
+pub struct ModuleKeyScan {
+    pub entries: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+    pub is_incremental: bool,
+}
+
 pub trait ModuleRuntime {
+    fn apply_module_call_effects(
+        &mut self,
+        _effects: super::api::call::pending::ModuleCallEffects,
+    ) {
+    }
+    fn module_server_info(&mut self, _section: Option<&str>) -> String {
+        String::new()
+    }
+    fn retain_pending_module_call(
+        &mut self,
+        _call: super::api::call::pending::PendingModuleCall,
+    ) -> Option<usize> {
+        None
+    }
+    fn abort_pending_module_call(&mut self, _handle: usize) -> bool {
+        false
+    }
     fn num_dbs(&self) -> usize;
     fn db_mut(&mut self, db_idx: u32) -> Option<&mut Db>;
     fn flush_all_dbs(&mut self);
     fn uses_lfu(&self) -> bool;
     fn is_oom(&self) -> bool {
+        false
+    }
+    fn has_paused_writes(&self) -> bool {
         false
     }
     fn has_enough_replicas_to_write(&self) -> bool {
@@ -134,12 +159,11 @@ pub trait ModuleRuntime {
     fn module_scan_keys(&mut self, _db_idx: u32) -> Vec<Vec<u8>> {
         Vec::new()
     }
-    fn module_scan_key(
-        &mut self,
-        _db_idx: u32,
-        _key: &[u8],
-    ) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>)>, ()> {
-        Ok(Vec::new())
+    fn module_scan_key(&mut self, _db_idx: u32, _key: &[u8]) -> Result<ModuleKeyScan, ()> {
+        Ok(ModuleKeyScan {
+            entries: Vec::new(),
+            is_incremental: false,
+        })
     }
     fn record_latency_sample(&mut self, _event: &str, _latency_ms: i64) {}
     fn record_internal_monitor(
@@ -195,6 +219,77 @@ pub unsafe fn runtime_from_opaque(ptr: *mut c_void) -> Option<&'static mut dyn M
 thread_local! {
     static ACTIVE_MODULE_RUNTIME: Cell<*mut ModuleRuntimeHandle> =
         const { Cell::new(std::ptr::null_mut()) };
+    static ACTIVE_MODULE_HOST: Cell<Option<*mut crate::engine::host::HostDispatcher<'static>>> =
+        const { Cell::new(None) };
+    static MODULE_YIELD_ACTIVE: Cell<bool> = const { Cell::new(false) };
+    static MODULE_HOST_STARTED: Cell<Option<std::time::Instant>> = const { Cell::new(None) };
+}
+
+pub struct ActiveModuleHostScope {
+    previous: Option<*mut crate::engine::host::HostDispatcher<'static>>,
+    previous_started: Option<std::time::Instant>,
+}
+
+impl ActiveModuleHostScope {
+    pub fn enter(dispatcher: Option<&mut crate::engine::host::HostDispatcher<'_>>) -> Self {
+        let dispatcher = dispatcher.map(|dispatcher| {
+            // SAFETY: the synchronous run scope restores the slot before the
+            // borrowed dispatcher is released. Yield never retains a request.
+            unsafe {
+                std::mem::transmute::<
+                    &mut crate::engine::host::HostDispatcher<'_>,
+                    *mut crate::engine::host::HostDispatcher<'static>,
+                >(dispatcher)
+            }
+        });
+        Self {
+            previous: ACTIVE_MODULE_HOST.with(|slot| slot.replace(dispatcher)),
+            previous_started: MODULE_HOST_STARTED
+                .with(|slot| slot.replace(Some(std::time::Instant::now()))),
+        }
+    }
+}
+
+impl Drop for ActiveModuleHostScope {
+    fn drop(&mut self) {
+        ACTIVE_MODULE_HOST.with(|slot| slot.set(self.previous));
+        MODULE_HOST_STARTED.with(|slot| slot.set(self.previous_started));
+    }
+}
+
+pub(crate) fn yield_module_to_host(flags: i32, busy_reply: Option<&str>) {
+    let Some(host) = ACTIVE_MODULE_HOST.with(Cell::get) else {
+        return;
+    };
+    if MODULE_YIELD_ACTIVE.with(|slot| slot.replace(true)) {
+        return;
+    }
+    struct YieldGuard;
+    impl Drop for YieldGuard {
+        fn drop(&mut self) {
+            MODULE_YIELD_ACTIVE.with(|slot| slot.set(false));
+        }
+    }
+    let _guard = YieldGuard;
+    let elapsed_ms = MODULE_HOST_STARTED
+        .with(|slot| slot.get())
+        .map_or(0, |started| {
+            started.elapsed().as_millis().min(u64::MAX as u128) as u64
+        });
+    // SAFETY: the host scope keeps this dispatcher live and YieldGuard prevents
+    // nested access. No ModuleRuntime reference spans this host invocation.
+    let result = unsafe {
+        (&mut *host)(crate::engine::host::HostRequest::Yield(
+            crate::engine::host::HostYield::Module {
+                flags,
+                busy_reply,
+                elapsed_ms,
+            },
+        ))
+    };
+    if let Err(error) = result {
+        log::warn!("Module yield failed: {error}");
+    }
 }
 
 pub struct ActiveModuleRuntimeScope {

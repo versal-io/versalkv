@@ -11,8 +11,8 @@ use crate::engine::extension::acl::{
 use crate::foundation::io::store::kv_engine::{now_ms, Db};
 use crate::framework::context::ServerContext;
 use crate::framework::observability::keyspace::{
-    self, NOTIFY_GENERIC, NOTIFY_HASH, NOTIFY_KEY_MISS, NOTIFY_LIST, NOTIFY_NEW, NOTIFY_SET,
-    NOTIFY_STREAM, NOTIFY_STRING, NOTIFY_ZSET,
+    self, NOTIFY_EXPIRED, NOTIFY_GENERIC, NOTIFY_HASH, NOTIFY_KEY_MISS, NOTIFY_LIST, NOTIFY_NEW,
+    NOTIFY_PATH_HASH, NOTIFY_SET, NOTIFY_STREAM, NOTIFY_STRING, NOTIFY_ZSET,
 };
 
 pub(crate) struct ServerCommandRuntime<'a> {
@@ -27,6 +27,10 @@ impl<'a> ServerCommandRuntime<'a> {
 }
 
 impl CommandRuntime for ServerCommandRuntime<'_> {
+    fn must_obey_command(&self) -> bool {
+        self.conn.import_source() || self.ctx.is_loading()
+    }
+
     fn command_catalog(&self) -> &dyn crate::framework::commands::introspection::CommandCatalog {
         self.ctx
     }
@@ -128,10 +132,32 @@ impl CommandRuntime for ServerCommandRuntime<'_> {
             &args.args,
             acl_categories,
         );
+        let extracted = crate::framework::commands::server::command::extract_command_keys(
+            command_name,
+            &args.args,
+            self.ctx,
+        );
+        let keys: Vec<_> = extracted
+            .iter()
+            .map(|(key, flags)| {
+                let mut required = 0;
+                if flags.contains(&"access") {
+                    required |= crate::engine::extension::acl::ACL_READ_PERMISSION;
+                }
+                if flags
+                    .iter()
+                    .any(|flag| matches!(*flag, "insert" | "update" | "delete"))
+                {
+                    required |= crate::engine::extension::acl::ACL_WRITE_PERMISSION;
+                }
+                (*key, required)
+            })
+            .collect();
         Ok(user.has_cmd_with_unrestricted_key_access(
             command,
-            self.conn.transaction_db_id(),
+            i64::from(self.conn.selected_db()),
             crate::engine::extension::acl::ACL_READ_PERMISSION,
+            &keys,
         ))
     }
 
@@ -184,6 +210,10 @@ impl CommandRuntime for ServerCommandRuntime<'_> {
             active_expire: self.ctx.config().server.active_expire_enabled && !is_read_only_replica,
             lazyfree_user_del: self.ctx.config().server.lazyfree_lazy_user_del,
         }
+    }
+
+    fn preserves_expired_deadline(&self) -> bool {
+        self.ctx.is_loading() || self.ctx.replication().is_replica() || self.suppress_lazy_expire()
     }
 
     fn session(&self) -> RuntimeSession {
@@ -474,6 +504,9 @@ pub(crate) fn apply_server_command_effects(
     if effects.skip_propagate {
         conn.set_skip_propagate(true);
     }
+    if let Some(delta) = effects.dirty_delta.take() {
+        conn.record_dirty_delta(delta);
+    }
     for object in effects.deferred_objects.drain(..) {
         conn.defer_lazyfree_object(object);
     }
@@ -498,7 +531,9 @@ fn apply_server_event(
     let notification_type = match event.kind {
         "new" => NOTIFY_NEW,
         "keymiss" => NOTIFY_KEY_MISS,
-        "set" | "setbit" => NOTIFY_STRING,
+        "set" | "setbit" | "incrby" | "incrbyfloat" => NOTIFY_STRING,
+        "expired" => NOTIFY_EXPIRED,
+        "phset" | "phmset" | "phdel" | "phdelprefix" => NOTIFY_PATH_HASH,
         "linsert" | "lmove_from" | "lmove_to" | "lpop" | "lpush" | "lrem" | "lset" | "ltrim"
         | "rpop" | "rpush" => NOTIFY_LIST,
         "sadd" | "sdiffstore" | "sinterstore" | "srem" | "sunionstore" => NOTIFY_SET,
@@ -545,6 +580,25 @@ mod tests {
                 .map(|_| Bytes::from_static(b"value"))
                 .collect::<Vec<_>>(),
         )))
+    }
+
+    #[test]
+    fn server_effects_move_generic_dirty_delta_once() {
+        use crate::framework::capabilities::connection::CommandEffectDrain;
+        let mut conn = Connection::new_fake();
+        let mut ctx = ServerContext::new(1);
+        let mut effects = CommandEffects {
+            dirty_delta: Some(7),
+            ..CommandEffects::default()
+        };
+        apply_server_command_effects(&mut conn, &mut ctx, 0, &mut effects);
+        assert_eq!(effects.dirty_delta, None);
+        apply_server_command_effects(&mut conn, &mut ctx, 0, &mut effects);
+        let mut drained = conn
+            .take_command_effects(CommandEffectDrain::Completed)
+            .unwrap();
+        assert_eq!(drained.take_dirty_delta(), Some(7));
+        assert_eq!(drained.take_dirty_delta(), None);
     }
 
     fn run_flushdb(conn: &mut Connection, args: &CommandArgs, ctx: &mut ServerContext) -> Value {

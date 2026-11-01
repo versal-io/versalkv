@@ -34,7 +34,7 @@ enum ConfigQuote {
     Single,
 }
 
-fn parse_config_arguments(value: &str) -> Result<Vec<String>, String> {
+pub(crate) fn parse_config_arguments(value: &str) -> Result<Vec<String>, String> {
     let input = value.as_bytes();
     let mut index = 0;
     let mut arguments = Vec::new();
@@ -268,9 +268,21 @@ pub(crate) fn validate_config_file_directives(contents: &str) -> Result<(), Stri
             }
             continue;
         }
-        let Some(raw_value) = raw_value else { continue };
+        let Some(raw_value) = raw_value else {
+            if matches!(
+                key.as_str(),
+                "tls-auto-reload-interval" | "tls-auth-clients-user"
+            ) {
+                return Err(format!("invalid value for {key}"));
+            }
+            continue;
+        };
         let value = decode_config_value(raw_value.trim());
         let valid = match key.as_str() {
+            "tls-auto-reload-interval" => value.parse::<i32>().is_ok_and(|number| number >= 0),
+            "tls-auth-clients-user" => {
+                matches!(value.to_ascii_lowercase().as_str(), "off" | "cn" | "uri")
+            }
             "commandlog-execution-slower-than" | "slowlog-log-slower-than" => {
                 value.parse::<i64>().is_ok_and(|number| number >= -1)
             }
@@ -380,9 +392,15 @@ static SIMPLE_CONFIGS: &[(&str, Setter)] = &[
     ("tls-port",                          Setter::ParsedU16(|c, v| c.tls_port = v)),
     ("tls-cert-file",                     Setter::Str(|c, v| c.tls_cert_file = v.to_string())),
     ("tls-key-file",                      Setter::Str(|c, v| c.tls_key_file = v.to_string())),
+    ("tls-key-file-pass",                 Setter::Str(|c, v| c.tls_key_file_pass = v.to_string().into())),
+    ("tls-alt-cert-file",                 Setter::Str(|c, v| c.tls_alt_cert_file = v.to_string())),
+    ("tls-alt-key-file",                  Setter::Str(|c, v| c.tls_alt_key_file = v.to_string())),
+    ("tls-alt-key-file-pass",             Setter::Str(|c, v| c.tls_alt_key_file_pass = v.to_string().into())),
+    ("tls-auto-reload-interval",          Setter::ParsedI32(|c, v| c.tls_auto_reload_interval = v)),
     ("tls-ca-cert-file",                  Setter::Str(|c, v| c.tls_ca_cert_file = v.to_string())),
     ("tls-ca-cert-dir",                   Setter::Str(|c, v| c.tls_ca_cert_dir = v.to_string())),
     ("tls-auth-clients",                  Setter::Lower(|c, v| c.tls_auth_clients = v)),
+    ("tls-auth-clients-user",             Setter::Lower(|c, v| c.tls_auth_clients_user = v)),
     ("tls-protocols",                     Setter::Str(|c, v| c.tls_protocols = v.to_string())),
     ("tls-ciphers",                       Setter::Str(|c, v| c.tls_ciphers = v.to_string())),
     ("tls-ciphersuites",                  Setter::Str(|c, v| c.tls_ciphersuites = v.to_string())),
@@ -393,6 +411,7 @@ static SIMPLE_CONFIGS: &[(&str, Setter)] = &[
     ("tls-cluster",                       Setter::Bool(|c, v| c.tls_cluster = v)),
     ("tls-client-cert-file",              Setter::Str(|c, v| c.tls_client_cert_file = v.to_string())),
     ("tls-client-key-file",               Setter::Str(|c, v| c.tls_client_key_file = v.to_string())),
+    ("tls-client-key-file-pass",          Setter::Str(|c, v| c.tls_client_key_file_pass = v.to_string().into())),
     ("cluster-port",                      Setter::ParsedU16(|c, v| c.cluster_port = v)),
     ("cluster-ping-interval",             Setter::ParsedU64(|c, v| c.cluster_ping_interval = v)),
     ("cluster-announce-port",             Setter::ParsedU16(|c, v| c.cluster_announce_port = v)),
@@ -549,6 +568,13 @@ impl Config {
         let mut parts = line.splitn(2, |c: char| c.is_whitespace());
         let key = parts.next().unwrap_or_default().to_ascii_lowercase();
         self.remember_explicit_key(&key);
+        if matches!(key.as_str(), "user" | "role") {
+            if key == "user" {
+                self.reject_existing_acl_user(line);
+            }
+            self.acl_declarations.push(line.to_string());
+            return;
+        }
         if skip_cli_set && self.cli_set_keys.contains(&key) {
             return;
         }
@@ -576,6 +602,23 @@ impl Config {
         }
     }
 
+    fn reject_existing_acl_user(&self, line: &str) {
+        let Ok(arguments) = parse_config_arguments(line) else {
+            return;
+        };
+        let Some(username) = arguments.get(1).filter(|name| name.as_str() != "default") else {
+            return;
+        };
+        let Ok(users) = acl_users().lock() else {
+            eprintln!("ACL user registry is unavailable");
+            std::process::exit(1);
+        };
+        if users.contains_key(username) {
+            eprintln!("Error in user declaration '{username}': Duplicate user found. A user can only be defined once in config files");
+            std::process::exit(1);
+        }
+    }
+
     fn apply_empty_config_value(&mut self, key: &str) {
         if let Some((_, clear)) = EMPTY_CONFIGS.iter().find(|(name, _)| *name == key) {
             clear(self);
@@ -595,7 +638,6 @@ impl Config {
         match key {
             "save" => self.prepend_save_config(value),
             "sentinel" => self.sentinel_directives.push(raw_value.to_string()),
-            "user" => self.apply_user_config(value),
             "rename-command" => self.apply_rename_command(value),
             "loadmodule" => self.apply_loadmodule(value),
             _ if capture_registry => self.capture_registry_config(key, value),
@@ -661,31 +703,6 @@ impl Config {
             Some(existing) => Some(existing),
             None => Some(parsed.collect()),
         };
-    }
-
-    fn apply_user_config(&mut self, value: &str) {
-        let user_parts: Vec<&str> = value.split_whitespace().collect();
-        let Some((username, rules)) = user_parts.split_first() else {
-            return;
-        };
-        let users = acl_users();
-        let mut users = users.lock().unwrap();
-        if let Some(user) = users.get_mut(*username) {
-            if username.eq_ignore_ascii_case("default") && !rules.is_empty() {
-                let _ = user.apply_rule("reset");
-                for rule in rules {
-                    let _ = user.apply_rule(rule);
-                }
-                return;
-            }
-            eprintln!("Error in user declaration '{}': Duplicate user found. A user can only be defined once in config files", username);
-            std::process::exit(1);
-        }
-        let mut user = crate::engine::extension::acl::AclUser::new_disabled();
-        for rule in rules {
-            let _ = user.apply_rule(rule);
-        }
-        users.insert(username.to_string(), user);
     }
 
     fn apply_rename_command(&mut self, value: &str) {

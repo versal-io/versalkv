@@ -306,7 +306,7 @@ pub(crate) fn register_persistence_configs(reg: &mut ConfigRegistry) {
     reg.register(&ConfigSpec {
         name: "rdbcompression",
         type_: ConfigType::Enum,
-        enum_values: &["no", "yes", "lzf", "lz4"],
+        enum_values: &["no", "yes", "lzf", "lz4", "zstd"],
         numeric_min: 0,
         numeric_max: 0,
         flags: &[],
@@ -314,6 +314,9 @@ pub(crate) fn register_persistence_configs(reg: &mut ConfigRegistry) {
         get: |rcfg| ConfigValue::String(rcfg.persistence.rdbcompression.as_str().to_string()),
         set: |rcfg, val| {
             if let ConfigValue::String(v) = val {
+                if v.eq_ignore_ascii_case("zstd") {
+                    return Err("Zstandard compression is not available in this build".to_string());
+                }
                 rcfg.persistence.rdbcompression =
                     crate::foundation::io::persistence::rdb::compression::RdbCompression::parse(v)
                         .ok_or_else(|| "Invalid RDB compression mode".to_string())?;
@@ -535,4 +538,31 @@ pub(crate) fn register_persistence_configs(reg: &mut ConfigRegistry) {
             }
         },
     });
+}
+
+#[cfg(test)]
+mod compression_tests {
+    use crate::engine::extension::config::spec_registry::ConfigRegistry;
+    use crate::engine::extension::config::RuntimeConfig;
+
+    #[test]
+    fn rdb_zstd_returns_unavailable_without_changing_mode() {
+        let registry = ConfigRegistry::new();
+        let mut config = RuntimeConfig::new();
+        let spec = registry.lookup("rdbcompression").expect("RDB config");
+        let previous = (spec.get)(&config).as_str();
+        let error = registry
+            .try_set(&mut config, "rdbcompression", "zstd")
+            .expect("registered config")
+            .expect_err("unsupported codec");
+        assert!(error.contains("Zstandard compression is not available in this build"));
+        assert_eq!((spec.get)(&config).as_str(), previous);
+        for mode in ["no", "yes", "lzf", "lz4"] {
+            registry
+                .try_set(&mut config, "rdbcompression", mode)
+                .expect("registered config")
+                .expect("supported mode");
+            assert_eq!((spec.get)(&config).as_str(), mode);
+        }
+    }
 }

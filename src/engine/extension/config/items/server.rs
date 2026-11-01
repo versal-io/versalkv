@@ -30,16 +30,30 @@ fn normalize_notify_keyspace_events(value: &str) -> Result<String, String> {
     if value.chars().any(|flag| {
         !matches!(
             flag,
-            'A' | 'g' | '$' | 'l' | 's' | 'h' | 'z' | 'x' | 'e' | 'K' | 'E' | 't' | 'm' | 'd' | 'n'
+            'A' | 'g'
+                | '$'
+                | 'l'
+                | 's'
+                | 'h'
+                | 'z'
+                | 'x'
+                | 'e'
+                | 'K'
+                | 'E'
+                | 't'
+                | 'm'
+                | 'd'
+                | 'n'
+                | 'p'
         )
     }) {
-        return Err("notify-keyspace-events contains an invalid event class".to_string());
+        return Err("Invalid event class character. Use 'Ag$lshzxeKEtmdnp'.".to_string());
     }
     let mut out = String::new();
     if value.contains('A') {
         out.push('A');
     } else {
-        for flag in ['g', '$', 'l', 's', 'h', 'z', 'x', 'e', 't', 'd', 'n'] {
+        for flag in ['g', '$', 'l', 's', 'h', 'z', 'x', 'e', 't', 'd', 'p', 'n'] {
             if value.contains(flag) {
                 out.push(flag);
             }
@@ -670,6 +684,30 @@ pub(crate) fn register_server_configs(reg: &mut ConfigRegistry) {
         alias: None,
         get: |rcfg| ConfigValue::UNumeric(rcfg.server.maxmemory),
         set: |_rcfg, _val| Ok(()),
+    });
+    reg.register(&ConfigSpec {
+        name: "maxmemory-scripts",
+        type_: ConfigType::String,
+        enum_values: &[],
+        numeric_min: 0,
+        numeric_max: 0,
+        flags: &[],
+        alias: None,
+        get: |rcfg| {
+            ConfigValue::String(
+                crate::engine::extension::config::server::scripts_memory::format(
+                    rcfg.server.maxmemory_scripts,
+                ),
+            )
+        },
+        set: |rcfg, val| {
+            let ConfigValue::String(value) = val else {
+                return Err("argument must be a memory or percent value".to_string());
+            };
+            rcfg.server.maxmemory_scripts =
+                crate::engine::extension::config::server::scripts_memory::parse(value)?;
+            Ok(())
+        },
     });
     reg.register(&ConfigSpec {
         name: "maxmemory-policy",

@@ -69,9 +69,53 @@ impl ServerWorkerState {
     /// which emits the "Connection with replica ... lost." notice and
     /// cleans up the diskless/disk-sync relay targets.
     pub(crate) fn disconnect_timedout_replicas(&mut self) {
+        self.reconcile_replication_compression();
         let now_ms = crate::foundation::io::sys::time::mstime();
         let now_sec = crate::foundation::io::sys::time::unixtime();
         self.disconnect_timedout_replicas_at(now_ms, now_sec);
+    }
+
+    fn reconcile_replication_compression(&mut self) {
+        if self.ctx.replication().failover_state != "no-failover" {
+            return;
+        }
+        let mode = self.ctx.config().replication.repl_compression.clone();
+        let downstream = self
+            .replication_runtime
+            .primary_links()
+            .values()
+            .find(|link| {
+                link.state() == PrimaryLinkState::Streaming
+                    && matches!(
+                        link.dual_state(),
+                        PrimaryDualChannelState::Disabled | PrimaryDualChannelState::Online
+                    )
+                    && crate::engine::distributed::replication::protocol::negotiate_lz4(
+                        &mode,
+                        &link.replica().capability,
+                    ) != link.is_compressed()
+            })
+            .map(|link| link.connection_id().0);
+        if let Some(token) = downstream {
+            self.remove_connection(token);
+        }
+        let upstream = self
+            .replication_runtime
+            .replica_link()
+            .filter(|link| {
+                link.is_streaming()
+                    && !link.has_pending_rdb_receive()
+                    && !(mode == "no" && link.compression_is_plaintext())
+                    && crate::engine::distributed::replication::protocol::compression_is_lz4(
+                        link.advertised_compression_mode(),
+                    ) != crate::engine::distributed::replication::protocol::compression_is_lz4(
+                        &mode,
+                    )
+            })
+            .map(|link| link.connection_id().0);
+        if let Some(token) = upstream {
+            self.tear_down_master_link(token);
+        }
     }
 
     pub(crate) fn disconnect_timedout_replicas_at(&mut self, now_ms: i64, now_sec: i64) {

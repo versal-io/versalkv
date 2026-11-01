@@ -104,6 +104,42 @@ fn nofailover_replica_does_not_start_automatic_election() {
 }
 
 #[test]
+fn zero_offset_warning_relogs_each_second_and_resets_after_reason_changes() {
+    let mut bus = ClusterBusManager::new();
+    let mut state = ClusterState::new("127.0.0.1", 6380, 16380);
+    let primary_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    state
+        .nodes
+        .insert(primary_id.to_string(), failed_primary(primary_id));
+    make_replica(&mut state, primary_id);
+    let offsets = std::collections::HashMap::from([(state.myself.name.clone(), 0)]);
+    let health = LocalReplicaFailoverStatus {
+        no_failover_if_empty: true,
+        ..LocalReplicaFailoverStatus::default()
+    };
+    for (now_ms, expected_last_ms) in [(1000, 1000), (1999, 1000), (2000, 2000)] {
+        bus.tick_automatic_failover(&mut state, now_ms, 1000, &offsets, &health);
+        assert_eq!(bus.last_zero_offset_warning_ms, Some(expected_last_ms));
+        assert_eq!(
+            state.automatic_failover.phase(),
+            AutomaticFailoverPhase::Idle
+        );
+    }
+    let healthy = LocalReplicaFailoverStatus::default();
+    bus.tick_automatic_failover(&mut state, 2001, 1000, &offsets, &healthy);
+    assert_eq!(bus.last_zero_offset_warning_ms, None);
+    bus.tick_automatic_failover(&mut state, 2002, 1000, &offsets, &health);
+    assert_eq!(bus.last_zero_offset_warning_ms, Some(2002));
+
+    state.nodes.get_mut(primary_id).unwrap().flags &= !CLUSTER_NODE_FAIL;
+    bus.tick_automatic_failover(&mut state, 2003, 1000, &offsets, &health);
+    assert_eq!(bus.last_zero_offset_warning_ms, None);
+    state.nodes.get_mut(primary_id).unwrap().flags |= CLUSTER_NODE_FAIL;
+    bus.tick_automatic_failover(&mut state, 2004, 1000, &offsets, &health);
+    assert_eq!(bus.last_zero_offset_warning_ms, Some(2004));
+}
+
+#[test]
 fn cron_starts_election_through_automatic_state_machine() {
     let mut bus = ClusterBusManager::new();
     let mut state = ClusterState::new("127.0.0.1", 6380, 16380);

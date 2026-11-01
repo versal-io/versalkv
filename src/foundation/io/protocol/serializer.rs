@@ -22,6 +22,19 @@ pub fn serialize(value: &Value, buf: &mut impl BufMut) {
     serialize_resp2(value, buf)
 }
 
+pub fn serialize_command(parts: &[&[u8]], buf: &mut impl BufMut) {
+    buf.put_u8(b'*');
+    buf.put_slice(parts.len().to_string().as_bytes());
+    buf.put_slice(b"\r\n");
+    for part in parts {
+        buf.put_u8(b'$');
+        buf.put_slice(part.len().to_string().as_bytes());
+        buf.put_slice(b"\r\n");
+        buf.put_slice(part);
+        buf.put_slice(b"\r\n");
+    }
+}
+
 pub fn serialize_to_vec(value: &Value) -> Vec<u8> {
     let mut buf = BytesMut::with_capacity(256);
     serialize(value, &mut buf);
@@ -54,6 +67,9 @@ pub fn serialize_resp2(value: &Value, buf: &mut impl BufMut) {
             buf.put_slice(b"\r\n");
             buf.put_slice(s.as_bytes());
             buf.put_slice(b"\r\n");
+        }
+        Value::DecimalDouble(text) => {
+            serialize_resp2(&Value::Bulk(text.bytes()), buf);
         }
         Value::Bulk(b) => {
             buf.put_u8(b'$');
@@ -154,6 +170,11 @@ pub fn serialize_resp3(value: &Value, buf: &mut impl BufMut) {
             buf.put_u8(b',');
             let s = format_double(*v);
             buf.put_slice(s.as_bytes());
+            buf.put_slice(b"\r\n");
+        }
+        Value::DecimalDouble(text) => {
+            buf.put_u8(b',');
+            buf.put_slice(text.as_bytes());
             buf.put_slice(b"\r\n");
         }
         Value::Bulk(b) => {

@@ -1,5 +1,7 @@
 use crate::common::TestServer;
-use std::time::Duration;
+use std::io::{Read, Write};
+use std::net::TcpStream;
+use std::time::{Duration, Instant};
 use versal::foundation::io::sys::process::{send_signal, ProcessSignal};
 
 mod common;
@@ -52,6 +54,211 @@ fn assert_info_hides_pre_psync_channels(server: &TestServer, context: &str) {
     );
 }
 
+struct RdbCandidateClient {
+    stream: TcpStream,
+}
+
+impl RdbCandidateClient {
+    fn connect(server: &TestServer) -> Self {
+        let stream = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        Self { stream }
+    }
+
+    fn send(&mut self, parts: &[&[u8]]) {
+        let value = versal::foundation::io::protocol::Value::Array(
+            parts
+                .iter()
+                .map(|part| versal::foundation::io::protocol::Value::bulk(part.to_vec()))
+                .collect(),
+        );
+        self.stream
+            .write_all(
+                &versal::foundation::io::protocol::serializer::serialize_to_vec_resp2(&value),
+            )
+            .unwrap();
+    }
+
+    fn read_exact_until(&mut self, bytes: &mut [u8], deadline: Instant) {
+        let mut consumed = 0;
+        while consumed < bytes.len() {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .expect("RDB handshake exceeded its absolute deadline");
+            assert!(!remaining.is_zero());
+            self.stream.set_read_timeout(Some(remaining)).unwrap();
+            let count = self.stream.read(&mut bytes[consumed..]).unwrap();
+            assert_ne!(count, 0, "unexpected RDB protocol EOF");
+            consumed += count;
+        }
+    }
+
+    fn read_line(&mut self, deadline: Instant) -> Vec<u8> {
+        let mut line = Vec::new();
+        loop {
+            let mut byte = [0; 1];
+            self.read_exact_until(&mut byte, deadline);
+            if byte[0] == b'\r' {
+                self.read_exact_until(&mut byte, deadline);
+                assert_eq!(byte[0], b'\n');
+                return line;
+            }
+            assert_ne!(byte[0], b'\n');
+            line.push(byte[0]);
+            assert!(line.len() <= 8192);
+        }
+    }
+
+    fn nonempty_line(&mut self, deadline: Instant) -> Vec<u8> {
+        for _ in 0..=128 {
+            let line = self.read_line(deadline);
+            if !line.is_empty() {
+                return line;
+            }
+        }
+        panic!("too many RDB handshake keepalives");
+    }
+
+    fn command(&mut self, parts: &[&[u8]]) -> Vec<u8> {
+        self.send(parts);
+        let mut line = self.read_line(Instant::now() + Duration::from_secs(5));
+        line.extend_from_slice(b"\r\n");
+        line
+    }
+
+    fn read_eof_rdb(&mut self) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let header = self.nonempty_line(deadline);
+        let marker = header
+            .strip_prefix(b"$EOF:")
+            .expect("candidate SYNC must use EOF framing, not FULLRESYNC");
+        assert_eq!(marker.len(), 40);
+        assert!(marker.iter().all(u8::is_ascii_hexdigit));
+        let mut body = Vec::new();
+        loop {
+            let mut byte = [0; 1];
+            self.read_exact_until(&mut byte, deadline);
+            body.push(byte[0]);
+            assert!(body.len() <= 16 * 1024 * 1024 + marker.len());
+            if body.ends_with(marker) {
+                body.truncate(body.len() - marker.len());
+                let mut dbs = versal::foundation::io::store::kv_engine::DbSet::new(16);
+                let (loaded, consumed, expired, functions) =
+                    versal::foundation::io::persistence::load_rdb_bytes_checked_with_functions(
+                        &body, &mut dbs, true,
+                    )
+                    .expect("candidate RDB must pass decoding and checksum validation");
+                assert_eq!(loaded, 0);
+                assert_eq!(consumed, body.len());
+                assert_eq!(expired, 0);
+                assert!(functions.is_empty());
+                return;
+            }
+        }
+    }
+}
+
+fn prepare_candidate_endoff(
+    server: &TestServer,
+    main: &mut crate::common::Client,
+    rdb: &mut RdbCandidateClient,
+    rdb_id: u64,
+) {
+    assert_eq!(
+        main.command(&[
+            b"REPLCONF",
+            b"set-rdb-client-id",
+            rdb_id.to_string().as_bytes()
+        ]),
+        format!("-ERR Unrecognized RDB client id {rdb_id}\r\n").as_bytes(),
+        "candidate declaration alone must not authorize association"
+    );
+    let info = server.connect().command_str(&[b"INFO", b"replication"]);
+    assert!(info.contains("connected_slaves:0\r\n"), "{info}");
+    let candidate_rows: Vec<_> = info
+        .lines()
+        .filter(|line| line.starts_with("slave") && line.contains("type="))
+        .collect();
+    assert_eq!(candidate_rows.len(), 1, "{info}");
+    assert!(candidate_rows[0].contains("type=rdb-channel"), "{info}");
+    assert_eq!(
+        main.command(&[
+            b"CONFIG",
+            b"SET",
+            b"dual-channel-replication-enabled",
+            b"yes",
+            b"repl-diskless-sync",
+            b"yes",
+            b"repl-diskless-sync-delay",
+            b"0"
+        ]),
+        b"+OK\r\n"
+    );
+    assert_eq!(
+        main.command(&[
+            b"REPLCONF",
+            b"capa",
+            b"eof",
+            b"capa",
+            b"psync2",
+            b"capa",
+            b"dual-channel"
+        ]),
+        b"+OK\r\n"
+    );
+    assert_eq!(
+        main.command(&[b"PSYNC", b"?", b"-1"]),
+        b"+DUALCHANNELSYNC\r\n"
+    );
+    rdb.send(&[b"SYNC"]);
+    let line = rdb.nonempty_line(Instant::now() + Duration::from_secs(5));
+    let fields: Vec<_> = line
+        .strip_prefix(b"$ENDOFF:")
+        .expect("real candidate SYNC must publish ENDOFF without FULLRESYNC")
+        .split(|byte| *byte == b' ')
+        .collect();
+    assert_eq!(fields.len(), 4);
+    assert!(
+        std::str::from_utf8(fields[0])
+            .unwrap()
+            .parse::<i64>()
+            .unwrap()
+            >= 0
+    );
+    assert_eq!(fields[1].len(), 40);
+    assert!(fields[1].iter().all(u8::is_ascii_hexdigit));
+    assert!((-1..=0).contains(
+        &std::str::from_utf8(fields[2])
+            .unwrap()
+            .parse::<i32>()
+            .unwrap()
+    ));
+    assert_eq!(fields[3], rdb_id.to_string().as_bytes());
+}
+
+fn assert_info_reports_associated_candidate(server: &TestServer, ip: &str, port: u16) {
+    let info = server.connect().command_str(&[b"INFO", b"replication"]);
+    assert!(info.contains("connected_slaves:2\r\n"), "{info}");
+    let rows: Vec<_> = info
+        .lines()
+        .filter(|line| line.starts_with("slave") && line.contains("type="))
+        .collect();
+    assert_eq!(rows.len(), 2, "{info}");
+    assert!(
+        rows.iter().any(|line| line.contains("type=rdb-channel")
+            && line.contains(&format!("ip={ip},port={port},"))),
+        "{info}"
+    );
+    assert!(
+        rows.iter()
+            .any(|line| line.contains("type=main-channel")
+                && line.contains("ip=127.0.0.1,port=6380,")),
+        "{info}"
+    );
+}
+
 fn assert_replconf_rdb_channel_option_order_preserves_candidate(rdb_channel_first: bool) {
     let server = TestServer::start_default();
     let mut main = server.connect();
@@ -68,8 +275,12 @@ fn assert_replconf_rdb_channel_option_order_preserves_candidate(rdb_channel_firs
         main.command(&[b"REPLCONF", b"listening-port", b"6380"]),
         b"+OK\r\n"
     );
+    assert_info_hides_pre_psync_channels(
+        &server,
+        "metadata-only main must stay hidden before PSYNC",
+    );
 
-    let mut rdb = server.connect();
+    let mut rdb = RdbCandidateClient::connect(&server);
     let rdb_id = rdb
         .command(&[b"CLIENT", b"ID"])
         .strip_prefix(b":")
@@ -106,6 +317,7 @@ fn assert_replconf_rdb_channel_option_order_preserves_candidate(rdb_channel_firs
         "RDB-channel REPLCONF option order must be accepted"
     );
 
+    prepare_candidate_endoff(&server, &mut main, &mut rdb, rdb_id);
     assert_eq!(
         main.command(&[
             b"REPLCONF",
@@ -116,10 +328,8 @@ fn assert_replconf_rdb_channel_option_order_preserves_candidate(rdb_channel_firs
         "main channel must associate the preserved RDB candidate"
     );
 
-    assert_info_hides_pre_psync_channels(
-        &server,
-        "RDB-channel REPLCONF option order must preserve the candidate before PSYNC",
-    );
+    assert_info_reports_associated_candidate(&server, "198.51.100.8", 6381);
+    rdb.read_eof_rdb();
 }
 
 #[test]
@@ -149,8 +359,12 @@ fn replconf_mixed_case_rdb_channel_option_order_preserves_candidate() {
         main.command(&[b"REPLCONF", b"LiStEnInG-PoRt", b"6380"]),
         b"+OK\r\n"
     );
+    assert_info_hides_pre_psync_channels(
+        &server,
+        "mixed-case main metadata must stay hidden before PSYNC",
+    );
 
-    let mut rdb = server.connect();
+    let mut rdb = RdbCandidateClient::connect(&server);
     let rdb_id = rdb
         .command(&[b"CLIENT", b"ID"])
         .strip_prefix(b":")
@@ -173,6 +387,7 @@ fn replconf_mixed_case_rdb_channel_option_order_preserves_candidate() {
         "mixed-case RDB-channel option must be recognized by the pre-scan"
     );
 
+    prepare_candidate_endoff(&server, &mut main, &mut rdb, rdb_id);
     assert_eq!(
         main.command(&[
             b"REPLCONF",
@@ -182,10 +397,8 @@ fn replconf_mixed_case_rdb_channel_option_order_preserves_candidate() {
         b"+OK\r\n"
     );
 
-    assert_info_hides_pre_psync_channels(
-        &server,
-        "mixed-case option order must preserve the candidate before PSYNC",
-    );
+    assert_info_reports_associated_candidate(&server, "198.51.100.9", 6381);
+    rdb.read_eof_rdb();
 }
 
 #[test]
@@ -216,8 +429,12 @@ fn replconf_rdb_candidate_metadata_survives_separate_frames() {
         main.command(&[b"REPLCONF", b"listening-port", b"6380"]),
         b"+OK\r\n"
     );
+    assert_info_hides_pre_psync_channels(
+        &server,
+        "main metadata must stay hidden before separate RDB frames",
+    );
 
-    let mut rdb = server.connect();
+    let mut rdb = RdbCandidateClient::connect(&server);
     let rdb_id = rdb
         .command(&[b"CLIENT", b"ID"])
         .strip_prefix(b":")
@@ -240,6 +457,7 @@ fn replconf_rdb_candidate_metadata_survives_separate_frames() {
         rdb.command(&[b"REPLCONF", b"rdb-channel", b"1"]),
         b"+OK\r\n"
     );
+    prepare_candidate_endoff(&server, &mut main, &mut rdb, rdb_id);
     assert_eq!(
         main.command(&[
             b"REPLCONF",
@@ -249,10 +467,8 @@ fn replconf_rdb_candidate_metadata_survives_separate_frames() {
         b"+OK\r\n"
     );
 
-    assert_info_hides_pre_psync_channels(
-        &server,
-        "repeated associated RDB metadata must preserve the candidate before PSYNC",
-    );
+    assert_info_reports_associated_candidate(&server, "203.0.113.8", 6382);
+    rdb.read_eof_rdb();
 }
 
 #[test]
@@ -263,8 +479,12 @@ fn replconf_listening_port_then_rdb_channel_preserves_candidate_ownership() {
         main.command(&[b"REPLCONF", b"listening-port", b"6380"]),
         b"+OK\r\n"
     );
+    assert_info_hides_pre_psync_channels(
+        &server,
+        "main metadata must stay hidden before RDB ownership conversion",
+    );
 
-    let mut rdb = server.connect();
+    let mut rdb = RdbCandidateClient::connect(&server);
     let rdb_id = rdb
         .command(&[b"CLIENT", b"ID"])
         .strip_prefix(b":")
@@ -272,7 +492,7 @@ fn replconf_listening_port_then_rdb_channel_preserves_candidate_ownership() {
         .and_then(|value| value.trim().parse::<u64>().ok())
         .expect("CLIENT ID should be an integer");
     assert_eq!(
-        rdb.command(&[b"REPLCONF", b"listening-port", b"6381"]),
+        rdb.command(&[b"REPLCONF", b"listening-port", b"6381", b"capa", b"eof"]),
         b"+OK\r\n"
     );
     assert_eq!(
@@ -280,6 +500,7 @@ fn replconf_listening_port_then_rdb_channel_preserves_candidate_ownership() {
         b"+OK\r\n"
     );
 
+    prepare_candidate_endoff(&server, &mut main, &mut rdb, rdb_id);
     assert_eq!(
         main.command(&[
             b"REPLCONF",
@@ -289,10 +510,8 @@ fn replconf_listening_port_then_rdb_channel_preserves_candidate_ownership() {
         b"+OK\r\n"
     );
 
-    assert_info_hides_pre_psync_channels(
-        &server,
-        "listening-port then rdb-channel must preserve the candidate before PSYNC",
-    );
+    assert_info_reports_associated_candidate(&server, "127.0.0.1", 6381);
+    rdb.read_eof_rdb();
 }
 
 #[test]
@@ -367,13 +586,20 @@ fn rdb_channel_candidate_rejects_sync_without_breaking_classic_sync() {
     );
     assert_eq!(
         candidate.command(&[b"PSYNC", b"?", b"-1"]),
-        b"-ERR RDB channel cannot issue SYNC or PSYNC\r\n"
+        b"-ERR Filtered replica requires EOF capability\r\n"
     );
     assert_eq!(
         candidate.command(&[b"SYNC"]),
+        b"-ERR Filtered replica requires EOF capability\r\n"
+    );
+    assert_eq!(
+        candidate.command(&[b"REPLCONF", b"capa", b"eof"]),
+        b"+OK\r\n"
+    );
+    assert_eq!(
+        candidate.command(&[b"PSYNC", b"?", b"-1"]),
         b"-ERR RDB channel cannot issue SYNC or PSYNC\r\n"
     );
-
     let mut classic = server.connect();
     classic.send_raw(b"SYNC\r\n");
     let reply = classic.read_raw_line();
@@ -381,6 +607,31 @@ fn rdb_channel_candidate_rejects_sync_without_breaking_classic_sync() {
         reply.starts_with(b"$"),
         "classic SYNC must still start with the RDB bulk length: {reply:?}"
     );
+
+    let legal_server = TestServer::start_default();
+    let server = &legal_server;
+    let mut main = server.connect();
+    assert_eq!(
+        main.command(&[b"REPLCONF", b"listening-port", b"6380"]),
+        b"+OK\r\n"
+    );
+    let mut legal = RdbCandidateClient::connect(server);
+    let response = legal.command(&[b"CLIENT", b"ID"]);
+    let id = std::str::from_utf8(response.strip_prefix(b":").unwrap())
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        legal.command(&[b"REPLCONF", b"rdb-channel", b"1", b"capa", b"eof"]),
+        b"+OK\r\n"
+    );
+    prepare_candidate_endoff(server, &mut main, &mut legal, id);
+    assert_eq!(
+        main.command(&[b"REPLCONF", b"set-rdb-client-id", id.to_string().as_bytes()]),
+        b"+OK\r\n"
+    );
+    legal.read_eof_rdb();
 }
 
 #[test]
@@ -400,8 +651,12 @@ fn replconf_dual_channel_association_rejects_bad_ids_and_is_reported() {
         main.command(&[b"REPLCONF", b"listening-port", b"6380"]),
         b"+OK\r\n"
     );
+    assert_info_hides_pre_psync_channels(
+        &server,
+        "main metadata must stay hidden before RDB association",
+    );
 
-    let mut rdb = server.connect();
+    let mut rdb = RdbCandidateClient::connect(&server);
     let rdb_id = rdb
         .command(&[b"CLIENT", b"ID"])
         .strip_prefix(b":")
@@ -410,7 +665,7 @@ fn replconf_dual_channel_association_rejects_bad_ids_and_is_reported() {
         .expect("CLIENT ID should be an integer");
     assert_eq!(rdb.command(&[b"REPLCONF", b"rdb-only", b"1"]), b"+OK\r\n");
     assert_eq!(
-        rdb.command(&[b"REPLCONF", b"rdb-channel", b"1"]),
+        rdb.command(&[b"REPLCONF", b"rdb-channel", b"1", b"capa", b"eof"]),
         b"+OK\r\n"
     );
 
@@ -419,6 +674,7 @@ fn replconf_dual_channel_association_rejects_bad_ids_and_is_reported() {
         malformed.starts_with(b"-ERR"),
         "malformed RDB client id must be rejected: {malformed:?}"
     );
+    prepare_candidate_endoff(&server, &mut main, &mut rdb, rdb_id);
     assert_eq!(
         main.command(&[
             b"REPLCONF",
@@ -428,10 +684,8 @@ fn replconf_dual_channel_association_rejects_bad_ids_and_is_reported() {
         b"+OK\r\n"
     );
 
-    assert_info_hides_pre_psync_channels(
-        &server,
-        "associated RDB metadata must stay hidden from INFO before PSYNC",
-    );
+    assert_info_reports_associated_candidate(&server, "127.0.0.1", 0);
+    rdb.read_eof_rdb();
 }
 
 #[test]

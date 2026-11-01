@@ -1,7 +1,7 @@
+use crate::foundation::io::protocol::Value;
+use crate::framework::context::ServerContext;
 use crate::framework::CommandRegistry;
 use crate::framework::CMD_SENTINEL;
-use crate::framework::context::ServerContext;
-use crate::foundation::io::protocol::Value;
 use bytes::Bytes;
 
 pub(crate) fn command_docs(reg: &CommandRegistry, ctx: &ServerContext, args: &[Bytes]) -> Value {
@@ -19,21 +19,21 @@ pub(crate) fn command_docs(reg: &CommandRegistry, ctx: &ServerContext, args: &[B
         let found = reg
             .iter()
             .find(|spec| spec.name.as_str().eq_ignore_ascii_case(&name))
-            .or_else(|| reg.iter().find(|spec| spec.name.as_str().eq_ignore_ascii_case(parent_name)));
+            .or_else(|| {
+                reg.iter()
+                    .find(|spec| spec.name.as_str().eq_ignore_ascii_case(parent_name))
+            });
         if let Some(spec) = found {
             if is_sentinel && (spec.flags & CMD_SENTINEL) == 0 {
                 continue;
             }
-            let doc = if let Some(module_name) =
-                ctx.module_registry().command_module_name(spec.name.as_str())
+            let doc = if let Some(module_name) = ctx
+                .module_registry()
+                .command_module_name(spec.name.as_str())
             {
                 module_doc(ctx, spec.name.as_str(), module_name)
             } else {
-                Value::Map(vec![
-                    (bulk("summary"), Value::bulk(Bytes::from_static(b""))),
-                    (bulk("since"), Value::bulk(Bytes::from_static(b""))),
-                    (bulk("group"), Value::bulk(Bytes::from_static(b""))),
-                ])
+                super::render::builtin_doc(&name)
             };
             result.push((Value::bulk(name_bytes.clone()), doc));
         }
@@ -46,9 +46,27 @@ pub(crate) fn command_docs(reg: &CommandRegistry, ctx: &ServerContext, args: &[B
 }
 
 fn module_doc(ctx: &ServerContext, command_name: &str, module_name: &str) -> Value {
+    let info = ctx
+        .module_registry()
+        .lookup_cmd_func(command_name)
+        .and_then(|entry| entry.info.as_ref());
     let mut fields = vec![
-        (bulk("summary"), Value::bulk(Bytes::from_static(b""))),
-        (bulk("since"), Value::bulk(Bytes::from_static(b""))),
+        (
+            bulk("summary"),
+            Value::bulk(Bytes::copy_from_slice(
+                info.and_then(|info| info.summary.as_deref())
+                    .unwrap_or("")
+                    .as_bytes(),
+            )),
+        ),
+        (
+            bulk("since"),
+            Value::bulk(Bytes::copy_from_slice(
+                info.and_then(|info| info.since.as_deref())
+                    .unwrap_or("")
+                    .as_bytes(),
+            )),
+        ),
         (bulk("group"), bulk("module")),
         (
             bulk("module"),
@@ -80,4 +98,54 @@ fn module_doc(ctx: &ServerContext, command_name: &str, module_name: &str) -> Val
 
 fn bulk(value: &'static str) -> Value {
     Value::bulk(Bytes::from_static(value.as_bytes()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::extension::module::{ModuleCommandInfo, ModuleRef};
+
+    #[test]
+    fn module_docs_keep_exported_fields_after_acl_metadata_updates() {
+        let mut ctx = ServerContext::new(1);
+        ctx.module_registry_mut()
+            .register(ModuleRef::new("docs-probe", std::ptr::null_mut(), 1, true))
+            .unwrap();
+        ctx.module_registry_mut()
+            .register_command("docs-probe", "docs-probe.xadd", None)
+            .unwrap();
+        assert!(ctx.module_registry_mut().set_legacy_command_info(
+            "docs-probe.xadd",
+            (0, 0, 0),
+            false,
+            -5,
+        ));
+        let mut info = ModuleCommandInfo {
+            summary: Some("Appends a message.".into()),
+            since: Some("5.0.0".into()),
+            key_specs: Vec::new(),
+            acl_categories: Vec::new(),
+            legacy_keys: None,
+            getkeys_api: false,
+            arity: None,
+        };
+        assert!(ctx
+            .module_registry_mut()
+            .set_command_info("docs-probe.xadd", info.clone()));
+        info.summary = None;
+        info.since = None;
+        info.acl_categories.push("write".into());
+        assert!(ctx
+            .module_registry_mut()
+            .set_command_info("docs-probe.xadd", info));
+        assert_eq!(
+            module_doc(&ctx, "docs-probe.xadd", "docs-probe"),
+            Value::Map(vec![
+                (bulk("summary"), Value::bulk("Appends a message.")),
+                (bulk("since"), Value::bulk("5.0.0")),
+                (bulk("group"), bulk("module")),
+                (bulk("module"), Value::bulk("docs-probe")),
+            ])
+        );
+    }
 }

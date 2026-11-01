@@ -132,20 +132,28 @@ pub(crate) fn register_cluster_configs(reg: &mut ConfigRegistry) {
     });
     reg.register(&ConfigSpec {
         name: "cluster-replica-no-failover",
-        type_: ConfigType::Bool,
-        enum_values: &[],
+        type_: ConfigType::Enum,
+        enum_values: &["no", "yes", "if-empty"],
         numeric_min: 0,
         numeric_max: 0,
         flags: &[],
         alias: Some("cluster-slave-no-failover"),
-        get: |rcfg| ConfigValue::Bool(rcfg.server.cluster_replica_no_failover),
+        get: |rcfg| {
+            ConfigValue::String(rcfg.server.cluster_replica_no_failover.as_str().to_string())
+        },
         set: |rcfg, val| {
-            if let ConfigValue::Bool(v) = val {
-                rcfg.server.cluster_replica_no_failover = *v;
-                Ok(())
+            use crate::engine::extension::config::server::ClusterReplicaNoFailover;
+            let value = val.as_str();
+            rcfg.server.cluster_replica_no_failover = if value.eq_ignore_ascii_case("no") {
+                ClusterReplicaNoFailover::No
+            } else if value.eq_ignore_ascii_case("yes") {
+                ClusterReplicaNoFailover::Yes
+            } else if value.eq_ignore_ascii_case("if-empty") {
+                ClusterReplicaNoFailover::IfEmpty
             } else {
-                Err("cluster-replica-no-failover must be a boolean".to_string())
-            }
+                return Err("cluster-replica-no-failover must be no, yes or if-empty".to_string());
+            };
+            Ok(())
         },
     });
     reg.register(&ConfigSpec {

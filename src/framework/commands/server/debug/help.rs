@@ -33,6 +33,7 @@ pub(super) fn debug_help() -> Value {
         "SDSLEN <key>",
         "SEGFAULT",
         "SET-ACTIVE-EXPIRE <0|1>",
+        "SWEEP-TRACKING-TABLE",
         "SET-DISABLE-DENY-SCRIPTS <0|1>",
         "QUICKLIST-PACKED-THRESHOLD <size>",
         "SET-SKIP-CHECKSUM-VALIDATION <0|1>",

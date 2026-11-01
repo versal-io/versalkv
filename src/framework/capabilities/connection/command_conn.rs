@@ -428,6 +428,10 @@ impl CommandConn for Connection {
         self.set_skip_propagation(v);
     }
 
+    fn record_dirty_delta(&mut self, delta: i64) {
+        Connection::record_dirty_delta(self, delta);
+    }
+
     fn mark_transaction_queue_error(&mut self) {
         self.transaction.mark_queue_error();
     }
@@ -562,6 +566,12 @@ impl CommandConn for Connection {
         if let Some((callback, privdata)) = self.module_auth_callback.take() {
             callback(self.token.0 as u64, privdata);
         }
+    }
+
+    fn module_auth_callback(
+        &self,
+    ) -> Option<(extern "C" fn(u64, *mut libc::c_void), *mut libc::c_void)> {
+        self.module_auth_callback
     }
 
     fn module_auth_user(&self) -> Option<&str> {

@@ -164,7 +164,12 @@ pub(crate) fn wait_for_pipe_eof(read_end: File) {
     drop(read_end);
 }
 
+#[cfg(test)]
 pub(crate) fn send_all(fd: RawFd, bytes: &[u8], timeout: Duration) -> bool {
+    send_all_counted(fd, bytes, timeout).0
+}
+
+pub(crate) fn send_all_counted(fd: RawFd, bytes: &[u8], timeout: Duration) -> (bool, usize) {
     let mut offset = 0;
     while offset < bytes.len() {
         // SAFETY: bytes exposes a live region for the duration of send(2).
@@ -184,7 +189,7 @@ pub(crate) fn send_all(fd: RawFd, bytes: &[u8], timeout: Duration) -> bool {
         if written == 0
             || (error != libc::EINTR && error != libc::EAGAIN && error != libc::EWOULDBLOCK)
         {
-            return false;
+            return (false, offset);
         }
         if error == libc::EINTR {
             continue;
@@ -195,10 +200,10 @@ pub(crate) fn send_all(fd: RawFd, bytes: &[u8], timeout: Duration) -> bool {
             timeout,
         ) {
             Ok(ready) if ready > 0 => {}
-            _ => return false,
+            _ => return (false, offset),
         }
     }
-    true
+    (true, offset)
 }
 
 pub(crate) fn set_send_timeout(fd: RawFd, timeout: Duration) -> io::Result<()> {

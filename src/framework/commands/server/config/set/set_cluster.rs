@@ -51,7 +51,11 @@ pub(crate) fn apply_cluster_config_snapshot(ctx: &mut ServerContext) -> Result<(
     endpoints.set_client_port(config.cluster_announce_client_port);
     endpoints.set_client_tls_port(config.cluster_announce_client_tls_port);
 
-    state.apply_local_cluster_config(endpoints, config.cluster_replica_no_failover);
+    state.apply_local_cluster_config(
+        endpoints,
+        config.cluster_replica_no_failover
+            == crate::engine::extension::config::server::ClusterReplicaNoFailover::Yes,
+    );
     state.myself.cluster_replica_priority = config.cluster_replica_priority;
     state.set_require_full_coverage(config.cluster_require_full_coverage);
     state.set_gossip_percentage(config.cluster_message_gossip_perc as usize);
@@ -128,6 +132,161 @@ mod tests {
         assert!(!state.myself.has_flag(CLUSTER_NODE_NOFAILOVER));
         assert!(state.take_config_save_request());
         assert!(state.take_topology_broadcast_request());
+    }
+
+    #[test]
+    fn replica_no_failover_if_empty_and_alias_round_trip() {
+        use crate::engine::distributed::cluster::node::CLUSTER_NODE_NOFAILOVER;
+        use crate::engine::extension::config::spec_registry::ConfigRegistry;
+
+        let mut context = context();
+        let mut connection = Connection::new(Token(1), "127.0.0.1:40000".parse().unwrap(), false);
+        for name in ["cluster-replica-no-failover", "cluster-slave-no-failover"] {
+            assert_eq!(
+                config_set(
+                    &mut connection,
+                    &args(&["CONFIG", "SET", name, "if-empty"]),
+                    &mut context
+                ),
+                Value::ok()
+            );
+            let registry = ConfigRegistry::new();
+            assert_eq!(
+                (registry.lookup(name).unwrap().get)(context.config()).as_str(),
+                "if-empty"
+            );
+            assert!(!context
+                .cluster_state()
+                .as_ref()
+                .unwrap()
+                .myself
+                .has_flag(CLUSTER_NODE_NOFAILOVER));
+        }
+    }
+
+    #[test]
+    fn replica_no_failover_case_insensitive_values_round_trip() {
+        use crate::engine::distributed::cluster::node::CLUSTER_NODE_NOFAILOVER;
+        use crate::engine::extension::config::server::ClusterReplicaNoFailover;
+        use crate::engine::extension::config::spec_registry::ConfigRegistry;
+
+        let registry = ConfigRegistry::new();
+        let mut context = context();
+        let mut connection = Connection::new(Token(1), "127.0.0.1:40000".parse().unwrap(), false);
+        for name in ["cluster-replica-no-failover", "cluster-slave-no-failover"] {
+            for (text, expected) in [
+                ("NO", ClusterReplicaNoFailover::No),
+                ("YeS", ClusterReplicaNoFailover::Yes),
+                ("IF-EMPTY", ClusterReplicaNoFailover::IfEmpty),
+                ("If-EmPtY", ClusterReplicaNoFailover::IfEmpty),
+            ] {
+                assert_eq!(
+                    config_set(
+                        &mut connection,
+                        &args(&["CONFIG", "SET", name, text]),
+                        &mut context,
+                    ),
+                    Value::ok(),
+                    "{name} {text}"
+                );
+                assert_eq!(
+                    context.config().server.cluster_replica_no_failover,
+                    expected
+                );
+                assert_eq!(
+                    (registry.lookup(name).unwrap().get)(context.config()).as_str(),
+                    expected.as_str()
+                );
+                assert_eq!(
+                    context
+                        .cluster_state()
+                        .as_ref()
+                        .unwrap()
+                        .myself
+                        .has_flag(CLUSTER_NODE_NOFAILOVER),
+                    expected == ClusterReplicaNoFailover::Yes
+                );
+                let mut startup = crate::engine::extension::config::RuntimeConfig::new();
+                registry
+                    .try_set_startup(&mut startup, name, text)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(startup.server.cluster_replica_no_failover, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn replica_no_failover_file_rewrite_preserves_each_enum_value() {
+        use crate::engine::extension::config::server::ClusterReplicaNoFailover;
+        use crate::engine::extension::config::spec_registry::ConfigRegistry;
+        use crate::framework::commands::server::config::config_rewrite;
+        use crate::framework::config::Config;
+        use clap::Parser;
+
+        let path = std::env::temp_dir().join(format!(
+            "versal-cluster-no-failover-{}-{}.conf",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let registry = ConfigRegistry::new();
+        for (text, expected) in [
+            ("no", ClusterReplicaNoFailover::No),
+            ("yes", ClusterReplicaNoFailover::Yes),
+            ("if-empty", ClusterReplicaNoFailover::IfEmpty),
+            ("NO", ClusterReplicaNoFailover::No),
+            ("YeS", ClusterReplicaNoFailover::Yes),
+            ("IF-EMPTY", ClusterReplicaNoFailover::IfEmpty),
+            ("If-EmPtY", ClusterReplicaNoFailover::IfEmpty),
+        ] {
+            std::fs::write(&path, format!("cluster-slave-no-failover {text}\n")).unwrap();
+            let mut parsed = Config::parse_from(["versal-server"]);
+            parsed.load_from_file(path.to_str().unwrap()).unwrap();
+            let mut loaded_context = context();
+            for (name, value) in &parsed.extra_cli_configs {
+                registry
+                    .try_set_startup(loaded_context.config_mut(), name, value)
+                    .unwrap()
+                    .unwrap();
+            }
+            assert_eq!(
+                loaded_context.config().server.cluster_replica_no_failover,
+                expected
+            );
+            loaded_context.config_mut().server.config_file =
+                Some(path.to_str().unwrap().to_string());
+            assert_eq!(config_rewrite(&mut loaded_context), Value::ok());
+            let rewritten = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(
+                rewritten
+                    .lines()
+                    .filter(|line| line.starts_with("cluster-replica-no-failover "))
+                    .collect::<Vec<_>>(),
+                [format!("cluster-replica-no-failover {}", expected.as_str())]
+            );
+            let mut restored = Config::parse_from(["versal-server"]);
+            restored.load_from_file(path.to_str().unwrap()).unwrap();
+            let mut restored_context = context();
+            for (name, value) in restored.extra_cli_configs {
+                if matches!(
+                    name.as_str(),
+                    "cluster-replica-no-failover" | "cluster-slave-no-failover"
+                ) {
+                    registry
+                        .try_set_startup(restored_context.config_mut(), &name, &value)
+                        .unwrap()
+                        .unwrap();
+                }
+            }
+            assert_eq!(
+                restored_context.config().server.cluster_replica_no_failover,
+                expected
+            );
+        }
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

@@ -125,7 +125,7 @@ impl ServerContext {
         port_changed: bool,
         reconnect_replica: bool,
         rebind_cluster_bus: bool,
-        changed_parameter: &'static str,
+        changed_parameter: String,
     ) {
         self.pending_tls_reconfigure = Some(PendingTlsReconfigure {
             previous_config,

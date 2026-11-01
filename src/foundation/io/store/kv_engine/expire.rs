@@ -23,6 +23,16 @@ pub fn active_expire_cycle_with_effort(
     fast: bool,
     effort: u8,
 ) -> (u64, usize) {
+    active_expire_cycle_with_effort_and_filter(db, fast, effort, |_| true)
+}
+
+/// Restrict every key-level expiration step to values safe for mutation.
+pub fn active_expire_cycle_with_effort_and_filter(
+    db: &mut crate::foundation::io::store::kv_engine::Db,
+    fast: bool,
+    effort: u8,
+    should_expire_key: impl Fn(&[u8]) -> bool,
+) -> (u64, usize) {
     let effort = effort.clamp(1, 10) as usize - 1;
     let timelimit = if fast {
         ACTIVE_EXPIRE_CYCLE_FAST_DURATION + ACTIVE_EXPIRE_CYCLE_FAST_DURATION / 4 * effort as u64
@@ -34,7 +44,9 @@ pub fn active_expire_cycle_with_effort(
 
     let volatile_hash_keys = db.hash_keys_with_volatile_fields();
     for key in &volatile_hash_keys {
-        expired += db.cleanup_expired_hash_fields(key);
+        if should_expire_key(key) {
+            expired += db.cleanup_expired_hash_fields(key);
+        }
         if start.elapsed().as_micros() as u64 >= timelimit {
             return (
                 expired,
@@ -62,6 +74,7 @@ pub fn active_expire_cycle_with_effort(
                 && now >= expire_time
                 && db.should_expire_locally(key)
                 && !db.is_importing_slot_key(key)
+                && should_expire_key(key)
             {
                 to_delete.push(key.to_vec());
             }
@@ -143,6 +156,84 @@ mod tests {
         let _stats = ServerStats::new();
         let (deleted, _remaining) = active_expire_cycle(&mut db, true);
         assert!(deleted > 0);
+    }
+
+    #[test]
+    fn active_expire_filter_protects_key_and_hash_field_metadata() {
+        for should_allow_captured in [false, true] {
+            let mut db = Db::new();
+            let deadline = now_ms() - 1;
+            for key in [b"captured".as_slice(), b"uncaptured".as_slice()] {
+                db.set(key.to_vec(), Robj::string("value"));
+                db.set_expire(key, deadline);
+            }
+            for key in [b"captured-hash".as_slice(), b"uncaptured-hash".as_slice()] {
+                db.hash_set_with_limits(key, b"field", b"value", 512, 64)
+                    .unwrap();
+                db.set_hash_field_expire(key, b"field", deadline);
+            }
+
+            active_expire_cycle_with_effort_and_filter(&mut db, false, 10, |key| {
+                should_allow_captured && key.starts_with(b"captured")
+            });
+
+            assert_eq!(
+                db.get_allow_expired(b"captured").is_none(),
+                should_allow_captured
+            );
+            assert_eq!(
+                db.get_allow_expired(b"captured-hash").is_none(),
+                should_allow_captured
+            );
+            assert_eq!(
+                db.get_allow_expired(b"uncaptured").unwrap().as_bytes(),
+                b"value"
+            );
+            assert_eq!(db.get_expire(b"uncaptured"), Some(deadline));
+            assert_eq!(
+                db.get_allow_expired(b"uncaptured-hash")
+                    .unwrap()
+                    .hash_get(b"field")
+                    .unwrap(),
+                b"value"
+            );
+            assert_eq!(
+                db.get_hash_field_expire(b"uncaptured-hash", b"field"),
+                Some(deadline)
+            );
+            assert!(db
+                .active_expired_deletions
+                .iter()
+                .all(|key| key.as_slice() == b"captured"));
+            assert!(db
+                .pending_hexpired
+                .iter()
+                .all(|(key, _)| key.as_slice() == b"captured-hash"));
+        }
+    }
+
+    #[test]
+    fn active_expire_filter_preserves_import_and_replica_local_guards() {
+        let mut db = Db::new_with_slot_router(2, first_byte_slot);
+        let deadline = now_ms() - 1;
+        for key in [b"\x01imported".as_slice(), b"\x02primary", b"\x03local"] {
+            db.set(key.to_vec(), Robj::string("value"));
+            db.set_expire(key, deadline);
+        }
+        db.set_slot_importing(1, true);
+        db.set_replica_local_expire_only(true);
+        db.mark_replica_local_expire(b"\x01imported");
+        db.mark_replica_local_expire(b"\x03local");
+
+        active_expire_cycle_with_effort_and_filter(&mut db, false, 1, |_| true);
+
+        assert!(db.get_allow_expired(b"\x01imported").is_some());
+        assert!(db.get_allow_expired(b"\x02primary").is_some());
+        assert!(db.get_allow_expired(b"\x03local").is_none());
+        assert_eq!(db.get_expire(b"\x01imported"), Some(deadline));
+        assert_eq!(db.get_expire(b"\x02primary"), Some(deadline));
+        // Imported slots are excluded from the serving keyspace counters.
+        assert_eq!(db.expires_count(), 1);
     }
 
     #[test]

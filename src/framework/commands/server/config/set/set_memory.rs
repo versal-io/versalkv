@@ -15,6 +15,9 @@ pub(super) fn config_set_memory(
             };
             ctx.config_mut().server.maxmemory = n;
             ctx.set_needs_eviction(n > 0);
+            if ctx.config().server.maxmemory_scripts < 0 {
+                ctx.schedule_script_eviction();
+            }
         }
         _ => unreachable!(),
     }

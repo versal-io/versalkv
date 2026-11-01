@@ -12,7 +12,20 @@ pub(super) fn gen_clients_section(
     let (watching_clients, total_watched_keys) = ctx.watched_client_summary();
     s.push_str("# Clients\r\n");
     emit_line(&mut s, "connected_clients", connected_clients);
-    emit_line(&mut s, "cluster_connections", 0);
+    emit_line(
+        &mut s,
+        "connected_priority_clients",
+        ctx.stats().connected_priority_clients,
+    );
+    emit_line(
+        &mut s,
+        "cluster_connections",
+        if ctx.config().server.cluster_enabled {
+            ctx.cluster_state().as_ref().map_or(0, |state| state.connection_budget())
+        } else {
+            0
+        },
+    );
     emit_line(&mut s, "maxclients", ctx.config().server.maxclients);
     emit_line(&mut s, "client_recent_max_input_buffer", 0);
     emit_line(&mut s, "client_recent_max_output_buffer", 0);

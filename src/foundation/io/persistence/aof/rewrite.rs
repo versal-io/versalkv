@@ -14,7 +14,8 @@ pub struct AofRewriteFileOptions {
     pub use_rdb_preamble: bool,
     pub timestamp_enabled: bool,
     pub key_delay_us: i64,
-    pub rdb_compression: bool,
+    pub rdb_compression: crate::foundation::io::persistence::rdb::compression::RdbCompression,
+    pub rdb_checksum: bool,
     pub incremental_fsync: bool,
 }
 

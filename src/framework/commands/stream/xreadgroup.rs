@@ -97,10 +97,25 @@ pub fn xreadgroup(
     let keys = &args.args[first_key_index..first_key_index + num_keys];
     let id_args = &args.args[i + num_keys..];
 
-    let db = match ctx.db_mut(conn.selected_db()) {
+    let db_idx = conn.selected_db();
+    let db = match ctx.db_mut(db_idx) {
         Some(d) => d,
         None => return CommandError::db_index_out_of_range(),
     };
+
+    // Validate every stream and ID before creating consumers or delivering entries.
+    for (key, id_arg) in keys.iter().zip(id_args) {
+        if id_arg.as_ref() != b">" {
+            if let Err(error) = parse_stream_id(id_arg, false) {
+                return error;
+            }
+        }
+        match db.get_stream(key) {
+            Ok(Some(stream)) if stream.group(group_name.unwrap()).is_some() => {}
+            Ok(_) => return Value::error("NOGROUP No such key or consumer group"),
+            Err(_) => return CommandError::wrong_type(),
+        }
+    }
 
     let mut streams_result = Vec::with_capacity(num_keys);
     let mut has_new_message_request = false;
@@ -128,6 +143,12 @@ pub fn xreadgroup(
                 mstime(),
             ) {
                 Ok(result) => {
+                    if result.consumer_created || !result.entries.is_empty() {
+                        conn.record_dirty_key((db_idx, key.clone()));
+                        conn.record_dirty_delta(
+                            i64::from(result.consumer_created) + i64::from(!result.entries.is_empty()),
+                        );
+                    }
                     if result.consumer_created {
                         created_consumers.push(key.clone());
                     }
@@ -177,8 +198,23 @@ pub fn xreadgroup(
                 mstime(),
             ) {
                 Ok(result) => {
+                    if result.consumer_created || !result.entries.is_empty() {
+                        conn.record_dirty_key((db_idx, key.clone()));
+                        conn.record_dirty_delta(
+                            i64::from(result.consumer_created) + i64::from(!result.entries.is_empty()),
+                        );
+                    }
                     if result.consumer_created {
                         created_consumers.push(key.clone());
+                        if noack {
+                            propagate.push(encode_command(&[
+                                b"XGROUP" as &[u8],
+                                b"CREATECONSUMER",
+                                key.as_ref(),
+                                group_name.unwrap(),
+                                consumer_name.unwrap(),
+                            ]));
+                        }
                     }
                     result.entries
                 }
@@ -199,7 +235,6 @@ pub fn xreadgroup(
         streams_result.push(Value::Array(key_entry));
     }
 
-    let db_idx = conn.selected_db();
     for key in created_consumers {
         keyspace::notify_keyspace_event(
             conn,
@@ -209,6 +244,11 @@ pub fn xreadgroup(
             db_idx,
             &key,
         );
+    }
+
+    conn.set_skip_propagate(true);
+    if !propagate.is_empty() {
+        conn.extend_custom_propagation(propagate);
     }
 
     if streams_result.is_empty() {
@@ -223,12 +263,7 @@ pub fn xreadgroup(
                 );
             }
         }
-        conn.set_skip_propagate(true);
         return Value::null_array();
-    }
-
-    if !propagate.is_empty() {
-        conn.extend_custom_propagation(propagate);
     }
 
     Value::Array(streams_result)
@@ -300,8 +335,107 @@ fn freeze_xreadgroup_args(args: &CommandArgs, first_id_index: usize) -> CommandA
 
 #[cfg(test)]
 mod tests {
-    use super::append_xreadgroup_propagation;
+    use super::*;
     use crate::foundation::io::store::structure::stream::StreamID;
+    use crate::framework::capabilities::connection::Connection;
+
+    fn args(parts: &[&[u8]]) -> CommandArgs {
+        CommandArgs::from_parts(parts.iter().map(|part| Bytes::copy_from_slice(part)).collect())
+    }
+
+    fn setup() -> (Connection, ServerContext) {
+        let mut conn = Connection::new_fake();
+        conn.selected_db = 1;
+        let mut ctx = ServerContext::new(2);
+        let stream = ctx.db_mut(1).unwrap().get_or_create_stream(b"s").unwrap();
+        stream.create_group(Bytes::from_static(b"g"), StreamID::zero(), None).unwrap();
+        (conn, ctx)
+    }
+
+    #[test]
+    fn group_reads_record_creation_delivery_and_history_effects() {
+        for noack in [false, true] {
+            let (mut conn, mut ctx) = setup();
+            let stream = ctx.db_mut(1).unwrap().get_stream_mut(b"s").unwrap().unwrap();
+            stream.append(StreamID::new(1, 0),
+                vec![(Bytes::from_static(b"f"), Bytes::from_static(b"v"))], true, false, 0).unwrap();
+            stream.create_consumer(b"g", b"c", 0).unwrap();
+            let mut parts = vec![b"XREADGROUP".as_slice(), b"GROUP", b"g", b"c"];
+            if noack {
+                parts.push(b"NOACK");
+            }
+            parts.extend([b"STREAMS".as_slice(), b"s", b">"]);
+            let reply = xreadgroup(&mut conn, &args(&parts), &mut ctx);
+            assert!(matches!(reply, Value::Array(_)));
+            assert_eq!(conn.dirty_keys(), &[(1, Bytes::from_static(b"s"))]);
+            assert!(!conn.custom_propagation().is_empty());
+            let stream = ctx.db_mut(1).unwrap().get_stream(b"s").unwrap().unwrap();
+            let group = stream.group(b"g").unwrap();
+            assert_eq!(group.last_id, StreamID::new(1, 0));
+            assert_eq!(group.pending.len(), usize::from(!noack));
+
+            conn.replace_dirty_keys(Vec::new());
+            conn.clear_custom_propagation();
+            let reply = xreadgroup(&mut conn,
+                &args(&[b"XREADGROUP", b"GROUP", b"g", b"c", b"STREAMS", b"s", b"0"]), &mut ctx);
+            assert!(matches!(reply, Value::Array(_)));
+            if noack {
+                assert!(conn.dirty_keys().is_empty());
+            } else {
+                assert_eq!(conn.dirty_keys(), &[(1, Bytes::from_static(b"s"))]);
+                assert_eq!(ctx.db_mut(1).unwrap().get_stream(b"s").unwrap().unwrap()
+                    .group(b"g").unwrap().pending[&StreamID::new(1, 0)].delivery_count, 2);
+            }
+        }
+    }
+
+    #[test]
+    fn empty_group_reads_dirty_only_new_consumers_and_preserve_noack_propagation() {
+        for is_blocking in [false, true] {
+            for noack in [false, true] {
+                let (mut conn, mut ctx) = setup();
+                let mut parts = vec![b"XREADGROUP".as_slice(), b"GROUP", b"g", b"c"];
+                if is_blocking {
+                    parts.extend([b"BLOCK".as_slice(), b"0"]);
+                }
+                if noack {
+                    parts.push(b"NOACK");
+                }
+                parts.extend([b"STREAMS".as_slice(), b"s", b">"]);
+                xreadgroup(&mut conn, &args(&parts), &mut ctx);
+                assert_eq!(conn.dirty_keys(), &[(1, Bytes::from_static(b"s"))]);
+                assert_eq!(conn.blocked.is_some(), is_blocking);
+                if noack {
+                    assert_eq!(conn.custom_propagation(), &[encode_command(&[
+                        b"XGROUP", b"CREATECONSUMER", b"s", b"g", b"c",
+                    ])]);
+                } else {
+                    assert!(conn.custom_propagation().is_empty());
+                }
+                conn.blocked = None;
+                conn.replace_dirty_keys(Vec::new());
+                conn.clear_custom_propagation();
+                xreadgroup(&mut conn, &args(&parts), &mut ctx);
+                assert!(conn.dirty_keys().is_empty());
+                assert!(conn.custom_propagation().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_multistream_reads_do_not_create_consumers_or_record_effects() {
+        for (second_key, second_id) in [(b"missing".as_slice(), b">".as_slice()), (b"s", b"invalid")] {
+            let (mut conn, mut ctx) = setup();
+            let reply = xreadgroup(&mut conn, &args(&[
+                b"XREADGROUP", b"GROUP", b"g", b"c", b"STREAMS", b"s", second_key, b">", second_id,
+            ]), &mut ctx);
+            assert!(matches!(reply, Value::Error(_)));
+            assert!(conn.dirty_keys().is_empty());
+            assert!(conn.custom_propagation().is_empty());
+            assert!(ctx.db_mut(1).unwrap().get_stream(b"s").unwrap().unwrap()
+                .group(b"g").unwrap().consumers.is_empty());
+        }
+    }
 
     #[test]
     fn noack_propagation_creates_consumer_without_pending_claim() {

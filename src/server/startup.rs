@@ -170,6 +170,7 @@ impl Server {
         }
         self.register_commands(&mut backend);
         self.load_modules(&mut backend)?;
+        self.load_configured_acl(&backend)?;
         self.init_cluster(&mut backend)
             .map_err(Self::report_listener_error)?;
         self.init_observability(&mut backend);
@@ -395,6 +396,10 @@ impl Server {
                 .config()
                 .persistence
                 .loading_process_events_interval_bytes,
+        )
+        .with_skip_codec_checksums(
+            !backend.ctx.config().persistence.rdbchecksum
+                || backend.ctx.config().server.skip_checksum_validation,
         );
         backend.ctx.set_host_task_loading(true);
         let result = backend.run_background_rdb_task(&mut task);
@@ -802,7 +807,8 @@ impl Server {
                         use_rdb_preamble: persistence.aof_use_rdb_preamble,
                         timestamp_enabled: persistence.aof_timestamp_enabled,
                         key_delay_us: persistence.rdb_key_save_delay,
-                        rdb_compression: persistence.rdbcompression.uses_lzf(),
+                        rdb_compression: persistence.rdbcompression,
+                        rdb_checksum: persistence.rdbchecksum,
                         incremental_fsync: persistence.aof_rewrite_incremental_fsync,
                     };
                 let pid = process::id() as i32;
@@ -851,6 +857,7 @@ impl Server {
         backend.ctx.script_mut().function_registry.flush();
         backend.ctx.prepare_slot_migration_load();
         backend.ctx.set_host_task_loading(true);
+        let configured_import_mode = backend.ctx.config().server.import_mode;
         backend.ctx.config_mut().server.import_mode = true;
         let last_path_index = paths.len().saturating_sub(1);
         for (path_index, path) in paths.iter().enumerate() {
@@ -875,7 +882,7 @@ impl Server {
             }
         }
         backend.ctx.set_host_task_loading(false);
-        backend.ctx.config_mut().server.import_mode = false;
+        backend.ctx.config_mut().server.import_mode = configured_import_mode;
         if !loaded_any {
             crate::server_log!(notice, "Creating new AOF {}", filename);
         }
@@ -941,6 +948,108 @@ mod tests {
         BacklogCursor, InvalidReplicationPosition, ReplicationRole,
     };
     use crate::foundation::io::persistence::{ExpiredHashFields, RdbExpiryEvent};
+
+    struct StartupAofDirectory(std::path::PathBuf);
+
+    impl StartupAofDirectory {
+        fn new(label: &str) -> Self {
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let directory = std::env::temp_dir().join(format!(
+                "versal-expiry-time-{label}-{}-{timestamp}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&directory).unwrap();
+            Self(directory)
+        }
+    }
+
+    impl Drop for StartupAofDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn startup_aof_backend(
+        directory: &StartupAofDirectory,
+        import_mode: bool,
+    ) -> (
+        super::Server,
+        crate::runtime::server::worker::ServerWorkerState,
+    ) {
+        use clap::Parser;
+
+        let mut server = super::Server::new(crate::framework::config::Config::parse_from([
+            "versal-server",
+        ]));
+        let mut backend = crate::runtime::server::worker::ServerWorkerState::new(1).unwrap();
+        let config = backend.ctx.config_mut();
+        config.server.import_mode = import_mode;
+        config.persistence.dir = directory.0.to_str().unwrap().to_string();
+        config.persistence.aof_appenddirname = String::new();
+        server.register_commands(&mut backend);
+        (server, backend)
+    }
+
+    #[test]
+    fn startup_aof_replay_preserves_configured_import_mode_and_past_values() {
+        let directory = StartupAofDirectory::new("replay-import");
+        let frame = crate::engine::distributed::replication::protocol::encode_command(&[
+            b"SET", b"key", b"value", b"PXAT", b"1500",
+        ]);
+        std::fs::write(directory.0.join("appendonly.aof"), frame).unwrap();
+        let (server, mut backend) = startup_aof_backend(&directory, true);
+
+        let journal = server.load_aof(&mut backend);
+
+        assert!(journal.is_some());
+        assert!(backend.ctx.config().server.import_mode);
+        assert!(!backend.ctx.is_host_task_loading());
+        let db = backend.ctx.db_mut(0).unwrap();
+        assert_eq!(db.get_allow_expired(b"key").unwrap().as_bytes(), b"value");
+        assert_eq!(db.get_expire(b"key"), Some(1_500));
+        assert!(db.expired_deletions.is_empty());
+    }
+
+    #[test]
+    fn startup_empty_aof_preserves_configured_import_mode() {
+        let directory = StartupAofDirectory::new("empty-import");
+        let (server, mut backend) = startup_aof_backend(&directory, true);
+
+        let journal = server.load_aof(&mut backend);
+
+        assert!(journal.is_some());
+        assert!(backend.ctx.config().server.import_mode);
+        assert!(!backend.ctx.is_host_task_loading());
+    }
+
+    #[test]
+    fn startup_aof_replay_does_not_enable_unconfigured_import_mode() {
+        let directory = StartupAofDirectory::new("replay-primary");
+        let frame = crate::engine::distributed::replication::protocol::encode_command(&[
+            b"SET", b"key", b"value",
+        ]);
+        std::fs::write(directory.0.join("appendonly.aof"), frame).unwrap();
+        let (server, mut backend) = startup_aof_backend(&directory, false);
+
+        let journal = server.load_aof(&mut backend);
+
+        assert!(journal.is_some());
+        assert!(!backend.ctx.config().server.import_mode);
+        assert!(!backend.ctx.is_host_task_loading());
+        assert_eq!(
+            backend
+                .ctx
+                .db_mut(0)
+                .unwrap()
+                .get(b"key")
+                .unwrap()
+                .as_bytes(),
+            b"value"
+        );
+    }
 
     #[test]
     fn ignore_warnings_uses_case_insensitive_whitespace_tokens() {

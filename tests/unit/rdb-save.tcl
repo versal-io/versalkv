@@ -15,7 +15,7 @@ start_server {tags {"rdb"}} {
         set magic [read $fd 9]
         close $fd
         set magic
-    } {VALKEY080}
+    } {VALKEY081}
 
     test {BGSAVE replies with the expected status} {
         r set k v
@@ -46,7 +46,7 @@ start_server {tags {"rdb"}} {
         set magic [read $fd 9]
         close $fd
         set magic
-    } {VALKEY080}
+    } {VALKEY081}
 
     test {INFO persistence exposes rdb fields} {
         set info [r info persistence]

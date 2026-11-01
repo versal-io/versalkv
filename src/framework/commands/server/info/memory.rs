@@ -2,6 +2,14 @@ use super::util::{emit_line, format_bytes, total_system_memory};
 use crate::foundation::memory::metrics::memory_stats::{get_tracker, MemoryCategory};
 use crate::framework::context::ServerContext;
 
+pub(super) fn append_external_memory_debug(section: &mut String) {
+    emit_line(
+        section,
+        "used_memory_module_external",
+        crate::foundation::memory::util_alloc::external_allocated(),
+    );
+}
+
 pub(super) fn gen_memory_section(ctx: &ServerContext) -> String {
     let mut s = String::new();
     s.push_str("# Memory\r\n");
@@ -223,6 +231,60 @@ mod tests {
             let (key, value) = line.split_once(':')?;
             (key == name).then(|| value.parse::<usize>().ok()).flatten()
         })
+    }
+
+    #[test]
+    fn module_external_memory_counts_for_oom_peak_and_debug_only() {
+        use crate::engine::extension::module::capability::ModuleRuntime;
+        use crate::foundation::memory::{external::lock_external_memory, util_alloc};
+        const CHILD_ENV: &str = "VERSAL_TEST_MODULE_EXTERNAL_MEMORY_CHILD";
+        // External accounting and allocator peaks are process-global. Keep
+        // this large synthetic reservation away from concurrent unit tests.
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    concat!(
+                        module_path!(),
+                        "::module_external_memory_counts_for_oom_peak_and_debug_only"
+                    ),
+                ])
+                .env(CHILD_ENV, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated memory test failed: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let mut ctx = ServerContext::new(1);
+        let _lock = lock_external_memory();
+        let before = util_alloc::external_allocated();
+        let bytes = 1usize << 30;
+        util_alloc::increase_external_memory(bytes).unwrap();
+        ctx.config_mut().server.maxmemory = (bytes - 1) as u64;
+        let state = ctx.maxmemory_state();
+        let is_oom = ModuleRuntime::is_oom(&ctx);
+        let memory = gen_memory_section(&ctx);
+        let debug = super::super::dispatch::gen_one(&mut ctx, "debug");
+        util_alloc::decrease_external_memory(bytes).unwrap();
+
+        assert_eq!(util_alloc::external_allocated(), before);
+        assert!(state.reported >= before + bytes);
+        assert!(state.logical >= bytes);
+        assert!(is_oom);
+        assert!(info_value(&memory, "used_memory").is_some_and(|used| used >= bytes));
+        assert!(info_value(&memory, "used_memory_peak").is_some_and(|peak| peak >= bytes));
+        assert!(util_alloc::peak_allocated() >= bytes);
+        assert_eq!(info_value(&memory, "used_memory_module_external"), None);
+        assert_eq!(
+            info_value(&debug, "used_memory_module_external"),
+            Some(before + bytes)
+        );
+        assert_eq!(debug.matches("used_memory_module_external:").count(), 1);
     }
 
     #[test]

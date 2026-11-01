@@ -148,9 +148,10 @@ fn config_runtime_settings_round_trip_and_startup_only_backlog_is_rejected() {
         .contains("Unable to update TLS configuration"));
     let tls_cluster_reply = client.command_str(&[b"CONFIG", b"SET", b"tls-cluster", b"yes"]);
     #[cfg(feature = "tls")]
-    assert_eq!(tls_cluster_reply, "+OK\r\n");
+    assert!(tls_cluster_reply.contains("Unable to update TLS configuration"));
     #[cfg(not(feature = "tls"))]
     assert!(tls_cluster_reply.contains("TLS support is not compiled in"));
+    assert_config_value(&mut client, b"tls-cluster", "no");
 }
 
 #[test]
@@ -1455,8 +1456,10 @@ fn replica_syncs_over_the_configured_tls_upstream() {
     std::fs::write(
         &replica_config,
         format!(
-            "replicaof localhost {tls_port}\ntls-replication yes\ntls-ca-cert-file {}\ntls-client-cert-file {}\ntls-client-key-file {}\n",
+            "replicaof localhost {tls_port}\ntls-replication yes\ntls-ca-cert-file {}\ntls-cert-file {}\ntls-key-file {}\ntls-client-cert-file {}\ntls-client-key-file {}\n",
             cert_path.display(),
+            cert_path.display(),
+            key_path.display(),
             cert_path.display(),
             key_path.display()
         ),

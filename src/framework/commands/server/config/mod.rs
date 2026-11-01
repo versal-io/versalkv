@@ -8,25 +8,25 @@ mod get;
 mod help;
 mod meta;
 mod reset;
+mod restore_asking;
 mod rewrite;
 mod set;
 mod support;
-mod restore_asking;
 
 pub use get::config_get;
 pub use help::config_help;
+use meta::config_info;
 pub use reset::config_resetstat;
 pub use rewrite::config_rewrite;
 pub use set::config_set;
-pub(crate) use set::apply_config_set_one;
 pub(crate) use set::set_cluster::apply_cluster_config_snapshot;
-pub use support::{config_registry, set_oom_score_adj, set_oom_score_adj_child};
-use meta::config_info;
+pub(crate) use set::{apply_config_set_one, commit_tls_log_config};
 use support::read_oom_score_adj;
 pub(crate) use support::write_oom_score_adj;
 pub(in crate::framework::commands::server::config) use support::{
     bool_to_yesno, parse_bool_strict, parse_mem_unit_unsigned,
 };
+pub use support::{config_registry, set_oom_score_adj, set_oom_score_adj_child};
 
 pub fn register_all(reg: &mut crate::framework::CommandRegistry) {
     reg.register(CONFIG_SPEC);

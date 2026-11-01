@@ -1,3 +1,4 @@
+use super::{DecimalDoubleText, InvalidDecimalDouble};
 use bytes::Bytes;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -6,6 +7,7 @@ pub enum Value {
     Error(Bytes),
     Integer(i64),
     Double(f64),
+    DecimalDouble(DecimalDoubleText),
     Bulk(Bytes),
     Null,
     NullArray,
@@ -46,6 +48,9 @@ impl Value {
     }
     pub fn double(v: f64) -> Self {
         Value::Double(v)
+    }
+    pub fn decimal_double(text: impl Into<Bytes>) -> Result<Self, InvalidDecimalDouble> {
+        DecimalDoubleText::new(text).map(Value::DecimalDouble)
     }
     pub fn null() -> Self {
         Value::Null

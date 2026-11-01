@@ -112,6 +112,14 @@ impl ServerWorkerState {
         promotion: &Promotion,
         now_ms: i64,
     ) -> Vec<ClusterAction> {
+        let is_manual = state.automatic_failover.is_manual() || state.manual_failover.is_takeover();
+        let (local_status, applied_offset) = self.local_replica_failover_inputs(now_ms);
+        // Receive-batch actions may predate a successful configuration change.
+        // Recheck the current guard before mutating the role or slot ownership.
+        if !is_manual && local_status.no_failover_if_empty && applied_offset == 0 {
+            state.automatic_failover.reset();
+            return Vec::new();
+        }
         if !state.apply_promotion(promotion, now_ms) {
             return Vec::new();
         }

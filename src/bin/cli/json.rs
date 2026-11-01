@@ -33,10 +33,12 @@ fn format_json(val: &RespValue, quoted: bool) -> String {
         }
         RespValue::Boolean(b) => (if *b { "true" } else { "false" }).to_string(),
         RespValue::Double(v) => {
-            if *v == v.floor() && v.is_finite() {
-                format!("{}.0", v)
+            if matches!(v.as_str(), "inf" | "-inf" | "nan") {
+                format!("\"{v}\"")
+            } else if !v.contains(['.', 'e', 'E']) {
+                format!("{v}.0")
             } else {
-                format!("{}", v)
+                v.clone()
             }
         }
         RespValue::BigNumber(s) => s.clone(),
@@ -190,4 +192,30 @@ fn escape_json_utf8(value: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod decimal_tests {
+    use super::*;
+
+    #[test]
+    fn decimal_double_json_keeps_finite_literals_and_quotes_special_values() {
+        for (text, expected) in [
+            ("9007199254740993", "9007199254740993.0"),
+            ("1e4932", "1e4932"),
+            ("0.00000000000000001", "0.00000000000000001"),
+            ("inf", "\"inf\""),
+            ("-inf", "\"-inf\""),
+            ("nan", "\"nan\""),
+        ] {
+            assert_eq!(
+                format_json(&RespValue::Double(text.to_owned()), false),
+                expected
+            );
+            assert_eq!(
+                format_json(&RespValue::Double(text.to_owned()), true),
+                expected
+            );
+        }
+    }
 }

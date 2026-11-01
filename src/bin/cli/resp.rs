@@ -3,6 +3,32 @@ mod framing_tests {
     use super::{RespParser, RespValue};
 
     #[test]
+    fn decimal_double_cli_preserves_fragmented_and_large_wire_text() {
+        for text in [
+            "9007199254740993",
+            "1e4932",
+            "0.00000000000000001",
+            "inf",
+            "-inf",
+            "nan",
+        ] {
+            let mut parser = RespParser::new();
+            parser.feed(format!(",{text}\r").as_bytes());
+            assert!(parser.try_parse().unwrap().is_none());
+            parser.feed(b"\n");
+            let value = parser.try_parse().unwrap().unwrap();
+            assert!(matches!(&value, RespValue::Double(value) if value == text));
+            assert_eq!(value.to_string_raw(), text);
+            assert_eq!(value.to_string_tty(), format!("(double) {text}"));
+        }
+        for text in ["1e", "1e+", "1tail", "1\0", "0x1"] {
+            let mut parser = RespParser::new();
+            parser.feed(format!(",{text}\r\n").as_bytes());
+            assert!(parser.try_parse().is_err(), "{text}");
+        }
+    }
+
+    #[test]
     fn bulk_body_waits_for_complete_trailing_crlf_before_next_reply() {
         let mut parser = RespParser::new();
         parser.feed(b"$2\r\nok");
@@ -29,7 +55,7 @@ pub enum RespValue {
     NullArray,
     Array(Vec<RespValue>),
     Boolean(bool),
-    Double(f64),
+    Double(String),
     BigNumber(String),
     Push(Vec<RespValue>),
     Verbatim { data: Vec<u8> },
@@ -56,7 +82,7 @@ impl RespValue {
                 .collect::<Vec<_>>()
                 .join("\n"),
             RespValue::Boolean(b) => (if *b { "true" } else { "false" }).to_string(),
-            RespValue::Double(v) => format!("{}", v),
+            RespValue::Double(v) => v.clone(),
             RespValue::BigNumber(s) => s.clone(),
             RespValue::Push(items) => items
                 .iter()
@@ -344,11 +370,12 @@ impl RespParser {
     fn parse_double(&mut self) -> Result<RespValue, String> {
         self.pos += 1;
         let line = self.read_line()?;
-        let s = String::from_utf8_lossy(line);
-        let v = s
-            .parse::<f64>()
-            .map_err(|e| format!("Invalid double: {}", e))?;
-        Ok(RespValue::Double(v))
+        let text = std::str::from_utf8(line).map_err(|_| "Invalid double".to_owned())?;
+        if text != "nan" {
+            versal::foundation::io::protocol::DecimalDoubleText::new(line.to_vec())
+                .map_err(|_| "Invalid double".to_owned())?;
+        }
+        Ok(RespValue::Double(text.to_owned()))
     }
 
     fn parse_bignumber(&mut self) -> Result<RespValue, String> {

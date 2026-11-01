@@ -14,6 +14,8 @@ pub fn hexpiretime(
 }
 
 fn hexpiretime_reply(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> Value {
+    let now_ms = runtime.now_ms();
+    let ignore_expiry = runtime.read_expired_values();
     if args.args.len() < 2 {
         return CommandError::wrong_arity("hexpiretime");
     }
@@ -55,11 +57,15 @@ fn hexpiretime_reply(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> Va
         if !key_exists[i] {
             out.push(Value::integer(-2));
         } else {
-            let ms = db.hash_field_expiretime_ms(key, field.as_ref());
+            let ms = if !ignore_expiry && db.hash_field_expired_at(key, field, now_ms) {
+                -2
+            } else {
+                db.get_hash_field_expire(key, field).map_or(-1, |ms| ms as i64)
+            };
             if ms < 0 {
                 out.push(Value::integer(ms));
             } else {
-                out.push(Value::integer((ms + 500) / 1000));
+                out.push(Value::integer(((ms as u64 + 500) / 1000) as i64));
             }
         }
     }

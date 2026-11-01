@@ -64,7 +64,21 @@ impl ServerWorkerState {
         let frame =
             crate::runtime::server::worker::distributed::propagation::encode_command_args(&args);
         let command_name = args.name.clone();
-        if let Err(error) = self.ctx.apply_slot_import(&id, args, &self.registry) {
+        let is_outer_execution = self.command_execution_depth == 0;
+        self.command_execution_depth += 1;
+        let (result, execution) =
+            self.ctx
+                .apply_slot_import_with_execution(&id, args, &self.registry);
+        self.command_execution_depth -= 1;
+        if is_outer_execution
+            && self
+                .is_priority_connection(crate::framework::capabilities::io::Token(connection_token))
+        {
+            if let Some(duration_us) = execution.duration_us() {
+                self.ctx.stats_mut().record_priority_command(duration_us);
+            }
+        }
+        if let Err(error) = result {
             crate::server_log!(
                 warning,
                 "Slot import {} failed to apply {}: {:?}",

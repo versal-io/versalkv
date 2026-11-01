@@ -16,7 +16,7 @@ pub enum RdbCompression {
     Lz4,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RdbSnapshotOptions {
     pub compression: RdbCompression,
     pub checksum: bool,
@@ -64,8 +64,9 @@ impl CompressionError {
     pub fn message(self) -> &'static str {
         match self.kind {
             CompressionErrorKind::Incompatible => "Invalid or unsupported RDB stream envelope",
-            CompressionErrorKind::Corrupt => "Corrupt compressed RDB stream",
-            CompressionErrorKind::Truncated => "Compressed RDB stream did not end cleanly",
+            CompressionErrorKind::Corrupt | CompressionErrorKind::Truncated => {
+                "Corrupt streaming-compressed RDB input"
+            }
         }
     }
 }

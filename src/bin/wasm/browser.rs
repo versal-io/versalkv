@@ -179,6 +179,11 @@ fn serialize_reply(reply: &Reply, output: &mut Vec<u8>) {
         Reply::Bulk(None) => output.extend_from_slice(b"$-1\r\n"),
         Reply::Integer(value) => output.extend_from_slice(format!(":{value}\r\n").as_bytes()),
         Reply::Double(value) => output.extend_from_slice(format!(",{value}\r\n").as_bytes()),
+        Reply::DecimalDouble(value) => {
+            output.push(b',');
+            output.extend_from_slice(value.as_bytes());
+            output.extend_from_slice(b"\r\n");
+        }
         Reply::Boolean(value) => {
             output.extend_from_slice(if *value { b"#t\r\n" } else { b"#f\r\n" })
         }

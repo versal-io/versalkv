@@ -8,6 +8,7 @@ pub(crate) mod hash_seed;
 pub mod hashtable;
 pub mod kvstore;
 pub mod list;
+pub mod path_hash;
 pub mod set;
 pub mod stream;
 pub mod string;

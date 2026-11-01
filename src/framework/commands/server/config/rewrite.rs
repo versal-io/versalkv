@@ -1,4 +1,4 @@
-use crate::engine::extension::acl::acl_users;
+use crate::engine::extension::acl::{acl_roles, acl_users};
 use crate::foundation::io::persistence::AofFsync;
 use crate::foundation::io::protocol::Value;
 use crate::framework::context::ServerContext;
@@ -223,6 +223,12 @@ pub fn config_rewrite(ctx: &mut ServerContext) -> Value {
         r.server.large_reply_max_len
     ));
     lines.push(format!("maxmemory {}", r.server.maxmemory));
+    lines.push(format!(
+        "maxmemory-scripts {}",
+        crate::engine::extension::config::server::scripts_memory::format(
+            r.server.maxmemory_scripts
+        )
+    ));
     lines.push(format!("maxmemory-clients {}", r.server.maxmemory_clients));
     lines.push(format!(
         "hash-max-listpack-entries {}",
@@ -290,14 +296,28 @@ pub fn config_rewrite(ctx: &mut ServerContext) -> Value {
     if let Some(ref pw) = r.security.requirepass {
         lines.push(format!("requirepass {}", String::from_utf8_lossy(pw)));
     }
-    let users = acl_users().lock().unwrap();
-    let mut users: Vec<_> = users.iter().collect();
-    users.sort_by_key(|(left, _)| *left);
-    for (username, user) in users {
-        if username == "default" && user.is_factory_default_privileged() {
-            continue;
+    if r.server.aclfile.is_empty() {
+        let users = match acl_users().lock() {
+            Ok(users) => users,
+            Err(_) => return Value::error("ERR ACL user registry is unavailable"),
+        };
+        let roles = match acl_roles().lock() {
+            Ok(roles) => roles,
+            Err(_) => return Value::error("ERR ACL role registry is unavailable"),
+        };
+        let mut roles: Vec<_> = roles.iter().collect();
+        roles.sort_by_key(|(name, _)| *name);
+        for (name, role) in roles {
+            lines.push(format!("role {}", role.describe_role(name)));
         }
-        lines.push(format!("user {}", user.to_acl_rule_string(username)));
+        let mut users: Vec<_> = users.iter().collect();
+        users.sort_by_key(|(name, _)| *name);
+        for (username, user) in users {
+            if username == "default" && user.is_factory_default_privileged() {
+                continue;
+            }
+            lines.push(format!("user {}", user.to_acl_rule_string(username)));
+        }
     }
     let oom_mode = match r.server.oom_score_adj {
         crate::engine::extension::config::server::OOM_SCORE_ADJ_NO => "no",
@@ -369,7 +389,15 @@ pub fn config_rewrite(ctx: &mut ServerContext) -> Value {
             continue;
         }
         emitted.insert(spec.name.to_string());
-        lines.push(format!("{} {}", spec.name, (spec.get)(r).as_str()));
+        let value = (spec.get)(r).as_str();
+        let value = if spec.name.starts_with("tls-")
+            && matches!(spec.type_, crate::engine::extension::config::spec::ConfigType::String)
+        {
+            quote_binary_config_value(&value)
+        } else {
+            value
+        };
+        lines.push(format!("{} {}", spec.name, value));
     }
 
     let content = lines.join("\n") + "\n";

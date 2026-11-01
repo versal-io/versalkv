@@ -62,6 +62,9 @@ pub(crate) fn flag_char_for_conn(
     if conn.no_touch {
         flags.push('N');
     }
+    if conn.is_priority {
+        flags.push('H');
+    }
     if flags.is_empty() {
         flags.push('N');
     }

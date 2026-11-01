@@ -61,7 +61,7 @@ fn pexpireat_absolute_future() {
         b":1\r\n"
     );
     assert_eq!(c.command(&[b"PEXPIRETIME", b"k"]), b":99999999999999\r\n");
-    assert_eq!(c.command(&[b"EXPIRETIME", b"k"]), b":99999999999\r\n");
+    assert_eq!(c.command(&[b"EXPIRETIME", b"k"]), b":100000000000\r\n");
 }
 
 #[test]

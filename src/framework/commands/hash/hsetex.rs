@@ -202,6 +202,7 @@ fn fields_count_error() -> Value {
 
 struct HSetExSettings {
     ignore_expiry: bool,
+    should_preserve_deadline: bool,
     max_entries: usize,
     max_value_size: usize,
     now_ms: u64,
@@ -227,7 +228,7 @@ impl HSetExOutcome {
     }
 }
 
-fn conditions_allow(db: &mut Db, request: &HSetExRequest, ignore_expiry: bool) -> bool {
+fn conditions_allow(db: &mut Db, request: &HSetExRequest, settings: &HSetExSettings) -> bool {
     let key_exists = db.get_hash_object(&request.key).ok().flatten().is_some();
     if matches!(request.hash_condition, HashExistence::Missing) && key_exists
         || matches!(request.hash_condition, HashExistence::Existing) && !key_exists
@@ -240,7 +241,7 @@ fn conditions_allow(db: &mut Db, request: &HSetExRequest, ignore_expiry: bool) -
             .ok()
             .flatten()
             .is_some_and(|hash| hash.hash_contains(field))
-            && (ignore_expiry || !db.hash_field_expired(&request.key, field));
+            && (settings.ignore_expiry || !db.hash_field_expired_at(&request.key, field, settings.now_ms));
         match request.field_condition {
             FieldExistence::Any => true,
             FieldExistence::AllMissing => !exists,
@@ -254,9 +255,16 @@ fn execute_hsetex(
     request: &HSetExRequest,
     settings: &HSetExSettings,
 ) -> Result<HSetExOutcome, Value> {
+    db.hash_prepare_pairs_with_limits(
+        &request.key,
+        &request.pairs,
+        settings.max_entries,
+        settings.max_value_size,
+    )
+    .map_err(|_| CommandError::wrong_type())?;
     let mut outcome = HSetExOutcome::default();
     for (field, value) in &request.pairs {
-        let expired = !settings.ignore_expiry && db.hash_field_expired(&request.key, field);
+        let expired = !settings.ignore_expiry && db.hash_field_expired_at(&request.key, field, settings.now_ms);
         let preserved = if matches!(request.expiry, HSetExExpiry::KeepTtl) && !expired {
             db.get_hash_field_expire(&request.key, field)
         } else {
@@ -267,6 +275,9 @@ fn execute_hsetex(
             outcome.overwritten_expired += 1;
         }
         outcome.preserved_expiries.push(preserved);
+        if preserved.is_none() {
+            db.remove_hash_field_expire(&request.key, field);
+        }
         db.hash_set_with_limits(
             &request.key,
             field,
@@ -289,7 +300,7 @@ fn apply_new_expiry(
 ) {
     let Some(expire_at) = settings.expire_at_ms else { return };
     db.set_hash_field_expire(&request.key, field, expire_at);
-    if expire_at <= settings.now_ms && !settings.ignore_expiry {
+    if expire_at <= settings.now_ms && !settings.should_preserve_deadline {
         if let Ok(Some(hash)) = db.get_hash_object_mut(&request.key) {
             hash.hash_del(field);
         }
@@ -313,7 +324,7 @@ pub fn hsetex(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> CommandOu
         Some(db) => db,
         None => return CommandOutcome::reply(CommandError::db_index_out_of_range()),
     };
-    if !conditions_allow(db, &request, settings.ignore_expiry) {
+    if !conditions_allow(db, &request, &settings) {
         return CommandOutcome {
             reply: Value::integer(0),
             effects: CommandEffects {
@@ -341,7 +352,8 @@ fn build_settings(
     let now = runtime.now_ms();
     let (max_entries, max_value_size) = runtime.hash_encoding_limits();
     Ok(HSetExSettings {
-        ignore_expiry: runtime.suppress_lazy_expire(),
+        ignore_expiry: runtime.read_expired_values(),
+        should_preserve_deadline: runtime.preserves_expired_deadline(),
         max_entries,
         max_value_size,
         now_ms: now,

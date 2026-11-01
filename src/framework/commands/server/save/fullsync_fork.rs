@@ -9,6 +9,7 @@ use std::fs::File;
 use std::io::{BufWriter, Read, Write};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::Path;
+use crate::foundation::io::persistence::rdb::compression::{RdbCompression, RdbSnapshotOptions};
 
 const DISK_RDB_FILE_BUFFER_BYTES: usize = 128 * 1024;
 
@@ -33,6 +34,7 @@ pub(super) struct ReplicationRdbSource<'a> {
     function_codes: &'a [Vec<u8>],
     replication: &'a crate::foundation::io::persistence::RdbReplicationInfo,
     additional_datasets: &'a [&'a crate::foundation::io::store::kv_engine::DbSet],
+    snapshot: Option<RdbSnapshotOptions>,
 }
 
 impl<'a> ReplicationRdbSource<'a> {
@@ -51,7 +53,13 @@ impl<'a> ReplicationRdbSource<'a> {
             function_codes,
             replication,
             additional_datasets,
+            snapshot: None,
         }
+    }
+
+    fn with_snapshot(mut self, options: RdbSnapshotOptions) -> Self {
+        self.snapshot = Some(options);
+        self
     }
 }
 
@@ -62,14 +70,17 @@ pub(super) fn write_replication_rdb_streaming(
     let mut bytes_written = 0u64;
     let mut write_error = None;
     let completed =
-        crate::foundation::io::persistence::serialize_all_with_functions_and_replication_streaming_with_options(
+        crate::foundation::io::persistence::rdb::serialize::serialize_replication_snapshot_streaming(
             source.dbs,
             source.key_delay_us,
             source.function_codes,
             true,
             Some(source.replication),
             source.additional_datasets,
-            source.serialization,
+            source.snapshot.unwrap_or(RdbSnapshotOptions {
+                compression: if source.serialization.compression { RdbCompression::Lzf } else { RdbCompression::No },
+                checksum: source.serialization.checksum,
+            }),
             |chunk| match writer.write_all(chunk) {
                 Ok(()) => {
                     bytes_written = bytes_written.saturating_add(chunk.len() as u64);
@@ -218,6 +229,7 @@ fn child_wait_for_parent_release(read_end: File) {
 /// Write a direct RDB socket without changing the shared `O_NONBLOCK` flag.
 /// The parent keeps this file description registered with the polling backend, so changing it
 /// in the child can make a later parent-side read block.
+#[cfg(test)]
 pub(crate) fn child_write_socket_all(fd: RawFd, buf: &[u8], timeout_ms: u64) -> bool {
     crate::framework::capabilities::process::send_all(
         fd,
@@ -232,13 +244,27 @@ pub(crate) fn child_write_socket_all(fd: RawFd, buf: &[u8], timeout_ms: u64) -> 
 /// Fork-safety: `fds` is allocated before `fork()`, and this function only
 /// mutates that inherited allocation while calling the async-signal-safe
 /// socket write/poll primitives used by `child_write_socket_all`.
+#[cfg(test)]
 pub(crate) fn child_write_active_sockets(fds: &mut [RawFd], buf: &[u8], timeout_ms: u64) -> bool {
+    child_write_active_sockets_counted(fds, buf, timeout_ms, &mut 0)
+}
+
+fn child_write_active_sockets_counted(
+    fds: &mut [RawFd],
+    buf: &[u8],
+    timeout_ms: u64,
+    bytes: &mut u64,
+) -> bool {
     let mut still_active = false;
     for fd in fds {
         if *fd < 0 {
             continue;
         }
-        if child_write_socket_all(*fd, buf, timeout_ms) {
+        let (completed, written) = crate::framework::capabilities::process::send_all_counted(
+            *fd, buf, std::time::Duration::from_millis(timeout_ms),
+        );
+        *bytes = bytes.saturating_add(written as u64);
+        if completed {
             still_active = true;
         } else {
             *fd = -1;
@@ -276,6 +302,7 @@ fn fork_rdb_pipe_child(
     ctx: &mut ServerContext,
     function_codes: &[Vec<u8>],
     frame_as_bulk: bool,
+    snapshot: RdbSnapshotOptions,
 ) -> Option<(i32, File, Option<File>)> {
     let data_pipe = match pipe(PipeFlags::CLOEXEC) {
         Ok(pipe) => pipe,
@@ -311,10 +338,6 @@ fn fork_rdb_pipe_child(
     // C's diskless save calling debugDelay(server.rdb_key_save_delay) per key
     // (rdb.c). Reading it in the parent avoids touching shared config post-fork.
     let key_delay_us = ctx.config().persistence.rdb_key_save_delay;
-    let serialization = crate::foundation::io::persistence::RdbSerializeOptions {
-        compression: ctx.config().persistence.rdbcompression.uses_lzf(),
-        checksum: true,
-    };
     let bgsave_affinity = match prepare_bgsave_cpu_affinity(&ctx.config().server.bgsave_cpulist) {
         Ok(affinity) => affinity,
         Err(error) => {
@@ -344,9 +367,9 @@ fn fork_rdb_pipe_child(
             }
             exit_child_if_parent_is_gone(parent_pid);
             if !frame_as_bulk {
-                let ok = crate::foundation::io::persistence::serialize_all_with_functions_and_replication_streaming_with_options(
+                let ok = crate::foundation::io::persistence::rdb::serialize::serialize_replication_snapshot_streaming(
                     ctx.dbs(), key_delay_us, function_codes, true, Some(&replication), &slot_imports,
-                    serialization,
+                    snapshot,
                     |chunk| child_write_all(write_fd, chunk),
                 );
                 drop(data_write_end);
@@ -355,14 +378,14 @@ fn fork_rdb_pipe_child(
                 );
                 exit_immediately(if ok { 0 } else { 1 });
             }
-            let bytes = crate::foundation::io::persistence::serialize_all_with_functions_and_replication_with_options(
+            let bytes = crate::foundation::io::persistence::rdb::serialize::serialize_replication_snapshot(
                 ctx.dbs(),
                 key_delay_us,
                 function_codes,
                 true,
                 Some(&replication),
                 &slot_imports,
-                serialization,
+                snapshot,
             );
             let header = format!("${}\r\n", bytes.len());
             let ok = child_write_all(write_fd, header.as_bytes())
@@ -398,12 +421,25 @@ fn fork_rdb_pipe_child(
 /// Pure fork primitive: does NOT register the pid. The caller owns the returned
 /// `File` and must call `begin_diskless_child(pid)`, otherwise
 /// `reap_diskless_child_if_any` has no pid to reap.
+#[cfg(test)]
 pub fn fork_diskless_rdb_child(
     ctx: &mut ServerContext,
     function_codes: &[Vec<u8>],
 ) -> Option<DisklessPipeChild> {
+    let snapshot = RdbSnapshotOptions {
+        compression: ctx.config().persistence.rdbcompression,
+        checksum: ctx.config().persistence.rdbchecksum,
+    };
+    fork_diskless_rdb_child_with_options(ctx, function_codes, snapshot)
+}
+
+pub fn fork_diskless_rdb_child_with_options(
+    ctx: &mut ServerContext,
+    function_codes: &[Vec<u8>],
+    snapshot: RdbSnapshotOptions,
+) -> Option<DisklessPipeChild> {
     let (pid, data_read_end, child_release_write_end) =
-        fork_rdb_pipe_child(ctx, function_codes, false)?;
+        fork_rdb_pipe_child(ctx, function_codes, false, snapshot)?;
     Some(DisklessPipeChild {
         pid,
         data_read_end,
@@ -417,6 +453,8 @@ pub fn fork_direct_diskless_rdb_child(
     function_codes: &[Vec<u8>],
     fds: &[RawFd],
     marker: &[u8],
+    include_data: bool,
+    snapshot: RdbSnapshotOptions,
 ) -> Option<(i32, File, File)> {
     if fds.is_empty() {
         return None;
@@ -430,10 +468,6 @@ pub fn fork_direct_diskless_rdb_child(
     // disconnected socket targets without invoking the allocator post-fork.
     let mut child_fds = fds.to_vec();
     let key_delay_us = ctx.config().persistence.rdb_key_save_delay;
-    let serialization = crate::foundation::io::persistence::RdbSerializeOptions {
-        compression: ctx.config().persistence.rdbcompression.uses_lzf(),
-        checksum: true,
-    };
     let bgsave_affinity = match prepare_bgsave_cpu_affinity(&ctx.config().server.bgsave_cpulist) {
         Ok(affinity) => affinity,
         Err(error) => {
@@ -472,34 +506,28 @@ pub fn fork_direct_diskless_rdb_child(
         }
         exit_child_if_parent_is_gone(parent_pid);
         child_write_direct_dual_rdb_phase(phase_write_fd, DirectDualRdbChildPhase::Started);
-        let mut bytes = (b"$EOF:".len() + marker.len() + b"\r\n".len()) as u64;
-        let mut metric_written = false;
-        let mut ok = child_write_active_sockets(&mut child_fds, b"$EOF:", send_timeout_ms)
-            && child_write_active_sockets(&mut child_fds, marker, send_timeout_ms)
-            && child_write_active_sockets(&mut child_fds, b"\r\n", send_timeout_ms);
+        let mut bytes = 0u64;
+        let mut ok = child_write_active_sockets_counted(&mut child_fds, b"$EOF:", send_timeout_ms, &mut bytes)
+            && child_write_active_sockets_counted(&mut child_fds, marker, send_timeout_ms, &mut bytes)
+            && child_write_active_sockets_counted(&mut child_fds, b"\r\n", send_timeout_ms, &mut bytes);
         if ok {
             child_write_direct_dual_rdb_phase(phase_write_fd, DirectDualRdbChildPhase::HeaderSent);
         }
         if ok {
-            ok = crate::foundation::io::persistence::serialize_all_with_functions_and_replication_streaming_with_options(ctx.dbs(), key_delay_us, function_codes, true, Some(&replication), &slot_imports, serialization, |chunk| {
-                bytes = bytes.saturating_add(chunk.len() as u64);
-                child_write_active_sockets(&mut child_fds, chunk, send_timeout_ms)
+            ok = crate::foundation::io::persistence::rdb::serialize::serialize_replication_snapshot_streaming(ctx.dbs(), key_delay_us, function_codes, include_data, Some(&replication), &slot_imports, snapshot, |chunk| {
+                child_write_active_sockets_counted(&mut child_fds, chunk, send_timeout_ms, &mut bytes)
             });
         }
         if ok {
             child_write_direct_dual_rdb_phase(phase_write_fd, DirectDualRdbChildPhase::SerializeDone);
-            metric_written = child_write_all(metric_write_fd, &bytes.to_ne_bytes());
         }
         if ok {
-            bytes = bytes.saturating_add(marker.len() as u64);
-            ok = child_write_active_sockets(&mut child_fds, marker, send_timeout_ms);
+            ok = child_write_active_sockets_counted(&mut child_fds, marker, send_timeout_ms, &mut bytes);
         }
         if ok {
             child_write_direct_dual_rdb_phase(phase_write_fd, DirectDualRdbChildPhase::MarkerSent);
         }
-        if ok && !metric_written {
-            let _ = child_write_all(metric_write_fd, &bytes.to_ne_bytes());
-        }
+        let _ = child_write_all(metric_write_fd, &bytes.to_ne_bytes());
             drop(metric_write_end);
             drop(phase_write_end);
             exit_immediately(if ok { 0 } else { 1 });
@@ -519,10 +547,24 @@ pub fn fork_direct_diskless_rdb_child(
 /// file path. The parent owns bulk framing and independent per-replica cursors.
 /// The child registers in the DiskSync persistence slot, so only one RDB-shaped
 /// child can exist at a time.
+#[cfg(test)]
 pub fn fork_disk_rdb_file_child(
     ctx: &mut ServerContext,
     function_codes: &[Vec<u8>],
     path: &Path,
+) -> Option<i32> {
+    let snapshot = RdbSnapshotOptions {
+        compression: ctx.config().persistence.rdbcompression,
+        checksum: ctx.config().persistence.rdbchecksum,
+    };
+    fork_disk_rdb_file_child_with_options(ctx, function_codes, path, snapshot)
+}
+
+pub fn fork_disk_rdb_file_child_with_options(
+    ctx: &mut ServerContext,
+    function_codes: &[Vec<u8>],
+    path: &Path,
+    snapshot: RdbSnapshotOptions,
 ) -> Option<i32> {
     let listener_fds = ctx.listener_fds().to_vec();
     let replication = ctx.rdb_full_sync_replication_info();
@@ -561,7 +603,7 @@ pub fn fork_disk_rdb_file_child(
                         function_codes,
                         &replication,
                         &slot_imports,
-                    ),
+                    ).with_snapshot(snapshot),
                     &mut writer,
                 )?;
                 writer.flush()?;

@@ -1,4 +1,5 @@
 use super::wakeup_check_acl_keys;
+use crate::engine::command::context::CommandConn;
 use crate::engine::command::{
     CommandArgs, CommandError, CMD_MAY_REPLICATE, CMD_NO_AUTH, CMD_WRITE,
 };
@@ -20,7 +21,7 @@ use crate::runtime::server::worker::flows::request::dispatch::{
     CmdPreconditions, DispatchAction, PostponeReason,
 };
 use crate::runtime::server::worker::flows::request::dispatch::{
-    CommandEffects, ExecCollectedEffects, SpecialCommandCompletion,
+    CommandEffects, EffectQueue, ExecCollectedEffects, SpecialCommandCompletion,
 };
 use crate::runtime::server::worker::flows::request::invocation::CommandOrigin;
 use crate::runtime::server::worker::flows::request::outcome::{
@@ -58,12 +59,93 @@ pub(super) enum WakeupSpecialResult {
 }
 
 impl ServerWorkerState {
+    pub(crate) fn commit_blocked_stream_read_effects(
+        &mut self,
+        connection_token: usize,
+        pending_replication: Option<&mut Vec<Vec<u8>>>,
+        pending_aof: Option<&mut Vec<Vec<u8>>>,
+        pending_effects: Option<&mut EffectQueue>,
+    ) {
+        let token = Token(connection_token);
+        let Some(connection) = self.connection_registry.get_mut(token) else {
+            return;
+        };
+        let Some(blocked) = connection
+            .blocked
+            .as_ref()
+            .filter(|blocked| matches!(blocked.cmd, BlockedCmd::Xreadgroup))
+        else {
+            return;
+        };
+        if connection.dirty_keys().is_empty() && connection.custom_propagation().is_empty() {
+            return;
+        }
+        let args = blocked.orig_args.clone();
+        // Drain data effects without completing the blocked request's accounting.
+        let Some(mut effects) = connection.take_command_effects(CommandEffectDrain::Nested) else {
+            return;
+        };
+        connection.resume_command_effects();
+        let (propagation_ops, dirty_keys) =
+            self.wakeup_collect_propagation_and_dirty(connection_token, &args, false, &mut effects);
+        if let Some(pending) = pending_effects {
+            self.wakeup_apply_propagation(
+                connection_token,
+                propagation_ops,
+                Some(&mut pending.replication_only),
+                Some(&mut pending.aof_only),
+            );
+            pending
+                .tracking
+                .extend(self.wakeup_collect_watch_and_tracking(&dirty_keys, token));
+            pending.publish.extend(effects.take_notifications());
+            pending
+                .publish_shard
+                .extend(effects.take_shard_notifications());
+            pending
+                .cluster_publish
+                .extend(effects.take_cluster_notifications());
+            pending
+                .cluster_publish_shard
+                .extend(effects.take_cluster_shard_notifications());
+        } else {
+            self.wakeup_apply_propagation(
+                connection_token,
+                propagation_ops,
+                pending_replication,
+                pending_aof,
+            );
+            self.wakeup_handle_watch_and_tracking(&dirty_keys, token);
+            self.wakeup_deliver_notifications(&mut effects);
+        }
+        self.dispose_data_lazyfree_objects(effects.take_lazyfree_objects());
+    }
+
     pub(crate) fn wakeup_blocked_client(
         &mut self,
         token: Token,
         pending_replication: Option<&mut Vec<Vec<u8>>>,
         pending_aof: Option<&mut Vec<Vec<u8>>>,
     ) -> Vec<(u32, Bytes)> {
+        self.wakeup_blocked_client_with_effect_queue(token, pending_replication, pending_aof, None)
+    }
+
+    pub(super) fn wakeup_blocked_client_with_effect_queue(
+        &mut self,
+        token: Token,
+        mut pending_replication: Option<&mut Vec<Vec<u8>>>,
+        mut pending_aof: Option<&mut Vec<Vec<u8>>>,
+        mut pending_effects: Option<&mut EffectQueue>,
+    ) -> Vec<(u32, Bytes)> {
+        let is_key_wakeup = self
+            .connection_registry
+            .get(token)
+            .is_some_and(|connection| {
+                connection
+                    .blocked
+                    .as_ref()
+                    .is_some_and(|blocked| !blocked.keys.is_empty())
+            });
         let Some((connection_token, args, blocked_start_ms, blocked_req_bytes, was_paused)) =
             self.wakeup_prepare(token)
         else {
@@ -103,7 +185,9 @@ impl ServerWorkerState {
         let (reply, rejected, is_exec_paused) = if was_paused {
             self.wakeup_handle_paused(connection_token, &args, blocked_req_bytes, token)
         } else {
+            self.command_execution_depth += usize::from(is_key_wakeup);
             let (reply, rejected) = self.wakeup_execute_command(connection_token, &args);
+            self.command_execution_depth -= usize::from(is_key_wakeup);
             (reply, rejected, false)
         };
         if !self.connection_registry.contains(token) {
@@ -111,6 +195,14 @@ impl ServerWorkerState {
         }
 
         if is_exec_paused {
+            if let Some(pending) = pending_effects {
+                return self.finish_paused_exec_wakeup(
+                    connection_token,
+                    token,
+                    Some(&mut pending.replication_only),
+                    Some(&mut pending.aof_only),
+                );
+            }
             return self.finish_paused_exec_wakeup(
                 connection_token,
                 token,
@@ -119,7 +211,14 @@ impl ServerWorkerState {
             );
         }
 
-        if self.wakeup_reblock_if_needed(connection_token, token, blocked_start_ms) {
+        if self.wakeup_reblock_if_needed(
+            connection_token,
+            token,
+            blocked_start_ms,
+            pending_replication.as_deref_mut(),
+            pending_aof.as_deref_mut(),
+            pending_effects.as_deref_mut(),
+        ) {
             return Vec::new();
         }
 
@@ -146,7 +245,21 @@ impl ServerWorkerState {
         );
         let swapdb = connection_effects.take_swapdb();
 
-        self.wakeup_apply_propagation(propagation_ops, pending_replication, pending_aof);
+        if let Some(pending) = pending_effects {
+            self.wakeup_apply_propagation(
+                connection_token,
+                propagation_ops,
+                Some(&mut pending.replication_only),
+                Some(&mut pending.aof_only),
+            );
+        } else {
+            self.wakeup_apply_propagation(
+                connection_token,
+                propagation_ops,
+                pending_replication,
+                pending_aof,
+            );
+        }
         if !rejected {
             self.wakeup_cmd_log(
                 connection_token,
@@ -156,13 +269,13 @@ impl ServerWorkerState {
             );
         }
         self.deliver_wakeup_reply(token, reply_output);
-        self.wakeup_deliver_notifications(&mut connection_effects);
-        self.dispose_data_lazyfree_objects(connection_effects.take_lazyfree_objects());
         if let Some((db1, db2)) = swapdb {
             self.apply_swapdb_watch_state(db1, db2);
         } else {
             self.wakeup_handle_watch_and_tracking(&dirty_keys, token);
         }
+        self.wakeup_deliver_notifications(&mut connection_effects);
+        self.dispose_data_lazyfree_objects(connection_effects.take_lazyfree_objects());
         if self.connection_registry.contains(token) {
             self.connection_registry[token].complete_command();
             self.queue_client_for_reprocessing(token);
@@ -253,7 +366,14 @@ impl ServerWorkerState {
             .blocked
             .is_some()
         {
-            self.wakeup_reblock_if_needed(connection_token, token, blocked_start_ms);
+            self.wakeup_reblock_if_needed(
+                connection_token,
+                token,
+                blocked_start_ms,
+                None,
+                None,
+                None,
+            );
             return WakeupSpecialResult::Reblocked;
         }
         self.finish_resumed_multi_command(token, effects)
@@ -612,20 +732,30 @@ impl ServerWorkerState {
         pending_replication: Option<&mut Vec<Vec<u8>>>,
         pending_aof: Option<&mut Vec<Vec<u8>>>,
     ) -> Vec<(u32, Bytes)> {
-        self.wakeup_blocked_on_keys(
+        let mut pending = EffectQueue::default();
+        pending.replication_only = effects.replication_only;
+        pending.aof_only = effects.aof_only;
+        self.wakeup_blocked_on_keys_with_effect_queue(
             &effects.wakeup_only,
-            Some(&mut effects.replication_only),
-            Some(&mut effects.aof_only),
+            None,
+            None,
+            Some(&mut pending),
         );
         self.apply_wakeup_exec_propagation(
-            effects.replication_only,
-            effects.aof_only,
+            pending.replication_only,
+            pending.aof_only,
             pending_replication,
             pending_aof,
         );
         for frame in effects.replies.drain(..) {
             self.queue_client_reply(token, frame);
         }
+        for (target_id, frame) in pending.tracking {
+            self.queue_client_reply(Token(target_id), frame);
+        }
+        self.propagate_cluster_publishes(pending.cluster_publish, pending.cluster_publish_shard);
+        effects.publish.extend(pending.publish);
+        effects.publish_shard.extend(pending.publish_shard);
         self.deliver_published(effects.publish, effects.publish_shard);
         effects.watch_dirty
     }
@@ -665,7 +795,16 @@ impl ServerWorkerState {
         connection_token: usize,
         token: Token,
         blocked_start_ms: i64,
+        pending_replication: Option<&mut Vec<Vec<u8>>>,
+        pending_aof: Option<&mut Vec<Vec<u8>>>,
+        pending_effects: Option<&mut EffectQueue>,
     ) -> bool {
+        self.commit_blocked_stream_read_effects(
+            connection_token,
+            pending_replication,
+            pending_aof,
+            pending_effects,
+        );
         let conn = &mut self.connection_registry
             [crate::framework::capabilities::io::Token(connection_token)];
         if conn.blocked.is_none() {
@@ -868,6 +1007,10 @@ impl ServerWorkerState {
         rejected: bool,
         effects: &mut ConnectionCommandEffects,
     ) -> (Vec<PropagationOp>, Vec<(u32, Bytes)>) {
+        let dirty_delta = effects.take_dirty_delta();
+        if let Some(delta) = dirty_delta {
+            self.ctx.persistence_mut().add_dirty(delta);
+        }
         let has_script_ops = !effects.script_propagation().is_empty();
         let force_propagate = !effects.custom_propagation().is_empty();
         if rejected && !has_script_ops && !force_propagate {
@@ -890,7 +1033,7 @@ impl ServerWorkerState {
             },
             effects,
         );
-        if is_write && !propagation_ops.is_empty() {
+        if dirty_delta.is_none() && is_write && !propagation_ops.is_empty() {
             self.ctx.persistence_mut().add_dirty(1);
         }
         (propagation_ops, dirty_keys)
@@ -906,7 +1049,7 @@ impl ServerWorkerState {
     ) -> Vec<(u32, Bytes)> {
         if !effects.dirty_keys().is_empty() {
             effects.take_dirty_keys()
-        } else if is_write && !rejected {
+        } else if is_write && !rejected && !effects.skip_propagation() {
             self.registry
                 .lookup(&args.name)
                 .and_then(|spec| {
@@ -966,6 +1109,7 @@ impl ServerWorkerState {
 
     pub(super) fn wakeup_apply_propagation(
         &mut self,
+        connection_token: usize,
         propagation_ops: Vec<PropagationOp>,
         pending_replication: Option<&mut Vec<Vec<u8>>>,
         pending_aof: Option<&mut Vec<Vec<u8>>>,
@@ -973,7 +1117,7 @@ impl ServerWorkerState {
         if propagation_ops.is_empty() {
             return;
         }
-        let sequenced = self.sequence_wakeup_propagation(&propagation_ops);
+        let sequenced = self.sequence_wakeup_propagation(connection_token, &propagation_ops);
         match pending_replication {
             Some(frames) => frames.extend(sequenced.replication_frames),
             None => {
@@ -999,6 +1143,7 @@ impl ServerWorkerState {
 
     fn sequence_wakeup_propagation(
         &mut self,
+        connection_token: usize,
         propagation_ops: &[PropagationOp],
     ) -> SequencedPropagation {
         if self.ctx.persistence_mut().take_rewrite_force_select() {
@@ -1009,6 +1154,25 @@ impl ServerWorkerState {
             self.ctx.repl_seldb(),
             self.ctx.persistence().aof_selected_db(),
         );
+        let offset_before = self.ctx.replication().primary_repl_offset();
+        let replication_bytes = sequenced.replication_frames.iter().map(Vec::len).sum();
+        let is_aof_enabled = self.ctx.config().persistence.aof_enabled;
+        if self
+            .ctx
+            .replication_mut()
+            .record_local_propagation(replication_bytes, is_aof_enabled)
+            .is_err()
+        {
+            crate::server_log!(
+                warning,
+                "Primary replication offset overflow; requesting server shutdown"
+            );
+            self.ctx.set_shutdown_requested(true);
+        }
+        let offset_after = self.ctx.replication().primary_repl_offset();
+        if offset_after != offset_before {
+            self.connection_registry[Token(connection_token)].set_last_write_offset(offset_after);
+        }
         self.ctx.set_repl_seldb(sequenced.replication_selected_db);
         self.ctx
             .persistence_mut()
@@ -1054,8 +1218,18 @@ impl ServerWorkerState {
         dirty_keys: &[(u32, Bytes)],
         token: Token,
     ) {
+        for (target_id, frame) in self.wakeup_collect_watch_and_tracking(dirty_keys, token) {
+            self.queue_client_reply(Token(target_id), frame);
+        }
+    }
+
+    fn wakeup_collect_watch_and_tracking(
+        &mut self,
+        dirty_keys: &[(u32, Bytes)],
+        token: Token,
+    ) -> Vec<(usize, Vec<u8>)> {
         if dirty_keys.is_empty() {
-            return;
+            return Vec::new();
         }
         for (db_id, key) in dirty_keys {
             let exists_after = self
@@ -1073,9 +1247,7 @@ impl ServerWorkerState {
         }
         let mut pending_tracking = Vec::new();
         self.collect_tracking_invalidations(dirty_keys, Some(token), &mut pending_tracking);
-        for (target_id, frame) in pending_tracking {
-            self.queue_client_reply(Token(target_id), frame);
-        }
+        pending_tracking
     }
 }
 
@@ -1084,6 +1256,298 @@ mod tests {
     use super::*;
     use crate::engine::command::context::{BlockedState, CommandConn};
     use crate::runtime::server::worker::reactor::transport::RuntimeConnectedPeer;
+
+    #[path = "stream_durability_tests.rs"]
+    mod stream_durability_tests;
+
+    #[test]
+    fn stream_spec_repairs_paused_exec_swapdb_reply_precedes_reblock_notification() {
+        use crate::foundation::io::store::structure::stream::StreamID;
+        use crate::runtime::server::worker::flows::request::dispatch::ReadBatchEffects;
+
+        let mut backend = ServerWorkerState::new(2).unwrap();
+        crate::framework::commands::register_all(&mut backend.registry);
+        for db_id in [0, 1] {
+            backend
+                .ctx
+                .db_mut(db_id)
+                .unwrap()
+                .get_or_create_stream(b"s")
+                .unwrap()
+                .create_group(Bytes::from_static(b"g"), StreamID::zero(), None)
+                .unwrap();
+        }
+        let mut add_connection = |id| {
+            let mut conn = Connection::new_fake();
+            conn.set_token_for_test(Token(id));
+            conn.resp_version = 3;
+            conn.set_custom_reply_enabled(false);
+            conn.set_skip_propagation(false);
+            Token(backend.connection_registry.insert(conn))
+        };
+        let reader = add_connection(42);
+        let trigger = add_connection(43);
+        let dispatch = |backend: &mut ServerWorkerState, token, parts: &[&[u8]]| {
+            let args = CommandArgs::from_parts(
+                parts
+                    .iter()
+                    .map(|part| Bytes::copy_from_slice(part))
+                    .collect(),
+            );
+            let name = String::from_utf8_lossy(&args.name).to_ascii_lowercase();
+            let mut batch = ReadBatchEffects::default();
+            backend.process_parsed_command(token, args, name, true, &mut batch);
+            backend.finalize_handle_readable(token.0, token.0, batch);
+        };
+        dispatch(
+            &mut backend,
+            reader,
+            &[
+                b"XREADGROUP",
+                b"GROUP",
+                b"g",
+                b"c",
+                b"BLOCK",
+                b"0",
+                b"NOACK",
+                b"STREAMS",
+                b"s",
+                b">",
+            ],
+        );
+        assert!(backend.connection_registry[reader].blocked.is_some());
+        dispatch(&mut backend, trigger, &[b"MULTI"]);
+        dispatch(&mut backend, trigger, &[b"SWAPDB", b"0", b"1"]);
+        backend.connection_registry[trigger].clear_output_queue();
+        backend.ctx.config_mut().server.notify_keyspace_events = "Kt".to_owned();
+        backend
+            .ctx
+            .pubsub_mut()
+            .subscribe(trigger.0, Bytes::from_static(b"__keyspace@0__:s"));
+        backend.ctx.client_pause_mut().action = PauseAction::Write;
+        backend.ctx.client_pause_mut().end_time_ms = i64::MAX;
+        dispatch(&mut backend, trigger, &[b"EXEC"]);
+        assert!(matches!(
+            backend.connection_registry[trigger]
+                .blocked
+                .as_ref()
+                .map(|state| &state.cmd),
+            Some(BlockedCmd::Paused)
+        ));
+        assert!(backend.connection_registry[trigger].output.queue.is_empty());
+
+        backend.connection_registry[trigger].set_tracking(true);
+        backend
+            .ctx
+            .tracking_mut()
+            .remember_key(trigger.0, &Bytes::from_static(b"s"));
+        backend.ctx.client_pause_mut().action = PauseAction::None;
+        backend.ctx.client_pause_mut().end_time_ms = 0;
+        let prefix = b"existing-batch-frame".to_vec();
+        let mut replication = vec![prefix.clone()];
+        let mut aof = vec![prefix.clone()];
+        backend.wakeup_blocked_client(trigger, Some(&mut replication), Some(&mut aof));
+        let output = _delivered_bytes(&backend, trigger.0);
+        assert!(
+            output.starts_with(b"*1\r\n+OK\r\n>2\r\n"),
+            "output: {}",
+            String::from_utf8_lossy(&output)
+        );
+        let tracking = output
+            .windows(10)
+            .position(|part| part == b"invalidate")
+            .unwrap();
+        let notification = output
+            .windows(21)
+            .position(|part| part == b"xgroup-createconsumer")
+            .unwrap();
+        assert!(tracking < notification);
+        assert!(backend.connection_registry[reader].blocked.is_some());
+        assert!(backend.connection_registry[reader].output.queue.is_empty());
+        assert_eq!(
+            output
+                .windows(21)
+                .filter(|part| *part == b"xgroup-createconsumer")
+                .count(),
+            1
+        );
+        assert_eq!(replication, aof);
+        assert_eq!(replication[0], prefix);
+        let swap = replication
+            .iter()
+            .position(|frame| frame.windows(6).any(|part| part == b"SWAPDB"))
+            .unwrap();
+        let create = replication
+            .iter()
+            .position(|frame| frame.windows(14).any(|part| part == b"CREATECONSUMER"))
+            .unwrap();
+        assert!(swap < create);
+        assert!(backend
+            .ctx
+            .db_mut(0)
+            .unwrap()
+            .get_stream(b"s")
+            .unwrap()
+            .unwrap()
+            .group(b"g")
+            .unwrap()
+            .consumers
+            .contains_key(b"c".as_slice()));
+    }
+
+    #[test]
+    fn stream_spec_repairs_reblock_queue_commits_watch_before_all_observer_delivery() {
+        use crate::engine::command::context::WatchedKey;
+        use crate::foundation::io::store::structure::stream::StreamID;
+
+        let mut backend = ServerWorkerState::new(1).unwrap();
+        crate::framework::commands::register_all(&mut backend.registry);
+        backend
+            .ctx
+            .db_mut(0)
+            .unwrap()
+            .get_or_create_stream(b"s")
+            .unwrap()
+            .create_group(Bytes::from_static(b"g"), StreamID::zero(), None)
+            .unwrap();
+        let mut observer = Connection::new_fake();
+        observer.set_token_for_test(Token(42));
+        observer.resp_version = 3;
+        observer.set_tracking(true);
+        observer
+            .transaction
+            .watch_many(vec![WatchedKey::new(0, Bytes::from_static(b"s"), false)]);
+        let observer = Token(backend.connection_registry.insert(observer));
+        backend
+            .ctx
+            .tracking_mut()
+            .remember_key(observer.0, &Bytes::from_static(b"s"));
+        let mut reader = Connection::new_fake();
+        reader.set_token_for_test(Token(43));
+        let reader = Token(backend.connection_registry.insert(reader));
+        let args = CommandArgs::from_parts(
+            [
+                b"XREADGROUP".as_slice(),
+                b"GROUP",
+                b"g",
+                b"c",
+                b"BLOCK",
+                b"0",
+                b"NOACK",
+                b"STREAMS",
+                b"s",
+                b">",
+            ]
+            .into_iter()
+            .map(Bytes::copy_from_slice)
+            .collect(),
+        );
+        crate::framework::commands::stream::xreadgroup::xreadgroup(
+            &mut backend.connection_registry[reader],
+            &args,
+            &mut backend.ctx,
+        );
+        let notice = (
+            Bytes::from_static(b"channel"),
+            Bytes::from_static(b"payload"),
+        );
+        backend.connection_registry[reader].record_notification(notice.clone());
+        backend.connection_registry[reader].record_shard_notification(notice.clone());
+        backend.connection_registry[reader].record_cluster_notification(notice.clone());
+        backend.connection_registry[reader].record_cluster_shard_notification(notice.clone());
+        let mut pending = EffectQueue::default();
+        backend.commit_blocked_stream_read_effects(reader.0, None, None, Some(&mut pending));
+        assert!(backend.connection_registry[observer]
+            .transaction
+            .is_watch_dirty());
+        assert!(backend.connection_registry[observer]
+            .output
+            .queue
+            .is_empty());
+        assert_eq!(pending.tracking.len(), 1);
+        assert_eq!(pending.publish, vec![notice.clone()]);
+        assert_eq!(pending.publish_shard, vec![notice.clone()]);
+        assert_eq!(pending.cluster_publish, vec![notice.clone()]);
+        assert_eq!(pending.cluster_publish_shard, vec![notice]);
+        assert!(!pending.replication_only.is_empty());
+        assert_eq!(pending.aof_only, pending.replication_only);
+        let dirty = backend.ctx.persistence().dirty();
+        backend.commit_blocked_stream_read_effects(reader.0, None, None, Some(&mut pending));
+        assert_eq!(backend.ctx.persistence().dirty(), dirty);
+        assert_eq!(pending.tracking.len(), 1);
+    }
+
+    #[test]
+    fn blocked_stream_consumer_effects_commit_before_delivery_and_only_once() {
+        for noack in [false, true] {
+            let mut backend = ServerWorkerState::new(2).unwrap();
+            crate::framework::commands::register_all(&mut backend.registry);
+            let stream = backend
+                .ctx
+                .db_mut(1)
+                .unwrap()
+                .get_or_create_stream(b"s")
+                .unwrap();
+            stream
+                .create_group(
+                    Bytes::from_static(b"g"),
+                    crate::foundation::io::store::structure::stream::StreamID::zero(),
+                    None,
+                )
+                .unwrap();
+            let mut watcher = Connection::new_fake();
+            watcher.set_token_for_test(Token(42));
+            watcher
+                .transaction
+                .watch_many(vec![crate::engine::command::context::WatchedKey::new(
+                    1,
+                    Bytes::from_static(b"s"),
+                    false,
+                )]);
+            let watcher_token = Token(backend.connection_registry.insert(watcher));
+            let mut reader = Connection::new_fake();
+            reader.set_token_for_test(Token(43));
+            reader.selected_db = 1;
+            let reader_token = Token(backend.connection_registry.insert(reader));
+            let mut parts = vec![
+                b"XREADGROUP".as_slice(),
+                b"GROUP",
+                b"g",
+                b"c",
+                b"BLOCK",
+                b"0",
+            ];
+            if noack {
+                parts.push(b"NOACK");
+            }
+            parts.extend([b"STREAMS".as_slice(), b"s", b">"]);
+            let args =
+                CommandArgs::from_parts(parts.into_iter().map(Bytes::copy_from_slice).collect());
+            crate::framework::commands::stream::xreadgroup::xreadgroup(
+                &mut backend.connection_registry[reader_token],
+                &args,
+                &mut backend.ctx,
+            );
+            assert!(!backend.connection_registry[watcher_token]
+                .transaction
+                .is_watch_dirty());
+            let dirty_before = backend.ctx.persistence().dirty();
+            let request_bytes =
+                backend.connection_registry[reader_token].request_bytes_current_command();
+            backend.commit_blocked_stream_read_effects(reader_token.0, None, None, None);
+            assert!(backend.connection_registry[watcher_token]
+                .transaction
+                .is_watch_dirty());
+            assert_eq!(backend.ctx.persistence().dirty(), dirty_before + 1);
+            let reader = &backend.connection_registry[reader_token];
+            assert!(reader.blocked.is_some());
+            assert!(reader.dirty_keys().is_empty());
+            assert!(reader.custom_propagation().is_empty());
+            assert_eq!(reader.request_bytes_current_command(), request_bytes);
+            backend.commit_blocked_stream_read_effects(reader_token.0, None, None, None);
+            assert_eq!(backend.ctx.persistence().dirty(), dirty_before + 1);
+        }
+    }
 
     fn redacting_write_handler(
         conn: &mut dyn CommandConn,
@@ -1238,7 +1702,14 @@ mod tests {
                 [crate::framework::capabilities::io::Token(connection_token)],
         );
 
-        assert!(backend.wakeup_reblock_if_needed(connection_token, token, mstime()));
+        assert!(backend.wakeup_reblock_if_needed(
+            connection_token,
+            token,
+            mstime(),
+            None,
+            None,
+            None
+        ));
 
         assert!(backend.connection_registry
             [crate::framework::capabilities::io::Token(connection_token)]

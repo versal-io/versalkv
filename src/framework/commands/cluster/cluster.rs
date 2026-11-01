@@ -78,9 +78,37 @@ pub fn cluster(conn: &mut dyn CommandConn, args: &CommandArgs, ctx: &mut ServerC
         "FLUSHSLOT" => flush_slot::cluster_flushslot(&args.args[1..], conn, ctx),
         "FLUSHSLOTS" => cluster_flushslots(ctx),
         "SETSLOT" => super::slots::cluster_setslot(&args.args[1..], conn.import_source(), ctx),
-        "SYNCSLOTS" => migration::cluster_syncslots(&args.args[1..], conn, ctx),
+        "SYNCSLOTS" => {
+            if args
+                .args
+                .get(1)
+                .is_some_and(|arg| arg.eq_ignore_ascii_case(b"establish"))
+            {
+                if let Some(role) = conn.slot_migration_role().cloned() {
+                    conn.set_skip_propagate(true);
+                    crate::server_log!(
+                        warning,
+                        "ERR CLUSTER SYNCSLOTS ESTABLISH is not allowed on a client that is already a slot migration client"
+                    );
+                    if let Some(state) = ctx.cluster_state_mut().as_deref_mut() {
+                        if let Ok(actions) = state.finish_migration(
+                            role.job_id(),
+                            crate::engine::distributed::cluster::migration::TerminalPhase::Failed,
+                            Some("Failed to process command during slot migration. Check logs for more information".to_string()),
+                            crate::foundation::io::sys::time::unixtime(),
+                        ) {
+                            state.queue_migration_actions(actions);
+                        }
+                    }
+                    conn.mark_closing();
+                    conn.suppress_reply();
+                    return Value::Null;
+                }
+            }
+            migration::cluster_syncslots(&args.args[1..], conn, ctx)
+        }
         "GETSLOTMIGRATIONS" => migration::cluster_getslotmigrations(&args.args[1..], ctx),
-        "MIGRATESLOTS" => migration::cluster_migrateslots(&args.args[1..], ctx),
+        "MIGRATESLOTS" => migration::cluster_migrateslots(&args.args[1..], conn, ctx),
         "CANCELSLOTMIGRATIONS" => migration::cluster_cancelslotmigrations(&args.args[1..], ctx),
         "SLOT-STATS" => super::slot_stats::cluster_slot_stats(&args.args[1..], ctx),
         _ => Value::error(format!(
@@ -110,7 +138,16 @@ fn cluster_info(ctx: &mut ServerContext) -> Value {
         Ok(s) => s,
         Err(e) => return e,
     };
-    Value::bulk(Bytes::from(state.info_str()))
+    let state_info = state.info_str();
+    let stats = ctx.stats();
+    let info = format!(
+        "{}cluster_io_threaded_reads_processed:{}\r\ncluster_io_threaded_writes_processed:{}\r\ncluster_io_main_thread_fallbacks:{}\r\n",
+        state_info,
+        stats.cluster_io_threaded_reads_processed,
+        stats.cluster_io_threaded_writes_processed,
+        stats.cluster_io_main_thread_fallbacks,
+    );
+    Value::bulk(Bytes::from(info))
 }
 
 fn cluster_myid(ctx: &mut ServerContext) -> Value {
@@ -488,13 +525,61 @@ mod tests {
     use super::{
         cluster_bumpepoch, cluster_forget, cluster_replicate, cluster_reset, cluster_shards,
     };
+    use crate::engine::command::context::CommandConn;
     use crate::engine::distributed::cluster::node::{ClusterNode, CLUSTER_NODE_MYSELF};
     use crate::engine::distributed::cluster::ClusterState;
-    use crate::engine::command::context::CommandConn;
     use crate::foundation::io::protocol::Value;
-    use crate::framework::context::ServerContext;
     use crate::framework::capabilities::connection::{CommandEffectDrain, Connection};
+    use crate::framework::context::ServerContext;
     use bytes::Bytes;
+
+    #[test]
+    fn repeated_establish_fails_bound_job_before_parsing_and_suppresses_reply() {
+        use crate::engine::command::context::ConnectionState;
+        use crate::engine::distributed::cluster::migration::{
+            MigrationJob, MigrationJobId, MigrationOperation, MigrationPhase,
+            SlotMigrationConnectionRole, SlotRanges, TerminalPhase,
+        };
+        use crate::engine::distributed::cluster::{NodeId, SlotRange};
+        use crate::framework::CommandArgs;
+
+        let mut context = ServerContext::new(1);
+        let mut state = ClusterState::new("127.0.0.1", 6379, 16_379);
+        let local = NodeId::parse(state.myself.name.as_bytes()).unwrap();
+        let id = MigrationJobId::generate();
+        let job = MigrationJob::new(
+            id.clone(),
+            NodeId::parse(b"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap(),
+            local,
+            SlotRanges::new(vec![SlotRange::new(0, 0).unwrap()]).unwrap(),
+            MigrationOperation::Import,
+            1,
+        );
+        state.migrations.start(job).unwrap();
+        *context.cluster_state_mut() = Some(Box::new(state));
+        let mut conn = Connection::new_fake();
+        conn.slot_migration_role = Some(SlotMigrationConnectionRole::Import(id.clone()));
+        let args = CommandArgs::from_parts(vec![
+            Bytes::from_static(b"CLUSTER"),
+            Bytes::from_static(b"SYNCSLOTS"),
+            Bytes::from_static(b"ESTABLISH"),
+            Bytes::from_static(b"invalid"),
+        ]);
+        assert_eq!(super::cluster(&mut conn, &args, &mut context), Value::Null);
+        assert_eq!(conn.state, ConnectionState::Closing);
+        assert!(conn.skip_propagate());
+        assert!(!conn.has_pending_output());
+        let state = context.cluster_state().as_ref().unwrap();
+        assert_eq!(state.migrations.views().len(), 1);
+        let job = state.migrations.get(&id).unwrap();
+        assert_eq!(job.phase, MigrationPhase::Terminal(TerminalPhase::Failed));
+        assert_eq!(
+            job.message.as_deref(),
+            Some(
+                "Failed to process command during slot migration. Check logs for more information"
+            )
+        );
+    }
 
     fn map_field<'a>(fields: &'a [(Value, Value)], key: &[u8]) -> &'a Value {
         fields
@@ -512,7 +597,11 @@ mod tests {
         state.add_slot(0).unwrap();
         state.myself.repl_offset = 0;
         *context.cluster_state_mut() = Some(Box::new(state));
-        context.replication_mut().backlog.append(b"replicated").unwrap();
+        context
+            .replication_mut()
+            .backlog
+            .append(b"replicated")
+            .unwrap();
         let mut connection = Connection::new_fake();
 
         let Value::Array(shards) = cluster_shards(&mut connection, &mut context) else {

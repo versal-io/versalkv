@@ -172,6 +172,21 @@ impl ServerWorkerState {
                 listening_port,
                 replica_announce_ip: &replica_announce_ip,
             };
+            if link.is_dual_rdb_mode_active()
+                && !all_events.is_empty()
+                && self
+                    .buffer_replica_events_into_pending_inner(
+                        connection_token,
+                        &mut link,
+                        std::mem::take(&mut all_events),
+                        false,
+                    )
+                    .is_err()
+            {
+                self.replication_runtime.set_replica_link(link);
+                self.abort_replica_read(token_value);
+                return;
+            }
             let Some(chunk) = self.process_classic_rdb_chunk(link, &context, &read_data) else {
                 return;
             };
@@ -229,19 +244,21 @@ impl ServerWorkerState {
     ) -> Result<DecodedReplicaChunk, LinkError> {
         self.pin_replica_rdb_load_mode(link);
         let payload_before = link.rdb_payload_bytes();
-        let (events, actions) = if self.ctx.is_script_busy() {
+        let decoded = if self.ctx.is_script_busy() {
             link.on_bytes_while_script_blocked(
                 read_data,
                 context.listening_port,
                 context.replica_announce_ip,
-            )?
+            )
         } else {
             link.on_bytes_with_announce_ip(
                 read_data,
                 context.listening_port,
                 context.replica_announce_ip,
-            )?
+            )
         };
+        self.account_replica_wire_input(link);
+        let (events, actions) = decoded?;
         self.mark_replica_transfer_started(link);
         let payload_delta = link
             .rdb_payload_bytes()
@@ -285,13 +302,30 @@ impl ServerWorkerState {
         context: &ClassicChunkContext<'_>,
         read_data: &[u8],
     ) -> Option<ClassicChunkResult> {
-        let decoded = match self.decode_classic_rdb_chunk(&mut link, context, read_data) {
+        let mut decoded = match self.decode_classic_rdb_chunk(&mut link, context, read_data) {
             Ok(decoded) => decoded,
             Err(error) => {
                 self.reject_classic_rdb_chunk(context.token_value, link, error, read_data);
                 return None;
             }
         };
+        // RDB commit may read newer main-channel frames during handoff.
+        // Publish this older batch first without recursively entering handoff.
+        if link.is_dual_rdb_mode_active()
+            && !decoded.events.is_empty()
+            && self
+                .buffer_replica_events_into_pending_inner(
+                    context.connection_token,
+                    &mut link,
+                    std::mem::take(&mut decoded.events),
+                    false,
+                )
+                .is_err()
+        {
+            self.replication_runtime.set_replica_link(link);
+            self.abort_replica_read(context.token_value);
+            return None;
+        }
         if link.has_received_rdb_payload() {
             self.apply_streaming_loading_gate(&link);
         }
@@ -437,6 +471,12 @@ impl ServerWorkerState {
             self.replication_runtime.reset_master_reconnect_backoff();
         }
         if result.peer_closed {
+            if is_loading {
+                crate::server_log!(
+                    warning,
+                    "RDB stream ended before the announced transfer size"
+                );
+            }
             if !is_streaming {
                 self.ctx.config_mut().replication.master_link_status = "down".to_string();
             }
@@ -529,6 +569,10 @@ impl ServerWorkerState {
                 self.classic_rdb_loading_progress
                     .begin_session(link.session_id());
             }
+            if let Some(receive) = link.rdb_receive_mut() {
+                receive.finish_input();
+                receive.begin_decode_turn();
+            }
             loop {
                 let key_load_delay_us = self.ctx.config().persistence.key_load_delay;
                 let Some(recv) = link.rdb_receive_mut() else {
@@ -601,16 +645,29 @@ impl ServerWorkerState {
         // Socket loads start on the first payload. Disk-backed loads wait for
         // the complete transfer before decoding or applying key-load-delay.
         self.init_streaming_target(link).map_err(|_| ())?;
+        let input_complete =
+            !link.is_receiving_rdb() && (!is_dual_mode || link.rdb_framing_is_complete());
         let key_load_delay_us = self.ctx.config().persistence.key_load_delay;
         let step = {
             let Some(recv) = link.rdb_receive_mut() else {
                 return Ok(());
             };
+            if input_complete {
+                recv.finish_input();
+            }
             recv.drive(self.ctx.dbs_mut(), key_load_delay_us)
         };
         match step {
             Ok(StreamStep::NeedMore) => Ok(()),
             Ok(StreamStep::Finished) => {
+                if link.is_receiving_rdb() || (is_dual_mode && !link.rdb_framing_is_complete()) {
+                    return Ok(());
+                }
+                if let Some(receive) = link.rdb_receive_mut() {
+                    receive.validate_complete().map_err(|error| {
+                        super::replica_apply::log_rdb_decode_error(&error);
+                    })?;
+                }
                 if is_dual_mode {
                     let loaded_keys = link
                         .rdb_receive_mut()
@@ -857,7 +914,12 @@ impl ServerWorkerState {
             self.ctx.config_mut().replication.master_link_status = "down".to_string();
             return;
         }
-        if read_data.is_empty() {
+        if read_data.is_empty()
+            && !self
+                .replication_runtime
+                .replica_link()
+                .is_some_and(|link| link.has_pending_decompression())
+        {
             return;
         }
 
@@ -872,6 +934,7 @@ impl ServerWorkerState {
         };
         let decoded =
             link.on_bytes_with_announce_ip(&read_data, listening_port, &replica_announce_ip);
+        self.account_replica_wire_input(&mut link);
         let (events, actions) = match decoded {
             Ok(decoded) => decoded,
             Err(error) => {
@@ -917,17 +980,18 @@ impl ServerWorkerState {
             .client_pause()
             .is_paused(crate::foundation::io::sys::time::mstime())
             != crate::framework::context::PauseAction::None;
-        let apply_result = if paused && link.is_streaming() {
-            if events.is_empty() && link.is_dual_rdb_mode_active() {
+        let apply_result =
+            if (paused || self.ctx.module_registry().busy_reply.is_some()) && link.is_streaming() {
+                if events.is_empty() && link.is_dual_rdb_mode_active() {
+                    self.buffer_replica_events_into_pending(connection_token, &mut link, events)
+                } else {
+                    self.defer_replica_events(connection_token, &mut link, events)
+                }
+            } else if link.is_dual_rdb_mode_active() {
                 self.buffer_replica_events_into_pending(connection_token, &mut link, events)
             } else {
-                self.defer_replica_events(connection_token, &mut link, events)
-            }
-        } else if link.is_dual_rdb_mode_active() {
-            self.buffer_replica_events_into_pending(connection_token, &mut link, events)
-        } else {
-            self.apply_replica_events(connection_token, &mut link, events)
-        };
+                self.apply_replica_events(connection_token, &mut link, events)
+            };
         if apply_result.is_err() {
             self.ctx.replication_mut().async_loading = false;
             self.ctx.set_loading(false);
@@ -994,13 +1058,21 @@ impl ServerWorkerState {
     ) -> Option<ReplicaLink> {
         self.pin_replica_rdb_load_mode(&mut link);
         let payload_before = link.rdb_payload_bytes();
-        let actions = match link.on_rdb_bytes(read_data) {
+        let previous_state = link.rdb_channel_state();
+        let decoded = link.on_rdb_bytes(read_data);
+        self.account_replica_wire_input(&mut link);
+        let actions = match decoded {
             Ok((_events, actions)) => actions,
             Err(error) => {
                 self.reject_dual_rdb_chunk(context, link, error, read_data);
                 return None;
             }
         };
+        self.send_dual_rdb_sync_after_handshake(
+            context.rdb_connection_token,
+            previous_state,
+            &link,
+        );
         self.mark_replica_transfer_started(&link);
         let payload_delta = link.rdb_payload_bytes().saturating_sub(payload_before);
         let payload_delta = payload_delta.min(usize::MAX as u64) as usize;
@@ -1161,7 +1233,10 @@ impl ServerWorkerState {
             self.replication_runtime.set_replica_link(link);
             return Err(());
         }
-        match link.on_bytes_with_announce_ip(read_data, listening_port, &replica_announce_ip) {
+        let decoded =
+            link.on_bytes_with_announce_ip(read_data, listening_port, &replica_announce_ip);
+        self.account_replica_wire_input(&mut link);
+        match decoded {
             Ok((events, actions)) => Ok((link, events, actions)),
             Err(error) => {
                 crate::server_log!(warning, "dual-rdb main decode rejected while RDB loading: token={} rdb_state={:?} error={:?} bytes={:?}", token_value, link.rdb_channel_state(), error, String::from_utf8_lossy(read_data));
@@ -1282,6 +1357,9 @@ impl ServerWorkerState {
         }
     }
 }
+
+#[cfg(test)]
+mod replay_fifo_tests;
 
 #[cfg(test)]
 mod tests {

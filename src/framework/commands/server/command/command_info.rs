@@ -123,6 +123,9 @@ fn module_key_specs(info: &crate::engine::extension::module::ModuleCommandInfo) 
 }
 
 fn command_key_specs(spec: &CommandSpec) -> Vec<Value> {
+    if let Some(key_specs) = super::render::rename_key_specs(spec.name.as_str()) {
+        return key_specs;
+    }
     if let Some(key_specs) = super::render::geo_key_specs(spec.name.as_str()) {
         return key_specs;
     }

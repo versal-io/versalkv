@@ -7,9 +7,8 @@ use crate::engine::command::context::Token;
 use crate::foundation::io::transport::PollSourceMode;
 use crate::foundation::io::transport::TransportPollState;
 use crate::foundation::io::transport::{
-    ConnectedPeer, Interest, ListenerHandle, OwnedPollSource, ThreadIoHandle, TlsClientConfig,
-    TlsConfig, TransportEvent, TransportId, TransportRuntime, TransportWakeHandle,
-    TransportWorkerBackend, UnixBindOptions,
+    ConnectedPeer, Interest, ListenerHandle, OwnedPollSource, ThreadIoHandle, TransportEvent,
+    TransportId, TransportRuntime, TransportWakeHandle, TransportWorkerBackend, UnixBindOptions,
 };
 use crate::framework::distributed::sentinel::io::{IoInterest, SentinelIo};
 use crate::runtime::server::worker::reactor::sources::{RuntimeSourceRegistry, SourceOwner};
@@ -197,8 +196,17 @@ impl<T: TransportRuntime> RuntimeTransport<T> {
         Ok(self.register_listener(listener))
     }
 
-    pub(crate) fn configure_tls_server(&mut self, config: TlsConfig) -> io::Result<()> {
-        self.inner.configure_tls_server(config)
+    pub(crate) fn swap_tls_contexts(
+        &mut self,
+        batch: crate::foundation::io::transport::TlsContextBatch,
+    ) -> io::Result<crate::foundation::io::transport::TlsContextBatch> {
+        self.inner.swap_tls_contexts(batch)
+    }
+
+    pub(crate) fn tls_peer_names(&self, token: Token, use_uri: bool) -> Option<Vec<Vec<u8>>> {
+        self.registry
+            .transport_id(token)
+            .and_then(|id| self.inner.tls_peer_names(id, use_uri))
     }
 
     pub(crate) fn bind_tls(&mut self, addr: SocketAddr) -> io::Result<RuntimeListenerHandle> {
@@ -255,10 +263,6 @@ impl<T: TransportRuntime> RuntimeTransport<T> {
 
     pub(crate) fn connect_tcp(&mut self, addr: SocketAddr) -> io::Result<RuntimeConnectedPeer> {
         self.connect_tcp_bound(addr, None)
-    }
-
-    pub(crate) fn configure_tls_client(&mut self, config: TlsClientConfig) -> io::Result<()> {
-        self.inner.configure_tls_client(config)
     }
 
     pub(crate) fn connect_tls_bound(

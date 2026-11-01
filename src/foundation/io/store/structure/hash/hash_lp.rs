@@ -2,9 +2,17 @@
 
 use crate::foundation::memory::value::{Encoding, EncodingChange, HashOps};
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub struct HashLp {
     lp: Vec<u8>,
+}
+
+impl Clone for HashLp {
+    fn clone(&self) -> Self {
+        let mut lp = Vec::with_capacity(self.lp.capacity());
+        lp.extend_from_slice(&self.lp);
+        Self { lp }
+    }
 }
 
 const LP_HDR_SIZE: usize = 6; // 4 bytes total_size + 2 bytes num_items
@@ -32,13 +40,16 @@ impl HashLp {
         let mut p = LP_HDR_SIZE;
         while p < lp.len() - 1 {
             let entry_size = lp_entry_total_size(&lp, p)?;
-            p += entry_size;
+            p = p.checked_add(entry_size)?;
+            if p > lp.len() - 1 {
+                return None;
+            }
             count += 1;
         }
-        if count != num {
+        if num != u16::MAX as usize && count != num {
             return None;
         }
-        if !num.is_multiple_of(2) {
+        if !count.is_multiple_of(2) {
             return None;
         }
         Some(HashLp { lp })
@@ -55,7 +66,8 @@ impl HashLp {
         max_entries: usize,
         max_value_size: usize,
     ) -> Result<bool, EncodingChange> {
-        if field.len() > max_value_size || value.len() > max_value_size {
+        if field.len() > max_value_size || value.len() > max_value_size || self.len() > max_entries
+        {
             return Err(EncodingChange::Upgrade);
         }
 
@@ -141,7 +153,20 @@ impl HashOps for HashLp {
 }
 
 fn lp_num_pairs(lp: &[u8]) -> usize {
-    (u16::from_le_bytes(lp[4..6].try_into().unwrap_or([0, 0])) as usize) / 2
+    let count = u16::from_le_bytes(lp[4..6].try_into().unwrap_or([0, 0]));
+    if count != u16::MAX {
+        return count as usize / 2;
+    }
+    let mut entries = 0;
+    let mut position = LP_HDR_SIZE;
+    while position < lp.len() - 1 {
+        let Some(next) = lp_next_entry_offset(lp, position) else {
+            break;
+        };
+        position = next;
+        entries += 1;
+    }
+    entries / 2
 }
 
 fn lp_set_header(buf: &mut [u8], total: u32, num_items: u16) {
@@ -336,7 +361,7 @@ fn lp_insert_pair_at(
 
     let new_total = lp.len() as u32;
     let old_num = u16::from_le_bytes(lp[4..6].try_into().unwrap_or([0, 0]));
-    let new_num = old_num + 2;
+    let new_num = old_num.saturating_add(2);
     lp_set_header(lp, new_total, new_num);
 }
 
@@ -358,13 +383,45 @@ fn lp_remove_pair(lp: &mut Vec<u8>, pair_idx: usize) {
 
     let new_total = lp.len() as u32;
     let old_num = u16::from_le_bytes(lp[4..6].try_into().unwrap_or([0, 0]));
-    let new_num = old_num - 2;
+    let new_num = if old_num == u16::MAX {
+        u16::MAX
+    } else {
+        old_num - 2
+    };
     lp_set_header(lp, new_total, new_num);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hfe_raw_listpack_accepts_unknown_count_and_checks_entry_bounds() {
+        let mut hash = HashLp::new();
+        hash.set_with_threshold(b"f", b"v", 512, 64).unwrap();
+        let mut raw = hash.raw_bytes().to_vec();
+        raw[4..6].copy_from_slice(&u16::MAX.to_le_bytes());
+        let mut loaded = HashLp::from_raw_bytes(raw).unwrap();
+        assert_eq!(loaded.len(), 1);
+        loaded.set_with_threshold(b"f", b"new", 512, 64).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded.del(b"f"), Ok(true));
+        assert_eq!(loaded.len(), 0);
+        let raw = vec![8, 0, 0, 0, 2, 0, 0xbf, LP_EOF];
+        assert!(HashLp::from_raw_bytes(raw).is_none());
+    }
+
+    #[test]
+    fn hfe_existing_pair_update_honors_lowered_entry_limit() {
+        let mut hash = HashLp::new();
+        hash.set_with_threshold(b"f1", b"v", 2, 64).unwrap();
+        hash.set_with_threshold(b"f2", b"v", 2, 64).unwrap();
+        assert_eq!(
+            hash.set_with_threshold(b"f1", b"new", 1, 64),
+            Err(EncodingChange::Upgrade)
+        );
+        assert_eq!(hash.get(b"f1"), Some(b"v".to_vec()));
+    }
 
     #[test]
     fn new_is_empty() {
@@ -427,6 +484,19 @@ mod tests {
         assert_eq!(pairs[0].0, b"a");
         assert_eq!(pairs[1].0, b"b");
         assert_eq!(pairs[2].0, b"c");
+    }
+
+    #[test]
+    fn clone_preserves_allocated_memory_usage() {
+        let mut hash = HashLp::new();
+        for field in [b"f1".as_slice(), b"f2", b"f3"] {
+            hash.set_with_threshold(field, b"value", 512, 64).unwrap();
+        }
+
+        let cloned = hash.clone();
+
+        assert_eq!(cloned.raw_bytes(), hash.raw_bytes());
+        assert_eq!(cloned.memory_usage(), hash.memory_usage());
     }
 
     #[test]

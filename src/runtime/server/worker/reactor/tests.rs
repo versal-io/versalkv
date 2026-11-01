@@ -42,6 +42,9 @@ mod blocked_pump_tests;
 #[path = "tests/dispatch_policy_tests.rs"]
 mod dispatch_policy_tests;
 
+#[path = "tests/qos_tests.rs"]
+mod qos_tests;
+
 #[test]
 fn server_cron_interval_uses_c_clamped_hz_bounds() {
     assert_eq!(server_cron_interval(0), Duration::from_secs(1));

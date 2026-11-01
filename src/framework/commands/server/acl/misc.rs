@@ -123,8 +123,9 @@ pub(super) fn acl_dryrun(args: &CommandArgs, ctx: &ServerContext) -> Value {
 
     let cmd_args = &args.args[3..];
     let cmd_lower = cmd_name.to_ascii_lowercase();
-    let extracted =
-        crate::framework::commands::server::command::extract_command_keys(&cmd_lower, cmd_args, ctx);
+    let extracted = crate::framework::commands::server::command::extract_command_keys(
+        &cmd_lower, cmd_args, ctx,
+    );
     let keys: Vec<(&[u8], u8)> = extracted
         .iter()
         .map(|(key, flags)| {
@@ -152,19 +153,12 @@ pub(super) fn acl_dryrun(args: &CommandArgs, ctx: &ServerContext) -> Value {
         &cmd_lower,
         cmd_args,
         (spec.flags & crate::engine::command::CMD_ALL_DBS) != 0,
-        crate::engine::extension::acl::should_restrict_cmd(
-            &cmd_lower,
-            acl_categories,
-            has_keys,
-        ),
+        crate::engine::extension::acl::should_restrict_cmd(&cmd_lower, acl_categories, has_keys),
         dbid,
         num_dbs,
     );
-    let command = crate::engine::extension::acl::AclCommand::new(
-        &cmd_lower,
-        cmd_args,
-        acl_categories,
-    );
+    let command =
+        crate::engine::extension::acl::AclCommand::new(&cmd_lower, cmd_args, acl_categories);
     if let Some(denial) = user.check_command_perm(command, &db_req, num_dbs, &keys) {
         use crate::engine::extension::acl::AclDenial;
         return match denial {
@@ -187,6 +181,15 @@ pub(super) fn acl_dryrun(args: &CommandArgs, ctx: &ServerContext) -> Value {
                 Value::bulk(Bytes::from(format!(
                     "User {} has no permissions to access the '{}' key",
                     username, key_name
+                )))
+            }
+            AclDenial::Channel(i) => {
+                let channel = cmd_args
+                    .get(i)
+                    .map(|channel| String::from_utf8_lossy(channel))
+                    .unwrap_or_default();
+                Value::bulk(Bytes::from(format!(
+                    "User {username} has no permissions to access the '{channel}' channel"
                 )))
             }
         };

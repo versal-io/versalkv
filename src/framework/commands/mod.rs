@@ -22,6 +22,8 @@ pub mod hyperloglog;
 #[rustfmt::skip]
 pub mod list;
 #[rustfmt::skip]
+pub mod pathhash;
+#[rustfmt::skip]
 pub mod pubsub;
 #[rustfmt::skip]
 pub mod scripting;
@@ -51,6 +53,7 @@ pub fn register_all(reg: &mut CommandRegistry) {
     hash::register_all(reg);
     hyperloglog::register_all(reg);
     list::register_all(reg);
+    pathhash::register_all(reg);
     pubsub::register_all(reg);
     scripting::register_all(reg);
     sentinel::register_all(reg);

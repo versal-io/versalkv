@@ -10,9 +10,12 @@ use command_macros::command;
 
 mod fullsync_fork;
 pub use fullsync_fork::{
-    fork_direct_diskless_rdb_child, fork_disk_rdb_file_child, fork_diskless_rdb_child,
+    fork_direct_diskless_rdb_child,
+    fork_disk_rdb_file_child_with_options, fork_diskless_rdb_child_with_options,
     pause_parent_after_replication_fork, DiskSyncChildExit,
 };
+#[cfg(test)]
+pub use fullsync_fork::{fork_diskless_rdb_child, fork_disk_rdb_file_child};
 #[cfg(test)]
 pub use fullsync_fork::reap_disk_sync_file_child;
 pub(crate) use fullsync_fork::{

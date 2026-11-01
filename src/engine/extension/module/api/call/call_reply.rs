@@ -8,8 +8,8 @@ use super::super::super::auto_memory;
 use super::super::super::{
     ModuleInternalCtx, ValkeyModuleCtx, ValkeyModuleString, VALKEYMODULE_ERR, VALKEYMODULE_OK,
 };
-use crate::foundation::io::protocol::serializer::format_double;
-use crate::foundation::io::protocol::Value;
+use crate::foundation::io::protocol::serializer::{format_double, serialize_to_vec_resp3};
+use crate::foundation::io::protocol::{DecimalDoubleText, Value};
 
 // ============================================================================
 // ============================================================================
@@ -58,6 +58,7 @@ pub struct ValkeyModuleCallReply {
     verbatim_storage: Option<Box<[u8]>>,
     verbatim_format_storage: Option<Box<[u8]>>,
     raw_proto: Option<Box<[u8]>>,
+    decimal_double_storage: Option<DecimalDoubleText>,
 }
 
 #[cfg(test)]
@@ -155,6 +156,10 @@ impl<'a> CallReplyNode<'a> {
 
     pub(crate) fn string_bytes(self) -> Option<&'a [u8]> {
         self.bytes(self.reply.str_data, self.reply.str_len)
+    }
+
+    pub(crate) fn decimal_double(self) -> Option<&'a DecimalDoubleText> {
+        self.reply.decimal_double_storage.as_ref()
     }
 
     pub(crate) fn big_number_bytes(self) -> Option<&'a [u8]> {
@@ -257,6 +262,7 @@ fn normalize_resp2(value: &Value) -> Value {
         }
         Value::Boolean(value) => Value::Integer(i64::from(*value)),
         Value::Double(value) => Value::Bulk(Bytes::from(format_double(*value))),
+        Value::DecimalDouble(value) => Value::Bulk(value.bytes()),
         Value::BigNumber(value) => Value::Bulk(value.clone()),
         Value::Verbatim { data, .. } => Value::Bulk(data.clone()),
         Value::Attribute { inner, .. } => normalize_resp2(inner),
@@ -290,6 +296,7 @@ impl ValkeyModuleCallReply {
             verbatim_storage: None,
             verbatim_format_storage: None,
             raw_proto: None,
+            decimal_double_storage: None,
         }
     }
 
@@ -313,22 +320,32 @@ impl ValkeyModuleCallReply {
         items: impl Iterator<Item = &'a Value>,
         exact: bool,
         resp3: bool,
-    ) -> (*mut *mut ValkeyModuleCallReply, size_t) {
-        let mut elements: Vec<*mut ValkeyModuleCallReply> = Vec::new();
+    ) -> Result<(*mut *mut ValkeyModuleCallReply, size_t), &'static str> {
+        let mut children: Vec<Box<Self>> = Vec::new();
         for item in items {
-            let mut child = Self::from_wire_value(item, exact, resp3);
+            let mut child = match Self::from_wire_value(item, exact, resp3) {
+                Ok(child) => child,
+                Err(error) => {
+                    for mut child in children {
+                        // SAFETY: each completed child uniquely owns its constructed tree.
+                        unsafe { child.free() };
+                    }
+                    return Err(error);
+                }
+            };
             child.is_root = false;
-            elements.push(Box::into_raw(child));
+            children.push(child);
         }
+        let elements: Vec<_> = children.into_iter().map(Box::into_raw).collect();
         if elements.is_empty() {
-            (std::ptr::null_mut(), 0)
+            Ok((std::ptr::null_mut(), 0))
         } else {
             let count = elements.len() as size_t;
             let boxed = elements.into_boxed_slice();
-            (
+            Ok((
                 Box::into_raw(boxed) as *mut *mut ValkeyModuleCallReply,
                 count,
-            )
+            ))
         }
     }
 
@@ -337,26 +354,57 @@ impl ValkeyModuleCallReply {
     }
 
     pub(crate) fn from_value_with_resp(value: &Value, exact: bool, resp3: bool) -> Box<Self> {
+        Self::try_from_value_with_resp(value, exact, resp3).unwrap_or_else(|error| {
+            Self::from_string(
+                &Bytes::from_static(error.as_bytes()),
+                VALKEYMODULE_REPLY_ERROR,
+                exact,
+                resp3,
+            )
+        })
+    }
+
+    pub(crate) fn try_from_value_with_resp(
+        value: &Value,
+        exact: bool,
+        resp3: bool,
+    ) -> Result<Box<Self>, &'static str> {
         if resp3 {
             return Self::from_wire_value(value, exact, true);
         }
         Self::from_wire_value(&normalize_resp2(value), exact, false)
     }
 
-    fn from_wire_value(value: &Value, exact: bool, resp3: bool) -> Box<Self> {
-        match value {
+    fn from_wire_value(value: &Value, exact: bool, resp3: bool) -> Result<Box<Self>, &'static str> {
+        let mut reply = match value {
             Value::Null
             | Value::NullArray
             | Value::Integer(_)
             | Value::Double(_)
-            | Value::Boolean(_) => Self::from_scalar(value, exact, resp3),
-            Value::SimpleString(value) => {
-                Self::from_string(value, VALKEYMODULE_REPLY_SIMPLE_STRING, exact, resp3)
+            | Value::Boolean(_) => Ok(Self::from_scalar(value, exact, resp3)),
+            Value::DecimalDouble(value) => Self::from_decimal_double(value, exact, resp3),
+            Value::SimpleString(value) => Ok(Self::from_string(
+                value,
+                VALKEYMODULE_REPLY_SIMPLE_STRING,
+                exact,
+                resp3,
+            )),
+            Value::Bulk(value) => Ok(Self::from_string(
+                value,
+                VALKEYMODULE_REPLY_STRING,
+                exact,
+                resp3,
+            )),
+            Value::Error(value) => Ok(Self::from_string(
+                value,
+                VALKEYMODULE_REPLY_ERROR,
+                exact,
+                resp3,
+            )),
+            Value::BigNumber(value) => Ok(Self::from_big_number(value, exact, resp3)),
+            Value::Verbatim { format, data } => {
+                Ok(Self::from_verbatim(*format, data, exact, resp3))
             }
-            Value::Bulk(value) => Self::from_string(value, VALKEYMODULE_REPLY_STRING, exact, resp3),
-            Value::Error(value) => Self::from_string(value, VALKEYMODULE_REPLY_ERROR, exact, resp3),
-            Value::BigNumber(value) => Self::from_big_number(value, exact, resp3),
-            Value::Verbatim { format, data } => Self::from_verbatim(*format, data, exact, resp3),
             Value::Array(items) => {
                 Self::from_sequence(items, VALKEYMODULE_REPLY_ARRAY, exact, resp3)
             }
@@ -366,7 +414,27 @@ impl ValkeyModuleCallReply {
             }
             Value::Map(entries) => Self::from_map(entries, exact, resp3),
             Value::Attribute { attrs, inner } => Self::from_attribute(attrs, inner, exact, resp3),
+        }?;
+        if resp3 && contains_decimal_double(value) {
+            reply.raw_proto = Some(serialize_to_vec_resp3(value).into_boxed_slice());
         }
+        Ok(reply)
+    }
+
+    fn from_decimal_double(
+        value: &DecimalDoubleText,
+        exact: bool,
+        resp3: bool,
+    ) -> Result<Box<Self>, &'static str> {
+        // Only the module's c_double getter and callback consume this narrowed cache.
+        let double = std::str::from_utf8(value.as_bytes())
+            .ok()
+            .and_then(|text| text.parse::<f64>().ok())
+            .ok_or("ERR invalid decimal double reply")?;
+        let mut reply = Self::empty(VALKEYMODULE_REPLY_DOUBLE, exact, resp3);
+        reply.double_val = double;
+        reply.decimal_double_storage = Some(value.clone());
+        Ok(Box::new(reply))
     }
 
     fn from_scalar(value: &Value, exact: bool, resp3: bool) -> Box<Self> {
@@ -415,21 +483,30 @@ impl ValkeyModuleCallReply {
         Box::new(reply)
     }
 
-    fn from_sequence(items: &[Value], reply_type: c_int, exact: bool, resp3: bool) -> Box<Self> {
-        let (elements, count) = Self::build_elements(items.iter(), exact, resp3);
+    fn from_sequence(
+        items: &[Value],
+        reply_type: c_int,
+        exact: bool,
+        resp3: bool,
+    ) -> Result<Box<Self>, &'static str> {
+        let (elements, count) = Self::build_elements(items.iter(), exact, resp3)?;
         let mut reply = Self::empty(reply_type, exact, resp3);
         reply.num_elements = count;
         reply.elements = elements;
-        Box::new(reply)
+        Ok(Box::new(reply))
     }
 
-    fn from_map(entries: &[(Value, Value)], exact: bool, resp3: bool) -> Box<Self> {
+    fn from_map(
+        entries: &[(Value, Value)],
+        exact: bool,
+        resp3: bool,
+    ) -> Result<Box<Self>, &'static str> {
         let items = entries.iter().flat_map(|(key, value)| [key, value]);
-        let (elements, _) = Self::build_elements(items, exact, resp3);
+        let (elements, _) = Self::build_elements(items, exact, resp3)?;
         let mut reply = Self::empty(VALKEYMODULE_REPLY_MAP, exact, resp3);
         reply.num_elements = entries.len();
         reply.elements = elements;
-        Box::new(reply)
+        Ok(Box::new(reply))
     }
 
     fn from_attribute(
@@ -437,16 +514,35 @@ impl ValkeyModuleCallReply {
         inner: &Value,
         exact: bool,
         resp3: bool,
-    ) -> Box<Self> {
-        let mut reply = Self::from_wire_value(inner, exact, resp3);
+    ) -> Result<Box<Self>, &'static str> {
         let items = attrs.iter().flat_map(|(key, value)| [key, value]);
-        let (elements, _) = Self::build_elements(items, exact, resp3);
+        let (elements, _) = Self::build_elements(items, exact, resp3)?;
         let mut attribute = Self::empty(VALKEYMODULE_REPLY_ATTRIBUTE, exact, resp3);
         attribute.is_root = false;
         attribute.num_elements = attrs.len();
         attribute.elements = elements;
+        if resp3
+            && attrs
+                .iter()
+                .any(|(key, value)| contains_decimal_double(key) || contains_decimal_double(value))
+        {
+            let mut proto = serialize_to_vec_resp3(&Value::Attribute {
+                attrs: attrs.to_vec(),
+                inner: Box::new(Value::Null),
+            });
+            proto.truncate(proto.len() - b"_\r\n".len());
+            attribute.raw_proto = Some(proto.into_boxed_slice());
+        }
+        let mut reply = match Self::from_wire_value(inner, exact, resp3) {
+            Ok(reply) => reply,
+            Err(error) => {
+                // SAFETY: this local attribute uniquely owns all completed children.
+                unsafe { attribute.free() };
+                return Err(error);
+            }
+        };
         reply.attribute = Box::into_raw(Box::new(attribute));
-        reply
+        Ok(reply)
     }
 
     pub fn effective_type(&self) -> c_int {
@@ -473,6 +569,8 @@ impl ValkeyModuleCallReply {
             self.big_number_storage.take();
             self.verbatim_storage.take();
             self.verbatim_format_storage.take();
+            self.decimal_double_storage.take();
+            self.raw_proto.take();
             if !self.elements.is_null() {
                 let count =
                     reply_child_count(CallReplyKind::from_raw(self.reply_type), self.num_elements);
@@ -492,6 +590,25 @@ impl ValkeyModuleCallReply {
                 self.attribute = std::ptr::null_mut();
             }
         }
+    }
+}
+
+fn contains_decimal_double(value: &Value) -> bool {
+    match value {
+        Value::DecimalDouble(_) => true,
+        Value::Array(items) | Value::Set(items) | Value::Push(items) => {
+            items.iter().any(contains_decimal_double)
+        }
+        Value::Map(entries) => entries
+            .iter()
+            .any(|(key, value)| contains_decimal_double(key) || contains_decimal_double(value)),
+        Value::Attribute { attrs, inner } => {
+            contains_decimal_double(inner)
+                || attrs.iter().any(|(key, value)| {
+                    contains_decimal_double(key) || contains_decimal_double(value)
+                })
+        }
+        _ => false,
     }
 }
 
@@ -724,7 +841,10 @@ pub unsafe extern "C" fn ValkeyModule_CreateStringFromCallReply(
                 data.to_vec()
             }
             CallReplyKind::Integer => format!("{}", r.int_val).into_bytes(),
-            CallReplyKind::Double => format!("{}", r.double_val).into_bytes(),
+            CallReplyKind::Double => match node.decimal_double() {
+                Some(value) => value.as_bytes().to_vec(),
+                None => format!("{}", r.double_val).into_bytes(),
+            },
             CallReplyKind::Bool => {
                 if r.bool_val != 0 {
                     b"true".to_vec()
@@ -885,6 +1005,77 @@ mod tests {
     use super::*;
     use crate::foundation::io::protocol::Value;
     use bytes::Bytes;
+
+    #[test]
+    fn decimal_double_module_accessors_preserve_text_and_wire_cache() {
+        for (text, narrowed) in [
+            ("9007199254740993", 9007199254740992.0),
+            ("1e4932", f64::INFINITY),
+            ("1e-4932", 0.0),
+            ("-inf", f64::NEG_INFINITY),
+        ] {
+            let scalar = Value::DecimalDouble(DecimalDoubleText::new(text.to_owned()).unwrap());
+            let mut reply =
+                ValkeyModuleCallReply::try_from_value_with_resp(&scalar, true, true).unwrap();
+            // SAFETY: each accessor borrows this live owned root; string and tree are freed once.
+            unsafe {
+                assert_eq!(
+                    ValkeyModule_CallReplyType(&mut *reply),
+                    VALKEYMODULE_REPLY_DOUBLE
+                );
+                assert_eq!(ValkeyModule_CallReplyDouble(&mut *reply), narrowed);
+                assert!(
+                    ValkeyModule_CallReplyStringPtr(&mut *reply, std::ptr::null_mut()).is_null()
+                );
+                let string = ValkeyModule_CreateStringFromCallReply(&mut *reply);
+                assert_eq!((*string).as_bytes(), text.as_bytes());
+                ValkeyModuleString::release(string);
+                let mut len = 0;
+                let proto = ValkeyModule_CallReplyProto(&mut *reply, &mut len);
+                assert_eq!(
+                    std::slice::from_raw_parts(proto.cast::<u8>(), len),
+                    serialize_to_vec_resp3(&scalar)
+                );
+                reply.free();
+            }
+            let mut resp2 = ValkeyModuleCallReply::from_value_with_resp(&scalar, false, false);
+            assert_eq!(resp2.reply_type, VALKEYMODULE_REPLY_STRING);
+            // SAFETY: this node borrows a complete live tree until its unique cleanup.
+            unsafe {
+                assert_eq!(
+                    CallReplyNode::from_reply(&resp2).string_bytes(),
+                    Some(text.as_bytes())
+                );
+                resp2.free();
+            }
+        }
+        let scalar = Value::DecimalDouble(DecimalDoubleText::new("9007199254740993").unwrap());
+        let value = Value::attribute(
+            vec![(Value::bulk("meta"), scalar.clone())],
+            Value::Array(vec![Value::Map(vec![(scalar.clone(), scalar.clone())])]),
+        );
+        let mut root = ValkeyModuleCallReply::from_value_with_resp(&value, true, true);
+        assert_eq!(
+            root.raw_proto(),
+            Some(serialize_to_vec_resp3(&value).as_slice())
+        );
+        // SAFETY: all children and the attribute remain owned by the live root throughout inspection.
+        unsafe {
+            let node = CallReplyNode::from_reply(&root);
+            let map = node.children().next().unwrap();
+            assert_eq!(
+                map.reply().raw_proto(),
+                Some(
+                    serialize_to_vec_resp3(&Value::Map(vec![(scalar.clone(), scalar)])).as_slice()
+                )
+            );
+            assert_eq!(
+                node.attribute().unwrap().reply().raw_proto(),
+                Some(b"|1\r\n$4\r\nmeta\r\n,9007199254740993\r\n".as_slice())
+            );
+            root.free();
+        }
+    }
 
     // SAFETY: callers pass Box values returned by from_value and never reuse them after free().
     #[allow(clippy::boxed_local)] // The Box owns the top-level reply after recursive free().

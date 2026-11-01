@@ -38,7 +38,7 @@ pub struct StreamGroup {
 }
 
 impl StreamGroup {
-    fn new(name: Bytes, last_id: StreamID, entries_read: Option<u64>) -> Self {
+    pub(super) fn new(name: Bytes, last_id: StreamID, entries_read: Option<u64>) -> Self {
         Self {
             name,
             last_id,
@@ -48,7 +48,7 @@ impl StreamGroup {
         }
     }
 
-    fn touch_consumer(&mut self, name: &[u8], now_ms: i64) -> bool {
+    pub(super) fn touch_consumer(&mut self, name: &[u8], now_ms: i64) -> bool {
         let key = Bytes::copy_from_slice(name);
         let is_new = !self.consumers.contains_key(&key);
         self.consumers
@@ -122,7 +122,10 @@ pub struct ReadGroupHistoryResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaimGroupResult {
     pub claimed: Vec<ClaimedEntry>,
+    pub deleted: Vec<StreamID>,
+    pub pending_updates: Vec<(StreamID, StreamPendingEntry)>,
     pub consumer_created: bool,
+    pub last_id_changed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -190,69 +193,6 @@ impl ValkeyStream {
 
     pub fn groups(&self) -> impl Iterator<Item = &StreamGroup> {
         self.groups.values()
-    }
-
-    pub(crate) fn restore_group(
-        &mut self,
-        restored: RestoredStreamGroup,
-    ) -> Result<(), StreamGroupCreateError> {
-        if self.groups.contains_key(&restored.name) {
-            return Err(StreamGroupCreateError::BusyGroup);
-        }
-        let mut group = StreamGroup::new(
-            restored.name.clone(),
-            restored.last_id,
-            restored.entries_read,
-        );
-        for consumer in restored.consumers {
-            if group.consumers.contains_key(&consumer.name) {
-                return Err(StreamGroupCreateError::BusyGroup);
-            }
-            let pending: BTreeSet<StreamID> = consumer.pending.into_iter().collect();
-            group.consumers.insert(
-                consumer.name.clone(),
-                StreamConsumer {
-                    name: consumer.name,
-                    seen_time_ms: consumer.seen_time_ms,
-                    active_time_ms: consumer.active_time_ms,
-                    pending,
-                },
-            );
-        }
-        for pending in restored.pending {
-            if !group.consumers.contains_key(&pending.consumer) {
-                return Err(StreamGroupCreateError::BusyGroup);
-            }
-            if !group
-                .consumers
-                .get(&pending.consumer)
-                .is_some_and(|consumer| consumer.pending.contains(&pending.id))
-            {
-                return Err(StreamGroupCreateError::BusyGroup);
-            }
-            if group
-                .pending
-                .insert(
-                    pending.id,
-                    StreamPendingEntry {
-                        consumer: pending.consumer,
-                        delivery_time_ms: pending.delivery_time_ms,
-                        delivery_count: pending.delivery_count,
-                    },
-                )
-                .is_some()
-            {
-                return Err(StreamGroupCreateError::BusyGroup);
-            }
-        }
-        let pending_ids: BTreeSet<StreamID> = group.pending.keys().copied().collect();
-        for consumer in group.consumers.values() {
-            if !consumer.pending.is_subset(&pending_ids) {
-                return Err(StreamGroupCreateError::BusyGroup);
-            }
-        }
-        self.groups.insert(restored.name, group);
-        Ok(())
     }
 
     pub fn create_consumer(
@@ -369,6 +309,12 @@ impl ValkeyStream {
                 continue;
             }
             let fields = self.entries.get(&id).cloned();
+            if fields.is_some() {
+                if let Some(pending) = group.pending.get_mut(&id) {
+                    pending.delivery_time_ms = now_ms;
+                    pending.delivery_count = pending.delivery_count.saturating_add(1);
+                }
+            }
             out.push((id, fields));
             if out.len() >= count {
                 break;
@@ -454,165 +400,11 @@ impl ValkeyStream {
             .ok_or(StreamGroupLookupError::NoGroup)?;
         let mut acked = 0;
         for id in ids {
-            let Some(pending) = group.pending.remove(id) else {
-                continue;
-            };
-            if let Some(consumer) = group.consumers.get_mut(&pending.consumer) {
-                consumer.pending.remove(id);
+            if super::references::remove_group_pending(group, id) {
+                acked += 1;
             }
-            acked += 1;
         }
         Ok(acked)
-    }
-
-    pub fn claim_group_pending(
-        &mut self,
-        group_name: &[u8],
-        consumer_name: &[u8],
-        min_idle_ms: i64,
-        ids: &[StreamID],
-        just_id: bool,
-        force: bool,
-        delivery_time_ms: Option<i64>,
-        retry_count: Option<u64>,
-        last_id: Option<StreamID>,
-        now_ms: i64,
-    ) -> Result<ClaimGroupResult, StreamGroupLookupError> {
-        let group = self
-            .groups
-            .get_mut(group_name)
-            .ok_or(StreamGroupLookupError::NoGroup)?;
-        let consumer_created = group.touch_consumer(consumer_name, now_ms);
-        if let Some(last_id) = last_id {
-            group.last_id = last_id;
-        }
-        let mut out = Vec::new();
-        for id in ids {
-            let existing_pending = match group.pending.get(id).cloned() {
-                Some(pending) => pending,
-                None if force => StreamPendingEntry {
-                    consumer: Bytes::copy_from_slice(consumer_name),
-                    delivery_time_ms: delivery_time_ms.unwrap_or(now_ms),
-                    delivery_count: retry_count.unwrap_or(1),
-                },
-                None => continue,
-            };
-            let idle_ms = now_ms.saturating_sub(existing_pending.delivery_time_ms);
-            if idle_ms < min_idle_ms {
-                continue;
-            }
-            let fields = self.entries.get(id).cloned();
-            if let Some(old_consumer) = group.consumers.get_mut(&existing_pending.consumer) {
-                old_consumer.pending.remove(id);
-            }
-            if let Some(new_consumer) = group.consumers.get_mut(consumer_name) {
-                new_consumer.pending.insert(*id);
-                new_consumer.active_time_ms = Some(now_ms);
-            }
-            let delivery_count = if let Some(retry_count) = retry_count {
-                retry_count
-            } else if just_id {
-                existing_pending.delivery_count
-            } else {
-                existing_pending.delivery_count.saturating_add(1)
-            };
-            group.pending.insert(
-                *id,
-                StreamPendingEntry {
-                    consumer: Bytes::copy_from_slice(consumer_name),
-                    delivery_time_ms: delivery_time_ms.unwrap_or(now_ms),
-                    delivery_count,
-                },
-            );
-            if let Some(fields) = fields {
-                out.push(ClaimedEntry::Entry(StreamEntry { id: *id, fields }));
-            }
-        }
-        Ok(ClaimGroupResult {
-            claimed: out,
-            consumer_created,
-        })
-    }
-
-    pub fn autoclaim_group_pending(
-        &mut self,
-        group_name: &[u8],
-        consumer_name: &[u8],
-        min_idle_ms: i64,
-        start: StreamID,
-        count: usize,
-        just_id: bool,
-        now_ms: i64,
-    ) -> Result<(StreamID, Vec<ClaimedEntry>, Vec<StreamID>, bool), StreamGroupLookupError> {
-        let ids: Vec<StreamID> = self
-            .groups
-            .get(group_name)
-            .ok_or(StreamGroupLookupError::NoGroup)?
-            .pending
-            .keys()
-            .copied()
-            .filter(|id| *id >= start)
-            .take(count)
-            .collect();
-        let next = ids
-            .last()
-            .and_then(|last_seen| {
-                self.groups
-                    .get(group_name)
-                    .and_then(|group| group.pending.keys().copied().find(|id| id > last_seen))
-            })
-            .unwrap_or_else(StreamID::zero);
-
-        let group = self
-            .groups
-            .get_mut(group_name)
-            .ok_or(StreamGroupLookupError::NoGroup)?;
-        let consumer_created = group.touch_consumer(consumer_name, now_ms);
-
-        let mut claimed = Vec::new();
-        let mut deleted = Vec::new();
-        for id in ids {
-            let Some(existing_pending) = group.pending.get(&id).cloned() else {
-                continue;
-            };
-            let idle_ms = now_ms.saturating_sub(existing_pending.delivery_time_ms);
-            if idle_ms < min_idle_ms {
-                continue;
-            }
-            let fields = self.entries.get(&id).cloned();
-            if fields.is_none() {
-                if let Some(old_consumer) = group.consumers.get_mut(&existing_pending.consumer) {
-                    old_consumer.pending.remove(&id);
-                }
-                group.pending.remove(&id);
-                deleted.push(id);
-                continue;
-            }
-            if let Some(old_consumer) = group.consumers.get_mut(&existing_pending.consumer) {
-                old_consumer.pending.remove(&id);
-            }
-            if let Some(new_consumer) = group.consumers.get_mut(consumer_name) {
-                new_consumer.pending.insert(id);
-                new_consumer.active_time_ms = Some(now_ms);
-            }
-            group.pending.insert(
-                id,
-                StreamPendingEntry {
-                    consumer: Bytes::copy_from_slice(consumer_name),
-                    delivery_time_ms: now_ms,
-                    delivery_count: if just_id {
-                        existing_pending.delivery_count
-                    } else {
-                        existing_pending.delivery_count.saturating_add(1)
-                    },
-                },
-            );
-            claimed.push(ClaimedEntry::Entry(StreamEntry {
-                id,
-                fields: fields.unwrap_or_default(),
-            }));
-        }
-        Ok((next, claimed, deleted, consumer_created))
     }
 }
 

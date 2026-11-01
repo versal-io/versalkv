@@ -9,6 +9,8 @@ pub fn hmget(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> CommandOut
 }
 
 fn hmget_reply(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> Value {
+    let now_ms = runtime.now_ms();
+    let ignore_expiry = runtime.read_expired_values();
     let db = match runtime.db_mut() {
         Some(d) => d,
         None => return CommandError::db_index_out_of_range(),
@@ -31,7 +33,7 @@ fn hmget_reply(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> Value {
     let mut out = Vec::with_capacity(values.len());
     for (field, value) in args.args[1..].iter().zip(values) {
         match value {
-            Some(v) if !db.hash_field_expired(key, field) => out.push(Value::bulk(v)),
+            Some(v) if ignore_expiry || !db.hash_field_expired_at(key, field, now_ms) => out.push(Value::bulk(v)),
             Some(_) | None => out.push(Value::null()),
         }
     }

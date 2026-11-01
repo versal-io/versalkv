@@ -7,6 +7,7 @@ mod hotkeys;
 mod logs;
 mod network;
 mod persistence;
+mod qos;
 mod replication;
 mod security;
 mod server;
@@ -15,6 +16,7 @@ pub fn register_all_configs(reg: &mut ConfigRegistry) {
     persistence::register_persistence_configs(reg);
     security::register_security_configs(reg);
     server::register_server_configs(reg);
+    qos::register_qos_configs(reg);
     hotkeys::register_hotkeys_configs(reg);
     encoding::register_encoding_configs(reg);
     logs::register_logs_configs(reg);

@@ -12,6 +12,8 @@ pub(super) struct TrackingState {
     pub(super) opt_in: bool,
     pub(super) opt_out: bool,
     pub(super) caching: bool,
+    /// The outer CLIENT command retains selection for the next command.
+    pub(super) should_preserve_caching: bool,
     pub(super) redirect: Option<usize>,
     pub(super) prefixes: Vec<Bytes>,
     pub(super) prefix_node_count: usize,

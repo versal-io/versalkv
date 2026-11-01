@@ -3,6 +3,8 @@
 #[rustfmt::skip]
 pub mod xack;
 #[rustfmt::skip]
+pub mod xackdel;
+#[rustfmt::skip]
 pub mod xadd;
 #[rustfmt::skip]
 pub mod xautoclaim;
@@ -10,6 +12,8 @@ pub mod xautoclaim;
 pub mod xclaim;
 #[rustfmt::skip]
 pub mod xdel;
+#[rustfmt::skip]
+pub mod xdelex;
 #[rustfmt::skip]
 pub mod xgroup;
 #[rustfmt::skip]
@@ -37,10 +41,12 @@ use crate::framework::CommandRegistry;
 
 pub fn register_all(reg: &mut CommandRegistry) {
     reg.register(xack::XACK_SPEC);
+    reg.register(xackdel::XACKDEL_SPEC);
     reg.register(xadd::XADD_SPEC);
     reg.register(xautoclaim::XAUTOCLAIM_SPEC);
     reg.register(xclaim::XCLAIM_SPEC);
     reg.register(xdel::XDEL_SPEC);
+    reg.register(xdelex::XDELEX_SPEC);
     reg.register(xgroup::XGROUP_SPEC);
     reg.register(xinfo::XINFO_SPEC);
     reg.register(xlen::XLEN_SPEC);

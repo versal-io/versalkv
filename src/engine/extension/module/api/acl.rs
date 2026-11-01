@@ -393,6 +393,7 @@ pub unsafe extern "C" fn ValkeyModule_ACLCheckPermissions(
                     crate::engine::extension::acl::AclDenial::Db { .. } => ACL_LOG_DB,
                     crate::engine::extension::acl::AclDenial::Command => ACL_LOG_CMD,
                     crate::engine::extension::acl::AclDenial::Key(_) => ACL_LOG_KEY,
+                    crate::engine::extension::acl::AclDenial::Channel(_) => ACL_LOG_CHANNEL,
                 };
             }
             VALKEYMODULE_ERR
@@ -556,6 +557,8 @@ pub unsafe extern "C" fn ValkeyModule_SetCommandACLCategories(
             return VALKEYMODULE_ERR;
         };
         let info = ModuleCommandInfo {
+            summary: None,
+            since: None,
             acl_categories: categories,
             key_specs: Vec::new(),
             legacy_keys: None,

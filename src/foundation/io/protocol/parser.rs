@@ -251,9 +251,9 @@ impl Parser {
                     }
                 }
                 Inline => {
-                    let end = match self.find_crlf(self.pos) {
-                        Ok(Some(e)) => e,
-                        Ok(None) => {
+                    let newline = match self.find_lf(self.pos) {
+                        Some(newline) => newline,
+                        None => {
                             if self.buf.len() - self.cmd_start > PROT_INLINE_MAX {
                                 self.reset();
                                 return Err(ParseError::Protocol(
@@ -262,13 +262,18 @@ impl Parser {
                             }
                             return Ok(None);
                         }
-                        Err(()) => {
-                            self.reset();
-                            return Err(ParseError::Protocol(
-                                "Protocol error: invalid CRLF in request".into(),
-                            ));
-                        }
                     };
+                    let end = if newline > self.pos && self.buf[newline - 1] == b'\r' {
+                        newline - 1
+                    } else {
+                        newline
+                    };
+                    if self.buf[self.pos..end].contains(&0) {
+                        self.reset();
+                        return Err(ParseError::Protocol(
+                            "Protocol error: embedded NUL byte in inline request".into(),
+                        ));
+                    }
                     self.args = match inline::parse_inline_args(&self.buf[self.pos..end]) {
                         Ok(args) => args,
                         Err(e) => {
@@ -276,7 +281,7 @@ impl Parser {
                             return Err(e);
                         }
                     };
-                    self.pos = end + 2;
+                    self.pos = newline + 1;
                     self.last_cmd_len = self.pos - self.cmd_start;
                     if self.args.is_empty() {
                         self.compact();
@@ -376,6 +381,10 @@ impl Parser {
                 }
             }
         }
+    }
+
+    fn find_lf(&self, from: usize) -> Option<usize> {
+        memchr::memchr(b'\n', &self.buf[from..]).map(|pos| from + pos)
     }
 
     fn find_crlf(&self, from: usize) -> Result<Option<usize>, ()> {

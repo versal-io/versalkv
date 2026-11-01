@@ -112,6 +112,21 @@ impl ServerWorkerState {
             }
         }
 
+        self.exec_drain_expired_keys(
+            connection_token,
+            pending_watch_dirty,
+            pending_replication,
+            pending_aof,
+        );
+    }
+
+    fn exec_drain_expired_keys(
+        &mut self,
+        connection_token: usize,
+        pending_watch_dirty: &mut Vec<(u32, Bytes)>,
+        pending_replication: &mut Vec<Vec<u8>>,
+        pending_aof: &mut Vec<Vec<u8>>,
+    ) {
         let expired = self.ctx.drain_expired_deletions();
         if expired.is_empty() {
             return;
@@ -383,6 +398,7 @@ impl ServerWorkerState {
         self.ctx.begin_cmd();
         self.connection_registry[state.token].begin_nested_command_effects();
         let reply = self.exec_invoke_queued_item(state.token, &spec, args);
+        self.refresh_connection_priorities();
         let Some(token) = state.target.resolve(self) else {
             return false;
         };
@@ -502,7 +518,9 @@ impl ServerWorkerState {
         self.exec_emit_item_monitor(item.token, item.args, item.command_flags, false);
         let name = String::from_utf8_lossy(&item.args.name).to_ascii_lowercase();
         let stats_name = super::dispatch::command_stats_name(&name, item.args);
+        let was_priority = self.ctx.stats_mut().set_priority_command(false);
         let duration_us = self.ctx.end_cmd(&stats_name, false);
+        self.ctx.stats_mut().set_priority_command(was_priority);
         super::dispatch::record_error_reply(&mut self.ctx, &item.reply, Some(&stats_name));
         self.exec_update_blocking_flags(item.token.0, item.token.0, item.was_blocked);
         if item.was_blocked && self.connection_registry[item.token].blocked.is_some() {

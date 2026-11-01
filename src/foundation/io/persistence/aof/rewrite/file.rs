@@ -95,16 +95,17 @@ fn write_temp_contents(
     let mut file =
         IncrementalSyncWriter::new(file, options.incremental_fsync, |file| file.sync_data());
     if options.use_rdb_preamble {
-        if options.timestamp_enabled {
-            write_timestamp_annotation(&mut file)?;
-        }
         file.write_all(
-            &crate::foundation::io::persistence::serialize_all_with_options(
+            &crate::foundation::io::persistence::rdb::serialize::serialize_replication_snapshot(
                 dbs,
                 options.key_delay_us,
-                crate::foundation::io::persistence::RdbSerializeOptions {
+                &[],
+                true,
+                None,
+                &[],
+                crate::foundation::io::persistence::rdb::compression::RdbSnapshotOptions {
                     compression: options.rdb_compression,
-                    checksum: true,
+                    checksum: options.rdb_checksum,
                 },
             ),
         )?;
@@ -323,7 +324,9 @@ mod tests {
             use_rdb_preamble: false,
             timestamp_enabled: false,
             key_delay_us: 0,
-            rdb_compression: true,
+            rdb_compression:
+                crate::foundation::io::persistence::rdb::compression::RdbCompression::Yes,
+            rdb_checksum: true,
             incremental_fsync: true,
         }
     }
@@ -384,6 +387,51 @@ mod tests {
     }
 
     #[test]
+    fn codec_fix_timestamp_rdb_preamble_starts_at_byte_zero() {
+        use crate::foundation::io::persistence::rdb::compression::{
+            decode_rdb_stream, RdbCompression,
+        };
+
+        for compression in [RdbCompression::No, RdbCompression::Yes, RdbCompression::Lz4] {
+            let dir = temp_dir(&format!("timestamp-preamble-{compression:?}"));
+            let mut options = options(dir.clone(), true);
+            options.use_rdb_preamble = true;
+            options.timestamp_enabled = true;
+            options.rdb_compression = compression;
+            let mut dbs = DbSet::new(1);
+            dbs.get_mut(0)
+                .unwrap()
+                .set(b"key".to_vec(), Robj::string("value"));
+            write_rewrite_temp(&dbs, &[], &[], &options, 45).unwrap();
+            let bytes = std::fs::read(options.temp_path(45)).unwrap();
+            assert!(
+                bytes.starts_with(if compression == RdbCompression::Lz4 {
+                    b"VCS"
+                } else {
+                    b"VALKEY"
+                }),
+                "preamble signature at byte zero for {compression:?}"
+            );
+            if compression == RdbCompression::Lz4 {
+                let decoded = decode_rdb_stream(&bytes, false).unwrap().unwrap();
+                assert_eq!(decoded.physical_bytes, bytes.len());
+                assert!(decoded.bytes.starts_with(b"VALKEY"));
+            }
+            let tail = b"#TS:100\r\n*1\r\n$4\r\nPING\r\n";
+            finalize_rewrite(&options, 45, tail, true, false, false).unwrap();
+            assert_eq!(
+                std::fs::read(options.aof_dir().join("appendonly.aof.1.base.rdb")).unwrap(),
+                bytes
+            );
+            assert_eq!(
+                std::fs::read(options.aof_dir().join("appendonly.aof.1.incr.aof")).unwrap(),
+                tail
+            );
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
     fn rdb_preamble_honors_rdb_compression_option() {
         let dir = temp_dir("rdb-compression");
         let mut options = options(dir.clone(), false);
@@ -394,10 +442,12 @@ mod tests {
             .unwrap()
             .set(b"key".to_vec(), Robj::string(value.clone()));
 
-        options.rdb_compression = false;
+        options.rdb_compression =
+            crate::foundation::io::persistence::rdb::compression::RdbCompression::No;
         write_rewrite_temp(&dbs, &[], &[], &options, 51).unwrap();
         let uncompressed = std::fs::read(options.temp_path(51)).unwrap();
-        options.rdb_compression = true;
+        options.rdb_compression =
+            crate::foundation::io::persistence::rdb::compression::RdbCompression::Yes;
         write_rewrite_temp(&dbs, &[], &[], &options, 52).unwrap();
         let compressed = std::fs::read(options.temp_path(52)).unwrap();
 

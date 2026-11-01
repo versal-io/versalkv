@@ -848,10 +848,7 @@ mod tests {
                 rdb_filter_mode: RdbFilterMode::All,
             },
         );
-        backend
-            .replication_runtime
-            .register_rdb_channel(rdb, main)
-            .unwrap();
+        backend.associate_waiting_rdb_for_test(main, rdb);
         backend.refresh_replication_view();
         let connection_token = main.0;
         let args = CommandArgs {
@@ -1072,6 +1069,8 @@ mod tests {
 
         assert!(!backend.handle_replconf(rdb_slab, rdb.0, &args, false, &mut replies));
         assert_eq!(replies, vec![b"+OK\r\n".to_vec()]);
+        assert!(backend.full_sync.pending_dual_rdb_snapshots.is_empty());
+        backend.admit_rdb_sync_for_test(rdb);
         assert!(backend
             .full_sync
             .pending_dual_rdb_snapshots
@@ -1173,6 +1172,8 @@ mod tests {
         let mut replies = Vec::new();
 
         assert!(!backend.handle_replconf(rdb.0, rdb.0, &args, false, &mut replies));
+        assert!(backend.full_sync.pending_dual_rdb_snapshots.is_empty());
+        backend.admit_rdb_sync_for_test(rdb);
         backend.drive_pending_dual_rdb_snapshots();
 
         assert_eq!(replies, vec![b"+OK\r\n".to_vec()]);
@@ -1357,6 +1358,8 @@ mod tests {
         let mut replies = Vec::new();
         backend.handle_replconf(rdb_slab, rdb.0, &args, false, &mut replies);
         assert_eq!(replies, vec![b"+OK\r\n".to_vec()]);
+        assert!(backend.full_sync.pending_dual_rdb_snapshots.is_empty());
+        backend.admit_rdb_sync_for_test(rdb);
         assert!(backend
             .full_sync
             .pending_dual_rdb_snapshots
@@ -1402,6 +1405,8 @@ mod tests {
         let mut replies = Vec::new();
         assert!(!backend.handle_replconf(rdb_slab, rdb.0, &rdb_channel, false, &mut replies,));
         assert_eq!(replies, vec![b"+OK\r\n".to_vec()]);
+        assert!(backend.full_sync.pending_dual_rdb_snapshots.is_empty());
+        backend.admit_rdb_sync_for_test(rdb);
         backend.drive_pending_dual_rdb_snapshots();
 
         let associate = CommandArgs {
@@ -1608,6 +1613,8 @@ mod tests {
         let mut replies = Vec::new();
         assert!(!backend.handle_replconf(rdb_slab, rdb.0, &rdb_channel, false, &mut replies));
         assert_eq!(replies, vec![b"+OK\r\n".to_vec()]);
+        assert!(backend.full_sync.pending_dual_rdb_snapshots.is_empty());
+        backend.admit_rdb_sync_for_test(rdb);
         backend.drive_pending_dual_rdb_snapshots();
         let snapshot_offset = backend.ctx.replication().backlog.reported_offset().get();
         assert_eq!(snapshot_offset, 0);
@@ -1737,6 +1744,8 @@ mod tests {
         };
         assert!(!backend.handle_replconf(rdb.0, rdb.0, &rdb_channel, false, &mut replies));
         assert_eq!(replies, vec![b"+OK\r\n".to_vec()]);
+        assert!(backend.full_sync.pending_dual_rdb_snapshots.is_empty());
+        backend.admit_rdb_sync_for_test(rdb);
         backend.drive_pending_dual_rdb_snapshots();
         let snapshot_offset = backend.ctx.replication().backlog.reported_offset().get();
         let associate = CommandArgs {
@@ -1878,6 +1887,8 @@ mod tests {
         let mut replies = Vec::new();
         assert!(!backend.handle_replconf(rdb_slab, rdb.0, &rdb_channel, false, &mut replies));
         assert_eq!(replies, vec![b"+OK\r\n".to_vec()]);
+        assert!(backend.full_sync.pending_dual_rdb_snapshots.is_empty());
+        backend.admit_rdb_sync_for_test(rdb);
         backend.drive_pending_dual_rdb_snapshots();
 
         let associate = CommandArgs {
@@ -2305,6 +2316,8 @@ mod tests {
         assert!(!backend.handle_replconf(rdb_slab, rdb.0, &args, false, &mut replies));
 
         assert_eq!(replies, vec![b"+OK\r\n".to_vec()]);
+        assert!(backend.full_sync.pending_dual_rdb_snapshots.is_empty());
+        backend.admit_rdb_sync_for_test(rdb);
         assert!(backend
             .full_sync
             .pending_dual_rdb_snapshots

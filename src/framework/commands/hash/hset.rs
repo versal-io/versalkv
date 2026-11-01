@@ -22,6 +22,9 @@ pub fn hset(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> CommandOutc
     let Some(db) = runtime.db_mut() else {
         return CommandOutcome::reply(CommandError::db_index_out_of_range());
     };
+    if db.hash_prepare_pairs_with_limits(&key, &pairs, max_entries, max_value_size).is_err() {
+        return CommandOutcome::reply(CommandError::wrong_type());
+    }
     let mut added = 0i64;
     let mut expired_overwritten = 0u64;
     for (field, value) in &pairs {

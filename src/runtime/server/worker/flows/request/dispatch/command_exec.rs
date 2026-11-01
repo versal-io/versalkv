@@ -14,6 +14,10 @@ use crate::runtime::server::worker::distributed::propagation::{
 };
 use bytes::Bytes;
 
+#[cfg(test)]
+#[path = "dirty_delta_tests.rs"]
+mod dirty_delta_tests;
+
 pub(super) fn client_last_command_name(name_lower: &str, args: &CommandArgs) -> String {
     args.args
         .first()
@@ -161,16 +165,7 @@ impl ServerWorkerState {
         executor: CommandExecutor,
         args: &CommandArgs,
     ) -> Value {
-        let should_skip_expire = self
-            .ctx
-            .client_pause()
-            .is_paused(crate::foundation::io::sys::time::mstime())
-            != crate::framework::context::PauseAction::None
-            || (self.ctx.replication().is_replica()
-                && self.ctx.config().replication.replica_read_only);
-        self.ctx
-            .dbs_mut()
-            .set_pause_skip_expire_all(should_skip_expire);
+        self.ctx.set_forkless_capture_expiration_paused(false);
         let replica_local_expire_only =
             self.ctx.replication().is_replica() && !self.ctx.config().replication.replica_read_only;
         for db_idx in 0..self.ctx.num_dbs() {
@@ -242,11 +237,14 @@ impl ServerWorkerState {
             let _time_guard = crate::foundation::io::sys::time::enter_command_time_snapshot(
                 crate::foundation::io::sys::time::mstime(),
             );
-            self.invoke_command_executor(
+            let reply = self.invoke_command_executor(
                 crate::framework::capabilities::io::Token(connection_token),
                 executor,
                 args,
-            )
+            );
+            // CLIENT UNPAUSE and save handlers can change DB-local guards.
+            self.ctx.set_forkless_capture_expiration_paused(false);
+            reply
         }
     }
 
@@ -325,10 +323,17 @@ impl ServerWorkerState {
         fx: &mut CommandEffects,
         mode: PropagationCaptureMode,
     ) -> Vec<PropagationOp> {
+        let dirty_delta = connection_effects.take_dirty_delta();
+        if let Some(delta) = dirty_delta {
+            self.ctx.persistence_mut().add_dirty(delta);
+        }
         if !state.should_propagate(plan) {
             return Vec::new();
         }
-        if plan.is_write && (!plan.rejected || state.has_script_ops || state.force_propagate) {
+        if dirty_delta.is_none()
+            && plan.is_write
+            && (!plan.rejected || state.has_script_ops || state.force_propagate)
+        {
             self.ctx.persistence_mut().add_dirty(1);
         }
         if !plan.rejected && plan.is_write && !state.has_explicit_dirty_keys {

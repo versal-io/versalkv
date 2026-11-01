@@ -117,6 +117,11 @@ impl ConfigRegistry {
         spec: &'static ConfigSpec,
         value: &str,
     ) -> Option<Result<(), String>> {
+        if let Some(parsed) =
+            crate::engine::extension::config::qos::parse_priority_numeric_value(spec.name, value)
+        {
+            return Some(parsed.and_then(|number| (spec.set)(rcfg, &ConfigValue::Numeric(number))));
+        }
         let cv = match spec.type_ {
             ConfigType::Bool => {
                 let v = if value.eq_ignore_ascii_case("yes")

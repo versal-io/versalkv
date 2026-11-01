@@ -12,6 +12,7 @@ const FAIL_BODY_LEN: usize = 40;
 const PUBLISH_PREFIX_LEN: usize = 8;
 const UPDATE_BODY_LEN: usize = 8 + 40 + SLOT_BYTES;
 const MODULE_PREFIX_LEN: usize = 13;
+const FAILOVER_AUTH_NACK_BODY_LEN: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GossipEntry {
@@ -76,7 +77,7 @@ pub enum ClusterBusBody {
     Publish(ClusterPublish),
     Update(SlotOwnershipUpdate),
     Module(ClusterModuleMessage),
-    FailoverAuthNack { reason: u8 },
+    FailoverAuthNack { request_epoch: u64, reason: u8 },
     Empty,
 }
 
@@ -101,8 +102,16 @@ pub(super) fn encode_body(
             output.extend_from_slice(node_id.as_str().as_bytes());
             Ok(0)
         }
-        (ClusterMsgType::FailoverAuthNack, ClusterBusBody::FailoverAuthNack { reason }) => {
+        (
+            ClusterMsgType::FailoverAuthNack,
+            ClusterBusBody::FailoverAuthNack {
+                request_epoch,
+                reason,
+            },
+        ) => {
+            output.extend_from_slice(&request_epoch.to_be_bytes());
             output.push(*reason);
+            output.extend_from_slice(&[0; 7]);
             Ok(0)
         }
         (
@@ -180,12 +189,14 @@ pub(super) fn decode_body(
             Ok((ClusterBusBody::Fail { node_id }, end))
         }
         ClusterMsgType::FailoverAuthNack => {
-            require_exact(packet, start + 1, "FAILOVER_AUTH_NACK body")?;
+            let end = start + FAILOVER_AUTH_NACK_BODY_LEN;
+            require_exact(packet, end, "FAILOVER_AUTH_NACK body")?;
             Ok((
                 ClusterBusBody::FailoverAuthNack {
-                    reason: packet[start],
+                    request_epoch: read_u64(packet, start)?,
+                    reason: packet[start + 8],
                 },
-                start + 1,
+                end,
             ))
         }
         ClusterMsgType::Publish | ClusterMsgType::PublishShard => {

@@ -251,7 +251,34 @@ fn command_count_list_and_help_use_the_compiled_catalog() {
     let Reply::Integer(count) = runtime.execute(&args(&["COMMAND", "COUNT"]), 0) else {
         panic!("expected COMMAND COUNT integer");
     };
-    assert_eq!(count, 189);
+    assert_eq!(count, 205);
+    let Reply::Array(mut pathhash_names) = runtime.execute(
+        &args(&["COMMAND", "LIST", "FILTERBY", "ACLCAT", "PATHHASH"]),
+        0,
+    ) else {
+        panic!("expected PathHash command list");
+    };
+    pathhash_names.sort();
+    assert_eq!(
+        pathhash_names,
+        [
+            "phcard",
+            "phdel",
+            "phdelprefix",
+            "phexists",
+            "phget",
+            "phgetall",
+            "phlongest",
+            "phmget",
+            "phmset",
+            "phprefixes",
+            "phscan",
+            "phset"
+        ]
+        .into_iter()
+        .map(|name| Some(name.into()))
+        .collect::<Vec<_>>()
+    );
 
     let Reply::Array(names) =
         runtime.execute(&args(&["COMMAND", "LIST", "FILTERBY", "PATTERN", "m*"]), 0)

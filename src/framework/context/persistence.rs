@@ -57,9 +57,18 @@ impl ServerContext {
         self.set_forkless_capture_expiration_paused(false);
     }
     pub(crate) fn set_forkless_capture_expiration_paused(&mut self, is_paused: bool) {
-        self.db.dbs.set_pause_skip_expire_all(is_paused);
+        let should_skip_expire = is_paused
+            || self.persistence.forkless_capture_in_progress()
+            || self
+                .client_pause
+                .is_paused(crate::foundation::io::sys::time::mstime())
+                != super::PauseAction::None
+            || (self.replication.is_replica() && self.rconfig.replication.replica_read_only);
+        self.db.dbs.set_pause_skip_expire_all(should_skip_expire);
         for dataset in self.slot_imports.values_mut() {
-            dataset.dbs_mut().set_pause_skip_expire_all(is_paused);
+            dataset
+                .dbs_mut()
+                .set_pause_skip_expire_all(should_skip_expire);
         }
     }
     pub fn aof(&self) -> &AofState {

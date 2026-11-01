@@ -146,6 +146,10 @@ pub trait CommandConn {
     fn reply_suppressed(&self) -> bool;
     fn suppress_reply(&mut self);
     fn tracking(&self) -> bool;
+    /// Token of the external client that owns cache invalidations.
+    fn tracking_token(&self) -> Token {
+        self.token()
+    }
     fn set_tracking(&mut self, v: bool);
     fn tracking_bcast(&self) -> bool;
     fn set_tracking_bcast(&mut self, v: bool);
@@ -189,6 +193,7 @@ pub trait CommandConn {
     fn request_cluster_config_save_with_reply(&mut self, _reply: Value) {}
     fn skip_propagate(&self) -> bool;
     fn set_skip_propagate(&mut self, v: bool);
+    fn record_dirty_delta(&mut self, _delta: i64) {}
     fn mark_transaction_queue_error(&mut self) {}
     fn clear_watched_keys(&mut self) {}
     fn watch_keys(&mut self, _watched: Vec<WatchedKey>) -> usize {
@@ -245,6 +250,11 @@ pub trait CommandConn {
         callback: *mut libc::c_void,
         privdata: *mut libc::c_void,
     );
+    fn module_auth_callback(
+        &self,
+    ) -> Option<(extern "C" fn(u64, *mut libc::c_void), *mut libc::c_void)> {
+        None
+    }
     fn notify_module_auth_changed(&mut self);
     fn module_auth_user(&self) -> Option<&str>;
     fn set_module_auth_user(&mut self, username: Option<String>);

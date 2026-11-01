@@ -106,6 +106,10 @@ impl<'a> AofScanner<'a> {
             return Err("RDB preamble of AOF file is not sane, aborting.".to_string());
         }
         let (offset, parsed) = find_rdb_end(self.data);
+        if !parsed && self.data.starts_with(b"VCS") {
+            self.preamble = AofPreambleInfo::Invalid;
+            return Err("RDB preamble of AOF file is not sane, aborting.".to_string());
+        }
         self.pos = offset;
         self.ok_up_to = offset;
         self.preamble = if offset == 0 && !parsed {
@@ -272,7 +276,7 @@ impl<'a> AofScanner<'a> {
 }
 
 fn has_rdb_signature(data: &[u8]) -> bool {
-    data.starts_with(b"REDIS") || data.starts_with(b"VALKEY")
+    versal::foundation::io::persistence::is_rdb_magic(data)
 }
 
 fn find_rdb_end(data: &[u8]) -> (usize, bool) {
@@ -280,6 +284,9 @@ fn find_rdb_end(data: &[u8]) -> (usize, bool) {
     match versal::foundation::io::persistence::load_rdb_bytes_checked(data, &mut databases, false) {
         Ok((_, consumed)) => (consumed, true),
         Err(_) => {
+            if data.starts_with(b"VCS") {
+                return (0, false);
+            }
             let offset = data
                 .iter()
                 .enumerate()

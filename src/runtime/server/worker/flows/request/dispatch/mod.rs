@@ -22,7 +22,7 @@ pub(crate) use pre_dispatch::route_error_value;
 pub(crate) use script_helpers::{is_eval_without_shebang, is_ro_script};
 pub(crate) use side_effects::DeferredSlotMetric;
 pub(crate) use side_effects::ReadBatchEffects;
-pub(crate) use side_effects::{CommandEffects, ExecCollectedEffects};
+pub(crate) use side_effects::{CommandEffects, EffectQueue, ExecCollectedEffects};
 use types::PreflightRequest;
 pub(crate) use types::{
     CmdCallFlags, CmdLogEntry, CmdPreconditions, CommandClientFacts, DispatchAction,

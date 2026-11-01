@@ -41,6 +41,30 @@ impl ServerContext {
         result
     }
 
+    pub(crate) fn apply_slot_import_with_execution(
+        &mut self,
+        id: &crate::engine::distributed::cluster::migration::MigrationJobId,
+        args: crate::framework::CommandArgs,
+        registry: &crate::framework::CommandRegistry,
+    ) -> (
+        Result<(), crate::framework::distributed::migration::MigrationApplyError>,
+        crate::framework::aof_replay::ReplayExecution,
+    ) {
+        let Some(mut dataset) = self.slot_imports.remove(id) else {
+            return (
+                Err(
+                    crate::framework::distributed::migration::MigrationApplyError::Command(
+                        "missing import dataset".to_string(),
+                    ),
+                ),
+                crate::framework::aof_replay::ReplayExecution::NotInvoked,
+            );
+        };
+        let result = dataset.apply_with_execution(args, registry);
+        self.slot_imports.insert(id.clone(), dataset);
+        result
+    }
+
     pub fn absorb_serving_slots_into_import(
         &mut self,
         id: &crate::engine::distributed::cluster::migration::MigrationJobId,

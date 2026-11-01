@@ -12,7 +12,9 @@ use super::call_reply::{
     ValkeyModule_FreeCallReply,
 };
 use crate::engine::command::context::CommandConn;
-use crate::engine::command::{CommandArgs, CMD_DENYOOM, CMD_NOSCRIPT, CMD_STALE, CMD_WRITE};
+use crate::engine::command::{
+    CommandArgs, CMD_DENYOOM, CMD_MAY_REPLICATE, CMD_NOSCRIPT, CMD_STALE, CMD_WRITE,
+};
 use crate::engine::distributed::replication::protocol::encode_command;
 use crate::engine::extension::module::capability::runtime_from_opaque;
 use crate::foundation::io::protocol::Value;
@@ -21,11 +23,15 @@ thread_local! {
     static IN_MODULE_NOTIFICATION: Cell<bool> = const { Cell::new(false) };
 }
 
+const CALL_REPLICATE: c_int = 1 << 0;
+const CALL_NO_AOF: c_int = 1 << 1;
+const CALL_NO_REPLICAS: c_int = 1 << 2;
 const CALL_RESP3: c_int = 1 << 3;
 const CALL_RESP_AUTO: c_int = 1 << 4;
 const CALL_RUN_AS_USER: c_int = 1 << 5;
 const CALL_SCRIPT_MODE: c_int = 1 << 6;
 const CALL_NO_WRITES: c_int = 1 << 7;
+const CALL_ERRORS_AS_REPLIES: c_int = 1 << 8;
 const CALL_RESPECT_DENY_OOM: c_int = 1 << 9;
 const CALL_DRY_RUN: c_int = 1 << 10;
 const CALL_ALLOW_BLOCK: c_int = 1 << 11;
@@ -73,6 +79,26 @@ impl ModuleCallFormat {
     pub(crate) fn run_as_user(self) -> bool {
         self.has(CALL_RUN_AS_USER)
     }
+    pub(crate) fn replicate(self) -> bool {
+        self.has(CALL_REPLICATE)
+    }
+    pub(crate) fn propagation_targets(
+        self,
+    ) -> crate::engine::extension::script::PropagationTargets {
+        use crate::engine::extension::script::PropagationTargets;
+        match (
+            self.replicate() && !self.has(CALL_NO_AOF),
+            self.replicate() && !self.has(CALL_NO_REPLICAS),
+        ) {
+            (true, true) => PropagationTargets::Both,
+            (true, false) => PropagationTargets::Aof,
+            (false, true) => PropagationTargets::Replication,
+            (false, false) => PropagationTargets::None,
+        }
+    }
+    pub(crate) fn errors_as_replies(self) -> bool {
+        self.has(CALL_ERRORS_AS_REPLIES) || self.dry_run()
+    }
     pub(crate) fn script_mode(self) -> bool {
         self.has(CALL_SCRIPT_MODE)
     }
@@ -104,7 +130,7 @@ pub unsafe extern "C" fn VM_CallWithReply(
     flags: c_int,
 ) -> *mut ValkeyModuleCallReply {
     // SAFETY: the internal implementation only borrows the caller's argv.
-    let reply = unsafe { call_with_reply(ctx, argv, argc, flags) };
+    let reply = unsafe { call_with_reply(ctx, argv, argc, flags, None) };
     if reply.is_null() {
         return reply;
     }
@@ -118,6 +144,7 @@ unsafe fn call_with_reply(
     argv: *mut *mut ValkeyModuleString,
     argc: c_int,
     flags: c_int,
+    pending_conn: Option<&mut Option<(ModuleCallConn, crate::engine::command::CommandDescriptor)>>,
 ) -> *mut ValkeyModuleCallReply {
     if ctx.is_null() || argv.is_null() || argc < 1 {
         log::warn!("VM_CallWithReply: invalid args");
@@ -238,6 +265,22 @@ unsafe fn call_with_reply(
                 false,
             ));
         }
+        if format.replicate()
+            && spec.flags & (CMD_WRITE | CMD_MAY_REPLICATE) != 0
+            && runtime.has_paused_writes()
+        {
+            crate::foundation::io::sys::os::set_errno(libc::ENOSPC);
+            if format.errors_as_replies() {
+                return Box::into_raw(ValkeyModuleCallReply::from_value(
+                    &Value::error(format!(
+                        "ERR Write command '{}' was called while the server is paused for writes.",
+                        spec.name
+                    )),
+                    false,
+                ));
+            }
+            return std::ptr::null_mut();
+        }
         if format.run_as_user() {
             if let Some(error) = runtime.module_acl_error(spec.clone(), &cmd_args) {
                 return Box::into_raw(ValkeyModuleCallReply::from_value(
@@ -255,6 +298,9 @@ unsafe fn call_with_reply(
 
         let tracking = runtime.module_client_tracking();
         let mut conn = ModuleCallConn::with_tracking(db_idx as u32, tracking);
+        if format.allow_block() && pending_conn.is_some() {
+            conn.use_temporary_identity();
+        }
         conn.set_allow_oom(!format.respect_deny_oom());
         conn.set_deny_blocking(!format.allow_block());
         let response_version = format.response().version(client_resp as u8);
@@ -312,7 +358,6 @@ unsafe fn call_with_reply(
         for (channel, message) in conn.take_pending_shard_notifications() {
             runtime.publish_module_message(channel, message, true);
         }
-
         if spec.flags & CMD_WRITE == 0 && spec.flags & crate::engine::command::CMD_READONLY != 0 {
             let should_track = conn.tracking()
                 && !conn.tracking_bcast()
@@ -321,7 +366,7 @@ unsafe fn call_with_reply(
             conn.set_tracking_caching(false);
             if should_track {
                 if let Some(keys) = spec.extract_keys(&cmd_args) {
-                    let client_id = conn.token().0;
+                    let client_id = conn.tracking_client_id();
                     for key in keys {
                         runtime.remember_module_tracked_key(client_id, &key);
                     }
@@ -331,6 +376,24 @@ unsafe fn call_with_reply(
     }
 
     let reply_is_resp3 = conn.resp_version() == 3;
+    let effects = conn.take_call_effects(
+        &spec,
+        &cmd_args,
+        format.propagation_targets(),
+        !matches!(reply, Value::Error(_)),
+    );
+    if !effects.is_empty() {
+        // SAFETY: command execution and notification callbacks ended before this reborrow.
+        if let Some(runtime) = unsafe { runtime_from_opaque(runtime_handle) } {
+            runtime.apply_module_call_effects(effects);
+        }
+    }
+    if conn.blocked().is_some() {
+        if let Some(pending_conn) = pending_conn {
+            *pending_conn = Some((conn, spec));
+            return std::ptr::null_mut();
+        }
+    }
     if let Some(raw_reply) = conn.take_raw_reply() {
         return Box::into_raw(ValkeyModuleCallReply::from_raw_proto_with_resp(
             raw_reply,
@@ -338,11 +401,17 @@ unsafe fn call_with_reply(
         ));
     }
 
-    Box::into_raw(ValkeyModuleCallReply::from_value_with_resp(
+    match ValkeyModuleCallReply::try_from_value_with_resp(
         &reply,
         format.reply_exact(),
         reply_is_resp3,
-    ))
+    ) {
+        Ok(reply) => Box::into_raw(reply),
+        Err(error) => {
+            log::warn!("VM_CallWithReply: {error}");
+            std::ptr::null_mut()
+        }
+    }
 }
 
 // SAFETY: source and key are live for all synchronous callbacks.
@@ -429,6 +498,7 @@ fn module_keyspace_event<'a>(
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub(crate) struct ValkeyModuleReplyHandlers {
     version: u64,
     null: Option<extern "C" fn(*mut c_void)>,
@@ -451,7 +521,7 @@ pub(crate) struct ValkeyModuleReplyHandlers {
     setStart: Option<extern "C" fn(*mut c_void, size_t)>,
     setEnd: Option<extern "C" fn(*mut c_void)>,
     replyParsingError: Option<extern "C" fn(*mut c_void)>,
-    onBlocked: Option<extern "C" fn(*mut c_void, *mut ValkeyModuleCtx, *mut c_void)>,
+    pub(crate) onBlocked: Option<extern "C" fn(*mut c_void, *mut ValkeyModuleCtx, *mut c_void)>,
     onRespAvailable:
         Option<extern "C" fn(*mut c_void, *mut ValkeyModuleCtx, *const c_char, size_t) -> c_int>,
 }
@@ -478,7 +548,36 @@ pub unsafe extern "C" fn VM_CallArgv(
             return VALKEYMODULE_ERR;
         }
 
-        let reply = VM_CallWithReply(ctx, argv, argc, flags);
+        let mut pending_conn = None;
+        let reply = call_with_reply(ctx, argv, argc, flags, Some(&mut pending_conn));
+        if let Some((conn, command)) = pending_conn {
+            let internal = (*ctx).internal;
+            let module_name = super::super::ctx::get_module_name(ctx);
+            let call = super::pending::PendingModuleCall::new(
+                module_name,
+                conn,
+                argv,
+                argc,
+                resp_handlers,
+                reply_ctx,
+                command,
+                format,
+            );
+            let callback = call.handlers.and_then(|handlers| handlers.onBlocked);
+            let handle = {
+                let Some(runtime) = runtime_from_opaque((*internal).runtime_handle) else {
+                    return VALKEYMODULE_ERR;
+                };
+                runtime.retain_pending_module_call(call)
+            };
+            let Some(handle) = handle else {
+                return VALKEYMODULE_ERR;
+            };
+            if let Some(callback) = callback {
+                callback(reply_ctx, ctx, std::ptr::without_provenance_mut(handle));
+            }
+            return VALKEYMODULE_OK;
+        }
         if reply.is_null() {
             if format.dry_run() {
                 if !resp_handlers.is_null() {
@@ -492,18 +591,7 @@ pub unsafe extern "C" fn VM_CallArgv(
         }
 
         if !resp_handlers.is_null() {
-            let handlers = &*resp_handlers;
-            let r = &*reply;
-
-            if let Some(on_resp) = handlers.onRespAvailable {
-                let (mut proto, proto_len) = value_to_resp_proto(r);
-                proto.push(0); // null-terminate for C string safety
-                on_resp(reply_ctx, ctx, proto.as_ptr() as *const c_char, proto_len);
-                ValkeyModule_FreeCallReply(reply);
-                return VALKEYMODULE_OK;
-            }
-
-            let result = call_reply_handlers(reply, handlers, reply_ctx);
+            let result = deliver_call_reply(ctx, reply, &*resp_handlers, reply_ctx);
             ValkeyModule_FreeCallReply(reply);
             if result.is_err() {
                 return VALKEYMODULE_ERR;
@@ -514,6 +602,42 @@ pub unsafe extern "C" fn VM_CallArgv(
         ValkeyModule_FreeCallReply(reply);
         VALKEYMODULE_OK
     }
+}
+
+#[no_mangle]
+// SAFETY: the opaque handle is only used as an identity, never dereferenced.
+pub unsafe extern "C" fn VM_CallArgvAbort(handle: *mut c_void) -> c_int {
+    if handle.is_null() {
+        return VALKEYMODULE_ERR;
+    }
+    let did_abort = crate::engine::extension::module::capability::with_active_runtime(|runtime| {
+        runtime.abort_pending_module_call(handle.addr())
+    })
+    .unwrap_or(false);
+    if did_abort {
+        VALKEYMODULE_OK
+    } else {
+        VALKEYMODULE_ERR
+    }
+}
+
+// SAFETY: reply is a live owned root and ctx is live for the copied callbacks.
+pub(crate) unsafe fn deliver_call_reply(
+    ctx: *mut ValkeyModuleCtx,
+    reply: *mut ValkeyModuleCallReply,
+    handlers: &ValkeyModuleReplyHandlers,
+    reply_ctx: *mut c_void,
+) -> Result<(), ()> {
+    if let Some(on_resp) = handlers.onRespAvailable {
+        // SAFETY: reply belongs to this call until all callbacks return.
+        let (mut proto, proto_len) = unsafe { value_to_resp_proto(&*reply) };
+        proto.push(0);
+        if on_resp(reply_ctx, ctx, proto.as_ptr().cast(), proto_len) == 0 {
+            return Ok(());
+        }
+    }
+    // SAFETY: the live reply tree is retained throughout typed callback dispatch.
+    unsafe { call_reply_handlers(reply, handlers, reply_ctx) }
 }
 
 #[no_mangle]
@@ -535,6 +659,9 @@ pub unsafe extern "C" fn VM_ReplicateCommand(
         let Some(runtime) = runtime_from_opaque((*internal).runtime_handle) else {
             return VALKEYMODULE_ERR;
         };
+        if runtime.has_paused_writes() {
+            return VALKEYMODULE_ERR;
+        }
         let parts: Vec<&[u8]> = (0..argc as usize)
             .map(|i| (**argv.add(i)).as_bytes())
             .collect();
@@ -550,6 +677,17 @@ pub unsafe extern "C" fn VM_ReplicateCommand(
 // SAFETY: Called by C modules; ctx must be a live command context.
 pub unsafe extern "C" fn ValkeyModule_ReplicateVerbatim(ctx: *mut ValkeyModuleCtx) -> c_int {
     if ctx.is_null() {
+        return VALKEYMODULE_ERR;
+    }
+    // SAFETY: ctx is live; a non-null internal context owns a live runtime
+    // handle which is only borrowed during this synchronous pause check.
+    let is_paused = unsafe {
+        let internal = (*ctx).internal;
+        !internal.is_null()
+            && runtime_from_opaque((*internal).runtime_handle)
+                .is_some_and(|runtime| runtime.has_paused_writes())
+    };
+    if is_paused {
         return VALKEYMODULE_ERR;
     }
     VALKEYMODULE_OK
@@ -780,9 +918,15 @@ fn serialize_number_or_null(node: CallReplyNode<'_>, buf: &mut Vec<u8>) {
         CallReplyKind::Integer => {
             buf.extend_from_slice(format!(":{}\r\n", reply.int_val).as_bytes())
         }
-        CallReplyKind::Double => {
-            buf.extend_from_slice(format!(",{}\r\n", reply.double_val).as_bytes())
-        }
+        CallReplyKind::Double => match node.decimal_double() {
+            Some(value) => {
+                crate::foundation::io::protocol::serializer::serialize_resp3(
+                    &Value::DecimalDouble(value.clone()),
+                    buf,
+                );
+            }
+            None => buf.extend_from_slice(format!(",{}\r\n", reply.double_val).as_bytes()),
+        },
         CallReplyKind::Bool if reply.bool_val != 0 => buf.extend_from_slice(b"#t\r\n"),
         CallReplyKind::Bool => buf.extend_from_slice(b"#f\r\n"),
         CallReplyKind::Null => buf.extend_from_slice(b"_\r\n"),
@@ -1001,6 +1145,39 @@ mod traversal_tests {
             reply.free();
         }
         events
+    }
+
+    #[test]
+    fn decimal_double_module_rebuild_and_callbacks_use_their_respective_payloads() {
+        use crate::foundation::io::protocol::DecimalDoubleText;
+        extern "C" fn double(ctx: *mut c_void, value: libc::c_double) {
+            // SAFETY: the test passes a live f64 destination during synchronous traversal.
+            unsafe { *ctx.cast::<f64>() = value };
+        }
+        let scalar = Value::DecimalDouble(DecimalDoubleText::new("9007199254740993").unwrap());
+        let value = Value::attribute(
+            vec![(Value::bulk("meta"), scalar.clone())],
+            Value::Array(vec![scalar.clone()]),
+        );
+        let mut reply = ValkeyModuleCallReply::from_value_with_resp(&value, true, true);
+        let expected = crate::foundation::io::protocol::serializer::serialize_to_vec_resp3(&value);
+        // SAFETY: the protocol routine borrows this complete live owned tree.
+        let (proto, len) = unsafe { value_to_resp_proto(&reply) };
+        assert_eq!(proto, expected);
+        assert_eq!(len, expected.len());
+        // SAFETY: this test uniquely owns the reply and releases it once.
+        unsafe { reply.free() };
+        let mut reply = ValkeyModuleCallReply::from_value_with_resp(&scalar, true, true);
+        let mut callbacks = handlers();
+        callbacks.doubleVal = Some(double);
+        let mut received = f64::NAN;
+        // SAFETY: all inputs and the f64 destination remain live for synchronous callbacks.
+        unsafe {
+            call_reply_handlers(&mut *reply, &callbacks, (&mut received as *mut f64).cast())
+                .unwrap();
+            reply.free();
+        }
+        assert_eq!(received, 9007199254740992.0);
     }
 
     #[test]

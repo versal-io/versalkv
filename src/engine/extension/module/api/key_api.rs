@@ -5,8 +5,8 @@ use libc::{c_int, size_t};
 use super::super::{
     ModuleKeyHandle, ValkeyModuleKey, VALKEYMODULE_ERR, VALKEYMODULE_KEYTYPE_EMPTY,
     VALKEYMODULE_KEYTYPE_HASH, VALKEYMODULE_KEYTYPE_LIST, VALKEYMODULE_KEYTYPE_MODULE,
-    VALKEYMODULE_KEYTYPE_SET, VALKEYMODULE_KEYTYPE_STREAM, VALKEYMODULE_KEYTYPE_STRING,
-    VALKEYMODULE_KEYTYPE_ZSET, VALKEYMODULE_OK,
+    VALKEYMODULE_KEYTYPE_PATH_HASH, VALKEYMODULE_KEYTYPE_SET, VALKEYMODULE_KEYTYPE_STREAM,
+    VALKEYMODULE_KEYTYPE_STRING, VALKEYMODULE_KEYTYPE_ZSET, VALKEYMODULE_OK,
 };
 use crate::engine::extension::module::capability::runtime_from_opaque;
 use crate::foundation::io::store::robj::Collection;
@@ -99,6 +99,7 @@ pub unsafe extern "C" fn ValkeyModule_KeyType(key: *mut ValkeyModuleKey) -> c_in
                 Robj::ZSetSkiplist(_) | Robj::ZSetListpack(_) => VALKEYMODULE_KEYTYPE_ZSET,
                 Robj::HashHashtable(_) | Robj::HashListpack(_) => VALKEYMODULE_KEYTYPE_HASH,
                 Robj::StreamListpack(_) | Robj::StreamRadix(_) => VALKEYMODULE_KEYTYPE_STREAM,
+                Robj::PathHash(_) => VALKEYMODULE_KEYTYPE_PATH_HASH,
             };
         }
 
@@ -138,6 +139,7 @@ pub unsafe extern "C" fn ValkeyModule_ValueLength(key: *mut ValkeyModuleKey) -> 
                 Robj::HashListpack(h) => h.len(),
                 Robj::StreamListpack(st) => st.len(),
                 Robj::StreamRadix(_) => 0,
+                Robj::PathHash(hash) => hash.len(),
             } as size_t;
         }
         0

@@ -1,5 +1,4 @@
 
-use bytes::Bytes;
 use command_macros::command;
 
 use crate::framework::CommandArgs;
@@ -16,53 +15,6 @@ pub fn eval(conn: &mut dyn CommandConn, args: &CommandArgs, ctx: &mut ServerCont
         }
         Ok(_) => Value::error("ERR invalid hosted task for EVAL"),
         Err(reply) => reply,
-    }
-}
-
-pub(crate) fn build_wrapped_script(script: &str, keys: &[Bytes], argv: &[Bytes]) -> String {
-    let argument_bytes = keys
-        .iter()
-        .chain(argv)
-        .map(Bytes::len)
-        .sum::<usize>();
-    let mut code = String::with_capacity(256 + script.len() + argument_bytes.saturating_mul(4));
-
-    code.push_str("KEYS={");
-    for (i, key) in keys.iter().enumerate() {
-        if i > 0 {
-            code.push(',');
-        }
-        code.push_str(&format!("[{}]=\"", i + 1));
-        push_lua_bytes(&mut code, key);
-        code.push('"');
-    }
-    code.push_str("}\n");
-
-    code.push_str("ARGV={");
-    for (i, arg) in argv.iter().enumerate() {
-        if i > 0 {
-            code.push(',');
-        }
-        code.push_str(&format!("[{}]=\"", i + 1));
-        push_lua_bytes(&mut code, arg);
-        code.push('"');
-    }
-    code.push_str("}\n");
-
-    let body = if let Some(rest) = script.strip_prefix("#!") {
-        rest.find('\n').map(|i| &rest[i + 1..]).unwrap_or("")
-    } else {
-        script
-    };
-    code.push_str(body);
-    code
-}
-
-fn push_lua_bytes(output: &mut String, bytes: &[u8]) {
-    use std::fmt::Write as _;
-
-    for byte in bytes {
-        write!(output, "\\{byte:03}").expect("writing to String cannot fail");
     }
 }
 

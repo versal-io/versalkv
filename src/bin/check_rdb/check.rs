@@ -79,15 +79,20 @@ pub fn scan_rdb(data: &[u8]) -> RdbCheckResult {
 }
 
 pub fn scan_rdb_at(data: &[u8], now_ms: i64) -> RdbCheckResult {
-    use versal::foundation::io::persistence::rdb::compression::decode_rdb_stream;
+    use versal::foundation::io::persistence::rdb::compression::{
+        decode_rdb_stream, CompressionErrorKind,
+    };
     match decode_rdb_stream(data, false) {
+        Ok(None) if !data.is_empty() && b"VCS".starts_with(data) => {
+            scan_compressed_failure(data, now_ms, data.len())
+        }
         Ok(None) => RdbScanner::new(data, now_ms).scan(),
         Ok(Some(decoded)) => {
             let mut scanner = RdbScanner::new(&decoded.bytes, now_ms);
             scanner.state.physical_offset = Some(decoded.physical_bytes as u64);
             scanner.scan()
         }
-        Err(error) => {
+        Err(error) if error.kind == CompressionErrorKind::Incompatible => {
             let mut state = RdbState::new();
             state.physical_offset = Some(error.physical_offset as u64);
             Err(RdbCheckFailure {
@@ -98,7 +103,75 @@ pub fn scan_rdb_at(data: &[u8], now_ms: i64) -> RdbCheckResult {
                 message: error.message().to_string(),
             })
         }
+        Err(error) => scan_compressed_failure(data, now_ms, error.physical_offset),
     }
+}
+
+fn scan_compressed_failure(data: &[u8], now_ms: i64, physical_offset: usize) -> RdbCheckResult {
+    use versal::foundation::io::compression::{DecodeError, StreamDecoder, StreamKind};
+
+    let mut decoder = StreamDecoder::new(StreamKind::Rdb, false);
+    let mut logical = Vec::new();
+    // Replay only failed inputs. Single-byte refills preserve each decoded
+    // block before a later frame error can discard a feed's partial output.
+    for byte in data {
+        match decoder.feed(std::slice::from_ref(byte), usize::MAX) {
+            Ok(bytes) => logical.extend(bytes),
+            Err(_) => break,
+        }
+    }
+    // C exposes complete raw bodies before reading their block checksum.
+    // Recover that progress for diagnostics only, never after a codec error.
+    if decoder.finish() == Err(DecodeError::Truncated) {
+        if let Some(block) = truncated_raw_block(data, decoder.physical_bytes()) {
+            logical.extend_from_slice(block);
+        }
+    }
+    let mut scanner = RdbScanner::new(&logical, now_ms);
+    scanner.state.physical_offset = Some(physical_offset as u64);
+    let (phase, message) = if !decoder.is_compressed() {
+        (
+            RdbCheckPhase::Header,
+            "Invalid or unsupported RDB stream envelope",
+        )
+    } else {
+        match scanner.scan_logical_rdb() {
+            Ok(()) => (
+                RdbCheckPhase::Checksum,
+                "Compressed RDB stream did not end cleanly",
+            ),
+            Err(issue) => (issue.phase, "Corrupt compressed RDB stream"),
+        }
+    };
+    scanner.state.final_offset = scanner.pos as u64;
+    Err(RdbCheckFailure {
+        offset: scanner.pos as u64,
+        state: Box::new(scanner.state),
+        notices: scanner.notices,
+        phase,
+        message: message.to_string(),
+    })
+}
+
+fn truncated_raw_block(data: &[u8], physical_bytes: usize) -> Option<&[u8]> {
+    // Only recover a block after a frame header validated by the decoder.
+    if physical_bytes < 14 || data.get(11)? & 0x10 == 0 {
+        return None;
+    }
+    let block = data.get(physical_bytes..)?;
+    let info = u32::from_le_bytes(block.get(..4)?.try_into().ok()?);
+    let count = (info & 0x7fff_ffff) as usize;
+    let block_size = match (data.get(12)? >> 4) & 7 {
+        4 => 64 * 1024,
+        5 => 256 * 1024,
+        6 => 1024 * 1024,
+        7 => 4 * 1024 * 1024,
+        _ => return None,
+    };
+    if info & 0x8000_0000 == 0 || count == 0 || count > block_size || block.len() >= 8 + count {
+        return None;
+    }
+    block.get(4..4 + count)
 }
 
 struct ScanIssue {
@@ -152,6 +225,17 @@ impl<'a> RdbScanner<'a> {
     }
 
     fn scan_inner(&mut self) -> Result<(), ScanIssue> {
+        self.scan_logical_rdb()?;
+        if self.state.physical_offset.is_some() && self.pos != self.data.len() {
+            return self.fail(
+                RdbCheckPhase::Checksum,
+                "Compressed RDB stream did not end cleanly",
+            );
+        }
+        Ok(())
+    }
+
+    fn scan_logical_rdb(&mut self) -> Result<(), ScanIssue> {
         self.scan_header()?;
         self.scan_opcodes()?;
         self.scan_checksum()
@@ -499,7 +583,7 @@ fn is_foreign_version(version: u64) -> bool {
 }
 
 fn is_object_type(object_type: u8) -> bool {
-    object_type <= 7 || (9..23).contains(&object_type)
+    object_type <= 7 || (9..=23).contains(&object_type)
 }
 
 fn classify_unknown_type(object_type: u8, version: u64) -> String {

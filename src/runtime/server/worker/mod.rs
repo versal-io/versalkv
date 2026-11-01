@@ -6,6 +6,7 @@ pub(crate) mod sessions;
 pub(crate) mod tasks;
 
 mod state;
+mod tls;
 
 pub(super) use runtime::ServerWorkerRuntime;
 pub(crate) use state::ServerWorkerState;

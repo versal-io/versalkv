@@ -2580,8 +2580,6 @@ fn replica_output_hard_limit_ignores_active_snapshot_queue() {
         .primary_link_mut(replica_id)
         .expect("primary link must exist")
         .set_state(PrimaryLinkState::PreparingFullResync);
-    backend.connection_registry[crate::framework::capabilities::io::Token(rdb_token_value)]
-        .queue_reply(vec![b'x'; 1_025]);
     backend
         .replication_runtime
         .primary_link_mut(replica_id)
@@ -2589,9 +2587,9 @@ fn replica_output_hard_limit_ignores_active_snapshot_queue() {
         .transition_to_waiting_for_rdb_channel()
         .unwrap();
     backend
-        .replication_runtime
-        .register_rdb_channel(ConnectionId(rdb_token_value), ConnectionId(token_value))
-        .unwrap();
+        .associate_waiting_rdb_for_test(ConnectionId(token_value), ConnectionId(rdb_token_value));
+    backend.connection_registry[crate::framework::capabilities::io::Token(rdb_token_value)]
+        .queue_reply(vec![b'x'; 1_025]);
     backend.full_sync.diskless_relay = Some(DisklessRelay {
         transfer_id: crate::runtime::server::worker::reactor::sources::TransferId(0),
         source: None,
@@ -2732,10 +2730,7 @@ fn replica_output_hard_limit_applies_after_direct_child_marker() {
         .unwrap()
         .transition_to_waiting_for_rdb_channel()
         .unwrap();
-    backend
-        .replication_runtime
-        .register_rdb_channel(ConnectionId(rdb_token), ConnectionId(main_token))
-        .unwrap();
+    backend.associate_waiting_rdb_for_test(ConnectionId(main_token), ConnectionId(rdb_token));
     backend
         .replication_runtime
         .primary_link_mut(replica_id)

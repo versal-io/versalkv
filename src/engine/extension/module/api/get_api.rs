@@ -18,6 +18,7 @@ extern "C" {
     fn VM_StringToLongDouble();
     fn VM_ReplyWithLongDouble();
     fn VM_HashSet();
+    fn VM_HashGet();
 }
 
 // SAFETY: Called by C module code via VALKEYMODULE_GET_API macro; name and ptr are
@@ -68,6 +69,8 @@ module_api_entries! {
         "ValkeyModule_Realloc" => memory_api::ValkeyModule_Realloc as *mut c_void,
         "ValkeyModule_Free" => memory_api::ValkeyModule_Free as *mut c_void,
         "ValkeyModule_Strdup" => memory_api::ValkeyModule_Strdup as *mut c_void,
+        "ValkeyModule_IncrExternalMemory" => memory_api::ValkeyModule_IncrExternalMemory as *mut c_void,
+        "ValkeyModule_DecrExternalMemory" => memory_api::ValkeyModule_DecrExternalMemory as *mut c_void,
         "ValkeyModule_TryAlloc" => memory_api::ValkeyModule_Alloc as *mut c_void,
         "ValkeyModule_TryCalloc" => memory_api::ValkeyModule_Calloc as *mut c_void,
         "ValkeyModule_TryRealloc" => memory_api::ValkeyModule_Realloc as *mut c_void,
@@ -153,6 +156,7 @@ module_api_entries! {
         "ValkeyModule_SetLFU" => key_eviction_api::ValkeyModule_SetLFU as *mut c_void,
         "ValkeyModule_GetLFU" => key_eviction_api::ValkeyModule_GetLFU as *mut c_void,
         "ValkeyModule_HashSet" => VM_HashSet as *mut c_void,
+        "ValkeyModule_HashGet" => VM_HashGet as *mut c_void,
         "ValkeyModule_HashSetStringRef" => {
             super::hash_api::ValkeyModule_HashSetStringRef as *mut c_void
         },
@@ -276,6 +280,8 @@ module_api_entries! {
         "ValkeyModule_RandomKey" => call::ValkeyModule_RandomKey as *mut c_void,
         "ValkeyModule_Assert" => call::ValkeyModule_Assert as *mut c_void,
         "ValkeyModule_Call" => VM_Call as *mut c_void,
+        "ValkeyModule_CallArgv" => call::VM_CallArgv as *mut c_void,
+        "ValkeyModule_CallArgvAbort" => call::VM_CallArgvAbort as *mut c_void,
         "ValkeyModule_Replicate" => VM_Replicate as *mut c_void,
         "ValkeyModule_ReplicateVerbatim" => call::ValkeyModule_ReplicateVerbatim as *mut c_void,
         "ValkeyModule_LatencyAddSample" => call::ValkeyModule_LatencyAddSample as *mut c_void,
@@ -321,6 +327,7 @@ module_api_entries! {
         "ValkeyModule_ScanCursorDestroy" => scan::ValkeyModule_ScanCursorDestroy as *mut c_void,
         "ValkeyModule_Scan" => scan::ValkeyModule_Scan as *mut c_void,
         "ValkeyModule_ScanKey" => scan::ValkeyModule_ScanKey as *mut c_void,
+        "ValkeyModule_ScanKeyRawBorrowed" => scan::ValkeyModule_ScanKeyRawBorrowed as *mut c_void,
         "ValkeyModule_CreateStringFromStreamID" => {
             stream::ValkeyModule_CreateStringFromStreamID as *mut c_void
         },
@@ -347,6 +354,8 @@ module_api_entries! {
         "ValkeyModule_GetServerInfo" => call::ValkeyModule_GetServerInfo as *mut c_void,
         "ValkeyModule_FreeServerInfo" => call::ValkeyModule_FreeServerInfo as *mut c_void,
         "ValkeyModule_ServerInfoGetFieldC" => call::ValkeyModule_ServerInfoGetFieldC as *mut c_void,
+        "ValkeyModule_ServerInfoGetFieldSigned" => call::ValkeyModule_ServerInfoGetFieldSigned as *mut c_void,
+        "ValkeyModule_Yield" => call::ValkeyModule_Yield as *mut c_void,
         "ValkeyModule_SubscribeToKeyspaceEvents" => {
             call::ValkeyModule_SubscribeToKeyspaceEvents as *mut c_void
         },
@@ -375,6 +384,116 @@ mod tests {
     };
     use std::collections::HashSet;
     use std::ffi::CStr;
+
+    #[test]
+    fn module_external_memory_public_c_callbacks_resolve() {
+        // SAFETY: resolved external-memory entries accept every size_t value and no context pointers.
+        type Callback = unsafe extern "C" fn(usize) -> libc::c_int;
+        for name in [
+            c"ValkeyModule_IncrExternalMemory",
+            c"ValkeyModule_DecrExternalMemory",
+        ] {
+            let mut address = std::ptr::null_mut();
+            // SAFETY: name and the output slot live through synchronous API resolution.
+            let result = unsafe { super::module_get_api_impl(name.as_ptr(), &mut address) };
+            assert_eq!(result, crate::engine::extension::module::VALKEYMODULE_OK);
+            assert!(!address.is_null(), "external memory API must resolve");
+            // SAFETY: these public entries must expose the exact size_t-to-int C ABI.
+            let callback: Callback = unsafe { std::mem::transmute(address) };
+            // SAFETY: zero changes no accounting and requires no module context.
+            assert_eq!(
+                unsafe { callback(0) },
+                crate::engine::extension::module::VALKEYMODULE_OK
+            );
+        }
+    }
+
+    #[test]
+    fn hfe_hash_get_variadic_api_resolves() {
+        assert!(resolve_module_api("ValkeyModule_HashGet").is_some());
+    }
+
+    #[test]
+    fn hfe_borrowed_scan_api_filters_ghosts_and_copies_callback_scoped_bytes() {
+        use super::scan::ValkeyModuleScanCursor;
+        use crate::engine::extension::module::{ModuleKeyHandle, ValkeyModuleKey};
+        use crate::foundation::io::store::kv_engine::Db;
+        type Entries = Vec<(Vec<u8>, Option<Vec<u8>>)>;
+        type Callback = extern "C" fn(
+            *mut ValkeyModuleKey,
+            *const libc::c_char,
+            usize,
+            *const libc::c_char,
+            usize,
+            *mut libc::c_void,
+        );
+        // SAFETY: the scan ABI requires live handles and a callback-scoped output context.
+        type Scan = unsafe extern "C" fn(
+            *mut ValkeyModuleKey,
+            *mut ValkeyModuleScanCursor,
+            Option<Callback>,
+            *mut libc::c_void,
+        ) -> libc::c_int;
+        extern "C" fn collect(
+            _key: *mut ValkeyModuleKey,
+            field: *const libc::c_char,
+            field_len: usize,
+            value: *const libc::c_char,
+            value_len: usize,
+            data: *mut libc::c_void,
+        ) {
+            // SAFETY: scan delivers live callback-scoped slices and the caller's output vector.
+            unsafe {
+                let field = std::slice::from_raw_parts(field.cast::<u8>(), field_len).to_vec();
+                let value = (!value.is_null())
+                    .then(|| std::slice::from_raw_parts(value.cast::<u8>(), value_len).to_vec());
+                (*(data as *mut Entries)).push((field, value));
+            }
+        }
+        let _clock = crate::foundation::io::sys::time::enter_command_time_snapshot(100);
+        let address = resolve_module_api("ValkeyModule_ScanKeyRawBorrowed")
+            .expect("borrowed scan API must resolve");
+        // SAFETY: the registered scan entry must have the public borrowed scan ABI.
+        let scan: Scan = unsafe { std::mem::transmute(address) };
+        let mut db = Db::new();
+        db.hash_set_with_limits(b"h", b"live", b"123", 128, 64)
+            .unwrap();
+        db.hash_set_with_limits(b"h", b"ghost", b"456", 128, 64)
+            .unwrap();
+        db.set_hash_field_expire(b"h", b"ghost", 99);
+        let handle = ModuleKeyHandle::new((&mut db as *mut Db).cast(), b"h".to_vec(), 1, -2, false);
+        let key = ValkeyModuleKey::from_handle(Box::into_raw(handle));
+        let mut cursor = ValkeyModuleScanCursor {
+            index: 0,
+            done: false,
+        };
+        let mut output = Entries::new();
+        // SAFETY: key, cursor, callback and output remain valid throughout the synchronous scan.
+        unsafe {
+            assert_eq!(
+                scan(
+                    key,
+                    &mut cursor,
+                    Some(collect),
+                    (&mut output as *mut Entries).cast()
+                ),
+                0
+            );
+            assert_eq!(
+                scan(
+                    key,
+                    &mut cursor,
+                    Some(collect),
+                    (&mut output as *mut Entries).cast()
+                ),
+                0
+            );
+            drop(Box::from_raw(key as *mut ModuleKeyHandle));
+        }
+        assert!(cursor.done);
+        assert_eq!(output, vec![(b"live".to_vec(), Some(b"123".to_vec()))]);
+        assert_eq!(db.get_hash_object(b"h").unwrap().unwrap().hash_len(), 2);
+    }
 
     #[test]
     fn declarative_api_names_are_unique_and_resolve_to_their_addresses() {

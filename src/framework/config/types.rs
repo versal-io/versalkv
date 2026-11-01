@@ -37,11 +37,23 @@ pub struct Config {
     #[arg(skip)]
     pub tls_key_file: String,
     #[arg(skip)]
+    pub tls_key_file_pass: crate::foundation::memory::tls::TlsPassword,
+    #[arg(skip)]
+    pub tls_alt_cert_file: String,
+    #[arg(skip)]
+    pub tls_alt_key_file: String,
+    #[arg(skip)]
+    pub tls_alt_key_file_pass: crate::foundation::memory::tls::TlsPassword,
+    #[arg(skip)]
+    pub tls_auto_reload_interval: i32,
+    #[arg(skip)]
     pub tls_ca_cert_file: String,
     #[arg(skip)]
     pub tls_ca_cert_dir: String,
     #[arg(skip = "yes")]
     pub tls_auth_clients: String,
+    #[arg(skip = "off")]
+    pub tls_auth_clients_user: String,
     #[arg(skip)]
     pub tls_protocols: String,
     #[arg(skip)]
@@ -62,6 +74,8 @@ pub struct Config {
     pub tls_client_cert_file: String,
     #[arg(skip)]
     pub tls_client_key_file: String,
+    #[arg(skip)]
+    pub tls_client_key_file_pass: crate::foundation::memory::tls::TlsPassword,
 
     // C valkey's compiled-in default is CONFIG_DEFAULT_BINDADDR {"*", "-::*"}
     // (server.h) — bind every IPv4 interface plus, optionally, every IPv6 one.
@@ -450,6 +464,10 @@ pub struct Config {
     #[arg(skip)]
     pub extra_cli_configs: Vec<(String, String)>,
 
+    /// ACL declarations are installed after modules load, with roles first.
+    #[arg(skip)]
+    pub acl_declarations: Vec<String>,
+
     /// Config keys the user explicitly set on the command line (normalised,
     /// e.g. `shutdown-on-sigterm`, `dir`). C valkey loads the config file
     /// first and appends CLI options after it, so CLI always wins. Our clap
@@ -581,9 +599,15 @@ impl Config {
         rconfig.server.tls_port = self.tls_port;
         rconfig.server.tls_cert_file = self.tls_cert_file.clone();
         rconfig.server.tls_key_file = self.tls_key_file.clone();
+        rconfig.server.tls_key_file_pass = self.tls_key_file_pass.clone();
+        rconfig.server.tls_alt_cert_file = self.tls_alt_cert_file.clone();
+        rconfig.server.tls_alt_key_file = self.tls_alt_key_file.clone();
+        rconfig.server.tls_alt_key_file_pass = self.tls_alt_key_file_pass.clone();
+        rconfig.server.tls_auto_reload_interval = self.tls_auto_reload_interval;
         rconfig.server.tls_ca_cert_file = self.tls_ca_cert_file.clone();
         rconfig.server.tls_ca_cert_dir = self.tls_ca_cert_dir.clone();
         rconfig.server.tls_auth_clients = self.tls_auth_clients.clone();
+        rconfig.server.tls_auth_clients_user = self.tls_auth_clients_user.clone();
         rconfig.server.tls_protocols = self.tls_protocols.clone();
         rconfig.server.tls_ciphers = self.tls_ciphers.clone();
         rconfig.server.tls_ciphersuites = self.tls_ciphersuites.clone();
@@ -594,6 +618,7 @@ impl Config {
         rconfig.server.tls_cluster = self.tls_cluster;
         rconfig.server.tls_client_cert_file = self.tls_client_cert_file.clone();
         rconfig.server.tls_client_key_file = self.tls_client_key_file.clone();
+        rconfig.server.tls_client_key_file_pass = self.tls_client_key_file_pass.clone();
         rconfig.server.daemonize = self.daemonize;
         rconfig.server.supervised = self.supervised.clone();
         rconfig.server.supervised_active = self.supervised_active;

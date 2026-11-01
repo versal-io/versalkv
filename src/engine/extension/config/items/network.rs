@@ -8,6 +8,91 @@ const CLIENT_QUERY_BUFFER_LIMIT_MAX: i64 = if usize::BITS >= 64 {
 };
 
 pub(crate) fn register_network_configs(reg: &mut ConfigRegistry) {
+    macro_rules! tls_string {
+        ($name:literal, $field:ident, $flags:expr) => {
+            reg.register(&ConfigSpec {
+                name: $name,
+                type_: ConfigType::String,
+                enum_values: &[],
+                numeric_min: 0,
+                numeric_max: 0,
+                flags: $flags,
+                alias: None,
+                get: |rcfg| ConfigValue::String(rcfg.server.$field.clone()),
+                set: |rcfg, value| {
+                    let ConfigValue::String(value) = value else {
+                        return Err(concat!($name, " must be a string").to_string());
+                    };
+                    rcfg.server.$field = value.clone();
+                    Ok(())
+                },
+            });
+        };
+    }
+    macro_rules! tls_password {
+        ($name:literal, $field:ident) => {
+            reg.register(&ConfigSpec {
+                name: $name,
+                type_: ConfigType::String,
+                enum_values: &[],
+                numeric_min: 0,
+                numeric_max: 0,
+                flags: &["sensitive"],
+                alias: None,
+                get: |rcfg| ConfigValue::String(rcfg.server.$field.expose_secret().to_string()),
+                set: |rcfg, value| {
+                    let ConfigValue::String(value) = value else {
+                        return Err(concat!($name, " must be a string").to_string());
+                    };
+                    rcfg.server.$field = value.clone().into();
+                    Ok(())
+                },
+            });
+        };
+    }
+    tls_string!("tls-alt-cert-file", tls_alt_cert_file, &["volatile"]);
+    tls_string!("tls-alt-key-file", tls_alt_key_file, &["volatile"]);
+    tls_password!("tls-key-file-pass", tls_key_file_pass);
+    tls_password!("tls-alt-key-file-pass", tls_alt_key_file_pass);
+    tls_password!("tls-client-key-file-pass", tls_client_key_file_pass);
+    reg.register(&ConfigSpec {
+        name: "tls-auth-clients-user",
+        type_: ConfigType::Enum,
+        enum_values: &["off", "cn", "uri"],
+        numeric_min: 0,
+        numeric_max: 0,
+        flags: &[],
+        alias: None,
+        get: |rcfg| ConfigValue::String(rcfg.server.tls_auth_clients_user.clone()),
+        set: |rcfg, value| {
+            let ConfigValue::String(value) = value else {
+                return Err("tls-auth-clients-user must be off, CN, or URI".to_string());
+            };
+            let value = value.to_ascii_lowercase();
+            if !["off", "cn", "uri"].contains(&value.as_str()) {
+                return Err("tls-auth-clients-user must be off, CN, or URI".to_string());
+            }
+            rcfg.server.tls_auth_clients_user = value;
+            Ok(())
+        },
+    });
+    reg.register(&ConfigSpec {
+        name: "tls-auto-reload-interval",
+        type_: ConfigType::Numeric,
+        enum_values: &[],
+        numeric_min: 0,
+        numeric_max: i32::MAX as i64,
+        flags: &[],
+        alias: None,
+        get: |rcfg| ConfigValue::Numeric(rcfg.server.tls_auto_reload_interval as i64),
+        set: |rcfg, value| {
+            let ConfigValue::Numeric(value) = value else {
+                return Err("tls-auto-reload-interval must be numeric".to_string());
+            };
+            rcfg.server.tls_auto_reload_interval = *value as i32;
+            Ok(())
+        },
+    });
     reg.register(&ConfigSpec {
         name: "tls-cluster",
         type_: ConfigType::Bool,
@@ -48,7 +133,7 @@ pub(crate) fn register_network_configs(reg: &mut ConfigRegistry) {
         enum_values: &[],
         numeric_min: 0,
         numeric_max: 0,
-        flags: &[],
+        flags: &["volatile"],
         alias: None,
         get: |rcfg| ConfigValue::String(rcfg.server.tls_client_cert_file.clone()),
         set: |rcfg, value| {
@@ -65,7 +150,7 @@ pub(crate) fn register_network_configs(reg: &mut ConfigRegistry) {
         enum_values: &[],
         numeric_min: 0,
         numeric_max: 0,
-        flags: &[],
+        flags: &["volatile"],
         alias: None,
         get: |rcfg| ConfigValue::String(rcfg.server.tls_client_key_file.clone()),
         set: |rcfg, value| {
@@ -120,7 +205,7 @@ pub(crate) fn register_network_configs(reg: &mut ConfigRegistry) {
         enum_values: &[],
         numeric_min: 0,
         numeric_max: 0,
-        flags: &[],
+        flags: &["volatile"],
         alias: None,
         get: |rcfg| ConfigValue::String(rcfg.server.tls_cert_file.clone()),
         set: |rcfg, value| {
@@ -137,7 +222,7 @@ pub(crate) fn register_network_configs(reg: &mut ConfigRegistry) {
         enum_values: &[],
         numeric_min: 0,
         numeric_max: 0,
-        flags: &[],
+        flags: &["volatile"],
         alias: None,
         get: |rcfg| ConfigValue::String(rcfg.server.tls_key_file.clone()),
         set: |rcfg, value| {
@@ -154,7 +239,7 @@ pub(crate) fn register_network_configs(reg: &mut ConfigRegistry) {
         enum_values: &[],
         numeric_min: 0,
         numeric_max: 0,
-        flags: &[],
+        flags: &["volatile"],
         alias: None,
         get: |rcfg| ConfigValue::String(rcfg.server.tls_ca_cert_file.clone()),
         set: |rcfg, value| {
@@ -171,7 +256,7 @@ pub(crate) fn register_network_configs(reg: &mut ConfigRegistry) {
         enum_values: &[],
         numeric_min: 0,
         numeric_max: 0,
-        flags: &[],
+        flags: &["volatile"],
         alias: None,
         get: |rcfg| ConfigValue::String(rcfg.server.tls_ca_cert_dir.clone()),
         set: |rcfg, value| {

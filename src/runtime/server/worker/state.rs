@@ -79,6 +79,7 @@ pub(crate) struct ServerWorkerState {
     pub(in crate::runtime::server) child_signal_token: Token,
     child_signal_write: Option<File>,
     pub(in crate::runtime::server) listeners: ListenerSet,
+    pub(super) tls_reload: super::tls::TlsReloadState,
     pub(in crate::runtime::server) connection_registry: ConnectionRegistry,
     /// Minimal retry registry: tokens whose owner already tore down all business
     /// state but whose L1 deregister failed. A retained entry keeps the
@@ -133,6 +134,11 @@ pub(crate) struct ServerWorkerState {
     pub(in crate::runtime::server) pending_due_time_events: HashMap<TimeEventId, DueTimeEvent>,
     pub(in crate::runtime::server) module_timer_event: Option<TimeEventId>,
     pub(in crate::runtime::server) event_loop_cycle_start: Option<EventLoopCycleStart>,
+    pub(crate) priority_subnets_generation: u64,
+    pub(crate) priority_command_token: Option<Token>,
+    pub(crate) priority_command_is_nested: bool,
+    pub(crate) command_execution_depth: usize,
+    pub(crate) priority_cycle: Option<super::sessions::qos::PriorityCycle>,
     #[cfg(test)]
     pub(in crate::runtime::server) test_time_event_callbacks:
         Vec<Option<Box<dyn FnOnce(&mut ServerWorkerState) + 'static>>>,
@@ -218,6 +224,7 @@ impl ServerWorkerState {
             child_signal_token,
             child_signal_write: Some(child_signal_write),
             listeners: ListenerSet::default(),
+            tls_reload: super::tls::TlsReloadState::default(),
             connection_registry: ConnectionRegistry::default(),
             pending_transport_removals: HashMap::new(),
             socket_owners: HashMap::new(),
@@ -256,6 +263,11 @@ impl ServerWorkerState {
             pending_due_time_events: HashMap::new(),
             module_timer_event: None,
             event_loop_cycle_start: None,
+            priority_subnets_generation: 0,
+            priority_command_token: None,
+            priority_command_is_nested: false,
+            command_execution_depth: 0,
+            priority_cycle: None,
             #[cfg(test)]
             test_time_event_callbacks: Vec::new(),
             #[cfg(test)]
@@ -642,64 +654,10 @@ impl ServerWorkerState {
         Ok(())
     }
 
-    pub(crate) fn configure_tls_server(
-        &mut self,
-        config: crate::foundation::io::transport::TlsConfig,
-    ) -> std::io::Result<()> {
-        self.transport.configure_tls_server(config)
-    }
-
-    pub(in crate::runtime::server) fn configure_tls_server_from_config(
-        &mut self,
-    ) -> std::io::Result<()> {
-        let server = &self.ctx.config().server;
-        if server.tls_port == 0 && !server.tls_cluster {
-            return Ok(());
-        }
-        self.configure_tls_server(crate::foundation::io::transport::TlsConfig {
-            cert_file: (!server.tls_cert_file.is_empty())
-                .then(|| std::path::PathBuf::from(&server.tls_cert_file)),
-            key_file: (!server.tls_key_file.is_empty())
-                .then(|| std::path::PathBuf::from(&server.tls_key_file)),
-            ca_cert_file: (!server.tls_ca_cert_file.is_empty())
-                .then(|| std::path::PathBuf::from(&server.tls_ca_cert_file)),
-            ca_cert_dir: (!server.tls_ca_cert_dir.is_empty())
-                .then(|| std::path::PathBuf::from(&server.tls_ca_cert_dir)),
-            client_auth: crate::foundation::io::transport::TlsClientAuth::parse(
-                &server.tls_auth_clients,
-            )?,
-            policy: crate::foundation::io::transport::TlsContextPolicy {
-                protocols: server.tls_protocols.clone(),
-                ciphers: server.tls_ciphers.clone(),
-                ciphersuites: server.tls_ciphersuites.clone(),
-            },
-            prefer_server_ciphers: server.tls_prefer_server_ciphers,
-            session_caching: server.tls_session_caching,
-            session_cache_size: server.tls_session_cache_size,
-        })
-    }
-
     pub(in crate::runtime::server) fn configure_tls_client_from_config(
         &mut self,
     ) -> std::io::Result<()> {
-        let server = &self.ctx.config().server;
-        self.transport
-            .configure_tls_client(crate::foundation::io::transport::TlsClientConfig {
-                cert_file: (!server.tls_client_cert_file.is_empty())
-                    .then(|| std::path::PathBuf::from(&server.tls_client_cert_file)),
-                key_file: (!server.tls_client_key_file.is_empty())
-                    .then(|| std::path::PathBuf::from(&server.tls_client_key_file)),
-                ca_cert_file: (!server.tls_ca_cert_file.is_empty())
-                    .then(|| std::path::PathBuf::from(&server.tls_ca_cert_file)),
-                ca_cert_dir: (!server.tls_ca_cert_dir.is_empty())
-                    .then(|| std::path::PathBuf::from(&server.tls_ca_cert_dir)),
-                verify_peer: true,
-                policy: crate::foundation::io::transport::TlsContextPolicy {
-                    protocols: server.tls_protocols.clone(),
-                    ciphers: server.tls_ciphers.clone(),
-                    ciphersuites: server.tls_ciphersuites.clone(),
-                },
-            })
+        self.configure_tls_contexts_from_config()
     }
 
     pub(crate) fn bind_tls(&mut self, addr: SocketAddr) -> std::io::Result<()> {

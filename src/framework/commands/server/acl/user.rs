@@ -8,12 +8,26 @@ fn users() -> std::sync::MutexGuard<'static, std::collections::HashMap<String, A
 
 pub fn acl_list() -> Value {
     let users = users();
-    let mut result = Vec::with_capacity(users.len());
-    for (name, user) in users.iter() {
-        result.push(Value::bulk(Bytes::from(format!(
-            "user {}",
-            user.describe(name)
-        ))));
+    let roles = match crate::engine::extension::acl::acl_roles().lock() {
+        Ok(roles) => roles,
+        Err(_) => return Value::error("ERR ACL role registry is unavailable"),
+    };
+    let mut role_entries: Vec<_> = roles.iter().collect();
+    role_entries.sort_by_key(|(name, _)| *name);
+    let mut result: Vec<_> = role_entries
+        .into_iter()
+        .map(|(name, role)| {
+            Value::bulk(Bytes::from(
+                [b"role ".as_slice(), &role.describe_role_bytes(name)].concat(),
+            ))
+        })
+        .collect();
+    let mut user_entries: Vec<_> = users.iter().collect();
+    user_entries.sort_by_key(|(name, _)| *name);
+    for (name, user) in user_entries {
+        result.push(Value::bulk(Bytes::from(
+            [b"user ".as_slice(), &user.describe(name)].concat(),
+        )));
     }
     Value::Array(result)
 }
@@ -71,10 +85,32 @@ pub fn acl_getuser(username: &str) -> Value {
             })
             .collect();
         result.push(Value::Array(sel_list));
+        result.push(Value::bulk(Bytes::from_static(b"roles")));
+        result.push(Value::Array(
+            user.roles
+                .iter()
+                .map(|name| Value::bulk(Bytes::from(name.clone())))
+                .collect(),
+        ));
         Value::Array(result)
     } else {
         Value::Null
     }
+}
+
+pub(super) fn selector_description(
+    selector: &crate::engine::extension::acl::permissions::AclSelector,
+) -> Vec<Value> {
+    vec![
+        Value::bulk(Bytes::from_static(b"commands")),
+        Value::bulk(Bytes::from(selector.categories_str())),
+        Value::bulk(Bytes::from_static(b"keys")),
+        Value::bulk(Bytes::from(selector.keys_str())),
+        Value::bulk(Bytes::from_static(b"channels")),
+        Value::bulk(Bytes::from(selector.channels_str())),
+        Value::bulk(Bytes::from_static(b"databases")),
+        Value::bulk(Bytes::from(selector.databases_str())),
+    ]
 }
 
 pub fn acl_deluser(

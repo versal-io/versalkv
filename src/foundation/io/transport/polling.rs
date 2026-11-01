@@ -6,7 +6,7 @@ use super::{
     TransportRuntime, TransportWakeHandle, TransportWorkerBackend, UnixBindOptions,
 };
 #[cfg(feature = "tls")]
-use openssl::ssl::{ErrorCode, Ssl, SslAcceptor, SslConnector, SslStream};
+use openssl::ssl::{ErrorCode, Ssl, SslStream};
 use polling::{Event, Events, PollMode, Poller};
 use slab::Slab;
 use socket2::{Domain, Protocol, SockRef, Socket, TcpKeepalive, Type};
@@ -43,7 +43,12 @@ impl Write for Stream {
         match self {
             Self::Tcp(stream) => stream.write(src),
             #[cfg(feature = "tls")]
-            Self::Tls(stream) => stream.write(src),
+            Self::Tls(stream) => {
+                if super::tls::should_fail_tls_write() {
+                    return Err(io::ErrorKind::WouldBlock.into());
+                }
+                stream.write(src)
+            }
             Self::Unix(stream) => stream.write(src),
         }
     }
@@ -56,7 +61,12 @@ impl Write for Stream {
         match self {
             Self::Tcp(stream) => stream.write_vectored(src),
             #[cfg(feature = "tls")]
-            Self::Tls(stream) => stream.write_vectored(src),
+            Self::Tls(stream) => {
+                if super::tls::should_fail_tls_write() {
+                    return Err(io::ErrorKind::WouldBlock.into());
+                }
+                stream.write_vectored(src)
+            }
             Self::Unix(stream) => stream.write_vectored(src),
         }
     }
@@ -155,10 +165,7 @@ pub(crate) struct PollingTransportRuntime {
     registered: Slab<Registered>,
     tcp_buffer_limits: Option<TcpBufferLimits>,
     tcp_backlog: i32,
-    #[cfg(feature = "tls")]
-    tls_server: Option<SslAcceptor>,
-    #[cfg(feature = "tls")]
-    tls_client: Option<SslConnector>,
+    tls_contexts: super::TlsContextBatch,
     #[cfg(test)]
     interest_requests: Vec<(TransportId, Interest)>,
     #[cfg(test)]
@@ -207,10 +214,7 @@ impl PollingTransportRuntime {
             registered: Slab::new(),
             tcp_buffer_limits,
             tcp_backlog: 511,
-            #[cfg(feature = "tls")]
-            tls_server: None,
-            #[cfg(feature = "tls")]
-            tls_client: None,
+            tls_contexts: super::TlsContextBatch::default(),
             #[cfg(test)]
             interest_requests: Vec::new(),
             #[cfg(test)]
@@ -456,7 +460,7 @@ impl TransportRuntime for PollingTransportRuntime {
     fn configure_tls_server(&mut self, config: TlsConfig) -> io::Result<()> {
         #[cfg(feature = "tls")]
         {
-            self.tls_server = config.server_acceptor()?;
+            self.tls_contexts.server = config.server_acceptor()?;
             Ok(())
         }
         #[cfg(not(feature = "tls"))]
@@ -472,7 +476,7 @@ impl TransportRuntime for PollingTransportRuntime {
     fn bind_tls(&mut self, addr: SocketAddr) -> io::Result<ListenerHandle> {
         #[cfg(feature = "tls")]
         {
-            if self.tls_server.is_none() {
+            if self.tls_contexts.server.is_none() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "TLS server context must be configured before binding a TLS listener",
@@ -493,7 +497,7 @@ impl TransportRuntime for PollingTransportRuntime {
     fn configure_tls_client(&mut self, config: TlsClientConfig) -> io::Result<()> {
         #[cfg(feature = "tls")]
         {
-            self.tls_client = Some(config.connector()?);
+            self.tls_contexts.client = Some(config.connector()?);
             Ok(())
         }
         #[cfg(not(feature = "tls"))]
@@ -503,6 +507,53 @@ impl TransportRuntime for PollingTransportRuntime {
                 io::ErrorKind::Unsupported,
                 "TLS support is not compiled in",
             ))
+        }
+    }
+
+    fn swap_tls_contexts(
+        &mut self,
+        batch: super::TlsContextBatch,
+    ) -> io::Result<super::TlsContextBatch> {
+        Ok(std::mem::replace(&mut self.tls_contexts, batch))
+    }
+
+    fn tls_peer_names(&self, id: TransportId, use_uri: bool) -> Option<Vec<Vec<u8>>> {
+        #[cfg(feature = "tls")]
+        {
+            let Registered::Stream(Stream::Tls(stream)) = self.registered.get(id.get() - 1)? else {
+                return None;
+            };
+            let ssl = stream.ssl();
+            if !ssl.is_init_finished() {
+                return None;
+            }
+            if ssl.verify_result() != openssl::x509::X509VerifyResult::OK {
+                return Some(Vec::new());
+            }
+            let Some(cert) = ssl.peer_certificate() else {
+                return Some(Vec::new());
+            };
+            if use_uri {
+                Some(cert.subject_alt_names().map_or_else(Vec::new, |names| {
+                    names
+                        .iter()
+                        .filter_map(|name| name.uri().map(|uri| uri.as_bytes().to_vec()))
+                        .collect()
+                }))
+            } else {
+                Some(
+                    cert.subject_name()
+                        .entries_by_nid(openssl::nid::Nid::COMMONNAME)
+                        .take(1)
+                        .map(|entry| entry.data().as_slice().to_vec())
+                        .collect(),
+                )
+            }
+        }
+        #[cfg(not(feature = "tls"))]
+        {
+            let _ = (id, use_uri);
+            None
         }
     }
 
@@ -632,7 +683,7 @@ impl TransportRuntime for PollingTransportRuntime {
         #[cfg(feature = "tls")]
         {
             self.ensure_poll_attached()?;
-            let connector = self.tls_client.as_ref().ok_or_else(|| {
+            let connector = self.tls_contexts.client.as_ref().ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "TLS client context must be configured before connecting",
@@ -753,7 +804,7 @@ impl TransportRuntime for PollingTransportRuntime {
             AcceptedStream::Tcp(stream) => Stream::Tcp(stream),
             #[cfg(feature = "tls")]
             AcceptedStream::Tls(stream) => {
-                let acceptor = self.tls_server.as_ref().ok_or_else(|| {
+                let acceptor = self.tls_contexts.server.as_ref().ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::InvalidInput,
                         "TLS listener has no configured server context",

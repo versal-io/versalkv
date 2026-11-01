@@ -1,80 +1,69 @@
+use super::runtime_support::{hash_field_deletion_propagation, parse_fields};
 use crate::engine::core::{CommandEffects, CommandOutcome, CoreEvent, Value};
-use crate::foundation::io::store::structure::string::encoding::int_encodable;
 use crate::framework::commands::command_runtime::CommandRuntime;
 use crate::framework::{CommandArgs, CommandError};
 use command_macros::command;
 
 #[command("HGETDEL", runtime)]
 pub fn hgetdel(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> CommandOutcome {
+    let Some(key) = args.args.first() else {
+        return CommandOutcome::reply(CommandError::wrong_arity("hgetdel"));
+    };
+    let (_, fields) = match parse_fields(&args.args, 1) {
+        Ok(fields) => fields,
+        Err(error) => return CommandOutcome::reply(error),
+    };
     let db_idx = runtime.selected_db();
-    let db = match runtime.db_mut() {
-        Some(d) => d,
-        None => return CommandOutcome::reply(CommandError::db_index_out_of_range()),
+    let read_expired_values = runtime.read_expired_values();
+    let now_ms = runtime.now_ms();
+    let Some(db) = runtime.db_mut() else {
+        return CommandOutcome::reply(CommandError::db_index_out_of_range());
     };
-    let key = &args.args[0];
-
-    let fields_token = std::str::from_utf8(&args.args[1]).unwrap_or("");
-    if !fields_token.eq_ignore_ascii_case("fields") {
-        return CommandOutcome::reply(CommandError::syntax_error());
+    let has_volatile_fields = db.hash_key_has_volatile_fields(key);
+    let mut has_skipped = false;
+    let mut removed_fields = Vec::new();
+    let mut reply = Vec::with_capacity(fields.len());
+    for field in &fields {
+        let value = match db.get_hash_object(key) {
+            Err(_) => return CommandOutcome::reply(CommandError::wrong_type()),
+            Ok(None) => None,
+            Ok(Some(hash)) => hash.hash_get(field),
+        };
+        let value = value.filter(|_| read_expired_values || !db.hash_field_expired_at(key, field, now_ms));
+        if let Some(value) = value {
+            if let Ok(Some(hash)) = db.get_hash_object_mut(key) {
+                hash.hash_del(field);
+            }
+            db.remove_hash_field_expire(key, field);
+            removed_fields.push(field.clone());
+            reply.push(Value::bulk(value));
+        } else {
+            has_skipped |= has_volatile_fields;
+            reply.push(Value::null());
+        }
     }
-
-    let num_fields = match int_encodable(&args.args[2]) {
-        Some(n) => n,
-        None => {
-            return CommandOutcome::reply(Value::error(
-                "ERR value is not an integer or out of range",
-            ))
-        }
-    };
-
-    if num_fields <= 0 || num_fields as usize != args.args.len() - 3 {
-        return CommandOutcome::reply(Value::error(
-            "numfields should be greater than 0 and match the provided number of fields",
-        ));
+    if removed_fields.is_empty() {
+        return CommandOutcome {
+            reply: Value::Array(reply),
+            effects: CommandEffects { skip_propagate: true, ..CommandEffects::default() },
+        };
     }
-
-    let num_fields = num_fields as usize;
-
-    let (reply, deleted) = match db.get_hash_object_mut(key) {
-        Err(_) => return CommandOutcome::reply(CommandError::wrong_type()),
-        Ok(None) => {
-            let mut out = Vec::with_capacity(num_fields);
-            for _ in 0..num_fields {
-                out.push(Value::null());
-            }
-            (Value::Array(out), 0)
-        }
-        Ok(Some(hash)) => {
-            let mut out = Vec::with_capacity(num_fields);
-            let mut deleted = 0;
-            for i in 0..num_fields {
-                let field = &args.args[3 + i];
-                match hash.hash_get(field) {
-                    Some(value) => {
-                        hash.hash_del(field);
-                        out.push(Value::bulk(value));
-                        deleted += 1;
-                    }
-                    None => out.push(Value::null()),
-                }
-            }
-            if hash.hash_is_empty() {
-                db.del(key);
-            }
-            (Value::Array(out), deleted)
-        }
-    };
-    if deleted == 0 {
-        return CommandOutcome::reply(reply);
+    let mut events = vec![CoreEvent { kind: "hdel", key: key.clone() }];
+    if matches!(db.get_hash_object(key), Ok(Some(hash)) if hash.hash_is_empty()) {
+        db.del(key);
+        events.push(CoreEvent { kind: "del", key: key.clone() });
     }
     CommandOutcome {
-        reply,
+        reply: Value::Array(reply),
         effects: CommandEffects {
             changed_keys: vec![(db_idx, key.clone())],
-            events: vec![CoreEvent {
-                kind: "hdel",
-                key: key.clone(),
-            }],
+            events,
+            skip_propagate: has_skipped,
+            custom_propagations: if has_skipped {
+                vec![hash_field_deletion_propagation(key, &removed_fields)]
+            } else {
+                Vec::new()
+            },
             ..CommandEffects::default()
         },
     }

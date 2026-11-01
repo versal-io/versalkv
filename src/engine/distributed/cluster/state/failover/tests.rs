@@ -449,6 +449,40 @@ mod automatic {
     }
 
     #[test]
+    fn negative_votes_ignore_future_epochs_without_changing_the_round() {
+        let mut failover = AutomaticFailover::default();
+        let election = facts(1_000);
+        failover.on_tick(&election);
+        failover.on_tick(&election);
+        assert_eq!(failover.election_epoch(), 10);
+        let deadline_ms = failover.deadline_ms();
+        for epoch in [11, u64::MAX] {
+            assert_eq!(failover.on_vote_nack(node_id(b'a'), epoch, 3, 1), None);
+            assert_eq!(failover.rejected_voter_count(), 0);
+            assert_eq!(failover.phase(), AutomaticFailoverPhase::RequestingVotes);
+            assert_eq!(failover.election_epoch(), 10);
+            assert_eq!(failover.deadline_ms(), deadline_ms);
+        }
+        assert_eq!(failover.on_vote_nack(node_id(b'a'), 10, 3, 1), Some(true));
+    }
+
+    #[test]
+    fn negative_votes_do_not_reject_a_voter_that_already_acked() {
+        let mut failover = AutomaticFailover::default();
+        let mut election = facts(1_000);
+        election.voting_primaries = 7;
+        failover.on_tick(&election);
+        failover.on_tick(&election);
+        assert!(failover.on_vote_ack(node_id(b'a'), 10, true).is_empty());
+        assert_eq!(failover.on_vote_nack(node_id(b'a'), 10, 7, 1), None);
+        assert_eq!(failover.rejected_voter_count(), 0);
+        assert_eq!(failover.voter_count(), 1);
+        assert_eq!(failover.on_vote_nack(node_id(b'b'), 10, 7, 1), Some(false));
+        assert_eq!(failover.on_vote_nack(node_id(b'b'), 10, 7, 1), None);
+        assert_eq!(failover.rejected_voter_count(), 1);
+    }
+
+    #[test]
     fn negative_votes_deduplicate_and_ignore_older_epochs() {
         let mut failover = AutomaticFailover::default();
         let mut election = facts(1_000);

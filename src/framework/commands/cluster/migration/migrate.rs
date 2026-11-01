@@ -2,11 +2,24 @@ use crate::engine::distributed::cluster::migration::{
     MigrationError, MigrationJob, MigrationJobId, MigrationOperation, SlotRanges, SlotRangesError,
 };
 use crate::engine::distributed::cluster::NodeId;
+use crate::engine::command::context::CommandConn;
 use crate::foundation::io::protocol::Value;
 use crate::framework::context::ServerContext;
 use bytes::Bytes;
 
-pub(crate) fn cluster_migrateslots(args: &[Bytes], ctx: &mut ServerContext) -> Value {
+pub(crate) fn cluster_migrateslots(
+    args: &[Bytes],
+    conn: &mut dyn CommandConn,
+    ctx: &mut ServerContext,
+) -> Value {
+    // Scan the original command, including invalid and incomplete AUTH groups.
+    for (index, arg) in args.iter().enumerate() {
+        if arg.eq_ignore_ascii_case(b"auth") {
+            for position in index + 1..(index + 3).min(args.len()) {
+                conn.redact_command_argument(position + 2);
+            }
+        }
+    }
     let now = crate::foundation::io::sys::time::unixtime();
     let jobs = match parse_migrate_slots(args, ctx, now) {
         Ok(jobs) => jobs,
@@ -103,15 +116,23 @@ fn parse_migrate_slots(
                 target.as_str()
             )));
         }
-        jobs.push(MigrationJob::new(
+        let mut job = MigrationJob::new(
             MigrationJobId::generate(),
             source.clone(),
             target,
             ranges,
             MigrationOperation::Export,
             now,
-        ));
+        );
         index += 2;
+        if args.get(index).is_some_and(|arg| arg.eq_ignore_ascii_case(b"auth")) {
+            if index + 2 >= args.len() {
+                return Err(crate::framework::CommandError::syntax_error());
+            }
+            job.set_auth(&args[index + 1], &args[index + 2]);
+            index += 3;
+        }
+        jobs.push(job);
     }
     Ok(jobs)
 }
@@ -178,7 +199,9 @@ fn validate_range_owner(
 
 #[cfg(test)]
 mod tests {
-    use super::parse_migrate_slots;
+    use super::{cluster_migrateslots, parse_migrate_slots};
+    use crate::engine::command::context::CommandConn;
+    use crate::framework::capabilities::connection::Connection;
     use crate::engine::distributed::cluster::node::{
         ClusterNode, CLUSTER_NODE_MYSELF, CLUSTER_NODE_PRIMARY, CLUSTER_NODE_REPLICA,
     };
@@ -402,5 +425,100 @@ mod tests {
             .migrations
             .views()
             .is_empty());
+    }
+
+    #[test]
+    fn accepts_per_target_auth_with_binary_credentials() {
+        let ctx = context();
+        let mut args = bytes(&["SLOTSRANGE", "0", "1", "NODE", TARGET, "aUtH"]);
+        args.push(Bytes::from_static(b"user\0\xff"));
+        args.push(Bytes::from_static(b"password\r\n\0\xfe"));
+        args.extend(bytes(&["SLOTSRANGE", "2", "3", "NODE", OTHER]));
+        let mut jobs = parse_migrate_slots(&args, &ctx, 100).unwrap();
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(jobs[0].target.as_str(), TARGET);
+        assert_eq!(jobs[1].target.as_str(), OTHER);
+        let auth = jobs[0].take_auth().unwrap();
+        assert_eq!(auth.username(), b"user\0\xff");
+        assert_eq!(auth.password(), b"password\r\n\0\xfe");
+        assert!(!jobs[1].has_auth());
+        assert!(ctx.cluster_state().as_ref().unwrap().migrations.views().is_empty());
+    }
+
+    #[test]
+    fn auth_syntax_errors_do_not_publish_any_jobs() {
+        let ctx = context();
+        for suffix in [
+            vec!["AUTH"],
+            vec!["AUTH", "onlyuser"],
+            vec!["AUTH", "user", "password", "AUTH", "user", "password"],
+            vec!["REPLACE"],
+        ] {
+            let mut args = bytes(&[
+                "SLOTSRANGE", "0", "0", "NODE", TARGET,
+                "SLOTSRANGE", "1", "1", "NODE", OTHER,
+            ]);
+            args.extend(bytes(&suffix));
+            assert_eq!(
+                parse_migrate_slots(&args, &ctx, 100).unwrap_err(),
+                crate::framework::CommandError::syntax_error()
+            );
+            assert!(ctx.cluster_state().as_ref().unwrap().migrations.views().is_empty());
+        }
+    }
+
+    #[test]
+    fn handler_redacts_all_auth_arguments_even_before_source_validation() {
+        for should_disable_cluster in [false, true] {
+            let mut ctx = context();
+            if should_disable_cluster {
+                *ctx.cluster_state_mut() = None;
+            }
+            let mut conn = Connection::new_fake();
+            let args = bytes(&[
+                "SLOTSRANGE", "0", "0", "NODE", "invalid",
+                "AUTH", "user", "password", "AUTH", "onlyuser",
+            ]);
+            let reply = cluster_migrateslots(&args, &mut conn, &mut ctx);
+            assert_eq!(
+                reply,
+                if should_disable_cluster {
+                    Value::error("ERR This instance has cluster support disabled")
+                } else {
+                    Value::error("ERR Invalid node name: invalid")
+                }
+            );
+            for position in [8, 9, 11] {
+                assert!(conn.is_redacted_command_argument(position));
+            }
+            assert!(!conn.is_redacted_command_argument(7));
+            assert_eq!(args[6].as_ref(), b"user");
+            assert_eq!(args[7].as_ref(), b"password");
+        }
+    }
+
+    #[test]
+    fn handler_validates_every_group_before_publishing_or_connecting() {
+        let mut ctx = context();
+        let mut conn = Connection::new_fake();
+        let invalid = bytes(&[
+            "SLOTSRANGE", "0", "0", "NODE", TARGET, "AUTH", "user", "password",
+            "SLOTSRANGE", "1", "1", "NODE", OTHER, "AUTH", "onlyuser",
+        ]);
+        assert_eq!(
+            cluster_migrateslots(&invalid, &mut conn, &mut ctx),
+            crate::framework::CommandError::syntax_error()
+        );
+        let state = ctx.cluster_state_mut().as_deref_mut().unwrap();
+        assert!(state.migrations.views().is_empty());
+        assert!(state.take_migration_actions().is_empty());
+        let valid = bytes(&[
+            "SLOTSRANGE", "0", "0", "NODE", TARGET, "AUTH", "user", "password",
+            "SLOTSRANGE", "1", "1", "NODE", OTHER, "AUTH", "", "",
+        ]);
+        assert_eq!(cluster_migrateslots(&valid, &mut conn, &mut ctx), Value::ok());
+        let state = ctx.cluster_state_mut().as_deref_mut().unwrap();
+        assert_eq!(state.migrations.views().len(), 2);
+        assert_eq!(state.take_migration_actions().len(), 2);
     }
 }

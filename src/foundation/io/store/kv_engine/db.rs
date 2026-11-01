@@ -521,6 +521,75 @@ impl Db {
     /// Return a Hash object without forcing its compact encoding to upgrade.
     /// Command paths that support both encodings must use this boundary rather
     /// than the legacy `get_hash` concrete-Hashtable accessor.
+    pub fn get_path_hash(
+        &mut self,
+        key: &[u8],
+    ) -> Result<Option<&crate::foundation::io::store::structure::path_hash::PathHash>, ()> {
+        match self.get(key) {
+            Some(Robj::PathHash(value)) => Ok(Some(value)),
+            Some(_) => Err(()),
+            None => Ok(None),
+        }
+    }
+
+    pub fn get_or_create_path_hash(
+        &mut self,
+        key: &[u8],
+    ) -> Result<&mut crate::foundation::io::store::structure::path_hash::PathHash, ()> {
+        if self.get_mut(key).is_none() {
+            self.set(key.to_vec(), Robj::PathHash(Box::default()));
+        }
+        match self.get_mut(key) {
+            Some(Robj::PathHash(value)) => Ok(value),
+            _ => Err(()),
+        }
+    }
+
+    /// Mutate a path hash in place while preserving TTL and object metadata.
+    pub fn mutate_path_hash<T>(
+        &mut self,
+        key: &[u8],
+        create: bool,
+        should_read_expired_values: bool,
+        operation: impl FnOnce(&mut crate::foundation::io::store::structure::path_hash::PathHash) -> T,
+    ) -> Result<Option<T>, ()> {
+        let is_missing = if should_read_expired_values {
+            self.get_allow_expired(key).is_none()
+        } else {
+            self.get(key).is_none()
+        };
+        if is_missing {
+            if !create {
+                return Ok(None);
+            }
+            self.set(key.to_vec(), Robj::PathHash(Box::default()));
+        }
+        let value = if should_read_expired_values {
+            let slot = self.key_slot(key);
+            // Dereferencing ValueSlot preserves snapshot copy-on-write.
+            self.data
+                .get_mut_in_slot(slot, key)
+                .map(|entry| &mut *entry.value)
+        } else {
+            self.get_mut(key)
+        };
+        let (result, old_size, new_size) = match value {
+            Some(Robj::PathHash(value)) => {
+                // Both reads use cached sizes; only the mutation touches entries.
+                let old_size = value.memory_usage();
+                let result = operation(value);
+                (result, old_size, value.memory_usage())
+            }
+            _ => return Err(()),
+        };
+        if new_size >= old_size {
+            memory_stats::track_add(MemoryCategory::Dataset, new_size - old_size);
+        } else {
+            memory_stats::track_sub(MemoryCategory::Dataset, old_size - new_size);
+        }
+        Ok(Some(result))
+    }
+
     pub fn get_hash_object(&mut self, key: &[u8]) -> Result<Option<&Robj>, ()> {
         match self.get(key) {
             Some(value @ (Robj::HashHashtable(_) | Robj::HashListpack(_))) => Ok(Some(value)),
@@ -800,6 +869,31 @@ impl Db {
             }
             _ => Err(()),
         }
+    }
+
+    /// Preconvert for a whole input batch, including duplicate fields.
+    pub fn hash_prepare_pairs_with_limits(
+        &mut self,
+        key: &[u8],
+        pairs: &[(Bytes, Bytes)],
+        max_entries: usize,
+        max_value_size: usize,
+    ) -> Result<(), ()> {
+        let should_convert = pairs.len() > max_entries
+            || pairs
+                .iter()
+                .any(|(field, value)| field.len() > max_value_size || value.len() > max_value_size);
+        let _ = self.get_mut(key);
+        if should_convert {
+            if self.get_hash_object(key)?.is_some() {
+                self.get_hash_mut(key)?;
+            } else {
+                self.get_or_create_hash(key)?;
+            }
+        } else {
+            self.get_hash_object(key)?;
+        }
+        Ok(())
     }
 
     /// Add a ZSet member while retaining listpack storage until the caller's
@@ -1330,6 +1424,11 @@ impl Db {
     }
 
     pub fn set_hash_string_ref(&mut self, key: &[u8], field: &[u8], value: &[u8]) -> bool {
+        if self.hash_field_expired(key, field)
+            || !matches!(self.get_hash_object(key), Ok(Some(hash)) if hash.hash_contains(field))
+        {
+            return false;
+        }
         let updated = match self.get_hash_mut(key) {
             Ok(Some(hash)) => {
                 hash.insert(Bytes::copy_from_slice(field), Bytes::copy_from_slice(value));
@@ -1347,9 +1446,19 @@ impl Db {
     }
 
     pub fn hash_has_string_ref(&self, key: &[u8], field: &[u8]) -> bool {
+        !self.hash_field_expired(key, field)
+            && matches!(self.get_no_expire(key), Some(hash @ (Robj::HashHashtable(_) | Robj::HashListpack(_))) if hash.hash_contains(field))
+            && self
+                .hash_string_refs
+                .get(key)
+                .is_some_and(|fields| fields.contains(field))
+    }
+
+    /// String references require physical hashtable storage, even without TTLs.
+    pub fn hash_key_has_string_refs(&self, key: &[u8]) -> bool {
         self.hash_string_refs
             .get(key)
-            .is_some_and(|fields| fields.contains(field))
+            .is_some_and(|fields| !fields.is_empty())
     }
 
     pub fn clear_hash_string_ref(&mut self, key: &[u8], field: &[u8]) {

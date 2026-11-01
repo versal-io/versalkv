@@ -9,7 +9,10 @@ pub(crate) use self::polling::PollingTransportRuntime;
 #[cfg(test)]
 pub(crate) use self::thread_io::TransportWake;
 pub use self::thread_io::{ThreadIoHandle, TransportWakeHandle};
-pub use self::tls::{TlsClientAuth, TlsClientConfig, TlsConfig, TlsContextPolicy};
+pub use self::tls::{
+    set_tls_write_error, TlsClientAuth, TlsClientConfig, TlsConfig, TlsContextBatch,
+    TlsContextPolicy, TlsInfo, TlsMaterialMetadata, TlsPassword,
+};
 #[cfg(test)]
 pub(crate) use api::TransportTestBackend;
 pub use api::{

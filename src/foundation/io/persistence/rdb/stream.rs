@@ -24,6 +24,8 @@ pub struct RdbDecodePolicy {
     pub key_load_delay_us: i64,
     pub zset_max_listpack_entries: usize,
     pub zset_max_listpack_value: usize,
+    pub hash_max_listpack_entries: usize,
+    pub hash_max_listpack_value: usize,
 }
 
 impl RdbDecodePolicy {
@@ -36,6 +38,8 @@ impl RdbDecodePolicy {
             key_load_delay_us,
             zset_max_listpack_entries: 128,
             zset_max_listpack_value: 64,
+            hash_max_listpack_entries: 512,
+            hash_max_listpack_value: 64,
         }
     }
 
@@ -48,12 +52,20 @@ impl RdbDecodePolicy {
             key_load_delay_us,
             zset_max_listpack_entries: 128,
             zset_max_listpack_value: 64,
+            hash_max_listpack_entries: 512,
+            hash_max_listpack_value: 64,
         }
     }
 
     pub fn with_zset_limits(mut self, max_entries: usize, max_value_size: usize) -> Self {
         self.zset_max_listpack_entries = max_entries;
         self.zset_max_listpack_value = max_value_size;
+        self
+    }
+
+    pub fn with_hash_limits(mut self, max_entries: usize, max_value_size: usize) -> Self {
+        self.hash_max_listpack_entries = max_entries;
+        self.hash_max_listpack_value = max_value_size;
         self
     }
 }
@@ -105,7 +117,7 @@ pub struct RdbDecoder {
     rdbver: i32,
     is_redis_magic: bool,
     cur_db: u32,
-    expire_ms: Option<u64>,
+    expire_ms: Option<i64>,
     crc: u64,
     loaded: usize,
     function_codes: Vec<Vec<u8>>,
@@ -171,12 +183,20 @@ impl RdbDecoder {
         self.policy = self.policy.with_zset_limits(max_entries, max_value_size);
     }
 
+    pub fn set_hash_limits(&mut self, max_entries: usize, max_value_size: usize) {
+        self.policy = self.policy.with_hash_limits(max_entries, max_value_size);
+    }
+
     pub fn set_key_load_delay(&mut self, key_load_delay_us: i64) {
         self.policy.key_load_delay_us = key_load_delay_us;
     }
 
     pub fn consumed_bytes(&self) -> usize {
         self.discarded_prefix.saturating_add(self.cursor)
+    }
+
+    pub fn unconsumed_bytes(&self) -> usize {
+        self.buf.len().saturating_sub(self.cursor)
     }
 
     pub fn loaded(&self) -> usize {
@@ -323,11 +343,13 @@ impl RdbDecoder {
             ExpiredKeyPolicy::Retain => None,
             ExpiredKeyPolicy::Skip => Some(now),
         };
-        let Some(loaded) = codec::load_robj_with_hash_field_expires_detailed(
+        let Some(loaded) = codec::load_robj_with_hash_field_expires_and_limits(
             input,
             &mut pos,
             type_byte,
             hash_field_expiry_cutoff,
+            self.policy.hash_max_listpack_entries,
+            self.policy.hash_max_listpack_value,
         ) else {
             return Ok(RdbStep::NeedInput);
         };
@@ -344,8 +366,13 @@ impl RdbDecoder {
             self.policy.zset_max_listpack_value,
         );
         let hfe = loaded.hash_field_expires;
-        let expire = self.expire_ms.take();
+        let raw_expire = self.expire_ms.take();
+        let expire = raw_expire
+            .filter(|deadline| *deadline >= 0)
+            .map(|deadline| deadline as u64);
 
+        // Signed deadlines below -1 are invalid on every loading path. The -1
+        // sentinel means persistent, including snapshots loaded by replicas.
         // A replica must retain keys that are already expired in the primary's
         // snapshot. The primary owns expiration and will stream the corresponding
         // deletion; dropping the key here would make the in-flight snapshot differ.
@@ -354,8 +381,9 @@ impl RdbDecoder {
             self.empty_keys += 1;
             log::warn!("skipping empty key: {}", String::from_utf8_lossy(&key));
             false
-        } else if expire.is_some_and(|deadline| deadline <= now)
-            && self.policy.expired_keys == ExpiredKeyPolicy::Skip
+        } else if raw_expire.is_some_and(|deadline| deadline < -1)
+            || (expire.is_some_and(|deadline| deadline <= now)
+                && self.policy.expired_keys == ExpiredKeyPolicy::Skip)
         {
             self.expired += 1;
             expired_key = Some((self.cur_db, key));
@@ -495,7 +523,7 @@ impl RdbDecoder {
                     }
                     let raw: [u8; 8] = input[pos..pos + 8].try_into().unwrap();
                     pos += 8;
-                    self.expire_ms = Some(i64::from_le_bytes(raw) as u64);
+                    self.expire_ms = Some(i64::from_le_bytes(raw));
                 }
                 RDB_OPCODE_EXPIRETIME => {
                     if input.len() < pos + 4 {
@@ -503,7 +531,7 @@ impl RdbDecoder {
                     }
                     let raw: [u8; 4] = input[pos..pos + 4].try_into().unwrap();
                     pos += 4;
-                    self.expire_ms = Some((i32::from_le_bytes(raw) as u64) * 1000);
+                    self.expire_ms = Some(i64::from(i32::from_le_bytes(raw)) * 1000);
                 }
                 RDB_OPCODE_IDLE => {
                     if load_len(input, &mut pos).is_none() {

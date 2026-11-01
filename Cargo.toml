@@ -36,6 +36,8 @@ xxhash-rust = { version = "0.8", features = ["xxh32"] }
 command_macros = { path = "command_macros" }
 cfg-if = "1"
 memchr = "2"
+rustc_apfloat = "0.2.3"
+num-bigint = "0.4.8"
 openssl = { version = "0.10", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 serde-wasm-bindgen = { version = "0.6", optional = true }

@@ -16,9 +16,8 @@ fn group_to_module(group: &str) -> String {
         "sorted_set" => "zset".to_string(),
         "transactions" => "transaction".to_string(),
         "bitmap" | "cluster" | "connection" | "generic" | "geo" | "hash" | "hyperloglog"
-        | "list" | "pubsub" | "scripting" | "sentinel" | "server" | "set" | "stream" | "string" => {
-            group.to_string()
-        }
+        | "pathhash" | "list" | "pubsub" | "scripting" | "sentinel" | "server" | "set"
+        | "stream" | "string" => group.to_string(),
         other => {
             eprintln!(
                 "cargo:warning=build.rs: unknown command group '{}', mapping to 'generic'",
@@ -311,6 +310,9 @@ struct ParsedCmd {
     /// which require no specific R/W bit. Mirrors C `ACLSelectorCheckKey`.
     key_flags: Vec<String>,
     acl_categories: Vec<String>,
+    summary: String,
+    since: String,
+    group: String,
 }
 
 fn compute_movable_keys(cmd: &serde_json::Value) -> bool {
@@ -639,6 +641,30 @@ fn generate_command_metadata(all_cmds: &[ParsedCmd], generated_root: &Path) {
         catalog.push_str(&format!("    &super::{},\n", command_const_name(cmd)));
     }
     catalog.push_str("];\n\n");
+    catalog.push_str(
+        "pub struct CommandDocMeta {\n\
+             pub name: &'static str,\n\
+             pub summary: &'static str,\n\
+             pub since: &'static str,\n\
+             pub group: &'static str,\n\
+         }\n\n\
+         pub const COMMAND_DOC_META: &[CommandDocMeta] = &[\n",
+    );
+    for cmd in all_cmds {
+        let name = match cmd.container.as_deref() {
+            Some(container) => format!(
+                "{}|{}",
+                container.to_ascii_lowercase(),
+                command_subcommand_name(cmd, container)
+            ),
+            None => cmd.lookup_name.to_ascii_lowercase(),
+        };
+        catalog.push_str(&format!(
+            "    CommandDocMeta {{ name: {name:?}, summary: {:?}, since: {:?}, group: {:?} }},\n",
+            cmd.summary, cmd.since, cmd.group,
+        ));
+    }
+    catalog.push_str("];\n\n");
     catalog.push_str("#[cfg(not(feature = \"wasm\"))]\n");
     catalog.push_str("pub const TOP_LEVEL_COMMANDS: &[&str] = &[\n");
     for cmd in all_cmds.iter().filter(|cmd| cmd.container.is_none()) {
@@ -889,6 +915,17 @@ fn main() {
             dispatch_group: dispatch_group.to_string(),
             key_flags,
             acl_categories,
+            summary: cmd
+                .get("summary")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            since: cmd
+                .get("since")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            group,
         });
     }
 
@@ -939,6 +976,7 @@ fn main() {
 
     let extra_modules: std::collections::HashMap<&str, &[&str]> = [
         ("hash", &["runtime_support"] as &[&str]),
+        ("pathhash", &["runtime_support"] as &[&str]),
         ("zset", &["basic"] as &[&str]),
         ("string", &["strops"] as &[&str]),
         ("scripting", &["script_cache", "script_cmd"] as &[&str]),

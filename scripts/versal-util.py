@@ -1487,6 +1487,9 @@ EXPLICIT_STATUS = {
     # same before inserting any business indexes; black-box coverage observes
     # both the RESP rejection and INFO STATS counter.
     "maxclients": "implemented",
+    "maxclients-reserved": "implemented",
+    "priority-subnets": "implemented",
+    "priority-preemptive-poll-interval-us": "implemented",
     "maxmemory": "implemented",
     # C's client-memory limit applies to normal/PubSub buffers independently of
     # key eviction. Rust parses byte/percentage values, refreshes client
@@ -1645,6 +1648,9 @@ EXPLICIT_STATUS = {
     # replica read/write behavior rather than CONFIG surface alone.
     "repl-backlog-size": "implemented",
     "repl-backlog-ttl": "implemented",
+    # Native replication negotiates LZ4 and compresses full-sync and continuous
+    # streams. ZSTD remains an explicitly rejected optional build capability.
+    "repl-compression": "implemented",
     "repl-disable-tcp-nodelay": "implemented",
     "repl-diskless-load": "implemented",
     "repl-diskless-sync": "implemented",
@@ -1721,8 +1727,14 @@ EXPLICIT_STATUS = {
     # after its certificate/key pair validates; client-auth is verified at the
     # actual handshake boundary.
     "tls-auth-clients": "implemented",
-    "tls-auth-clients-user": "unsupported_build",
-    "tls-auto-reload-interval": "unsupported_build",
+    "tls-auth-clients-user": "implemented",
+    # The TLS matrix verifies separate algorithm slots, per-identity chain and
+    # password loading, atomic server/client publication, background reload,
+    # certificate validity, and INFO attribution against the loaded batch.
+    "tls-alt-cert-file": "implemented",
+    "tls-alt-key-file": "implemented",
+    "tls-alt-key-file-pass": "implemented",
+    "tls-auto-reload-interval": "implemented",
     "tls-ca-cert-dir": "implemented",
     "tls-ca-cert-file": "implemented",
     "tls-cert-file": "implemented",
@@ -1730,11 +1742,11 @@ EXPLICIT_STATUS = {
     "tls-ciphersuites": "implemented",
     "tls-client-cert-file": "implemented",
     "tls-client-key-file": "implemented",
-    "tls-client-key-file-pass": "unsupported_build",
+    "tls-client-key-file-pass": "implemented",
     "tls-cluster": "implemented",
     "tls-dh-params-file": "unsupported_build",
     "tls-key-file": "implemented",
-    "tls-key-file-pass": "unsupported_build",
+    "tls-key-file-pass": "implemented",
     "tls-port": "implemented",
     "tls-prefer-server-ciphers": "implemented",
     "tls-protocols": "implemented",

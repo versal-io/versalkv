@@ -5,7 +5,7 @@ use super::types::{
     RDB_TYPE_STREAM_LISTPACKS, RDB_TYPE_STREAM_LISTPACKS_2, RDB_TYPE_STREAM_LISTPACKS_3,
     RDB_TYPE_STRING, RDB_TYPE_ZSET, RDB_TYPE_ZSET_2, RDB_TYPE_ZSET_LISTPACK, RDB_TYPE_ZSET_ZIPLIST,
 };
-use super::{hash, list, set, stream, string, zset, CodecLoad, LoadFn};
+use super::{hash, list, path_hash, set, stream, string, zset, CodecLoad, LoadFn};
 
 pub(super) fn build_registry() -> [Option<LoadFn>; 256] {
     let mut r: [Option<LoadFn>; 256] = [None; 256];
@@ -15,6 +15,7 @@ pub(super) fn build_registry() -> [Option<LoadFn>; 256] {
         };
     }
     reg!(string::StringCodec, RDB_TYPE_STRING);
+    reg!(path_hash::PathHashCodec, super::types::RDB_TYPE_PATH_HASH);
     reg!(
         list::ListCodec,
         RDB_TYPE_LIST,

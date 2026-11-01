@@ -91,14 +91,18 @@ impl ServerWorkerState {
         let policy = &config.server.maxmemory_policy;
         if config.server.maxmemory == 0
             || (meta.flags & CMD_DENYOOM) == 0
-            || !policy.starts_with("volatile-")
+            || !(policy.starts_with("volatile-") || policy.starts_with("allkeys-"))
         {
             return None;
         }
         let has_candidate = (0..self.ctx.num_dbs()).any(|db_idx| {
-            self.ctx
-                .db(db_idx as u32)
-                .is_some_and(|db| db.expires_iter().any(|(k, _)| !db.is_importing_slot_key(k)))
+            self.ctx.db(db_idx as u32).is_some_and(|db| {
+                if policy.starts_with("allkeys-") {
+                    db.dbsize() > 0
+                } else {
+                    db.expires_iter().any(|(k, _)| !db.is_importing_slot_key(k))
+                }
+            })
         });
         if self.ctx.maxmemory_state().is_over_limit() && !has_candidate {
             return Some(DispatchOutcome {
@@ -151,6 +155,15 @@ impl ServerWorkerState {
         let is_busy_control = matches!(meta.name.as_str(), "script" | "function");
         if self.ctx.is_loading() {
             return None;
+        }
+        if let Some(message) = &self.ctx.module_registry().busy_reply {
+            if meta.flags & CMD_ALLOW_BUSY == 0 {
+                return Some(DispatchOutcome {
+                    action: DispatchAction::Rejected,
+                    call_flags: CmdCallFlags::default(),
+                    reject_reply: Some(Value::error(format!("BUSY {message}"))),
+                });
+            }
         }
         if self.ctx.is_script_busy() && (meta.flags & CMD_ALLOW_BUSY) == 0 && !is_busy_control {
             return Some(DispatchOutcome {

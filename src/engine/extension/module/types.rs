@@ -28,6 +28,8 @@ pub type ValkeyModuleScanKeyCB = extern "C" fn(
     *mut ValkeyModuleString,
     *mut c_void,
 );
+pub type ValkeyModuleScanKeyRawBorrowedCB =
+    extern "C" fn(*mut ValkeyModuleKey, *const c_char, usize, *const c_char, usize, *mut c_void);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -182,6 +184,7 @@ pub const VALKEYMODULE_KEYTYPE_SET: c_int = 4;
 pub const VALKEYMODULE_KEYTYPE_ZSET: c_int = 5;
 pub const VALKEYMODULE_KEYTYPE_MODULE: c_int = 6;
 pub const VALKEYMODULE_KEYTYPE_STREAM: c_int = 7;
+pub const VALKEYMODULE_KEYTYPE_PATH_HASH: c_int = 8;
 
 #[repr(C)]
 pub struct ModuleKeyHandle {

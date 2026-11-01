@@ -16,8 +16,8 @@ pub(crate) const ACL_WRITE_PERMISSION: u8 = 2;
 pub(crate) const ACL_ALL_PERMISSION: u8 = ACL_READ_PERMISSION | ACL_WRITE_PERMISSION;
 
 /// A command ACL denial, mirroring C's `ACLCheckAllUserCommandPerm` result.
-/// Error precedence is `Db < Command < Key` (channels are checked separately by
-/// callers). `arg_index` on `Db` is the 0-based `cmd_args` position naming the
+/// Error precedence is `Db < Command < Key < Channel`.
+/// `arg_index` on `Db` is the 0-based `cmd_args` position naming the
 /// offending database, or `None` when it is the connection's current db (whose
 /// object name is the command name, as in C).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,6 +25,7 @@ pub(crate) enum AclDenial {
     Db { dbid: i64, arg_index: Option<usize> },
     Command,
     Key(usize),
+    Channel(usize),
 }
 
 /// Which databases a command touches, for ACL `db=` enforcement. Mirrors C's
@@ -159,26 +160,26 @@ pub(crate) fn compute_db_requirement(
 /// parenthesized selectors (`(`...`)`) that span multiple tokens into a single
 /// `(...)` rule. Mirrors C `ACLMergeSelectorArguments`. Returns `Err(())` when a
 /// `(` is never closed. Shared by ACL file loading (startup and `ACL LOAD`).
-pub(crate) fn merge_acl_tokens(tokens: &[&str]) -> Result<Vec<String>, ()> {
-    let mut merged: Vec<String> = Vec::new();
+pub(crate) fn merge_acl_tokens(tokens: &[&[u8]]) -> Result<Vec<Vec<u8>>, ()> {
+    let mut merged: Vec<Vec<u8>> = Vec::new();
     let mut open = false;
-    let mut selector = String::new();
+    let mut selector = Vec::new();
     for tok in tokens {
-        if !open && tok.starts_with('(') && !tok.ends_with(')') {
-            selector = (*tok).to_string();
+        if !open && tok.starts_with(b"(") && !tok.ends_with(b")") {
+            selector = tok.to_vec();
             open = true;
             continue;
         }
         if open {
-            selector.push(' ');
-            selector.push_str(tok);
-            if tok.ends_with(')') {
+            selector.push(b' ');
+            selector.extend_from_slice(tok);
+            if tok.ends_with(b")") {
                 open = false;
                 merged.push(std::mem::take(&mut selector));
             }
             continue;
         }
-        merged.push((*tok).to_string());
+        merged.push(tok.to_vec());
     }
     if open {
         return Err(());
@@ -186,14 +187,12 @@ pub(crate) fn merge_acl_tokens(tokens: &[&str]) -> Result<Vec<String>, ()> {
     Ok(merged)
 }
 
-fn parse_selector_rules(opset: &str) -> Option<Vec<String>> {
-    let opset = opset.trim();
-    if opset.len() < 2 || !opset.starts_with('(') || !opset.ends_with(')') {
+pub(crate) fn parse_selector_rules(opset: &[u8]) -> Option<Vec<Bytes>> {
+    if opset.len() < 2 || !opset.starts_with(b"(") || !opset.ends_with(b")") {
         return None;
     }
     let inner = &opset[1..opset.len() - 1];
-    let rules: Vec<String> = inner.split_whitespace().map(|s| s.to_string()).collect();
-    Some(rules)
+    crate::foundation::io::protocol::parser::parse_inline_args(inner).ok()
 }
 
 /// ACL user information.
@@ -206,40 +205,33 @@ pub(crate) struct AclUser {
     pub(crate) root_selector: AclSelector,
     /// Additional selectors defined via `(...)` syntax.
     pub(crate) selectors: Vec<AclSelector>,
+    pub(crate) roles: Vec<String>,
 }
 
 impl AclUser {
     pub(crate) fn references_command(&self, command: &str) -> bool {
         let command = command.to_ascii_lowercase();
         let prefix = format!("{}|", command);
-        self.root_selector
-            .categories
-            .iter()
-            .chain(
-                self.selectors
-                    .iter()
-                    .flat_map(|selector| selector.categories.iter()),
-            )
-            .any(|rule| {
-                let rule = rule.get(1..).unwrap_or_default();
-                rule.eq_ignore_ascii_case(&command) || rule.starts_with(&prefix)
+        self.with_selectors(|selectors| {
+            selectors.any(|selector| {
+                selector.categories.iter().any(|rule| {
+                    let rule = rule.get(1..).unwrap_or_default();
+                    rule.eq_ignore_ascii_case(&command) || rule.starts_with(&prefix)
+                })
             })
+        })
     }
 
     pub(crate) fn can_execute_command_with_args(&self, command: AclCommand<'_>) -> bool {
-        self.root_selector.can_execute_command_with_args(command)
-            || self
-                .selectors
-                .iter()
-                .any(|selector| selector.can_execute_command_with_args(command))
+        self.with_selectors(|selectors| {
+            selectors.any(|selector| selector.can_execute_command_with_args(command))
+        })
     }
 
     pub(crate) fn can_access_key_bits(&self, key: &[u8], required: u8) -> bool {
-        self.root_selector.can_access_key_bits(key, required)
-            || self
-                .selectors
-                .iter()
-                .any(|selector| selector.can_access_key_bits(key, required))
+        self.with_selectors(|selectors| {
+            selectors.any(|selector| selector.can_access_key_bits(key, required))
+        })
     }
 
     pub(crate) fn new_disabled() -> Self {
@@ -251,6 +243,7 @@ impl AclUser {
             nopass: false,
             root_selector: root,
             selectors: vec![],
+            roles: vec![],
         }
     }
 
@@ -271,12 +264,7 @@ impl AclUser {
     }
 
     pub(crate) fn can_access_db(&self, dbid: i64) -> bool {
-        // In Valkey's model, if any selector grants db access, it's allowed.
-        // The root selector is always checked.
-        if self.root_selector.can_access_db(dbid) {
-            return true;
-        }
-        self.selectors.iter().any(|s| s.can_access_db(dbid))
+        self.with_selectors(|selectors| selectors.any(|s| s.can_access_db(dbid)))
     }
 
     pub(crate) fn apply_rule(&mut self, rule: &str) -> Result<(), &'static str> {
@@ -288,7 +276,34 @@ impl AclUser {
         rule: &str,
         default_allchannels: bool,
     ) -> Result<(), &'static str> {
+        self.apply_rule_bytes_with_pubsub_default(rule.as_bytes(), default_allchannels)
+    }
+
+    pub(crate) fn apply_rule_bytes_with_pubsub_default(
+        &mut self,
+        rule: &[u8],
+        default_allchannels: bool,
+    ) -> Result<(), &'static str> {
+        if rule.starts_with(b"(") && rule.ends_with(b")") {
+            // C also creates an empty selector when the inner lexer fails.
+            let rules = parse_selector_rules(rule).unwrap_or_default();
+            let mut selector = AclSelector::new();
+            let _ = selector.apply_rule("-@all");
+            if default_allchannels {
+                let _ = selector.apply_rule("allchannels");
+            }
+            for rule in rules {
+                selector.apply_rule_bytes(&rule)?;
+            }
+            self.selectors.push(selector);
+            return Ok(());
+        }
+        let rule = match std::str::from_utf8(rule) {
+            Ok(rule) => rule,
+            Err(_) => return self.root_selector.apply_rule_bytes(rule),
+        };
         match rule {
+            "" => Ok(()),
             _ if rule.eq_ignore_ascii_case("on") => {
                 self.flags = "on".to_string();
                 Ok(())
@@ -332,29 +347,18 @@ impl AclUser {
                 self.selectors.clear();
                 Ok(())
             }
-            _ if rule.starts_with('(') && rule.ends_with(')') => {
-                crate::server_log!(debug, "ACL: parsing selector rule: {}", rule);
-                let rules = parse_selector_rules(rule).unwrap_or_default();
-                crate::server_log!(debug, "ACL: parsed rules: {:?}", rules);
-                // An empty selector `()` still yields one selector with no
-                // permissions (-@all), matching C aclCreateSelectorFromOpSet.
-                let mut selector = AclSelector::new();
-                let _ = selector.apply_rule("-@all");
-                if default_allchannels {
-                    let _ = selector.apply_rule("allchannels");
-                }
-                for r in &rules {
-                    crate::server_log!(debug, "ACL: applying selector rule: {}", r);
-                    selector.apply_rule(r)?;
-                }
-                crate::server_log!(
-                    debug,
-                    "ACL: selector created, categories: {:?}, keys: {}",
-                    selector.categories,
-                    selector.keys_str()
-                );
-                self.selectors.push(selector);
+            _ if rule.eq_ignore_ascii_case("resetroles") => {
+                self.roles.clear();
                 Ok(())
+            }
+            _ if rule
+                .get(..5)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("role=")) =>
+            {
+                let roles = super::role::acl_roles()
+                    .lock()
+                    .map_err(|_| "ACL role registry is unavailable")?;
+                self.set_roles(&rule[5..], &roles)
             }
             _ if rule == "reset" => {
                 self.passwords.clear();
@@ -362,6 +366,7 @@ impl AclUser {
                 self.root_selector = AclSelector::new();
                 let _ = self.root_selector.apply_rule("-@all");
                 self.selectors.clear();
+                self.roles.clear();
                 self.flags = "off".to_string();
                 Ok(())
             }
@@ -370,84 +375,44 @@ impl AclUser {
         }
     }
 
-    /// Generate ACL rule string for saving to ACL file (ACL SAVE).
+    /// Render the same complete rules used by ACL LIST for CONFIG REWRITE.
     pub(crate) fn to_acl_rule_string(&self, username: &str) -> String {
-        let mut parts = Vec::new();
-        parts.push(self.flags.clone());
+        let mut parts = vec![username.to_string(), self.flags.clone()];
         if self.nopass {
             parts.push("nopass".to_string());
         }
-        for pw in &self.passwords {
-            parts.push(format!("#{}", pw));
+        parts.extend(self.passwords.iter().map(|password| format!("#{password}")));
+        parts.push(self.root_selector.config_rule(true));
+        parts.extend(
+            self.selectors
+                .iter()
+                .map(|selector| selector.config_rule(false)),
+        );
+        if !self.roles.is_empty() {
+            parts.push(format!("role={}", self.roles.join(",")));
         }
-        for pat in &self.root_selector.patterns {
-            parts.push(pat.to_rule_string());
-        }
-        for pat in &self.root_selector.pubsub_patterns {
-            if pat == "*" {
-                parts.push("allchannels".to_string());
-            } else {
-                parts.push(format!("&{}", pat));
-            }
-        }
-        for cat in &self.root_selector.categories {
-            parts.push(cat.clone());
-        }
-        if let Some(dbs) = &self.root_selector.allowed_dbs {
-            if !dbs.is_empty() {
-                let db_str = dbs
-                    .iter()
-                    .map(|d| format!("db={}", d))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                parts.push(db_str);
-            }
-        }
-        // Additional selectors: serialize as (...)
-        for s in &self.selectors {
-            let mut sel_parts = Vec::new();
-            for pat in &s.patterns {
-                sel_parts.push(pat.to_rule_string());
-            }
-            for pat in &s.pubsub_patterns {
-                sel_parts.push(format!("&{}", pat));
-            }
-            for cat in &s.categories {
-                sel_parts.push(cat.clone());
-            }
-            if let Some(dbs) = &s.allowed_dbs {
-                if !dbs.is_empty() {
-                    let db_str = dbs
-                        .iter()
-                        .map(|d| format!("db={}", d))
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    sel_parts.push(db_str);
-                }
-            }
-            parts.push(format!("({})", sel_parts.join(" ")));
-        }
-        format!("{} {}", username, parts.join(" "))
+        parts.join(" ")
     }
 
     /// Describe the user as an ACL rule string in C `ACLDescribeUser` order:
     /// flags, passwords, root selector, then each additional selector wrapped
-    /// in `(...)`. Used by ACL LIST so the output round-trips through the
-    /// parser and exposes additional selectors.
-    pub(crate) fn describe(&self, username: &str) -> String {
-        let mut parts: Vec<String> = Vec::new();
-        parts.push(self.flags.clone());
+    /// in `(...)`, then role memberships. Used by ACL LIST and persistence.
+    pub(crate) fn describe(&self, username: &str) -> Vec<u8> {
+        let mut parts = vec![username.as_bytes().to_vec(), self.flags.as_bytes().to_vec()];
         if self.nopass {
-            parts.push("nopass".to_string());
+            parts.push(b"nopass".to_vec());
         }
         for pw in &self.passwords {
-            parts.push(format!("#{}", pw));
+            parts.push(format!("#{}", pw).into_bytes());
         }
         parts.push(self.root_selector.describe());
         for s in &self.selectors {
-            parts.push(format!("({})", s.describe()));
+            parts.push([b"(".as_slice(), &s.describe(), b")"].concat());
         }
-        format!("{} {}", username, parts.join(" "))
+        if !self.roles.is_empty() {
+            parts.push(format!("role={}", self.roles.join(",")).into_bytes());
+        }
+        parts.join(&b' ')
     }
 
     /// Check command permission with args, honoring the command's database
@@ -462,7 +427,7 @@ impl AclUser {
         let allows = |s: &AclSelector| {
             s.satisfies_db_requirement(db_req, num_dbs) && s.can_execute_command_with_args(command)
         };
-        allows(&self.root_selector) || self.selectors.iter().any(allows)
+        self.with_selectors(|selectors| selectors.any(allows))
     }
 
     /// Check command, database, and static key permissions using one selector.
@@ -482,7 +447,7 @@ impl AclUser {
                     .iter()
                     .all(|(key, is_write)| selector.can_access_key(key, *is_write))
         };
-        selector_allows(&self.root_selector) || self.selectors.iter().any(selector_allows)
+        self.with_selectors(|selectors| selectors.any(selector_allows))
     }
 
     /// Whether the user can run `cmd_name` with a selector that *also* grants
@@ -496,21 +461,25 @@ impl AclUser {
         command: AclCommand<'_>,
         current_dbid: i64,
         required: u8,
+        keys: &[(&[u8], u8)],
     ) -> bool {
         let selector_allows = |selector: &AclSelector| {
             selector.can_access_db(current_dbid)
                 && selector.can_execute_command_with_args(command)
                 && selector.has_unrestricted_key_access(required)
+                && keys
+                    .iter()
+                    .all(|(key, bits)| selector.can_access_key_bits(key, *bits))
         };
-        selector_allows(&self.root_selector) || self.selectors.iter().any(selector_allows)
+        self.with_selectors(|selectors| selectors.any(selector_allows))
     }
 
     /// Check command + database + key permissions across all selectors,
     /// returning the highest-precedence denial (or `None` if allowed), mirroring
-    /// C `ACLCheckAllUserCommandPerm`. Precedence: `Db < Command < Key`; within
+    /// C `ACLCheckAllUserCommandPerm`. Precedence: `Db < Command < Key < Channel`; within
     /// the same kind the highest offending index wins.
-    /// `keys` carry explicit required permission bits. Channel checks are done
-    /// separately by callers (as in C, where channels are a distinct pass).
+    /// `keys` carry explicit required permission bits. Channel arguments are
+    /// checked against the same selector after command and key permissions.
     pub(crate) fn check_command_perm(
         &self,
         command: AclCommand<'_>,
@@ -531,78 +500,78 @@ impl AclUser {
     where
         I: Iterator<Item = (&'a [u8], u8)> + Clone,
     {
-        // C initializes `relevant_error = ACL_DENIED_DB` (the lowest priority),
-        // so a command allowed by no selector defaults to a DB denial only when
-        // no selector even clears the command bit.
-        let mut best: Option<AclDenial> = None;
-        // Rank for precedence comparison (higher = reported): Db=1, Command=2, Key=3.
-        let rank = |d: &AclDenial| match d {
-            AclDenial::Db { .. } => 1,
-            AclDenial::Command => 2,
-            AclDenial::Key(_) => 3,
-        };
-        let idx_of = |d: &AclDenial| match d {
-            AclDenial::Db { arg_index, .. } => arg_index.map_or(0, |i| i + 1),
-            AclDenial::Command => 0,
-            AclDenial::Key(i) => *i,
-        };
-        let mut consider = |cand: AclDenial| {
-            let take = match &best {
-                None => true,
-                Some(cur) => {
-                    rank(&cand) > rank(cur)
-                        || (rank(&cand) == rank(cur) && idx_of(&cand) > idx_of(cur))
+        self.with_selectors(|selectors| {
+            // C initializes `relevant_error = ACL_DENIED_DB` (the lowest priority),
+            // so a command allowed by no selector defaults to a DB denial only when
+            // no selector even clears the command bit.
+            let mut best: Option<AclDenial> = None;
+            // Higher ranks take precedence: Db=1, Command=2, Key=3, Channel=4.
+            let rank = |d: &AclDenial| match d {
+                AclDenial::Db { .. } => 1,
+                AclDenial::Command => 2,
+                AclDenial::Key(_) => 3,
+                AclDenial::Channel(_) => 4,
+            };
+            let idx_of = |d: &AclDenial| match d {
+                AclDenial::Db { arg_index, .. } => arg_index.map_or(0, |i| i + 1),
+                AclDenial::Command => 0,
+                AclDenial::Key(i) | AclDenial::Channel(i) => *i,
+            };
+            let mut consider = |cand: AclDenial| {
+                let take = match &best {
+                    None => true,
+                    Some(cur) => {
+                        rank(&cand) > rank(cur)
+                            || (rank(&cand) == rank(cur) && idx_of(&cand) > idx_of(cur))
+                    }
+                };
+                if take {
+                    best = Some(cand);
                 }
             };
-            if take {
-                best = Some(cand);
-            }
-        };
 
-        for selector in std::iter::once(&self.root_selector).chain(self.selectors.iter()) {
-            // 1) Database check (C runs this first, before the command bit).
-            if let Some(denial) = selector_db_denial(selector, db_req, num_dbs) {
-                consider(denial);
-                continue;
-            }
-            // 2) Command check.
-            if !selector.can_execute_command_with_args(command) {
-                consider(AclDenial::Command);
-                continue;
-            }
-            // 3) Key check.
-            let mut key_denied: Option<usize> = None;
-            for (i, (key, required)) in keys.clone().enumerate() {
-                if !selector.can_access_key_bits(key, required) {
-                    key_denied = Some(i);
-                    break;
+            for selector in selectors {
+                // 1) Database check (C runs this first, before the command bit).
+                if let Some(denial) = selector_db_denial(selector, db_req, num_dbs) {
+                    consider(denial);
+                    continue;
                 }
+                // 2) Command check.
+                if !selector.can_execute_command_with_args(command) {
+                    consider(AclDenial::Command);
+                    continue;
+                }
+                // 3) Key check.
+                let mut key_denied: Option<usize> = None;
+                for (i, (key, required)) in keys.clone().enumerate() {
+                    if !selector.can_access_key_bits(key, required) {
+                        key_denied = Some(i);
+                        break;
+                    }
+                }
+                if let Some(i) = key_denied {
+                    consider(AclDenial::Key(i));
+                    continue;
+                }
+                if let Some(i) = selector.channel_denial(command) {
+                    consider(AclDenial::Channel(i));
+                    continue;
+                }
+                return None;
             }
-            {
-                let i = key_denied?;
-                consider(AclDenial::Key(i))
-            }
-        }
-        best
+            best
+        })
     }
 
     /// Check key access within a specific database context.
     pub(crate) fn can_access_key_db(&self, key: &[u8], is_write: bool, dbid: i64) -> bool {
-        if self.root_selector.can_access_db(dbid)
-            && self.root_selector.can_access_key(key, is_write)
-        {
-            return true;
-        }
-        self.selectors
-            .iter()
-            .any(|s| s.can_access_db(dbid) && s.can_access_key(key, is_write))
+        self.with_selectors(|selectors| {
+            selectors.any(|s| s.can_access_db(dbid) && s.can_access_key(key, is_write))
+        })
     }
 
     pub(crate) fn can_access_channel(&self, channel: &[u8]) -> bool {
-        if self.root_selector.can_access_channel(channel) {
-            return true;
-        }
-        self.selectors.iter().any(|s| s.can_access_channel(channel))
+        self.with_selectors(|selectors| selectors.any(|s| s.can_access_channel(channel)))
     }
 
     pub(crate) fn can_access_channel_for_command(
@@ -620,15 +589,12 @@ impl AclUser {
                 "psubscribe" => cmd_args.iter().all(|pat| {
                     s.pubsub_patterns
                         .iter()
-                        .any(|allowed| allowed == "*" || allowed.as_bytes() == pat.as_ref())
+                        .any(|allowed| allowed == b"*".as_slice() || allowed == pat)
                 }),
                 _ => true,
             }
         };
-        if check(&self.root_selector) {
-            return true;
-        }
-        self.selectors.iter().any(check)
+        self.with_selectors(|selectors| selectors.any(check))
     }
 
     pub(crate) fn has_denied_subscriptions(
@@ -637,39 +603,35 @@ impl AclUser {
         pubsub_patterns: &[Bytes],
         pubsub_shard_channels: &[Bytes],
     ) -> bool {
-        let has_allchannels = self.root_selector.pubsub_patterns.iter().any(|p| p == "*")
-            || self
-                .selectors
-                .iter()
-                .any(|s| s.pubsub_patterns.iter().any(|p| p == "*"));
-        for ch in pubsub_channels {
-            if !self.can_access_channel(ch) {
-                return true;
-            }
-        }
-        for pat in pubsub_patterns {
-            if !has_allchannels {
-                let allowed = self
-                    .root_selector
-                    .pubsub_patterns
+        self.with_selectors(|selectors| {
+            let patterns: Vec<_> = selectors.flat_map(|s| s.pubsub_patterns.iter()).collect();
+            let has_allchannels = patterns.iter().any(|p| p.as_ref() == b"*");
+            for ch in pubsub_channels {
+                if !patterns
                     .iter()
-                    .any(|a| a.as_bytes() == pat.as_ref())
-                    || self.selectors.iter().any(|s| {
-                        s.pubsub_patterns
-                            .iter()
-                            .any(|a| a.as_bytes() == pat.as_ref())
-                    });
-                if !allowed {
+                    .any(|p| crate::engine::distributed::pubsub::pattern_match(p, ch))
+                {
                     return true;
                 }
             }
-        }
-        for ch in pubsub_shard_channels {
-            if !self.can_access_channel(ch) {
-                return true;
+            for pat in pubsub_patterns {
+                if !has_allchannels {
+                    let allowed = patterns.contains(&pat);
+                    if !allowed {
+                        return true;
+                    }
+                }
             }
-        }
-        false
+            for ch in pubsub_shard_channels {
+                if !patterns
+                    .iter()
+                    .any(|p| crate::engine::distributed::pubsub::pattern_match(p, ch))
+                {
+                    return true;
+                }
+            }
+            false
+        })
     }
 
     /// Get the categories string for the root selector (used by ACL GETUSER).
@@ -678,12 +640,12 @@ impl AclUser {
     }
 
     /// Get the root selector's key-pattern rule string (used by ACL GETUSER).
-    pub(crate) fn root_keys_str(&self) -> String {
+    pub(crate) fn root_keys_str(&self) -> Vec<u8> {
         self.root_selector.keys_str()
     }
 
     /// Get the root selector's channels rule string (used by ACL GETUSER).
-    pub(crate) fn root_channels_str(&self) -> String {
+    pub(crate) fn root_channels_str(&self) -> Vec<u8> {
         self.root_selector.channels_str()
     }
 
@@ -709,6 +671,7 @@ pub(crate) fn acl_users() -> &'static Mutex<HashMap<String, AclUser>> {
             nopass: true,
             root_selector: AclSelector::new(),
             selectors: vec![],
+            roles: vec![],
         };
         let _ = default_user.root_selector.apply_rule("+@all");
         let _ = default_user.root_selector.apply_rule("~*");

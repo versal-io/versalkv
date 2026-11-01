@@ -35,7 +35,13 @@ pub fn scan(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> CommandOutc
             let value = options[index + 1].to_ascii_lowercase();
             if !matches!(
                 value.as_slice(),
-                b"string" | b"list" | b"hash" | b"set" | b"zset" | b"stream"
+                b"string"
+                    | b"list"
+                    | b"hash"
+                    | b"set"
+                    | b"zset"
+                    | b"stream"
+                    | b"pathhash"
             ) {
                 return CommandOutcome::reply(Value::error(format!(
                     "unknown type name '{}'",

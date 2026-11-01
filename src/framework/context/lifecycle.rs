@@ -112,6 +112,7 @@ impl ServerContext {
             tracking: TrackingState::new(),
             normal_client_memory: 0,
             io_thread_info: crate::framework::context::IoThreadInfo::default(),
+            tls_info: crate::foundation::memory::tls::TlsInfo::default(),
             pause_cron: 0,
             protected_clients: Vec::new(),
             pending_tcp_rebind: None,

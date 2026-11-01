@@ -359,7 +359,7 @@ fn hash_object_accessor_reads_a_listpack_without_upgrading_it() {
 }
 
 #[test]
-fn adding_hash_field_expiry_upgrades_listpack_to_hashtable() {
+fn adding_hash_field_expiry_preserves_listpack() {
     let mut db = Db::new();
     db.hash_set_with_limits(b"hash", b"field", b"value", 4, 64)
         .unwrap();
@@ -368,7 +368,7 @@ fn adding_hash_field_expiry_upgrades_listpack_to_hashtable() {
     let expire = future_ms();
     db.set_hash_field_expire(b"hash", b"field", expire);
 
-    assert!(matches!(db.get(b"hash"), Some(Robj::HashHashtable(_))));
+    assert!(matches!(db.get(b"hash"), Some(Robj::HashListpack(_))));
     assert_eq!(db.get_hash_field_expire(b"hash", b"field"), Some(expire));
 }
 
