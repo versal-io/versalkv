@@ -710,7 +710,7 @@ fn ordinary_read_refreshes_dirty_replication_memory_before_info() {
 }
 
 #[test]
-fn close_after_reply_does_not_take_a_second_ordinary_write_service() {
+fn close_after_reply_preserves_output_after_ordinary_write_service() {
     let mut backend = ServerWorkerState::new(1).expect("create runtime");
     let (mut client, connection_token, token) = add_socket_connection(&mut backend);
     backend.writes.ordinary.begin_turn();
@@ -721,6 +721,30 @@ fn close_after_reply_does_not_take_a_second_ordinary_write_service() {
 
     backend.finalize_handle_readable(connection_token, token.0, effects);
 
+    assert!(backend.connection_registry.contains(token));
+    assert_eq!(
+        backend.connection_registry[token].state,
+        ConnectionState::Closing
+    );
+    assert_eq!(
+        backend.connection_registry[token].ordinary_output_bytes(),
+        b"+LATE\r\n".len()
+    );
+    client
+        .set_nonblocking(true)
+        .expect("inspect same-turn output");
+    let mut probe = [0_u8; 1];
+    assert_eq!(
+        client.read(&mut probe).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    client
+        .set_nonblocking(false)
+        .expect("restore blocking read");
+    backend.event_batch.begin_next_turn();
+    backend.writes.begin_turn();
+    backend.drive_pending_ordinary_writes();
+
     client
         .set_read_timeout(Some(std::time::Duration::from_secs(1)))
         .expect("set client read timeout");
@@ -728,10 +752,7 @@ fn close_after_reply_does_not_take_a_second_ordinary_write_service() {
     client
         .read_to_end(&mut received)
         .expect("connection close must reach the peer");
-    assert!(
-        received.is_empty(),
-        "a second same-turn flush leaked output"
-    );
+    assert_eq!(received, b"+LATE\r\n");
     assert!(!backend.connection_registry.contains(Token(token.0)));
 }
 

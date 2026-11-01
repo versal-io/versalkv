@@ -88,6 +88,45 @@ fn nontty_status_reply() {
 }
 
 #[test]
+fn cluster_check_reports_complete_slot_coverage_for_ipv6_seed() {
+    let server = TestServer::start(&["--cluster-enabled", "yes", "--bind", "127.0.0.1 ::1"]);
+    let endpoint = format!("[::1]:{}", server.port);
+    let mut client = server.connect();
+    let check = || {
+        Command::new(binary_path("versal-cli"))
+            .args(["--cluster", "check", &endpoint])
+            .output()
+            .expect("run cluster check")
+    };
+    assert_eq!(
+        client.command(&[b"CLUSTER", b"ADDSLOTSRANGE", b"0", b"16383"]),
+        b"+OK\r\n"
+    );
+    assert_eq!(client.command(&[b"CLUSTER", b"DELSLOTS", b"0"]), b"+OK\r\n");
+    let uncovered = check();
+    assert!(
+        !uncovered.status.success(),
+        "uncovered check: stdout={:?} stderr={:?} nodes={:?}",
+        String::from_utf8_lossy(&uncovered.stdout),
+        String::from_utf8_lossy(&uncovered.stderr),
+        client.command_str(&[b"CLUSTER", b"NODES"])
+    );
+    assert!(!String::from_utf8_lossy(&uncovered.stdout).contains("All 16384 slots covered"));
+    assert_eq!(client.command(&[b"CLUSTER", b"ADDSLOTS", b"0"]), b"+OK\r\n");
+    let covered = check();
+    assert!(
+        covered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&covered.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&covered.stdout).contains("All 16384 slots covered"),
+        "cluster check must report successful slot coverage: {:?}",
+        covered.stdout
+    );
+}
+
+#[test]
 fn nontty_integer_reply() {
     let server = TestServer::start_default();
     let mut client = server.connect();

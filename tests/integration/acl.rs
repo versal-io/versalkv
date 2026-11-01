@@ -133,6 +133,31 @@ fn disabled_default_user_can_kill_existing_default_clients_before_reauth() {
 }
 
 #[test]
+fn client_kill_self_preserves_replies_across_write_turns() {
+    let server = TestServer::start_default();
+    let mut admin = server.connect();
+    assert_eq!(
+        admin.command(&[b"ACL", b"SETUSER", b"default", b"off"]),
+        b"+OK\r\n"
+    );
+    let mut pipeline = b"*1\r\n$4\r\nPING\r\n".to_vec();
+    let ping = pipeline.clone();
+    // More replies than one vectored write can consume.
+    for _ in 1..512 {
+        pipeline.extend_from_slice(&ping);
+    }
+    pipeline.extend_from_slice(
+        b"*6\r\n$6\r\nCLIENT\r\n$4\r\nKILL\r\n$4\r\nUSER\r\n$7\r\ndefault\r\n$6\r\nSKIPME\r\n$2\r\nno\r\n",
+    );
+    admin.send_raw(&pipeline);
+    for _ in 0..512 {
+        assert_eq!(admin.read_reply(), b"+PONG\r\n");
+    }
+    assert_eq!(admin.read_reply(), b":1\r\n");
+    assert!(admin.is_closed());
+}
+
+#[test]
 fn disabled_default_user_keeps_new_connections_unauthenticated() {
     let server = TestServer::start_default();
     let mut admin = server.connect();

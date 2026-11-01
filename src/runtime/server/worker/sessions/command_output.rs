@@ -197,7 +197,8 @@ impl ServerWorkerState {
             [crate::framework::capabilities::io::Token(connection_token)]
         .has_pending_output();
         if connection_state == ConnectionState::CloseAfterReply {
-            // C closes in this turn after one best-effort flush, before the peer's next read.
+            // Preserve the terminal reply when this turn's write service was
+            // already consumed or the socket cannot drain in one write.
             if !is_slot_export
                 && has_output
                 && self.writes.ordinary.claim_service(Token(token_value))
@@ -210,7 +211,17 @@ impl ServerWorkerState {
                         token_value,
                         error
                     );
+                    self.remove_connection(token_value);
+                    return;
                 }
+            }
+            if self.connection_registry[Token(connection_token)].has_pending_output() {
+                self.connection_registry[Token(connection_token)].mark_closing();
+                self.transport
+                    .set_interest(Token(token_value), Interest::Writable)
+                    .ok();
+                self.schedule_ordinary_write(token_value);
+                return;
             }
             self.remove_connection(token_value);
             return;

@@ -23,7 +23,9 @@ pub(super) fn execute(args: &[String], command_index: usize) -> Result<(), Strin
     };
     let nodes = super::parse_cluster_nodes(&nodes_text)?;
     validate_slot_coverage(&nodes)?;
-    validate_topology_consistency(&nodes)
+    validate_topology_consistency(&nodes)?;
+    println!("[OK] All 16384 slots covered.");
+    Ok(())
 }
 
 fn validate_topology_consistency(nodes: &[super::ClusterNode]) -> Result<(), String> {
