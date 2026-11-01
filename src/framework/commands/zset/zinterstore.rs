@@ -1,9 +1,10 @@
 use crate::engine::command::{CommandArgs, CommandError};
 use crate::engine::core::{CommandEffects, CommandOutcome, CoreEvent};
 use crate::foundation::io::protocol::Value;
+use crate::foundation::io::store::kv_engine::Db;
 use crate::foundation::io::store::Robj;
 use crate::framework::commands::command_runtime::CommandRuntime;
-use crate::framework::commands::zset::basic::{aggregate_score, parse_set_operation_args};
+use crate::framework::commands::zset::basic;
 use bytes::Bytes;
 use command_macros::command;
 use std::collections::HashMap;
@@ -13,19 +14,64 @@ pub fn zinterstore(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> Comm
     if args.args.len() < 3 {
         return CommandOutcome::reply(CommandError::syntax_error());
     }
-    let (key_weights, aggregate) = match parse_set_operation_args(&args.args, 1, "zinterstore") {
-        Ok(v) => v,
-        Err(e) => return CommandOutcome::reply(e),
-    };
+    let (key_weights, aggregate) =
+        match basic::parse_set_operation_args(&args.args, 1, "zinterstore") {
+            Ok(v) => v,
+            Err(e) => return CommandOutcome::reply(e),
+        };
     let (max_entries, max_value_size) = runtime.zset_encoding_limits();
     let db_index = runtime.selected_db();
     let Some(db) = runtime.db_mut() else {
         return CommandOutcome::reply(CommandError::db_index_out_of_range());
     };
     let dest = args.args[0].clone();
+    let result = match collect_intersection(db, &key_weights, aggregate) {
+        Ok(result) => result,
+        Err(error) => return CommandOutcome::reply(error),
+    };
+    let count = result.len() as i64;
+    let mut changed = db.del(&dest);
+    if !result.is_empty() {
+        use crate::foundation::io::store::structure::hashtable::HashTable;
+        let mut ht = HashTable::new();
+        for (k, v) in result {
+            ht.insert(k, v);
+        }
+        db.set(
+            dest.to_vec(),
+            Robj::zset_from_dict_with_limits(ht, max_entries, max_value_size),
+        );
+        changed = true;
+    }
+    CommandOutcome {
+        reply: Value::integer(count),
+        effects: CommandEffects {
+            changed_keys: changed
+                .then(|| (db_index, dest.clone()))
+                .into_iter()
+                .collect(),
+            events: changed
+                .then(|| CoreEvent {
+                    kind: "zinterstore",
+                    key: dest,
+                })
+                .into_iter()
+                .collect(),
+            skip_propagate: !changed,
+            ..CommandEffects::default()
+        },
+    }
+}
+
+/// Compute weighted scores without writing a destination key.
+pub(super) fn collect_intersection(
+    db: &mut Db,
+    key_weights: &[(Bytes, f64)],
+    aggregate: basic::Aggregate,
+) -> Result<HashMap<Bytes, f64>, Value> {
     let mut result: HashMap<Bytes, f64> = HashMap::new();
     let mut first = true;
-    for (key, weight) in &key_weights {
+    for (key, weight) in key_weights {
         match db.get_zset_object(key) {
             Ok(Some(m)) => {
                 if first {
@@ -47,7 +93,7 @@ pub fn zinterstore(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> Comm
                             }
                             new_result.insert(
                                 member.clone(),
-                                aggregate_score(existing, weighted, aggregate),
+                                basic::aggregate_score(existing, weighted, aggregate),
                             );
                         }
                     }
@@ -81,48 +127,17 @@ pub fn zinterstore(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> Comm
                                     }
                                     new_result.insert(
                                         member.clone(),
-                                        aggregate_score(existing, weighted, aggregate),
+                                        basic::aggregate_score(existing, weighted, aggregate),
                                     );
                                 }
                             }
                             result = new_result;
                         }
                     }
-                    _ => return CommandOutcome::reply(CommandError::wrong_type()),
+                    _ => return Err(CommandError::wrong_type()),
                 }
             }
         }
     }
-    let count = result.len() as i64;
-    let mut changed = db.del(&dest);
-    if !result.is_empty() {
-        use crate::foundation::io::store::structure::hashtable::HashTable;
-        let mut ht = HashTable::new();
-        for (k, v) in result {
-            ht.insert(k, v);
-        }
-        db.set(
-            dest.to_vec(),
-            Robj::zset_from_dict_with_limits(ht, max_entries, max_value_size),
-        );
-        changed = true;
-    }
-    CommandOutcome {
-        reply: Value::integer(count),
-        effects: CommandEffects {
-            changed_keys: changed
-                .then(|| (db_index, dest.clone()))
-                .into_iter()
-                .collect(),
-            events: changed
-                .then(|| CoreEvent {
-                    kind: "zinterstore",
-                    key: dest,
-                })
-                .into_iter()
-                .collect(),
-            skip_propagate: !changed,
-            ..CommandEffects::default()
-        },
-    }
+    Ok(result)
 }

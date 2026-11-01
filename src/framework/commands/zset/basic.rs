@@ -1,3 +1,6 @@
+use std::cmp::Ordering;
+use std::collections::HashMap;
+
 use crate::engine::command::{CommandArgs, CommandError};
 use crate::foundation::io::protocol::Value;
 use crate::foundation::io::store::structure::hashtable::HashTable;
@@ -194,4 +197,34 @@ pub fn aggregate_score(a: f64, b: f64, agg: Aggregate) -> f64 {
     } else {
         result
     }
+}
+
+/// Serialize a computed set operation without installing it in a database.
+pub(super) fn set_operation_reply(
+    scores: HashMap<Bytes, f64>,
+    has_scores: bool,
+    is_resp3: bool,
+) -> Value {
+    let mut entries: Vec<_> = scores.into_iter().collect();
+    entries.sort_unstable_by(|(left_member, left_score), (right_member, right_score)| {
+        left_score
+            .partial_cmp(right_score)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| left_member.cmp(right_member))
+    });
+    let mut output = Vec::new();
+    for (member, score) in entries {
+        if has_scores && is_resp3 {
+            output.push(Value::Array(vec![
+                Value::bulk(member),
+                score_value(score, true),
+            ]));
+        } else {
+            output.push(Value::bulk(member));
+            if has_scores {
+                output.push(score_value(score, is_resp3));
+            }
+        }
+    }
+    Value::Array(output)
 }
