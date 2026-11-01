@@ -3,6 +3,8 @@ use crate::engine::core::{CommandOutcome, Value};
 use crate::framework::commands::command_runtime::CommandRuntime;
 use command_macros::command;
 
+use super::keys;
+
 #[command("SCAN", runtime)]
 pub fn scan(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> CommandOutcome {
     let Some((cursor, options)) = args.args.split_first() else {
@@ -72,7 +74,7 @@ pub fn scan(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> CommandOutc
         });
     }
     if let Some(pattern) = pattern {
-        keys.retain(|key| scan_match(pattern, key));
+        keys.retain(|key| keys::glob_match(pattern, key));
     }
     if !suppress_lazy_expire {
         let mut live_keys = Vec::with_capacity(keys.len());
@@ -97,23 +99,71 @@ pub fn scan(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> CommandOutc
     ]))
 }
 
-fn scan_match(pattern: &[u8], value: &[u8]) -> bool {
-    let (mut p, mut v, mut star, mut retry) = (0, 0, None, 0);
-    while v < value.len() {
-        if pattern.get(p) == Some(&b'*') {
-            star = Some(p);
-            p += 1;
-            retry = v;
-        } else if pattern.get(p) == value.get(v) || pattern.get(p) == Some(&b'?') {
-            p += 1;
-            v += 1;
-        } else if let Some(position) = star {
-            p = position + 1;
-            retry += 1;
-            v = retry;
-        } else {
-            return false;
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+
+    use crate::engine::command::CommandArgs;
+    use crate::engine::core::Value;
+    use crate::foundation::io::store::Robj;
+    use crate::framework::commands::command_runtime::TestCommandRuntime;
+
+    #[test]
+    fn scan_matches_character_classes_ranges_negation_and_escapes() {
+        let mut runtime = TestCommandRuntime::new(1, 0);
+        let db = runtime.dbs.get_mut(0).expect("database zero");
+        for key in [
+            b"abc".as_slice(),
+            b"bbc",
+            b"cbc",
+            b"a*c",
+            b"a?c",
+            b"a[c",
+            b"a\0c",
+        ] {
+            db.set(key.to_vec(), Robj::string("value"));
+        }
+        for (pattern, expected) in [
+            (b"[a]bc".as_slice(), vec![b"abc".as_slice()]),
+            (b"[a-b]bc", vec![b"abc".as_slice(), b"bbc".as_slice()]),
+            (b"[^ab]bc", vec![b"cbc".as_slice()]),
+            (br"a\*c", vec![b"a*c".as_slice()]),
+            (br"a\?c", vec![b"a?c".as_slice()]),
+            (br"a\[c", vec![b"a[c".as_slice()]),
+            (b"a\0c", vec![b"a\0c".as_slice()]),
+        ] {
+            let mut cursor = Bytes::from_static(b"0");
+            let mut matches = Vec::new();
+            loop {
+                let args = CommandArgs::from_parts(vec![
+                    Bytes::from_static(b"SCAN"),
+                    cursor,
+                    Bytes::from_static(b"MATCH"),
+                    Bytes::copy_from_slice(pattern),
+                    Bytes::from_static(b"COUNT"),
+                    Bytes::from_static(b"1"),
+                ]);
+                let Value::Array(reply) = super::scan(&mut runtime, &args).reply else {
+                    panic!("SCAN must return an array");
+                };
+                let [Value::Bulk(next), Value::Array(keys)] = reply.as_slice() else {
+                    panic!("SCAN must return a cursor and matching keys");
+                };
+                matches.extend(keys.iter().cloned());
+                if next.as_ref() == b"0" {
+                    break;
+                }
+                cursor = next.clone();
+            }
+            let expected: Vec<_> = expected
+                .into_iter()
+                .map(|key| Value::bulk(key.to_vec()))
+                .collect();
+            // A stable dictionary visits each key once; ignore bucket order.
+            assert_eq!(matches.len(), expected.len());
+            for key in expected {
+                assert!(matches.contains(&key), "missing match {key:?}");
+            }
         }
     }
-    pattern[p..].iter().all(|byte| *byte == b'*')
 }
