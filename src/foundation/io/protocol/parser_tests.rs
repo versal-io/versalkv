@@ -433,6 +433,44 @@ fn inline_internal_cr_remains_an_argument_separator() {
 }
 
 #[test]
+fn bulk_terminators_are_validated_at_every_length_and_packet_boundary() {
+    for payload in [b"".as_slice(), b"a", b"ab"] {
+        for terminator in [b"XX", b"\rX", b"X\n", b"\r\n"] {
+            let mut request = format!("*2\r\n$4\r\nECHO\r\n${}\r\n", payload.len()).into_bytes();
+            request.extend_from_slice(payload);
+            request.extend_from_slice(terminator);
+            for split in 0..=request.len() {
+                let mut parser = Parser::new();
+                parser.feed(&request[..split]);
+                let first = parser.try_parse();
+                let result = if split == request.len() {
+                    first
+                } else {
+                    assert_eq!(first, Ok(None), "split at byte {split}");
+                    parser.feed(&request[split..]);
+                    parser.try_parse()
+                };
+                if terminator == b"\r\n" {
+                    assert_eq!(
+                        result,
+                        Ok(Some(vec![
+                            Bytes::from_static(b"ECHO"),
+                            Bytes::copy_from_slice(payload)
+                        ]))
+                    );
+                } else {
+                    assert!(
+                        matches!(result, Err(ParseError::Protocol(_))),
+                        "invalid terminator accepted for length {} at split {split}",
+                        payload.len()
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn inline_escape_sequences_are_processed() {
     let mut p = Parser::new();
     p.feed(b"\"a\\nb\"\r\n");
