@@ -404,6 +404,44 @@ fn try_parse_limited_rejects_over_limit_multibulk_and_bulk() {
 }
 
 #[test]
+fn multibulk_header_memory_is_bounded_by_initial_argument_limit() {
+    for count in [1_000_000, i32::MAX] {
+        let mut parser = Parser::new();
+        parser.feed(format!("*{count}\r\n").as_bytes());
+
+        assert!(parser
+            .try_parse()
+            .expect("valid multibulk header")
+            .is_none());
+        assert!(
+            parser.inflight_memory_usage().partial_argv <= 1024 * std::mem::size_of::<Bytes>(),
+            "a header without payload must not reserve the entire declared argument array"
+        );
+    }
+}
+
+#[test]
+fn multibulk_arguments_grow_incrementally_across_reads() {
+    let count = 2500;
+    let mut parser = Parser::new();
+    parser.feed(format!("*{count}\r\n").as_bytes());
+    for index in 0..count {
+        let argument = index.to_string();
+        parser.feed(format!("${}\r\n{argument}\r\n", argument.len()).as_bytes());
+        let result = parser.try_parse().expect("valid argument");
+        if index + 1 == count {
+            let arguments = result.expect("complete request");
+            assert_eq!(arguments.len(), count);
+            for (index, argument) in arguments.iter().enumerate() {
+                assert_eq!(argument.as_ref(), index.to_string().as_bytes());
+            }
+        } else {
+            assert!(result.is_none(), "incomplete request must remain buffered");
+        }
+    }
+}
+
+#[test]
 fn invalid_crlf_and_bulk_length_errors() {
     let mut p = Parser::new();
     p.feed(b"*1\rX\n");
