@@ -1222,6 +1222,37 @@ fn ready_upstream_replication_is_dispatched_before_ordinary_clients() {
 }
 
 #[test]
+fn ready_dual_rdb_channel_is_dispatched_before_main_replication_stream() {
+    let mut backend = ServerWorkerState::new(1).unwrap();
+    let main = ConnectionId(42);
+    let rdb = ConnectionId(43);
+    backend
+        .replication_runtime
+        .set_replica_link(ReplicaLink::new(
+            main,
+            MasterInfo {
+                host: "127.0.0.1".to_string(),
+                port: 6379,
+            },
+        ));
+    backend
+        .replication_runtime
+        .set_replica_rdb_link(rdb, main)
+        .expect("dual RDB link can be registered");
+    let mut events = vec![
+        (Token(7), true, false, false, false),
+        (Token(main.0), true, false, false, false),
+        (Token(rdb.0), true, false, false, false),
+    ];
+
+    backend.prioritize_upstream_readiness(&mut events);
+
+    assert_eq!(events[0].0, Token(rdb.0));
+    assert_eq!(events[1].0, Token(main.0));
+    assert_eq!(events[2].0, Token(7));
+}
+
+#[test]
 fn blocked_service_dispatches_writable_while_deferring_protected_read() {
     let mut backend = ServerWorkerState::new(1).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind replica-main listener");
