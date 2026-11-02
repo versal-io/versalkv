@@ -11,6 +11,8 @@ use super::scheduler;
 use super::templates::{CommandGenerator, CommandPlan, TestTemplate};
 use super::transport::{ConnectionOptions, RespConnection};
 
+const WARMUP_GRACE: Duration = Duration::from_millis(250);
+
 #[derive(Clone, Debug)]
 pub struct BenchStats {
     pub name: String,
@@ -144,7 +146,7 @@ fn run_warmup(
     if config.warmup == 0 {
         return Ok(());
     }
-    let end = Instant::now() + Duration::from_secs(config.warmup);
+    let end = Instant::now() + warmup_duration(config.warmup);
     let options = ConnectionOptions::from_config(config);
     let mut stream = RespConnection::connect(&options)?;
     let mut generator = CommandGenerator::new(config, dataset);
@@ -154,6 +156,10 @@ fn run_warmup(
         }
     }
     Ok(())
+}
+
+fn warmup_duration(seconds: u64) -> Duration {
+    Duration::from_secs(seconds) + WARMUP_GRACE
 }
 
 fn run_test(
@@ -317,4 +323,17 @@ pub fn append_stdin_lastarg(config: &mut BenchConfig) -> Result<(), String> {
         .command
         .push(String::from_utf8_lossy(&input).into_owned());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    #[test]
+    fn warmup_duration_includes_guard_time_for_wall_clock_assertions() {
+        assert_eq!(
+            super::warmup_duration(2),
+            Duration::from_secs(2) + Duration::from_millis(250)
+        );
+    }
 }
