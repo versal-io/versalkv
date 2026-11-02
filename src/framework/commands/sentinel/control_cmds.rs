@@ -2,14 +2,15 @@ use crate::engine::command::context::CommandConn;
 use crate::engine::distributed::sentinel::failover::vote_for_leader;
 use crate::engine::distributed::sentinel::failover::{select_replica, start_failover};
 use crate::engine::distributed::sentinel::{
-    format_sentinel_endpoint, DownState, SentinelInstance, SentinelInstanceId, SentinelState,
-    MONITORED_INSTANCE_FAILOVER_NS,
+    format_sentinel_endpoint, split_sentinel_endpoint, DownState, SentinelInstance,
+    SentinelInstanceId, SentinelState, MONITORED_INSTANCE_FAILOVER_NS,
 };
 use crate::foundation::io::protocol::Value;
 use crate::foundation::io::sys::time::mstime;
 use crate::framework::context::ServerContext;
 use crate::framework::{CommandArgs, CommandError};
 use bytes::Bytes;
+use std::net::{IpAddr, ToSocketAddrs};
 
 #[path = "control_set.rs"]
 mod control_set;
@@ -279,8 +280,41 @@ fn master_name_for_addr(ctx: &ServerContext, addr: &str) -> Option<String> {
     ctx.sentinel_state()
         .registry
         .masters()
-        .find(|(_, master)| master.addr == addr)
+        .find(|(_, master)| sentinel_endpoints_match(&master.addr, addr))
         .map(|(name, _)| name.to_string())
+}
+
+fn sentinel_endpoints_match(left: &str, right: &str) -> bool {
+    if left == right {
+        return true;
+    }
+    let (Some(left), Some(right)) = (split_sentinel_endpoint(left), split_sentinel_endpoint(right))
+    else {
+        return false;
+    };
+    left.port == right.port && sentinel_hosts_match(left.host, right.host)
+}
+
+fn sentinel_hosts_match(left: &str, right: &str) -> bool {
+    if left.eq_ignore_ascii_case(right) {
+        return true;
+    }
+    let left_ips = resolve_sentinel_host(left);
+    let right_ips = resolve_sentinel_host(right);
+    left_ips.iter().any(|left_ip| {
+        right_ips.iter().any(|right_ip| {
+            left_ip == right_ip
+                || (left_ip.is_unspecified() && right_ip.is_loopback())
+                || (right_ip.is_unspecified() && left_ip.is_loopback())
+        })
+    })
+}
+
+fn resolve_sentinel_host(host: &str) -> Vec<IpAddr> {
+    (host, 0_u16)
+        .to_socket_addrs()
+        .map(|addrs| addrs.map(|addr| addr.ip()).collect())
+        .unwrap_or_default()
 }
 
 fn reported_down(ctx: &ServerContext, master: &SentinelInstance, now: i64) -> i64 {

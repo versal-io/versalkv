@@ -4,7 +4,7 @@ use super::control_set::{
 };
 use super::{
     ensure_failover_candidate, failover_in_progress_error, is_primary_down, parse_failover_request,
-    parse_down_request, remove_monitored_master, validate_no_control_chars,
+    master_name_for_addr, parse_down_request, remove_monitored_master, validate_no_control_chars,
 };
 use crate::engine::command::CommandArgs;
 use crate::engine::distributed::sentinel::{
@@ -79,6 +79,21 @@ fn ipv6_vote_request_is_normalized_to_internal_endpoint() {
 
     let request = parse_down_request(&args).unwrap();
     assert_eq!(request.addr, "[::1]:6379");
+}
+
+#[test]
+fn down_by_addr_matches_wildcard_primary_address_by_resolved_endpoint() {
+    let mut ctx = crate::framework::context::ServerContext::new(1);
+    let master = SentinelInstance::new_master(1, "primary", "0.0.0.0:6379", 1);
+    ctx.sentinel_state_mut()
+        .registry
+        .insert_master(master.name.clone(), master)
+        .unwrap();
+
+    assert_eq!(
+        master_name_for_addr(&ctx, "127.0.0.1:6379").as_deref(),
+        Some("primary")
+    );
 }
 
 #[test]

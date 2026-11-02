@@ -266,6 +266,7 @@ impl ServerWorkerState {
         let Some(limit) = self.effective_client_memory_limit() else {
             return;
         };
+        self.drain_protected_clients();
         let mut total = self.ctx.normal_client_memory();
         if total <= limit {
             return;
@@ -1786,6 +1787,37 @@ mod tests {
             .connection_registry
             .contains(crate::framework::capabilities::io::Token(large_token.0)));
         assert_eq!(runtime.ctx.normal_client_memory(), expected_remaining);
+        assert_eq!(runtime.ctx.stats().evicted_clients, 1);
+    }
+
+    #[test]
+    fn client_eviction_applies_pending_debug_protection_before_selecting_candidates() {
+        use crate::framework::capabilities::connection::Connection;
+        use crate::framework::capabilities::io::Token;
+
+        let mut runtime = ServerWorkerState::new(1).unwrap();
+        runtime.ctx.config_mut().server.maxmemory_clients = "128kb".to_string();
+        let protected_token = Token(45);
+        let mut protected = Connection::new(protected_token, ([127, 0, 0, 1], 6380).into(), false);
+        protected.queue_reply(vec![b'x'; 200 * 1024]);
+        let protected_id = protected.client_id();
+        let protected_slab = runtime.connection_registry.insert(protected);
+        runtime.refresh_all_client_memory_usage();
+        runtime.ctx.protect_client(protected_id);
+
+        runtime.evict_clients();
+
+        assert!(runtime
+            .connection_registry
+            .contains(crate::framework::capabilities::io::Token(protected_slab)));
+        assert!(
+            runtime.connection_registry[crate::framework::capabilities::io::Token(protected_slab)]
+                .protected
+        );
+        assert!(
+            runtime.connection_registry[crate::framework::capabilities::io::Token(protected_slab)]
+                .is_async_close_pending
+        );
         assert_eq!(runtime.ctx.stats().evicted_clients, 1);
     }
 
