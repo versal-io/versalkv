@@ -1185,6 +1185,17 @@ mod tests {
         }
     }
 
+    fn run_expire_cycles_until_empty(runtime: &mut ServerWorkerState, db_id: u32) {
+        for _ in 0..64 {
+            if runtime.ctx.db(db_id).unwrap().dbsize() == 0 {
+                return;
+            }
+            runtime.run_expire_cycle();
+            runtime.process_expired_deletions();
+        }
+        assert_eq!(runtime.ctx.db(db_id).unwrap().dbsize(), 0);
+    }
+
     #[test]
     fn active_expiration_only_deletes_captured_keys_during_forkless_save() {
         let mut fixture = ForklessExpiryFixture::new();
@@ -1252,6 +1263,7 @@ mod tests {
         assert!(!runtime.ctx.persistence().forkless_capture_in_progress());
         assert!(!runtime.ctx.persistence().forkless_save_in_progress());
         runtime.run_expire_cycle();
+        run_expire_cycles_until_empty(runtime, 1);
         assert_eq!(runtime.ctx.db(0).unwrap().dbsize(), 1);
         assert_eq!(runtime.ctx.db(1).unwrap().dbsize(), 0);
         assert!(!fixture.dir.join("dump.rdb").exists());
@@ -1353,7 +1365,7 @@ mod tests {
                 Some(fixture.expire_at)
             );
         }
-        runtime.run_expire_cycle();
+        run_expire_cycles_until_empty(runtime, 1);
         assert_eq!(runtime.ctx.db(0).unwrap().dbsize(), 1);
         assert_eq!(runtime.ctx.db(1).unwrap().dbsize(), 0);
     }

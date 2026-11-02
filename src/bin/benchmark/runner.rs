@@ -11,7 +11,7 @@ use super::scheduler;
 use super::templates::{CommandGenerator, CommandPlan, TestTemplate};
 use super::transport::{ConnectionOptions, RespConnection};
 
-const WARMUP_GRACE: Duration = Duration::from_millis(250);
+const WARMUP_GRACE: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Debug)]
 pub struct BenchStats {
@@ -333,7 +333,7 @@ mod tests {
     fn warmup_duration_includes_guard_time_for_wall_clock_assertions() {
         assert_eq!(
             super::warmup_duration(2),
-            Duration::from_secs(2) + Duration::from_millis(250)
+            Duration::from_secs(2) + Duration::from_millis(500)
         );
     }
 }

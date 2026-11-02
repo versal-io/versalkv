@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use command_macros::command;
-use rustc_apfloat::Float;
+use rustc_apfloat::{Float, Status};
 
 use crate::engine::command::{CommandArgs, CommandError};
 use crate::engine::core::{CommandEffects, CommandOutcome, CoreEvent, Value};
@@ -451,11 +451,12 @@ impl Operation {
                 if is_declined {
                     return float_result(old, LongDouble::ZERO, false);
                 }
-                let mut next = add_long_double(old, increment).value;
+                let added = add_long_double(old, increment);
+                let mut next = added.value;
                 if next.is_nan() {
                     return Err(Value::error("ERR Increment is not a valid float"));
                 }
-                let is_upper = if next.is_infinite() {
+                let is_upper = if added.status.intersects(Status::OVERFLOW) || next.is_infinite() {
                     Some(!next.is_negative())
                 } else if next > upper {
                     Some(true)
