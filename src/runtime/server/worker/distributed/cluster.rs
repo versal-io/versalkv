@@ -23,6 +23,7 @@ pub(crate) struct ClusterConfigFile {
     pub lock: Option<ClusterConfigLock>,
     pub last_best_effort_warning_ms: i64,
     pub writer: Option<crate::runtime::server::worker::flows::maintenance::ClusterConfigWriter>,
+    pub pending_best_effort_saves: usize,
 }
 
 pub(crate) struct ClusterConfigLock {

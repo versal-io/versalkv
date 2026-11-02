@@ -57,6 +57,9 @@ pub fn replicaof(
         let is_now_replica = ctx.config().replication.master_host.is_some();
         if is_now_replica {
             if !was_replica {
+                if ctx.replication().throttle.is_active() || !ctx.throttled_clients().is_empty() {
+                    ctx.replication_mut().force_full_sync_on_next_reconnect = true;
+                }
                 ctx.replication_mut().switch_to_replica();
             } else if current_target != previous_target {
                 ctx.replication_mut().rebind_replica_resume_on_next_reconnect = true;

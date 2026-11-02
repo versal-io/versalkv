@@ -213,7 +213,10 @@ impl ServerWorkerState {
                 .writer
                 .as_ref()
                 .expect("save worker was initialized")
-                .submit(path, content, do_fsync)
+                .submit(path, content, do_fsync)?;
+            self.cluster_config.pending_best_effort_saves += 1;
+            state.config_save_succeeded = false;
+            Ok(())
         })();
         if result.is_err() {
             self.cluster_config.writer.take();
@@ -233,7 +236,18 @@ impl ServerWorkerState {
         is_best_effort: bool,
         finished_at_sec: i64,
     ) {
-        state.config_save_succeeded = result.is_ok();
+        let has_pending_best_effort_saves = if is_best_effort {
+            self.cluster_config.pending_best_effort_saves = self
+                .cluster_config
+                .pending_best_effort_saves
+                .saturating_sub(1);
+            self.cluster_config.pending_best_effort_saves > 0
+        } else {
+            false
+        };
+        if !has_pending_best_effort_saves {
+            state.config_save_succeeded = result.is_ok();
+        }
         if let Err(error) = result {
             crate::server_log!(warning, "{}", error);
             let now = finished_at_sec.saturating_mul(1_000);
@@ -417,5 +431,33 @@ mod tests {
         );
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn best_effort_status_does_not_report_success_until_all_saves_complete() {
+        let mut runtime = ServerWorkerState::new(1).unwrap();
+        let mut state = ClusterState::new("127.0.0.1", 6379, 16_379);
+        state.config_save_succeeded = false;
+        runtime.cluster_config.pending_best_effort_saves = 2;
+
+        runtime.record_cluster_config_completion(
+            &mut state,
+            &Ok(()),
+            true,
+            crate::foundation::io::sys::time::mstime() / 1_000,
+        );
+
+        assert!(!state.config_save_succeeded);
+        assert_eq!(runtime.cluster_config.pending_best_effort_saves, 1);
+
+        runtime.record_cluster_config_completion(
+            &mut state,
+            &Ok(()),
+            true,
+            crate::foundation::io::sys::time::mstime() / 1_000,
+        );
+
+        assert!(state.config_save_succeeded);
+        assert_eq!(runtime.cluster_config.pending_best_effort_saves, 0);
     }
 }

@@ -3393,6 +3393,57 @@ fn primary_with_new_writes_replaces_an_old_second_replid_resume() {
 }
 
 #[test]
+fn primary_demoted_while_throttling_forces_full_sync() {
+    let mut backend = ServerWorkerState::new(1).unwrap();
+    backend
+        .ctx
+        .replication_mut()
+        .backlog
+        .append(b"upstream-history")
+        .unwrap();
+    let upstream_replid = backend.ctx.replication().backlog.replid().to_string();
+    let upstream_offset = backend.ctx.replication().backlog.reported_offset();
+    backend.ctx.replication_mut().backlog.shift_replication_id();
+    backend
+        .ctx
+        .replication_mut()
+        .backlog
+        .append(b"local-writes-while-replica-output-was-throttled")
+        .unwrap();
+    let target = MasterInfo {
+        host: "127.0.0.1".to_string(),
+        port: 6380,
+    };
+    backend.replication_runtime.set_replica_resume(
+        target.clone(),
+        upstream_replid,
+        upstream_offset,
+        0,
+    );
+    backend
+        .ctx
+        .replication_mut()
+        .throttle
+        .adjust(true, 1024, true, &[(1, 8 * 1024 * 1024)]);
+    backend.ctx.config_mut().replication.master_host = Some(target.host.clone());
+    backend.ctx.config_mut().replication.master_port = target.port;
+    backend.ctx.replication_mut().role =
+        crate::engine::distributed::replication::ReplicationRole::Replica;
+    backend
+        .ctx
+        .replication_mut()
+        .cache_primary_on_next_reconnect = true;
+    backend.ctx.replication_mut().pending_replicaof_request = true;
+
+    backend.apply_pending_replicaof_request();
+
+    assert_eq!(
+        backend.replication_runtime.replica_resume_for(&target),
+        None
+    );
+}
+
+#[test]
 fn accepted_psync_failover_clears_the_old_primary_failover_state() {
     let mut backend = ServerWorkerState::new(1).unwrap();
     let paused = 88usize;

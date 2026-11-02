@@ -1319,8 +1319,16 @@ impl ServerWorkerState {
         if !self.ctx.replication().is_replica() {
             self.replication_runtime.clear_replica_resume();
         }
+        if self.ctx.replication().is_replica()
+            && (self.ctx.replication().throttle.is_active()
+                || !self.ctx.throttled_clients().is_empty())
+        {
+            self.ctx.replication_mut().force_full_sync_on_next_reconnect = true;
+        }
         self.schedule_master_reconnect(MasterReconnectCause::ExplicitTargetChange);
-        if self.ctx.replication().cache_primary_on_next_reconnect {
+        if self.ctx.replication().cache_primary_on_next_reconnect
+            && !self.ctx.replication().force_full_sync_on_next_reconnect
+        {
             let master = crate::framework::distributed::replication::MasterInfo {
                 host: self
                     .ctx
