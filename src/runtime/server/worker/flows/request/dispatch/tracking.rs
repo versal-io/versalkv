@@ -312,11 +312,11 @@ impl ServerWorkerState {
         let mut pending_publish = Vec::new();
         let replication_start = fx.replication_only.len();
         let aof_start = fx.aof_only.len();
-        // These frames are appended as one deferred segment. Start each sink
-        // from an unknown DB so the segment is self-contained, then reuse its
-        // local cursor across consecutive evictions.
-        let mut replication_selected_db = -1;
-        let mut aof_selected_db = -1;
+        // These frames are appended as one deferred segment. Reuse the physical
+        // replication/AOF cursors independently, then keep a local cursor across
+        // consecutive evictions in this segment.
+        let mut replication_selected_db = self.ctx.repl_seldb();
+        let mut aof_selected_db = self.ctx.persistence().aof_selected_db();
         for (db_idx, key) in evicted {
             fx.watch_dirty.push((db_idx, key.clone()));
             self._queue_eviction_unlink_with_cursors(

@@ -42,6 +42,21 @@ fn command_time_evictions_reuse_the_queued_cursor_after_one_explicit_select() {
 }
 
 #[test]
+fn command_time_eviction_reuses_the_global_replication_cursor() {
+    let mut backend = ServerWorkerState::new(16).unwrap();
+    backend.ctx.replication_mut().backlog.activate();
+    backend.ctx.set_repl_seldb(9);
+    let mut effects = DispatchSideEffects::default();
+    let unlink =
+        crate::engine::distributed::replication::protocol::encode_command(&[b"UNLINK", b"victim"]);
+
+    backend.apply_command_evictions(42, vec![(9, Bytes::from_static(b"victim"))], &mut effects);
+
+    assert_eq!(effects.replication_only, vec![unlink]);
+    assert_eq!(backend.ctx.repl_seldb(), 9);
+}
+
+#[test]
 fn command_time_eviction_is_counted_before_write_offset() {
     let mut backend = ServerWorkerState::new(16).unwrap();
     crate::framework::commands::register_all(&mut backend.registry);
