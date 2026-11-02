@@ -224,6 +224,11 @@ impl EventBatch {
         self.insert_next_turn(QueueTarget::BeforePoll(slot), event);
     }
 
+    pub(crate) fn push_ready_next_turn(&mut self, mut event: EventLoopEvent) {
+        event.phase = EventPhase::Ready;
+        self.insert_next_turn(QueueTarget::Ready(event.lane), event);
+    }
+
     pub(crate) fn push_time(&mut self, deadline: MonotonicInstant, mut event: EventLoopEvent) {
         let EventOwner::Timer(id) = event.owner else {
             panic!("time events require a timer owner");

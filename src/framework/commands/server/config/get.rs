@@ -10,58 +10,21 @@ pub fn config_get(args: &CommandArgs, ctx: &ServerContext) -> Value {
     if args.args.len() < 2 {
         return CommandError::wrong_arity("config");
     }
-    let patterns: Vec<String> = args.args[1..]
-        .iter()
-        .map(|arg| String::from_utf8_lossy(arg).to_ascii_lowercase())
-        .collect();
+    let patterns: Vec<&[u8]> = args.args[1..].iter().map(Bytes::as_ref).collect();
     let mut results = Vec::new();
 
-    let matches = |name: &str| -> bool {
-        patterns.iter().any(|pattern| {
-            pattern == "*"
-                || pattern == name
-                || pattern
-                    .strip_suffix('*')
-                    .is_some_and(|prefix| name.starts_with(prefix))
-        })
-    };
-
-    let add_bulk = |results: &mut Vec<Value>, name: &'static str, val: Value| {
-        results.push(Value::bulk(Bytes::from(name.as_bytes().to_vec())));
-        results.push(val);
-    };
-    let add_str = |results: &mut Vec<Value>, name: &'static str, v: &[u8]| {
-        add_bulk(results, name, Value::bulk(Bytes::copy_from_slice(v)));
+    let pattern_matches = |pattern: &[u8], name: &str| -> bool {
+        if pattern
+            .iter()
+            .any(|byte| matches!(byte, b'[' | b'*' | b'?'))
+        {
+            crate::framework::commands::pattern::string_match(pattern, name.as_bytes(), true)
+        } else {
+            pattern.eq_ignore_ascii_case(name.as_bytes())
+        }
     };
     let r = ctx.config();
-    if args.args[2..]
-        .iter()
-        .any(|arg| arg.eq_ignore_ascii_case(b"*of"))
-    {
-        add_str(&mut results, "slaveof", b"");
-        add_str(&mut results, "replicaof", b"");
-    }
-    if args.args[2..]
-        .iter()
-        .any(|arg| arg.eq_ignore_ascii_case(b"maxmemory*"))
-    {
-        add_str(
-            &mut results,
-            "maxmemory-clients",
-            r.server.maxmemory_clients.as_bytes(),
-        );
-    }
-    let mut seen_keys: Vec<Vec<u8>> = results
-        .iter()
-        .step_by(2)
-        .filter_map(|v| {
-            if let Value::Bulk(bytes) = v {
-                Some(bytes.to_vec())
-            } else {
-                None
-            }
-        })
-        .collect();
+    let mut seen_keys: Vec<Vec<u8>> = Vec::new();
     let mut add_from_registry = |results: &mut Vec<Value>, name: &str, val: &ConfigValue| {
         let name_bytes = name.as_bytes().to_vec();
         if seen_keys.iter().any(|k| k == &name_bytes) {
@@ -74,23 +37,25 @@ pub fn config_get(args: &CommandArgs, ctx: &ServerContext) -> Value {
     };
     for spec in config_registry().all_specs() {
         let name = spec.name;
-        let name_match = matches(name);
-        let alias_match = spec.alias.is_some_and(matches);
-        if !name_match && !alias_match {
-            continue;
-        }
-        let exact_match = patterns
-            .iter()
-            .any(|pattern| pattern == name || spec.alias.is_some_and(|alias| pattern == alias));
-        if spec.is_hidden() && !exact_match {
-            continue;
-        }
-        let val = (spec.get)(r);
-        if name_match {
-            add_from_registry(&mut results, name, &val);
-        }
-        if let Some(alias) = spec.alias {
-            if matches(alias) {
+        for pattern in &patterns {
+            let has_glob = pattern
+                .iter()
+                .any(|byte| matches!(byte, b'[' | b'*' | b'?'));
+            if spec.is_hidden() && has_glob {
+                continue;
+            }
+            let name_match = pattern_matches(pattern, name);
+            let alias_match = spec
+                .alias
+                .is_some_and(|alias| pattern_matches(pattern, alias));
+            if !name_match && !alias_match {
+                continue;
+            }
+            let val = (spec.get)(r);
+            if name_match {
+                add_from_registry(&mut results, name, &val);
+            }
+            if let Some(alias) = spec.alias.filter(|_| alias_match) {
                 add_from_registry(&mut results, alias, &val);
             }
         }
@@ -155,5 +120,95 @@ mod tests {
         assert!(keys.contains(&b"replicaof".as_slice()));
         assert!(keys.contains(&b"slaveof".as_slice()));
         assert!(keys.contains(&b"bind".as_slice()));
+    }
+
+    #[test]
+    fn config_get_preserves_escaped_character_class_case() {
+        let ctx = ServerContext::new(1);
+        let escaped = CommandArgs::from_parts(vec![
+            Bytes::from_static(b"CONFIG"),
+            Bytes::from_static(b"GET"),
+            Bytes::from_static(br"[\M]axmemory"),
+        ]);
+        let unescaped = CommandArgs::from_parts(vec![
+            Bytes::from_static(b"CONFIG"),
+            Bytes::from_static(b"GET"),
+            Bytes::from_static(b"[M]axmemory"),
+        ]);
+
+        assert_eq!(config_get(&escaped, &ctx), Value::Array(Vec::new()));
+        let Value::Array(values) = config_get(&unescaped, &ctx) else {
+            panic!("CONFIG GET must return an array");
+        };
+        assert!(values.iter().step_by(2).any(
+            |value| matches!(value, Value::Bulk(bytes) if bytes.as_ref() == b"maxmemory")
+        ));
+    }
+
+    #[test]
+    fn config_get_treats_backslash_as_literal_without_glob_metacharacters() {
+        let ctx = ServerContext::new(1);
+        let args = CommandArgs::from_parts(vec![
+            Bytes::from_static(b"CONFIG"),
+            Bytes::from_static(b"GET"),
+            Bytes::from_static(br"\maxmemory"),
+        ]);
+
+        assert_eq!(config_get(&args, &ctx), Value::Array(Vec::new()));
+    }
+
+    #[test]
+    fn config_get_exact_lookup_is_case_insensitive() {
+        let ctx = ServerContext::new(1);
+        let args = CommandArgs::from_parts(vec![
+            Bytes::from_static(b"CONFIG"),
+            Bytes::from_static(b"GET"),
+            Bytes::from_static(b"MAXMEMORY"),
+        ]);
+
+        let Value::Array(values) = config_get(&args, &ctx) else {
+            panic!("CONFIG GET must return an array");
+        };
+        let keys: Vec<_> = values
+            .iter()
+            .step_by(2)
+            .filter_map(|value| match value {
+                Value::Bulk(bytes) => Some(bytes.as_ref()),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(keys, vec![b"maxmemory".as_slice()]);
+    }
+
+    #[test]
+    fn config_get_hidden_alias_is_not_unlocked_for_other_patterns() {
+        let ctx = ServerContext::new(1);
+        let args = CommandArgs::from_parts(vec![
+            Bytes::from_static(b"CONFIG"),
+            Bytes::from_static(b"GET"),
+            Bytes::from_static(b"lua-*"),
+            Bytes::from_static(b"lua-enable-deprecated-api"),
+        ]);
+
+        let Value::Array(values) = config_get(&args, &ctx) else {
+            panic!("CONFIG GET must return an array");
+        };
+        let keys: Vec<_> = values
+            .iter()
+            .step_by(2)
+            .filter_map(|value| match value {
+                Value::Bulk(bytes) => Some(bytes.as_ref()),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            keys,
+            vec![
+                b"lua-enable-deprecated-api".as_slice(),
+                b"lua-time-limit".as_slice(),
+            ]
+        );
     }
 }

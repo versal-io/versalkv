@@ -163,3 +163,21 @@ fn restore_rejects_corrupt_payload() {
         .command_str(&[b"RESTORE", b"dst", b"0", &payload])
         .contains("checksum"));
 }
+
+#[test]
+fn restore_skip_checksum_still_rejects_future_payload_version() {
+    let srv = TestServer::start_default();
+    let mut c = srv.connect();
+    let payload = [
+        0x00, 0xc0, 0x01, 0x64, 0x00, 0x80, 0x8d, 0x93, 0x54, 0xb2, 0xcc, 0x9f, 0x81,
+    ];
+
+    assert_eq!(
+        c.command(&[b"DEBUG", b"SET-SKIP-CHECKSUM-VALIDATION", b"1"]),
+        b"+OK\r\n"
+    );
+    assert!(c
+        .command_str(&[b"RESTORE", b"probe", b"0", &payload])
+        .contains("version or checksum"));
+    assert_eq!(c.command(&[b"PING"]), b"+PONG\r\n");
+}

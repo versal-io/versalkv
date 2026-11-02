@@ -493,7 +493,7 @@ impl ServerWorkerState {
             }
         }
         let connection = &mut self.connection_registry[token];
-        connection.cmd_count -= 1;
+        connection.cmd_count = connection.cmd_count.saturating_sub(1);
         connection.set_custom_reply_enabled(false);
     }
 

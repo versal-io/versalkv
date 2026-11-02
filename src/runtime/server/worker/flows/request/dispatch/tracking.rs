@@ -310,8 +310,22 @@ impl ServerWorkerState {
     ) {
         let mut queued_remote_invalidation = false;
         let mut pending_publish = Vec::new();
+        let replication_start = fx.replication_only.len();
+        let aof_start = fx.aof_only.len();
+        // These frames are appended as one deferred segment. Start each sink
+        // from an unknown DB so the segment is self-contained, then reuse its
+        // local cursor across consecutive evictions.
+        let mut replication_selected_db = -1;
+        let mut aof_selected_db = -1;
         for (db_idx, key) in evicted {
-            self._queue_eviction_unlink(db_idx, &key, fx);
+            fx.watch_dirty.push((db_idx, key.clone()));
+            self._queue_eviction_unlink_with_cursors(
+                db_idx,
+                &key,
+                fx,
+                &mut replication_selected_db,
+                &mut aof_selected_db,
+            );
             crate::runtime::server::worker::flows::maintenance::enqueue_evicted_key_notifications(
                 self.ctx.config(),
                 &mut pending_publish,
@@ -331,6 +345,30 @@ impl ServerWorkerState {
                 }
             }
         }
+        let replication_bytes = fx.replication_only[replication_start..]
+            .iter()
+            .map(Vec::len)
+            .sum();
+        let aof_bytes = fx.aof_only[aof_start..].iter().map(Vec::len).sum();
+        let logical_propagation_bytes = if replication_bytes == 0 {
+            aof_bytes
+        } else {
+            replication_bytes
+        };
+        let is_aof_enabled = self.ctx.config().persistence.aof_enabled;
+        if self
+            .ctx
+            .replication_mut()
+            .record_local_propagation(logical_propagation_bytes, is_aof_enabled)
+            .is_err()
+        {
+            crate::server_log!(
+                warning,
+                "Primary replication offset overflow; requesting server shutdown"
+            );
+            self.ctx.set_shutdown_requested(true);
+        }
+        self.commit_eviction_cursors(replication_selected_db, aof_selected_db);
         if !pending_publish.is_empty() {
             self.deliver_published(pending_publish, Vec::new());
         }
@@ -345,6 +383,26 @@ impl ServerWorkerState {
         key: &[u8],
         fx: &mut CommandEffects,
     ) {
+        let mut replication_selected_db = -1;
+        let mut aof_selected_db = -1;
+        self._queue_eviction_unlink_with_cursors(
+            db_idx,
+            key,
+            fx,
+            &mut replication_selected_db,
+            &mut aof_selected_db,
+        );
+        self.commit_eviction_cursors(replication_selected_db, aof_selected_db);
+    }
+
+    fn _queue_eviction_unlink_with_cursors(
+        &mut self,
+        db_idx: u32,
+        key: &[u8],
+        fx: &mut CommandEffects,
+        replication_selected_db: &mut i64,
+        aof_selected_db: &mut i64,
+    ) {
         let propagate_aof = self.ctx.config().persistence.aof_enabled;
         let propagate_replication =
             !self.ctx.replication().is_replica() && self.ctx.replication().backlog.is_active();
@@ -353,7 +411,7 @@ impl ServerWorkerState {
         }
 
         if propagate_aof && self.ctx.persistence_mut().take_rewrite_force_select() {
-            self.ctx.persistence_mut().reset_aof_selected_db();
+            *aof_selected_db = -1;
         }
         let frame =
             crate::engine::distributed::replication::protocol::encode_command(&[b"UNLINK", key]);
@@ -364,17 +422,22 @@ impl ServerWorkerState {
             (false, false) => return,
         };
         let op = PropagationOp::new(db_idx, targets, frame);
-        let sequenced = sequence_propagation(
-            &[op],
-            self.ctx.repl_seldb(),
-            self.ctx.persistence().aof_selected_db(),
-        );
-        self.ctx.set_repl_seldb(sequenced.replication_selected_db);
-        self.ctx
-            .persistence_mut()
-            .set_aof_selected_db(sequenced.aof_selected_db);
+        let sequenced = sequence_propagation(&[op], *replication_selected_db, *aof_selected_db);
+        *replication_selected_db = sequenced.replication_selected_db;
+        *aof_selected_db = sequenced.aof_selected_db;
         fx.replication_only.extend(sequenced.replication_frames);
         fx.aof_only.extend(sequenced.aof_frames);
+    }
+
+    fn commit_eviction_cursors(&mut self, replication_selected_db: i64, aof_selected_db: i64) {
+        if replication_selected_db >= 0 {
+            self.ctx.set_repl_seldb(replication_selected_db);
+        }
+        if aof_selected_db >= 0 {
+            self.ctx
+                .persistence_mut()
+                .set_aof_selected_db(aof_selected_db);
+        }
     }
 
     pub(crate) fn evict_tracking_table_if_needed(

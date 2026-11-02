@@ -66,6 +66,21 @@ pub trait ModuleRuntime {
     fn has_paused_writes(&self) -> bool {
         false
     }
+    fn command_would_block(
+        &self,
+        _command: &CommandDescriptor,
+        _args: &CommandArgs,
+        _db_idx: u32,
+    ) -> bool {
+        false
+    }
+    fn effective_command_flags(
+        &self,
+        command: &CommandDescriptor,
+        _args: &CommandArgs,
+    ) -> CmdFlags {
+        command.flags
+    }
     fn has_enough_replicas_to_write(&self) -> bool {
         true
     }
@@ -407,8 +422,9 @@ mod tests {
                 first_key: 0,
                 last_key: 0,
                 key_step: 0,
-                container: None,
+                key_flags: &[],
                 acl_categories: &[],
+                get_keys: None,
             })
         }
 

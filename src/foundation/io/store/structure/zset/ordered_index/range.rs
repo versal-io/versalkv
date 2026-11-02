@@ -1,3 +1,4 @@
+use super::super::{LexBound, LexRange};
 use super::{node::Entry, Node, NodeData, OrderedIndex};
 use bytes::Bytes;
 
@@ -28,12 +29,11 @@ impl OrderedIndex {
         lim: i64,
         rev: bool,
     ) -> Vec<(Bytes, f64)> {
+        if off < 0 {
+            return Vec::new();
+        }
         let (start, end) = self.score_ranks(min, max);
-        let skip = if off < 0 {
-            0
-        } else {
-            usize::try_from(off).unwrap_or(usize::MAX)
-        };
+        let skip = usize::try_from(off).unwrap_or(usize::MAX);
         if skip >= end - start || lim == 0 {
             return Vec::new();
         }
@@ -84,15 +84,61 @@ impl OrderedIndex {
         max_inc: bool,
         rev: bool,
     ) -> Vec<(Bytes, f64)> {
-        let mut entries: Vec<_> = self
-            .iter()
-            .filter(|(member, _)| is_in_lex_range(member, min, min_inc, max, max_inc))
-            .map(|(member, score)| (member.clone(), *score))
-            .collect();
-        if rev {
-            entries.reverse();
+        self.range_by_lex_with_limit((min, min_inc), (max, max_inc), 0, -1, rev)
+    }
+
+    pub fn range_by_lex_with_limit(
+        &self,
+        min: (&[u8], bool),
+        max: (&[u8], bool),
+        offset: i64,
+        limit: i64,
+        rev: bool,
+    ) -> Vec<(Bytes, f64)> {
+        self.range_by_lex_bounds_with_limit(
+            LexBound::from_parts(min.0, min.1),
+            LexBound::from_parts(max.0, max.1),
+            offset,
+            limit,
+            rev,
+        )
+    }
+
+    pub(crate) fn range_by_lex_bounds_with_limit(
+        &self,
+        min: LexBound,
+        max: LexBound,
+        offset: i64,
+        limit: i64,
+        rev: bool,
+    ) -> Vec<(Bytes, f64)> {
+        let range = LexRange { min, max };
+        if !self.can_search_lex_range(&range, offset, limit) {
+            return Vec::new();
         }
-        entries
+        let skip = usize::try_from(offset).unwrap_or(usize::MAX);
+        let take = if limit < 0 {
+            usize::MAX
+        } else {
+            usize::try_from(limit).unwrap_or(usize::MAX)
+        };
+        if rev {
+            collect_lex_entries(
+                self.iter_reverse(),
+                |member| range.meets_max(member),
+                |member| range.meets_min(member),
+                skip,
+                take,
+            )
+        } else {
+            collect_lex_entries(
+                self.iter(),
+                |member| range.meets_min(member),
+                |member| range.meets_max(member),
+                skip,
+                take,
+            )
+        }
     }
 
     pub fn count_in_lex_range(
@@ -102,9 +148,22 @@ impl OrderedIndex {
         max: &[u8],
         max_inc: bool,
     ) -> usize {
-        self.iter()
-            .filter(|(member, _)| is_in_lex_range(member, min, min_inc, max, max_inc))
-            .count()
+        self.count_in_lex_bounds(
+            LexBound::from_parts(min, min_inc),
+            LexBound::from_parts(max, max_inc),
+        )
+    }
+
+    pub(crate) fn count_in_lex_bounds(&self, min: LexBound, max: LexBound) -> usize {
+        let range = LexRange { min, max };
+        if !self.can_search_lex_range(&range, 0, -1) {
+            return 0;
+        }
+        count_lex_entries(
+            self.iter(),
+            |member| range.meets_min(member),
+            |member| range.meets_max(member),
+        )
     }
 
     pub fn iter(&self) -> OrderedIndexIter<'_> {
@@ -112,22 +171,38 @@ impl OrderedIndex {
             pending: vec![&self.root],
             leaf: [].iter(),
             remaining: self.len(),
+            is_reverse: false,
         }
     }
-}
 
-fn is_in_lex_range(member: &[u8], min: &[u8], min_inc: bool, max: &[u8], max_inc: bool) -> bool {
-    if min == b"+" || max == b"-" {
-        return false;
+    fn iter_reverse(&self) -> OrderedIndexIter<'_> {
+        OrderedIndexIter {
+            pending: vec![&self.root],
+            leaf: [].iter(),
+            remaining: self.len(),
+            is_reverse: true,
+        }
     }
-    (min == b"-" || member > min || (min_inc && member == min))
-        && (max == b"+" || member < max || (max_inc && member == max))
+
+    fn can_search_lex_range(&self, range: &LexRange, offset: i64, limit: i64) -> bool {
+        if self.is_empty() || offset < 0 || limit == 0 || !range.is_valid() {
+            return false;
+        }
+        let first = self.iter().next().map(|(member, _)| member.as_ref());
+        let last = self
+            .iter_reverse()
+            .next()
+            .map(|(member, _)| member.as_ref());
+        first.is_some_and(|member| range.meets_max(member))
+            && last.is_some_and(|member| range.meets_min(member))
+    }
 }
 
 pub struct OrderedIndexIter<'a> {
     pending: Vec<&'a Node>,
     leaf: std::slice::Iter<'a, Entry>,
     remaining: usize,
+    is_reverse: bool,
 }
 
 impl<'a> Iterator for OrderedIndexIter<'a> {
@@ -135,12 +210,20 @@ impl<'a> Iterator for OrderedIndexIter<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            if let Some(entry) = self.leaf.next() {
+            let entry = if self.is_reverse {
+                self.leaf.next_back()
+            } else {
+                self.leaf.next()
+            };
+            if let Some(entry) = entry {
                 self.remaining -= 1;
                 return Some((&entry.member, &entry.score));
             }
             match &self.pending.pop()?.data {
                 NodeData::Leaf(entries) => self.leaf = entries.iter(),
+                NodeData::Branch { children, .. } if self.is_reverse => {
+                    self.pending.extend(children.iter())
+                }
                 NodeData::Branch { children, .. } => self.pending.extend(children.iter().rev()),
             }
         }
@@ -153,3 +236,42 @@ impl<'a> Iterator for OrderedIndexIter<'a> {
 
 impl ExactSizeIterator for OrderedIndexIter<'_> {}
 impl std::iter::FusedIterator for OrderedIndexIter<'_> {}
+
+fn collect_lex_entries<'a>(
+    mut entries: impl Iterator<Item = (&'a Bytes, &'a f64)>,
+    starts_range: impl Fn(&[u8]) -> bool,
+    remains_in_range: impl Fn(&[u8]) -> bool,
+    skip: usize,
+    take: usize,
+) -> Vec<(Bytes, f64)> {
+    let Some(first) = entries.find(|(member, _)| starts_range(member)) else {
+        return Vec::new();
+    };
+    if !remains_in_range(first.0) {
+        return Vec::new();
+    }
+    std::iter::once(first)
+        .chain(entries)
+        .skip(skip)
+        .take(take)
+        .take_while(|(member, _)| remains_in_range(member))
+        .map(|(member, score)| (member.clone(), *score))
+        .collect()
+}
+
+fn count_lex_entries<'a>(
+    mut entries: impl Iterator<Item = (&'a Bytes, &'a f64)>,
+    starts_range: impl Fn(&[u8]) -> bool,
+    remains_in_range: impl Fn(&[u8]) -> bool,
+) -> usize {
+    let Some(first) = entries.find(|(member, _)| starts_range(member)) else {
+        return 0;
+    };
+    if !remains_in_range(first.0) {
+        return 0;
+    }
+    std::iter::once(first)
+        .chain(entries)
+        .take_while(|(member, _)| remains_in_range(member))
+        .count()
+}

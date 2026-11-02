@@ -503,6 +503,13 @@ impl ReplicaLink {
                         // discarded and we restart on DB 0 (§5.6).
                         self.selected_db = 0;
                     } else if let Some(new_replid) = protocol::parse_continue(&line) {
+                        if self.master_replid.is_none() || self.requested_offset.is_none() {
+                            crate::server_log!(
+                                warning,
+                                "Primary replied +CONTINUE to a full resynchronization request, will try later."
+                            );
+                            return Err(LinkError::TryLater);
+                        }
                         self.mark_failover_accepted();
                         self.partial_resync_accepted = true;
                         if let Some(rid) = new_replid {

@@ -513,6 +513,29 @@ fn slot_export_limit_counts_disconnect_once_and_preserves_peer_connection_loss_s
 }
 
 #[test]
+fn migration_teardown_does_not_reenter_connection_removal() {
+    let (mut runtime, _peer, _id) = setup_registered_import_runtime();
+    let token = runtime
+        .connection_registry
+        .iter()
+        .find_map(|(_, connection)| {
+            matches!(
+                connection.slot_migration_role,
+                Some(SlotMigrationConnectionRole::Import(_))
+            )
+            .then_some(connection.token())
+        })
+        .expect("registered import connection");
+    runtime.transport.fail_remove_for_test();
+
+    runtime.remove_connection(token.0);
+
+    assert!(!runtime.connection_registry.contains(token));
+    assert!(runtime.transport.is_registered(token));
+    assert!(runtime.pending_transport_removals.contains_key(&token));
+}
+
+#[test]
 fn arm_slot_export_output_reports_interest_failure() {
     let (mut runtime, _peer, id) = setup_export_runtime();
     let connection_id = runtime
@@ -1394,7 +1417,7 @@ fn cleanup_releases_export_allocation_before_clearing_a_retained_connection_role
 }
 
 #[test]
-fn cleanup_keeps_export_role_until_connection_is_closed() {
+fn cleanup_removes_terminal_export_connection_immediately() {
     let mut runtime = ServerWorkerState::new(1).unwrap();
     let id = MigrationJobId::parse(b"cccccccccccccccccccccccccccccccccccccccc").unwrap();
     let token = Token(92);
@@ -1411,16 +1434,53 @@ fn cleanup_keeps_export_role_until_connection_is_closed() {
 
     runtime.drive_slot_migration_actions();
 
-    assert_eq!(
-        runtime.connection_registry[crate::framework::capabilities::io::Token(connection_token)]
-            .state,
-        ConnectionState::Closing
-    );
-    assert_eq!(
-        runtime.connection_registry[crate::framework::capabilities::io::Token(connection_token)]
-            .slot_migration_role,
-        Some(SlotMigrationConnectionRole::Export(id))
-    );
+    assert!(!runtime
+        .connection_registry
+        .contains(crate::framework::capabilities::io::Token(connection_token)));
+    assert_eq!(runtime.slot_migration_runtime.export_connection(&id), None);
+}
+
+#[test]
+fn terminal_cleanup_closes_export_socket_without_draining_pending_output() {
+    let (mut runtime, mut peer, id) = setup_export_runtime();
+    peer.set_read_timeout(Some(std::time::Duration::from_secs(1)))
+        .unwrap();
+    let connection_id = runtime
+        .slot_migration_runtime
+        .export_connection(&id)
+        .expect("connected export has a runtime connection");
+    runtime.connection_registry[Token(connection_id)]
+        .queue_replication_reply(vec![b'x'; 128 * 1024]);
+    runtime.reconcile_slot_export_output_allocation(connection_id);
+    let actions = runtime
+        .ctx
+        .cluster_state_mut()
+        .as_deref_mut()
+        .unwrap()
+        .migrations
+        .finish(
+            &id,
+            crate::engine::distributed::cluster::migration::TerminalPhase::Cancelled,
+            None,
+            crate::foundation::io::sys::time::unixtime(),
+        )
+        .unwrap();
+    runtime
+        .ctx
+        .cluster_state_mut()
+        .as_deref_mut()
+        .unwrap()
+        .queue_migration_actions(actions);
+
+    runtime.drive_slot_migration_actions();
+
+    assert!(!runtime.connection_registry.contains(Token(connection_id)));
+    assert!(!runtime.transport.is_registered(Token(connection_id)));
+    assert_eq!(runtime.writes.slot_export_allocation_bytes, 0);
+    let mut received = Vec::new();
+    peer.read_to_end(&mut received)
+        .expect("terminal cleanup must close the export socket");
+    assert!(received.is_empty());
 }
 
 #[test]
@@ -1509,14 +1569,22 @@ fn target_oom_fails_live_import_before_applying_write() {
         bytes::Bytes::copy_from_slice(key),
         bytes::Bytes::from_static(b"value"),
     ]);
-
-    assert!(runtime.apply_slot_import_command(connection_token, args));
+    let mut effects = ReadBatchEffects::default();
 
     assert_eq!(
-        runtime.connection_registry[crate::framework::capabilities::io::Token(connection_token)]
-            .state,
-        ConnectionState::Closing
+        runtime.process_parsed_command(
+            Token(connection_token),
+            args,
+            "set".to_string(),
+            false,
+            &mut effects,
+        ),
+        crate::runtime::server::worker::flows::request::dispatch::LoopAction::Break
     );
+
+    assert!(!runtime
+        .connection_registry
+        .contains(crate::framework::capabilities::io::Token(connection_token)));
     let job = runtime
         .ctx
         .cluster_state()
@@ -1918,6 +1986,115 @@ fn forkless_capture_reblocks_live_import_write_after_generic_unpause_wakeup() {
         runtime.ctx.slot_import_key_count(0, slot as usize),
         before + 1
     );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn forkless_capture_keeps_import_write_blocked_after_serving_key_resolution() {
+    let mut runtime = ServerWorkerState::new_with_slot_router(1, 14, |key| {
+        crate::engine::distributed::cluster::node::key_hash_slot(key) as usize
+    })
+    .unwrap();
+    crate::framework::commands::register_all(&mut runtime.registry);
+    let id = MigrationJobId::parse(b"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee").unwrap();
+    let key = b"{forkless-import}priority-resolved";
+    let slot = crate::engine::distributed::cluster::node::key_hash_slot(key);
+    let ranges = SlotRanges::new(vec![SlotRange::new(slot, slot).unwrap()]).unwrap();
+    runtime.ctx.create_slot_import(id.clone(), &ranges);
+    runtime
+        .ctx
+        .apply_slot_import(
+            &id,
+            crate::engine::command::CommandArgs::from_parts(vec![
+                bytes::Bytes::from_static(b"SET"),
+                bytes::Bytes::from_static(b"{forkless-import}existing"),
+                bytes::Bytes::from_static(b"value"),
+            ]),
+            &runtime.registry,
+        )
+        .unwrap();
+    for index in 0..256 {
+        runtime.ctx.db_mut(0).unwrap().set(
+            format!("serving-seed-{index}").into_bytes(),
+            crate::foundation::io::store::Robj::string("value"),
+        );
+    }
+
+    let dir = std::env::temp_dir().join(format!(
+        "versal-forkless-slot-import-priority-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    runtime.ctx.config_mut().persistence.dir = dir.to_string_lossy().into_owned();
+    runtime.ctx.config_mut().persistence.dbfilename = "dump.rdb".to_string();
+    runtime.ctx.config_mut().persistence.bgsave_default_method =
+        crate::engine::extension::config::persistence::BgsaveMethod::Forkless;
+    runtime.ctx.config_mut().persistence.rdb_key_save_delay = 0;
+    crate::framework::commands::server::save::start_bgsave(&mut runtime.ctx).unwrap();
+    assert!(runtime.ctx.persistence().forkless_capture_in_progress());
+    assert!(runtime
+        .ctx
+        .prioritize_forkless_keys(0, std::iter::once(key.to_vec())));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !runtime.ctx.persistence().forkless_key_captured(0, key) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "priority key was not captured before the deadline"
+        );
+        runtime.ctx.drive_forkless_feed();
+        std::thread::yield_now();
+    }
+    assert!(runtime.ctx.persistence().forkless_capture_in_progress());
+
+    let token = Token(97);
+    let mut connection = Connection::new_fake();
+    connection.set_token_for_test(token);
+    connection.slot_migration_role = Some(SlotMigrationConnectionRole::Import(id));
+    runtime.connection_registry.insert(connection);
+    let before = runtime.ctx.slot_import_key_count(0, slot as usize);
+    let mut effects = ReadBatchEffects::default();
+    runtime.process_parsed_command(
+        token,
+        crate::engine::command::CommandArgs::from_parts(vec![
+            bytes::Bytes::from_static(b"SET"),
+            bytes::Bytes::copy_from_slice(key),
+            bytes::Bytes::from_static(b"value"),
+        ]),
+        "set".to_string(),
+        false,
+        &mut effects,
+    );
+    assert!(matches!(
+        runtime.connection_registry[token]
+            .blocked
+            .as_ref()
+            .map(|blocked| &blocked.cmd),
+        Some(BlockedCmd::Forkless)
+    ));
+
+    runtime.release_forkless_clients();
+
+    assert_eq!(runtime.ctx.slot_import_key_count(0, slot as usize), before);
+    assert!(runtime.ctx.db(0).unwrap().get_no_expire(key).is_none());
+    assert!(matches!(
+        runtime.connection_registry[token]
+            .blocked
+            .as_ref()
+            .map(|blocked| &blocked.cmd),
+        Some(BlockedCmd::Forkless)
+    ));
+
+    runtime
+        .ctx
+        .abort_forkless_save(crate::foundation::io::sys::time::mstime() / 1_000);
+    runtime.release_forkless_clients();
+    assert_eq!(
+        runtime.ctx.slot_import_key_count(0, slot as usize),
+        before + 1
+    );
+    assert!(runtime.ctx.db(0).unwrap().get_no_expire(key).is_none());
     let _ = std::fs::remove_dir_all(dir);
 }
 

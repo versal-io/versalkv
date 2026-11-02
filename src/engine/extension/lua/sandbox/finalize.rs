@@ -241,6 +241,10 @@ pub(in crate::engine::extension::lua) fn finalize_sandbox(lua: &Lua) -> Result<(
         lib_redis_saved.register_function = saved['__vky_reg_fn']
         lib_redis_saved.REDIS_VERSION_NUM = saved['redis'].REDIS_VERSION_NUM
         lib_redis_saved.REDIS_VERSION = saved['redis'].REDIS_VERSION
+        for _, name in _orig_pairs({'log', 'LOG_DEBUG', 'LOG_VERBOSE', 'LOG_NOTICE', 'LOG_WARNING'}) do
+            lib_api.server[name] = saved.server[name]
+            lib_redis_saved[name] = saved.redis[name]
+        end
         local lib_redis_proxy = {}
         local lib_redis_proxy_meta = {
             __index = function(t, k)

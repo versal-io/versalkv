@@ -1,8 +1,9 @@
 use crate::engine::core::{CommandEffects, CommandOutcome, CoreEvent, Value};
 use crate::foundation::io::persistence;
 use crate::foundation::io::persistence::codec::types::{
-    RDB_TYPE_HASH_ZIPMAP, RDB_TYPE_STREAM_LISTPACKS, RDB_TYPE_STREAM_LISTPACKS_2,
-    RDB_TYPE_STREAM_LISTPACKS_3, RDB_TYPE_ZSET_LISTPACK, RDB_TYPE_ZSET_ZIPLIST,
+    load_len, RDB_ENC_LZF, RDB_TYPE_HASH_ZIPMAP, RDB_TYPE_STREAM_LISTPACKS,
+    RDB_TYPE_STREAM_LISTPACKS_2, RDB_TYPE_STREAM_LISTPACKS_3, RDB_TYPE_STRING,
+    RDB_TYPE_ZSET_LISTPACK, RDB_TYPE_ZSET_ZIPLIST,
 };
 use crate::framework::commands::command_runtime::CommandRuntime;
 use crate::framework::{CommandArgs, CommandError};
@@ -147,7 +148,9 @@ pub fn restore(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> CommandO
                 return CommandOutcome::reply(Value::error("ERR Bad data format"));
             }
             Ok(_) | Err(persistence::ObjectLoadError::Invalid) => {
-                log_restore_integrity_failure(type_byte);
+                if !log_restore_allocation_failure(body) {
+                    log_restore_integrity_failure(type_byte);
+                }
                 return CommandOutcome::reply(Value::error("ERR Bad data format"));
             }
         };
@@ -231,15 +234,18 @@ fn verify_payload(p: &[u8], skip_checksum: bool, rdb_relaxed: bool) -> Result<()
     if p.len() < 10 {
         return Err(());
     }
-    if skip_checksum {
-        return Ok(());
-    }
     let footer = &p[p.len() - 10..];
     let rdbver = u16::from_le_bytes([footer[0], footer[1]]);
-    // DUMP payloads from older Redis/Valkey versions are valid input for
-    // RESTORE; only future versions are rejected before object decoding.
-    if !rdb_relaxed && rdbver > persistence::RDB_VERSION {
+    if !persistence::types::is_rdb_version_accepted(
+        i32::from(rdbver),
+        false,
+        false,
+        !rdb_relaxed,
+    ) {
         return Err(());
+    }
+    if skip_checksum {
+        return Ok(());
     }
     let crc = persistence::crc64(0, &p[..p.len() - 8]);
     if crc.to_le_bytes() != footer[2..10] {
@@ -271,15 +277,68 @@ fn log_restore_integrity_failure(type_byte: Option<u8>) {
     }
 }
 
+fn log_restore_allocation_failure(body: &[u8]) -> bool {
+    if body.first().copied() != Some(RDB_TYPE_STRING) {
+        return false;
+    }
+    let mut position = 1;
+    let Some((length, encoded)) = load_len(body, &mut position) else {
+        return false;
+    };
+    if !encoded {
+        if !rdb_string_allocation_fits(length) {
+            log::warn!("rdbGenericLoadStringObject failed allocating {length} bytes");
+            return true;
+        }
+        return false;
+    }
+    if length as u8 != RDB_ENC_LZF {
+        return false;
+    }
+    let Some((_, false)) = load_len(body, &mut position) else {
+        return false;
+    };
+    let Some((uncompressed, false)) = load_len(body, &mut position) else {
+        return false;
+    };
+    if !rdb_string_allocation_fits(uncompressed) {
+        log::warn!("rdbLoadLzfStringObject failed allocating {uncompressed} bytes");
+        return true;
+    }
+    false
+}
+
+fn rdb_string_allocation_fits(length: u64) -> bool {
+    usize::try_from(length)
+        .ok()
+        .is_some_and(|length| length <= isize::MAX as usize)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::restore;
+    use super::{restore, verify_payload};
     use crate::engine::core::Value;
     use crate::foundation::io::store::Robj;
     use crate::framework::commands::command_runtime::{CommandRuntime, TestCommandRuntime};
     use crate::framework::commands::generic::dump::serialize_object_with_hash_field_expires_with_compression;
     use crate::framework::CommandArgs;
     use bytes::Bytes;
+
+    fn dump_payload_with_version(version: u16) -> Vec<u8> {
+        let mut payload = vec![0, 0xc0, 1];
+        payload.extend_from_slice(&version.to_le_bytes());
+        payload.extend_from_slice(&[0; 8]);
+        payload
+    }
+
+    #[test]
+    fn skipped_checksum_still_enforces_dump_version_policy() {
+        assert!(verify_payload(&dump_payload_with_version(0), true, true).is_err());
+        assert!(verify_payload(&dump_payload_with_version(79), true, false).is_err());
+        assert!(verify_payload(&dump_payload_with_version(79), true, true).is_ok());
+        assert!(verify_payload(&dump_payload_with_version(100), true, false).is_err());
+        assert!(verify_payload(&dump_payload_with_version(100), true, true).is_ok());
+    }
 
     #[test]
     fn past_replace_signals_only_actual_deletion() {

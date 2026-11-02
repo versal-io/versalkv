@@ -62,6 +62,8 @@ pub struct ClusterNode {
     pub ping_sent: i64,
     /// Pong received timestamp (ms).
     pub pong_received: i64,
+    /// Time when the node entered FAIL state (ms).
+    pub fail_time: i64,
     /// Last time any valid Cluster Bus frame was received from this node.
     pub data_received: i64,
     /// Node creation time, matching C clusterNode.ctime.
@@ -123,6 +125,7 @@ impl ClusterNode {
             replicaof: String::new(),
             ping_sent: 0,
             pong_received: 0,
+            fail_time: 0,
             data_received: 0,
             created_at: crate::foundation::io::sys::time::mstime(),
             handshake_retry_on_timeout: false,

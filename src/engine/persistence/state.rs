@@ -5,7 +5,7 @@ use crate::foundation::io::persistence::snapshot::background::{
     BackgroundRdbSave, RdbSaveOutcome, RdbSaveProgress,
 };
 use crate::foundation::io::store::kv_engine::DbSet;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,6 +151,8 @@ pub struct PersistenceState {
     forkless_feed: Option<ForklessFeed>,
     forkless_keys: HashSet<ForklessItemId>,
     forkless_captured_keys: HashSet<ForklessItemId>,
+    forkless_current_to_original_db: HashMap<u32, u32>,
+    forkless_original_to_current_db: HashMap<u32, u32>,
     bgsave_scheduled: Option<BgsaveMethod>,
     aof_rewrite_scheduled: bool,
 }
@@ -210,6 +212,8 @@ impl PersistenceState {
             forkless_feed: None,
             forkless_keys: HashSet::new(),
             forkless_captured_keys: HashSet::new(),
+            forkless_current_to_original_db: HashMap::new(),
+            forkless_original_to_current_db: HashMap::new(),
             bgsave_scheduled: None,
             aof_rewrite_scheduled: false,
         }
@@ -369,6 +373,8 @@ impl PersistenceState {
             })
             .collect();
         self.forkless_captured_keys.clear();
+        self.forkless_current_to_original_db.clear();
+        self.forkless_original_to_current_db.clear();
         self.forkless_feed = feed;
         self.forkless = Some((task, self.dirty));
         Ok(())
@@ -386,15 +392,17 @@ impl PersistenceState {
             .unwrap_or_default();
         let mut released_any = false;
         for item in completed {
-            if release_forkless_item(primary, additional_datasets, &item) {
+            let current_item = self.forkless_item_at_current_db(&item);
+            if release_forkless_item(primary, additional_datasets, &current_item) {
                 released_any |= self.forkless_keys.remove(&item);
             }
         }
         if let Some(feed) = self.forkless_feed.as_mut() {
             feed.drive(primary, additional_datasets, 128);
-            self.forkless_keys.extend(feed.take_shared_keys());
+            self.forkless_keys.extend(feed.take_queued_keys());
             self.forkless_captured_keys
                 .extend(feed.take_captured_keys());
+            released_any |= !feed.take_resolved_keys().is_empty();
             if feed.is_finished() {
                 self.forkless_feed = None;
             }
@@ -405,7 +413,7 @@ impl PersistenceState {
     pub fn forkless_key_blocked(&self, db_id: u32, key: &[u8]) -> bool {
         self.forkless_keys.contains(&ForklessItemId {
             dataset_id: None,
-            db_id,
+            db_id: self.forkless_original_db(db_id),
             key: key.to_vec(),
         })
     }
@@ -413,9 +421,71 @@ impl PersistenceState {
     pub fn forkless_key_captured(&self, db_id: u32, key: &[u8]) -> bool {
         self.forkless_captured_keys.contains(&ForklessItemId {
             dataset_id: None,
-            db_id,
+            db_id: self.forkless_original_db(db_id),
             key: key.to_vec(),
         })
+    }
+
+    pub fn prioritize_forkless_keys(
+        &mut self,
+        db_id: u32,
+        keys: impl IntoIterator<Item = Vec<u8>>,
+    ) -> bool {
+        let db_id = self.forkless_original_db(db_id);
+        if let Some(feed) = self.forkless_feed.as_mut() {
+            return feed.prioritize_keys(db_id, keys);
+        }
+        false
+    }
+
+    pub fn swap_forkless_databases(&mut self, first: u32, second: u32) {
+        if first == second || !self.forkless_save_in_progress() {
+            return;
+        }
+        let first_original = self.forkless_original_db(first);
+        let second_original = self.forkless_original_db(second);
+        set_non_identity_mapping(
+            &mut self.forkless_current_to_original_db,
+            first,
+            second_original,
+        );
+        set_non_identity_mapping(
+            &mut self.forkless_current_to_original_db,
+            second,
+            first_original,
+        );
+        set_non_identity_mapping(
+            &mut self.forkless_original_to_current_db,
+            first_original,
+            second,
+        );
+        set_non_identity_mapping(
+            &mut self.forkless_original_to_current_db,
+            second_original,
+            first,
+        );
+        if let Some(feed) = self.forkless_feed.as_mut() {
+            feed.swap_databases(first, second);
+        }
+    }
+
+    fn forkless_original_db(&self, current_db: u32) -> u32 {
+        self.forkless_current_to_original_db
+            .get(&current_db)
+            .copied()
+            .unwrap_or(current_db)
+    }
+
+    fn forkless_item_at_current_db(&self, item: &ForklessItemId) -> ForklessItemId {
+        let mut current = item.clone();
+        if current.dataset_id.is_none() {
+            current.db_id = self
+                .forkless_original_to_current_db
+                .get(&current.db_id)
+                .copied()
+                .unwrap_or(current.db_id);
+        }
+        current
     }
 
     pub fn set_forkless_key_delay(&self, delay_us: i64) {
@@ -476,13 +546,22 @@ impl PersistenceState {
         self.forkless_feed = None;
         self.forkless_captured_keys.clear();
         let outcome = task.finish();
-        for item in self.forkless_keys.drain() {
+        let original_to_current = &self.forkless_original_to_current_db;
+        for mut item in self.forkless_keys.drain() {
+            if item.dataset_id.is_none() {
+                item.db_id = original_to_current
+                    .get(&item.db_id)
+                    .copied()
+                    .unwrap_or(item.db_id);
+            }
             let released = release_forkless_item(primary, additional_datasets, &item);
             debug_assert!(
                 released,
                 "background save completion must release every shared value"
             );
         }
+        self.forkless_current_to_original_db.clear();
+        self.forkless_original_to_current_db.clear();
         match &outcome {
             RdbSaveOutcome::Saved => {
                 self.rdb.last_bgsave_status = OperationStatus::Ok;
@@ -779,6 +858,14 @@ impl PersistenceState {
             None => {}
         }
         child
+    }
+}
+
+fn set_non_identity_mapping(map: &mut HashMap<u32, u32>, from: u32, to: u32) {
+    if from == to {
+        map.remove(&from);
+    } else {
+        map.insert(from, to);
     }
 }
 

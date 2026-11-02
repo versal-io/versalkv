@@ -97,7 +97,11 @@ impl ServerWorkerState {
         if !self.should_defer_slot_import_write(token_value, &input.args)
             && self.apply_slot_import_command(token_value, input.args.clone())
         {
-            return if self.connection_registry[input.token].state == ConnectionState::Closing {
+            return if self
+                .connection_registry
+                .get(input.token)
+                .is_none_or(|connection| connection.state == ConnectionState::Closing)
+            {
                 fx.mark_closing = true;
                 LoopAction::Break
             } else {

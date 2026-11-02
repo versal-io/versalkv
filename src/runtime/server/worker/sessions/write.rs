@@ -799,6 +799,8 @@ impl ServerWorkerState {
             self.remove_connection(context.token.0);
         } else if flushed_dual_rdb_client_id && !keep_master_paused {
             self.read_dual_rdb_ack_after_flush(context.token);
+        } else {
+            self.queue_forked_debugger_for_reprocessing(context.token);
         }
     }
 

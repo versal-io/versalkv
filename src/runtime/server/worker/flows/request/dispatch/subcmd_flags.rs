@@ -1,30 +1,6 @@
 use crate::engine::command::CmdFlags;
 use crate::engine::command::CommandArgs;
 use crate::framework::context::ServerContext;
-use crate::framework::generated::commands as g;
-
-pub(super) fn subcommand_gate_flags(name: &str, sub: Option<&[u8]>) -> CmdFlags {
-    let Some(sub) = sub else {
-        return 0;
-    };
-    let Ok(sub) = std::str::from_utf8(sub) else {
-        return 0;
-    };
-    let sub_lower = sub.to_ascii_lowercase();
-    g::SUBCOMMAND_GATE_FLAGS
-        .iter()
-        .find(|(container, s, _)| *container == name && *s == sub_lower)
-        .map(|(_, _, flags)| *flags)
-        .unwrap_or(0)
-}
-
-pub(super) fn effective_command_flags(
-    name: &str,
-    base_flags: CmdFlags,
-    sub: Option<&[u8]>,
-) -> CmdFlags {
-    base_flags | subcommand_gate_flags(name, sub)
-}
 
 /// Resolve the ACL categories of the concrete subcommand selected by the
 /// first argument. Unknown or non-UTF-8 subcommands retain the container's
@@ -46,16 +22,12 @@ pub(crate) fn effective_command_flags_for_call(
     args: &CommandArgs,
     ctx: &ServerContext,
 ) -> CmdFlags {
-    let flags =
-        effective_command_flags(name, base_flags, args.args.first().map(|arg| arg.as_ref()));
-    super::script_helpers::effective_script_command_flags(name, flags, args, ctx)
+    crate::framework::spec::effective_command_flags_for_call(name, base_flags, args, ctx)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        effective_acl_categories, effective_command_flags, effective_command_flags_for_call,
-    };
+    use super::{effective_acl_categories, effective_command_flags_for_call};
     use crate::engine::command::{
         CommandArgs, CMD_DENYOOM, CMD_MAY_REPLICATE, CMD_STALE, CMD_WRITE,
     };
@@ -64,7 +36,12 @@ mod tests {
 
     #[test]
     fn effective_flags_include_cluster_setslot_replication_metadata() {
-        let flags = effective_command_flags("cluster", 0, Some(b"SETSLOT"));
+        let ctx = ServerContext::new(1);
+        let args = CommandArgs::from_parts(vec![
+            Bytes::from_static(b"CLUSTER"),
+            Bytes::from_static(b"SETSLOT"),
+        ]);
+        let flags = effective_command_flags_for_call("cluster", 0, &args, &ctx);
         assert_ne!(flags & CMD_MAY_REPLICATE, 0);
     }
 

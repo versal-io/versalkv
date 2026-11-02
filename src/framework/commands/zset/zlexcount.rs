@@ -15,11 +15,11 @@ fn zlexcount_reply(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> Valu
     }
     let min_raw = &args.args[1];
     let max_raw = &args.args[2];
-    let (min_val, min_inc) = match parse_lex_bound(min_raw) {
+    let min = match parse_lex_bound(min_raw) {
         Some(v) => v,
         None => return Value::error("ERR min or max not valid string range item"),
     };
-    let (max_val, max_inc) = match parse_lex_bound(max_raw) {
+    let max = match parse_lex_bound(max_raw) {
         Some(v) => v,
         None => return Value::error("ERR min or max not valid string range item"),
     };
@@ -32,7 +32,5 @@ fn zlexcount_reply(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> Valu
         Ok(Some(m)) => m,
         Err(_) => return CommandError::wrong_type(),
     };
-    Value::integer(
-        zset.zset_count_by_lex(&min_val, min_inc, &max_val, max_inc) as i64,
-    )
+    Value::integer(zset.zset_count_by_lex_bounds(min, max) as i64)
 }

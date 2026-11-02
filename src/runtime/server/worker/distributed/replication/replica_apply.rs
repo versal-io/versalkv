@@ -397,9 +397,9 @@ impl ServerWorkerState {
         if let Some(received_rdb) = received_rdb {
             received_rdb.commit().map_err(|_| ())?;
         }
+        self.install_prepared_functions(&prepared.function_codes)?;
         self.install_prepared_dataset(link, &mut prepared, rdb_boundary);
         self.install_prepared_aux(&prepared.aux_fields);
-        self.install_prepared_functions(&prepared.function_codes);
         let reused_aof_base = aof_base.is_some();
         self.publish_prepared_aof_base(aof_base);
         if delete_received_rdb && !reused_aof_base {
@@ -593,18 +593,8 @@ impl ServerWorkerState {
         self.ctx.dbs_mut().set_replica_local_expire_only_all(false);
     }
 
-    fn install_prepared_functions(&mut self, function_codes: &[Vec<u8>]) {
-        self.ctx.script_mut().function_registry.flush();
-        for code in function_codes {
-            let code = String::from_utf8_lossy(code);
-            let name = crate::engine::extension::lua::shebang::extract_shebang_name(&code)
-                .expect("prevalidated function library must have a name");
-            self.ctx
-                .script_mut()
-                .function_registry
-                .load_library(&name, &code)
-                .expect("prevalidated function library must install");
-        }
+    fn install_prepared_functions(&mut self, function_codes: &[Vec<u8>]) -> Result<(), ()> {
+        crate::framework::host_tasks::replace_function_libraries(&mut self.ctx, function_codes)
     }
 
     fn finish_streamed_loading_state(&mut self, link: &ReplicaLink, reused_aof_base: bool) {
@@ -1389,10 +1379,14 @@ impl ServerWorkerState {
                     String::from_utf8_lossy(&args.name)
                 );
             }
+            let error = replication_unknown_command_error(
+                args,
+                self.ctx.config().server.hide_user_data_from_log,
+            );
             crate::server_log!(
                 warning,
-                "== CRITICAL == This primary is sending an error to its replica: unknown command '{}'",
-                String::from_utf8_lossy(&args.name)
+                "== CRITICAL == This primary is sending an error to its replica: '{}' after processing the command '<unknown>'",
+                error
             );
             self.propagate_and_aof(relay_stream, &frame);
             return Ok((0, None));
@@ -1462,6 +1456,17 @@ impl ServerWorkerState {
                 .config()
                 .replication
                 .should_panic_on_propagation_error(false);
+        let replication_error_log = match &result {
+            crate::foundation::io::protocol::Value::Error(error) => Some((
+                replication_command_error_for_log(
+                    error,
+                    args,
+                    self.ctx.config().server.hide_user_data_from_log,
+                ),
+                spec.name.as_str().to_ascii_lowercase(),
+            )),
+            _ => None,
+        };
         let (selected_db, dirty_keys, lazyfree_objects, swapdb, pending, pending_shard) = {
             let Some(conn) = self.connection_registry.get_mut(Token(connection_token)) else {
                 return Err(());
@@ -1472,12 +1477,12 @@ impl ServerWorkerState {
                 }
             }
             conn.import_source = false;
-            if let crate::foundation::io::protocol::Value::Error(error) = &result {
+            if let Some((error, command)) = &replication_error_log {
                 crate::server_log!(
                     warning,
                     "== CRITICAL == This primary is sending an error to its replica: '{}' after processing the command '{}'",
-                    String::from_utf8_lossy(error),
-                    String::from_utf8_lossy(&args.name)
+                    error,
+                    command
                 );
             }
             let mut effects = conn
@@ -1618,6 +1623,18 @@ impl ServerWorkerState {
             self.feed_aof(frame);
         }
     }
+}
+
+fn replication_unknown_command_error(args: &CommandArgs, hide_user_data: bool) -> String {
+    super::render_unknown_replication_command_for_log(args, hide_user_data)
+}
+
+fn replication_command_error_for_log(
+    error: &[u8],
+    args: &CommandArgs,
+    hide_user_data: bool,
+) -> String {
+    super::render_replication_error_for_log(error, args, hide_user_data)
 }
 
 /// Log an RDB decode failure on the replica full-sync load path with C's

@@ -449,6 +449,10 @@ impl AutomaticFailover {
         self.rejected_voters.len()
     }
 
+    pub fn has_voter_response(&self, voter: &NodeId) -> bool {
+        self.voters.contains(voter) || self.rejected_voters.contains(voter)
+    }
+
     pub fn vote_rejection_reason(&self, facts: &VoteRequestFacts) -> Option<u8> {
         if !facts.local_is_voting_primary {
             return None;

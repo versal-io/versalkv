@@ -1,6 +1,8 @@
 use super::super::super::ServerWorkerState;
 use crate::engine::command::CommandArgs;
 use crate::engine::distributed::cluster::migration::SlotMigrationConnectionRole;
+use crate::engine::extension::script::PropagationOp;
+use crate::runtime::server::worker::distributed::propagation::sequence_propagation;
 
 impl ServerWorkerState {
     pub(crate) fn should_defer_slot_import_write(
@@ -51,14 +53,30 @@ impl ServerWorkerState {
         {
             return false;
         }
-        let rejects_for_oom = self.registry.lookup(&args.name).is_some_and(|spec| {
-            (spec.flags & crate::engine::command::CMD_DENYOOM) != 0
-                && self.ctx.maxmemory_state().is_over_limit()
-        });
-        if rejects_for_oom {
-            self.fail_slot_migration(&id, "Ran out of memory (OOM) during slot import");
+        if args.name.eq_ignore_ascii_case(b"reset") {
             self.connection_registry[crate::framework::capabilities::io::Token(connection_token)]
                 .mark_closing();
+            self.fail_slot_migration(&id, "RESET is not allowed on a slot migration connection");
+            return true;
+        }
+        let command_flags = self.registry.lookup(&args.name).map_or(0, |spec| {
+            crate::runtime::server::worker::flows::request::dispatch::subcmd_flags::effective_command_flags_for_call(
+                spec.name.as_str(),
+                spec.flags,
+                &args,
+                &self.ctx,
+            )
+        });
+        if command_flags & crate::engine::command::CMD_WRITE != 0 {
+            self.ctx.set_suppress_eviction_until_write(false);
+        }
+        self.propagate_slot_import_evictions();
+        let rejects_for_oom = command_flags & crate::engine::command::CMD_DENYOOM != 0
+            && self.ctx.maxmemory_state().is_over_limit();
+        if rejects_for_oom {
+            self.connection_registry[crate::framework::capabilities::io::Token(connection_token)]
+                .mark_closing();
+            self.fail_slot_migration(&id, "Ran out of memory (OOM) during slot import");
             return true;
         }
         let frame =
@@ -66,7 +84,7 @@ impl ServerWorkerState {
         let command_name = args.name.clone();
         let is_outer_execution = self.command_execution_depth == 0;
         self.command_execution_depth += 1;
-        let (result, execution) =
+        let (result, execution, selected_db) =
             self.ctx
                 .apply_slot_import_with_execution(&id, args, &self.registry);
         self.command_execution_depth -= 1;
@@ -86,19 +104,37 @@ impl ServerWorkerState {
                 String::from_utf8_lossy(&command_name),
                 error
             );
+            self.connection_registry[crate::framework::capabilities::io::Token(connection_token)]
+                .mark_closing();
             self.fail_slot_migration(
                 &id,
                 "Failed to process command during slot migration. Check logs for more information",
             );
-            self.connection_registry[crate::framework::capabilities::io::Token(connection_token)]
-                .mark_closing();
         } else {
-            self.propagate_to_replicas(&frame);
-            if self.ctx.config().persistence.aof_enabled {
-                self.feed_aof(&frame);
+            if !command_name.eq_ignore_ascii_case(b"select") {
+                let sequenced =
+                    sequence_propagation(&[PropagationOp::both(selected_db, frame)], -1, -1);
+                self.ctx.set_repl_seldb(sequenced.replication_selected_db);
+                self.ctx
+                    .persistence_mut()
+                    .set_aof_selected_db(sequenced.aof_selected_db);
+                for frame in &sequenced.replication_frames {
+                    self.propagate_to_replicas(frame);
+                }
+                if self.ctx.config().persistence.aof_enabled {
+                    for frame in &sequenced.aof_frames {
+                        self.feed_aof(frame);
+                    }
+                }
             }
+            self.propagate_slot_import_evictions();
         }
         true
+    }
+
+    fn propagate_slot_import_evictions(&mut self) {
+        let evicted = self.perform_evictions().evicted;
+        self.apply_background_evictions(evicted);
     }
 }
 

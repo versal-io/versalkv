@@ -85,6 +85,43 @@ fn sync_parent_directory(_path: &Path) -> io::Result<()> {
 }
 
 impl ServerWorkerState {
+    pub(crate) fn lock_cluster_config(&mut self, path: PathBuf) -> io::Result<()> {
+        let mut lock_path = path.as_os_str().to_os_string();
+        lock_path.push(".lock");
+        let lock_path = PathBuf::from(lock_path);
+        let lock = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!(
+                        "Can't open {} in order to acquire a lock: {error}",
+                        lock_path.display()
+                    ),
+                )
+            })?;
+        if let Err(error) = crate::foundation::io::sys::os::try_lock_file_exclusive(&lock) {
+            let message = if error.kind() == io::ErrorKind::WouldBlock {
+                format!(
+                    "Sorry, the cluster configuration file {} is already used by a different Cluster node. Please make sure that different nodes use different cluster configuration files.",
+                    path.display()
+                )
+            } else {
+                format!("Impossible to lock {}: {error}", lock_path.display())
+            };
+            crate::server_log!(warning, "{}", message);
+            return Err(io::Error::new(error.kind(), message));
+        }
+        self.cluster_config.path = Some(path);
+        self.cluster_config.lock = Some(
+            crate::runtime::server::worker::distributed::cluster::ClusterConfigLock::new(lock),
+        );
+        Ok(())
+    }
+
     pub(crate) fn resolve_cluster_config_save_request(
         &mut self,
         connection_token: usize,

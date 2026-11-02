@@ -95,6 +95,14 @@ impl MigrationCommandPlayer {
         Self { conn }
     }
 
+    pub(crate) fn selected_db(&self) -> u32 {
+        self.conn
+            .transaction
+            .selected_db()
+            .and_then(|db| u32::try_from(db).ok())
+            .unwrap_or(self.conn.selected_db)
+    }
+
     pub fn apply(
         &mut self,
         args: CommandArgs,
@@ -123,5 +131,41 @@ impl MigrationCommandPlayer {
             ctx,
         );
         (result.map_err(MigrationApplyError::Command), execution)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MigrationCommandPlayer;
+    use crate::framework::context::ServerContext;
+    use crate::framework::{CommandArgs, CommandRegistry};
+    use bytes::Bytes;
+
+    #[test]
+    fn transaction_selected_db_tracks_queued_select_before_exec() {
+        let mut registry = CommandRegistry::new();
+        crate::framework::commands::register_all(&mut registry);
+        let mut ctx = ServerContext::new(2);
+        let mut player = MigrationCommandPlayer::new();
+
+        player
+            .apply(
+                CommandArgs::from_parts(vec![Bytes::from_static(b"MULTI")]),
+                &registry,
+                &mut ctx,
+            )
+            .unwrap();
+        player
+            .apply(
+                CommandArgs::from_parts(vec![
+                    Bytes::from_static(b"SELECT"),
+                    Bytes::from_static(b"1"),
+                ]),
+                &registry,
+                &mut ctx,
+            )
+            .unwrap();
+
+        assert_eq!(player.selected_db(), 1);
     }
 }

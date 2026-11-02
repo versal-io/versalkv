@@ -20,6 +20,9 @@ impl ServerContext {
             self.config(),
             ranges.clone(),
         );
+        self.slot_import_infrastructure_memory = self
+            .slot_import_infrastructure_memory
+            .saturating_add(dataset.infrastructure_memory());
         self.slot_imports.insert(id, Box::new(dataset));
     }
 
@@ -49,6 +52,7 @@ impl ServerContext {
     ) -> (
         Result<(), crate::framework::distributed::migration::MigrationApplyError>,
         crate::framework::aof_replay::ReplayExecution,
+        u32,
     ) {
         let Some(mut dataset) = self.slot_imports.remove(id) else {
             return (
@@ -58,11 +62,13 @@ impl ServerContext {
                     ),
                 ),
                 crate::framework::aof_replay::ReplayExecution::NotInvoked,
+                0,
             );
         };
         let result = dataset.apply_with_execution(args, registry);
+        let selected_db = dataset.selected_db();
         self.slot_imports.insert(id.clone(), dataset);
-        result
+        (result.0, result.1, selected_db)
     }
 
     pub fn absorb_serving_slots_into_import(
@@ -164,6 +170,9 @@ impl ServerContext {
         if result.is_err() {
             self.slot_imports.insert(id.clone(), dataset);
         } else {
+            self.slot_import_infrastructure_memory = self
+                .slot_import_infrastructure_memory
+                .saturating_sub(dataset.infrastructure_memory());
             for range in ranges.iter() {
                 for slot in range.start..=range.end {
                     self.db.dbs.set_slot_importing(slot as usize, false);
@@ -187,7 +196,11 @@ impl ServerContext {
                     .and_then(|state| state.migrations.get(id))
                     .map(|job| job.ranges.clone())
             });
-        self.slot_imports.remove(id);
+        if let Some(dataset) = self.slot_imports.remove(id) {
+            self.slot_import_infrastructure_memory = self
+                .slot_import_infrastructure_memory
+                .saturating_sub(dataset.infrastructure_memory());
+        }
         if let Some(ranges) = ranges {
             for range in ranges.iter() {
                 for slot in range.start..=range.end {
@@ -200,6 +213,7 @@ impl ServerContext {
     pub(crate) fn clear_slot_imports(&mut self) {
         self.db.dbs.clear_importing_slots();
         self.slot_imports.clear();
+        self.slot_import_infrastructure_memory = 0;
     }
 
     pub(crate) fn slot_import_dbs(&self) -> Vec<&DbSet> {
@@ -235,7 +249,11 @@ impl ServerContext {
         let config = self.config().clone();
         let mut imports = std::collections::HashMap::new();
         for import in &metadata {
+            let before = crate::foundation::memory::util_alloc::current_thread_allocated();
             let mut dbs = self.dbs().empty_like();
+            let infrastructure_memory =
+                crate::foundation::memory::util_alloc::current_thread_allocated()
+                    .saturating_sub(before);
             for range in import.ranges.iter() {
                 for slot in range.start..=range.end {
                     let entries = self.take_slot_entries(slot as usize);
@@ -250,6 +268,7 @@ impl ServerContext {
                         dbs,
                         &config,
                         import.ranges.clone(),
+                        infrastructure_memory,
                     ),
                 ),
             );
@@ -277,12 +296,17 @@ impl ServerContext {
         } else if !metadata.is_empty() {
             return Err("slot import AUX requires cluster mode".to_string());
         }
+        self.slot_import_infrastructure_memory = imports
+            .values()
+            .map(|dataset| dataset.infrastructure_memory())
+            .sum();
         self.slot_imports = imports;
         Ok(())
     }
 
     pub(crate) fn prepare_slot_migration_load(&mut self) {
         self.slot_imports.clear();
+        self.slot_import_infrastructure_memory = 0;
         if let Some(cluster) = self.cluster_state.as_deref_mut() {
             cluster.clear_migrations_for_load();
         }
@@ -314,7 +338,11 @@ impl ServerContext {
             })
             .unwrap_or_default();
         for id in ids {
-            self.slot_imports.remove(&id);
+            if let Some(dataset) = self.slot_imports.remove(&id) {
+                self.slot_import_infrastructure_memory = self
+                    .slot_import_infrastructure_memory
+                    .saturating_sub(dataset.infrastructure_memory());
+            }
             if let Some(cluster) = self.cluster_state.as_deref_mut() {
                 let _ = cluster.finish_migration(
                     &id,

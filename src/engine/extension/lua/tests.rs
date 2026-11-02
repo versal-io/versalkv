@@ -3,8 +3,8 @@ use crate::engine::extension::lua::shebang::{
     extract_function_name, is_blocked_subcmd, is_noscript_subcmd,
 };
 use crate::engine::extension::script::{
-    PropagationOp, PropagationTargets, ScriptControlHandle, ScriptError, ScriptKind,
-    SCRIPT_EVAL_MODE,
+    CompiledFunction, PropagationOp, PropagationTargets, ScriptControlHandle, ScriptEngine,
+    ScriptError, ScriptKind, SCRIPT_EVAL_MODE,
 };
 use crate::foundation::io::protocol::Value;
 use bytes::Bytes;
@@ -56,6 +56,370 @@ fn test_ctx() -> ScriptRunCtx {
     }
 }
 
+fn table_string_keys(table: mlua::Table) -> Result<Vec<String>, ScriptError> {
+    let mut names = Vec::new();
+    for pair in table.pairs::<String, mlua::Table>() {
+        let (name, _) = pair.map_err(|error| ScriptError::Runtime(error.to_string()))?;
+        names.push(name);
+    }
+    names.sort();
+    Ok(names)
+}
+
+#[test]
+fn commit_compile_without_pending_functions_succeeds() {
+    reset_lua_runtime();
+
+    LuaEngine.commit_compile("", 0).unwrap();
+
+    reset_lua_runtime();
+}
+
+#[test]
+fn commit_compile_propagates_pending_entry_errors() {
+    reset_lua_runtime();
+    runtime::with_lua_runtime(false, |runtime| {
+        let pending = runtime
+            .lua
+            .create_table()
+            .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+        pending
+            .raw_set("invalid", true)
+            .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+        runtime
+            .lua
+            .globals()
+            .raw_set(REGISTERED_FUNCS_PENDING_TABLE, pending)
+            .map_err(|error| ScriptError::Runtime(error.to_string()))
+    })
+    .unwrap();
+
+    assert!(LuaEngine.commit_compile("", 0).is_err());
+
+    reset_lua_runtime();
+}
+
+#[test]
+fn commit_compile_propagates_active_table_write_errors() {
+    reset_lua_runtime();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut observed_error = false;
+        for headroom in [64usize, 128, 256, 512, 1024, 2048, 4096] {
+            reset_lua_runtime();
+            runtime::with_lua_runtime(false, |runtime| {
+                let lua = &runtime.lua;
+                let active = lua
+                    .create_table()
+                    .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+                let pending = lua
+                    .create_table()
+                    .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+                let existing_entry = lua
+                    .create_table()
+                    .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+                existing_entry
+                    .raw_set("marker", "original")
+                    .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+                active
+                    .raw_set("existing", existing_entry)
+                    .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+                for index in 0_i64..32 {
+                    let name = format!("pending_{index}");
+                    let entry = lua
+                        .create_table()
+                        .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+                    entry
+                        .raw_set("marker", name.clone())
+                        .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+                    entry
+                        .raw_set("index", index)
+                        .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+                    pending
+                        .raw_set(name, entry)
+                        .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+                }
+                let globals = lua.globals();
+                globals
+                    .raw_set(REGISTERED_FUNCS_TABLE, active)
+                    .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+                globals
+                    .raw_set(REGISTERED_FUNCS_PENDING_TABLE, pending)
+                    .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+                lua.set_memory_limit(lua.used_memory().saturating_add(headroom))
+                    .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+                Ok(())
+            })
+            .unwrap();
+
+            let commit_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                LuaEngine.commit_compile("", 0)
+            }));
+            let limit_cleanup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                runtime::with_lua_runtime(false, |runtime| {
+                    runtime
+                        .lua
+                        .set_memory_limit(0)
+                        .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+                    Ok(())
+                })
+            }));
+            let commit_result = match commit_outcome {
+                Ok(result) => {
+                    match limit_cleanup {
+                        Ok(result) => result.unwrap(),
+                        Err(payload) => std::panic::resume_unwind(payload),
+                    }
+                    result
+                }
+                Err(payload) => {
+                    let _ = limit_cleanup;
+                    std::panic::resume_unwind(payload);
+                }
+            };
+
+            if commit_result.is_err() {
+                observed_error = true;
+                runtime::with_lua_runtime(false, |runtime| {
+                    let globals = runtime.lua.globals();
+                    let active = globals
+                        .raw_get::<mlua::Table>(REGISTERED_FUNCS_TABLE)
+                        .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+                    let pending = globals
+                        .raw_get::<mlua::Table>(REGISTERED_FUNCS_PENDING_TABLE)
+                        .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+                    let mut expected_pending = (0_i64..32)
+                        .map(|index| format!("pending_{index}"))
+                        .collect::<Vec<_>>();
+                    expected_pending.sort();
+
+                    assert_eq!(
+                        table_string_keys(active.clone())?,
+                        vec!["existing".to_string()]
+                    );
+                    let existing_entry = active
+                        .raw_get::<mlua::Table>("existing")
+                        .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+                    assert_eq!(
+                        existing_entry
+                            .raw_get::<String>("marker")
+                            .map_err(|error| ScriptError::Runtime(error.to_string()))?,
+                        "original"
+                    );
+                    assert_eq!(table_string_keys(pending.clone())?, expected_pending);
+                    for index in 0_i64..32 {
+                        let name = format!("pending_{index}");
+                        assert!(matches!(
+                            active
+                                .raw_get::<LuaValue>(name.as_str())
+                                .map_err(|error| ScriptError::Runtime(error.to_string()))?,
+                            LuaValue::Nil
+                        ));
+                        let entry = pending
+                            .raw_get::<mlua::Table>(name.as_str())
+                            .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+                        assert_eq!(
+                            entry
+                                .raw_get::<String>("marker")
+                                .map_err(|error| ScriptError::Runtime(error.to_string()))?,
+                            name
+                        );
+                        assert_eq!(
+                            entry
+                                .raw_get::<i64>("index")
+                                .map_err(|error| ScriptError::Runtime(error.to_string()))?,
+                            index
+                        );
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            }
+            reset_lua_runtime();
+        }
+        assert!(
+            observed_error,
+            "at least one constrained-memory commit must fail"
+        );
+    }));
+
+    let cleanup_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        runtime::with_lua_runtime(false, |runtime| {
+            runtime
+                .lua
+                .set_memory_limit(0)
+                .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+            Ok(())
+        })
+    }));
+    reset_lua_runtime();
+
+    match outcome {
+        Ok(()) => match cleanup_outcome {
+            Ok(result) => result.unwrap(),
+            Err(payload) => std::panic::resume_unwind(payload),
+        },
+        Err(payload) => {
+            let _ = cleanup_outcome;
+            std::panic::resume_unwind(payload);
+        }
+    }
+}
+
+#[test]
+fn compile_propagates_exit_compile_mode_errors() {
+    reset_lua_runtime();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        runtime::with_lua_runtime(false, |runtime| {
+            runtime
+                .lua
+                .globals()
+                .raw_set("__vky_saved_runtime", true)
+                .map_err(|error| ScriptError::Runtime(error.to_string()))
+        })
+        .unwrap();
+
+        LuaEngine.compile(
+            "#!lua name=valid\nserver.register_function('valid', function() return 1 end)",
+            0,
+        )
+    }));
+    reset_lua_runtime();
+
+    match outcome {
+        Ok(result) => {
+            let error = match result {
+                Ok(_) => panic!("exit_compile_mode failure must fail compilation"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains("Failed to get runtime saved"),
+                "unexpected error: {error}"
+            );
+        }
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
+#[test]
+fn compile_propagates_invalid_active_table_and_clears_stale_pending() {
+    reset_lua_runtime();
+    runtime::with_lua_runtime(false, |runtime| {
+        let stale_pending = runtime
+            .lua
+            .create_table()
+            .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+        let globals = runtime.lua.globals();
+        globals
+            .raw_set(REGISTERED_FUNCS_PENDING_TABLE, stale_pending)
+            .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+        globals
+            .raw_set(REGISTERED_FUNCS_TABLE, true)
+            .map_err(|error| ScriptError::Runtime(error.to_string()))
+    })
+    .unwrap();
+
+    let result = LuaEngine.compile(
+        "#!lua name=valid\nserver.register_function('valid', function() return 1 end)",
+        0,
+    );
+    let (active_is_original, pending_is_nil) = runtime::with_lua_runtime(false, |runtime| {
+        let globals = runtime.lua.globals();
+        let active = globals
+            .raw_get::<LuaValue>(REGISTERED_FUNCS_TABLE)
+            .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+        let pending = globals
+            .raw_get::<LuaValue>(REGISTERED_FUNCS_PENDING_TABLE)
+            .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+        Ok((
+            matches!(active, LuaValue::Boolean(true)),
+            matches!(pending, LuaValue::Nil),
+        ))
+    })
+    .unwrap();
+
+    assert!(result.is_err());
+    assert!(active_is_original);
+    assert!(pending_is_nil);
+    reset_lua_runtime();
+}
+
+#[test]
+fn compile_failure_restores_active_table_and_clears_stale_pending() {
+    reset_lua_runtime();
+    runtime::with_lua_runtime(false, |runtime| {
+        let active = runtime
+            .lua
+            .create_table()
+            .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+        active
+            .raw_set("marker", true)
+            .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+        let stale_pending = runtime
+            .lua
+            .create_table()
+            .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+        stale_pending
+            .raw_set("stale", true)
+            .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+        let globals = runtime.lua.globals();
+        globals
+            .raw_set(REGISTERED_FUNCS_TABLE, active)
+            .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+        globals
+            .raw_set(REGISTERED_FUNCS_PENDING_TABLE, stale_pending)
+            .map_err(|error| ScriptError::Runtime(error.to_string()))
+    })
+    .unwrap();
+
+    let result = LuaEngine.compile("#!lua name=invalid\nerror('boom')", 0);
+    let (active_is_original, pending_is_nil) = runtime::with_lua_runtime(false, |runtime| {
+        let globals = runtime.lua.globals();
+        let active = globals
+            .raw_get::<mlua::Table>(REGISTERED_FUNCS_TABLE)
+            .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+        let pending = globals
+            .raw_get::<LuaValue>(REGISTERED_FUNCS_PENDING_TABLE)
+            .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+        Ok((
+            active
+                .raw_get::<bool>("marker")
+                .map_err(|error| ScriptError::Runtime(error.to_string()))?,
+            matches!(pending, LuaValue::Nil),
+        ))
+    })
+    .unwrap();
+
+    assert!(result.is_err());
+    assert!(active_is_original);
+    assert!(pending_is_nil);
+    reset_lua_runtime();
+}
+
+#[test]
+fn remove_functions_propagates_active_table_read_errors() {
+    reset_lua_runtime();
+    runtime::with_lua_runtime(false, |runtime| {
+        runtime
+            .lua
+            .globals()
+            .raw_set(REGISTERED_FUNCS_TABLE, true)
+            .map_err(|error| ScriptError::Runtime(error.to_string()))
+    })
+    .unwrap();
+    let function = CompiledFunction {
+        engine: "LUA",
+        name: "function".to_string(),
+        code: String::new(),
+        description: String::new(),
+        flags: 0,
+    };
+
+    let result = LuaEngine.remove_functions(&[function]);
+
+    assert!(result.is_err());
+    reset_lua_runtime();
+}
+
 fn command_args(parts: &[&'static [u8]]) -> crate::engine::command::CommandArgs {
     crate::engine::command::CommandArgs::from_parts(
         parts.iter().map(|part| Bytes::from_static(part)).collect(),
@@ -77,6 +441,24 @@ fn test_lua_engine_eval_simple_expression() {
     let mut ctx = test_ctx();
     let result = eval_without_commands(&engine, "return 42", &mut ctx).unwrap();
     assert_eq!(result, Value::Integer(42));
+}
+
+#[test]
+fn lua_log_accepts_all_string_and_number_arguments_and_returns_nil() {
+    let engine = LuaEngine;
+    for script in [
+        "return redis.log(redis.LOG_WARNING, 'before\\r\\nafter', 42, 'tail')",
+        "return redis.log('3', 'message')",
+        "return redis.log(-0.5, 'debug')",
+        "return redis.log(1.5, 'verbose')",
+        "return redis.log(3.5, 'warning')",
+    ] {
+        let mut ctx = test_ctx();
+        assert_eq!(
+            eval_without_commands(&engine, script, &mut ctx).unwrap(),
+            Value::Null
+        );
+    }
 }
 
 #[test]

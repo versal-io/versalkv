@@ -4,6 +4,16 @@ use crate::framework::commands::command_runtime::CommandRuntime;
 use crate::framework::{CommandArgs, CommandError};
 use command_macros::command;
 
+pub(crate) fn target_db_and_key(args: &CommandArgs) -> Option<(u32, &[u8])> {
+    let key = args.args.first()?;
+    let db_idx = std::str::from_utf8(args.args.get(1)?)
+        .ok()?
+        .trim()
+        .parse::<u32>()
+        .ok()?;
+    Some((db_idx, key))
+}
+
 #[command("MOVE", runtime)]
 pub fn r#move(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> CommandOutcome {
     if args.args.len() < 2 {

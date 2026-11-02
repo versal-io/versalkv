@@ -112,17 +112,53 @@ pub(crate) fn replace_function_libraries(
     ctx: &mut ServerContext,
     codes: &[Vec<u8>],
 ) -> Result<(), ()> {
-    let mut registry = crate::engine::extension::function::FunctionRegistry::new(
-        &crate::engine::extension::lua::LUA_ENGINE,
-    );
-    for code in codes {
-        let code = std::str::from_utf8(code).map_err(|_| ())?;
-        let name =
-            crate::engine::extension::lua::shebang::extract_shebang_name(code).map_err(|_| ())?;
-        registry.load_library(&name, code).map_err(|_| ())?;
+    ctx.script()
+        .function_registry
+        .begin_restore_transaction()
+        .map_err(|_| ())?;
+    let old_libraries = ctx.script_mut().function_registry.take_all_libraries();
+
+    let replacement = (|| {
+        for code in codes {
+            let code = std::str::from_utf8(code).map_err(|_| ())?;
+            let name = crate::engine::extension::lua::shebang::extract_shebang_name(code)
+                .map_err(|_| ())?;
+            ctx.script_mut()
+                .function_registry
+                .load_library(&name, code)
+                .map_err(|_| ())?;
+        }
+        for old_library in &old_libraries {
+            ctx.script()
+                .function_registry
+                .finish_library_replacement(old_library)
+                .map_err(|_| ())?;
+        }
+        ctx.script()
+            .function_registry
+            .commit_restore_transaction()
+            .map_err(|_| ())
+    })();
+
+    if replacement.is_ok() {
+        drop(old_libraries);
+        return Ok(());
     }
-    ctx.script_mut().function_registry = registry;
-    Ok(())
+
+    drop(ctx.script_mut().function_registry.take_all_libraries());
+    if ctx
+        .script()
+        .function_registry
+        .rollback_restore_transaction()
+        .is_ok()
+    {
+        for old_library in old_libraries {
+            ctx.script_mut()
+                .function_registry
+                .restore_library(old_library);
+        }
+    }
+    Err(())
 }
 
 fn debug_rdb_error(error: &LoadError) -> Value {
@@ -256,6 +292,7 @@ impl RdbLoadTask {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::extension::script::ScriptRunCtx;
     use crate::engine::host::{HostReply, HostRequest};
     use crate::foundation::io::persistence::{serialize_all_with_options, RdbSerializeOptions};
     use crate::foundation::io::store::Robj;
@@ -275,6 +312,87 @@ mod tests {
                 Ok(HostReply::Continue)
             }
             _ => Err(HostError::Invariant("unexpected RDB task request")),
+        }
+    }
+
+    fn call_function(ctx: &ServerContext, name: &str) -> Value {
+        let compiled = ctx
+            .script()
+            .function_registry
+            .find_function(name)
+            .expect("function exists")
+            .clone();
+        let engine = ctx
+            .script()
+            .function_registry
+            .function_engine(&compiled)
+            .expect("function engine exists");
+        let mut run = ScriptRunCtx::new_bare_for_test(compiled.flags);
+        let mut host = count_rdb_yield;
+        engine
+            .call(&compiled, &mut run, &[], &[], &mut host)
+            .expect("function call succeeds")
+    }
+
+    #[test]
+    fn replace_function_libraries_rolls_back_callbacks_after_later_compile_error() {
+        use crate::engine::extension::lua::reset_lua_runtime;
+        use crate::foundation::memory::metrics::memory_stats::{self, MemoryCategory};
+
+        let guard = memory_stats::lock_global_for_test();
+        let tracker = memory_stats::get_tracker();
+        let baseline = tracker.get(MemoryCategory::FunctionsVm);
+        let old = "#!lua name=stateful\nlocal counter = 0\nserver.register_function('counter', function() counter = counter + 1 return counter end)";
+        let replacement =
+            "#!lua name=stateful\nserver.register_function('counter', function() return 100 end)";
+        let invalid = "#!lua name=bad\nerror('boom')";
+
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            reset_lua_runtime();
+            {
+                let mut fixture_ctx = ServerContext::new(1);
+                fixture_ctx
+                    .script_mut()
+                    .function_registry
+                    .load_library("stateful", replacement)
+                    .unwrap();
+                assert_eq!(call_function(&fixture_ctx, "counter"), Value::Integer(100));
+                fixture_ctx.script_mut().function_registry.flush();
+            }
+            reset_lua_runtime();
+
+            let mut ctx = ServerContext::new(1);
+            ctx.script_mut()
+                .function_registry
+                .load_library("stateful", old)
+                .unwrap();
+            assert_eq!(call_function(&ctx, "counter"), Value::Integer(1));
+
+            let result = replace_function_libraries(
+                &mut ctx,
+                &[replacement.as_bytes().to_vec(), invalid.as_bytes().to_vec()],
+            );
+            let callback_after_failure = call_function(&ctx, "counter");
+            ctx.script_mut().function_registry.flush();
+
+            (result, callback_after_failure)
+        }));
+
+        let current = tracker.get(MemoryCategory::FunctionsVm);
+        if current > baseline {
+            memory_stats::track_sub(MemoryCategory::FunctionsVm, current - baseline);
+        } else if current < baseline {
+            memory_stats::track_add(MemoryCategory::FunctionsVm, baseline - current);
+        }
+        reset_lua_runtime();
+        drop(guard);
+
+        match outcome {
+            Ok((result, callback_after_failure)) => {
+                assert!(result.is_err());
+                assert_eq!(callback_after_failure, Value::Integer(2));
+            }
+            Err(payload) => std::panic::resume_unwind(payload),
         }
     }
 

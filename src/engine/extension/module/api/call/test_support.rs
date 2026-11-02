@@ -30,6 +30,36 @@ pub(super) struct TestReplyHandlers {
 }
 
 impl TestReplyHandlers {
+    pub(super) fn with_on_blocked(
+        callback: extern "C" fn(*mut c_void, *mut ValkeyModuleCtx, *mut c_void),
+    ) -> Self {
+        Self {
+            version: 1,
+            null: None,
+            null_bulk_string: None,
+            null_array: None,
+            bulk_string: None,
+            simple_string: None,
+            verbatim_string: None,
+            error: None,
+            integer: None,
+            double_val: None,
+            big_number: None,
+            bool_val: None,
+            attribute_start: None,
+            attribute_end: None,
+            array_start: None,
+            array_end: None,
+            map_start: None,
+            map_end: None,
+            set_start: None,
+            set_end: None,
+            reply_parsing_error: None,
+            on_blocked: Some(callback),
+            on_resp_available: None,
+        }
+    }
+
     pub(super) fn with_on_resp_available(
         callback: extern "C" fn(*mut c_void, *mut ValkeyModuleCtx, *const c_char, size_t) -> c_int,
     ) -> Self {

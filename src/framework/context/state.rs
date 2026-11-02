@@ -416,6 +416,10 @@ pub struct ScriptExecutionState {
     pub running_script: Option<ScriptControlHandle>,
     pub(crate) scripts_eviction_pending: bool,
     pub debug_session: Option<crate::engine::command::SessionId>,
+    pub debug_modes: HashMap<
+        crate::engine::command::SessionId,
+        crate::engine::extension::script::ScriptDebugMode,
+    >,
     pub script_busy: bool,
     pub script_busy_is_function: bool,
     pub script_busy_write_dirty: bool,
@@ -436,6 +440,7 @@ impl ScriptExecutionState {
             running_script: None,
             scripts_eviction_pending: false,
             debug_session: None,
+            debug_modes: HashMap::new(),
             script_busy: false,
             script_busy_is_function: false,
             script_busy_write_dirty: false,

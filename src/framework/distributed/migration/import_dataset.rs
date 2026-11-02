@@ -15,24 +15,44 @@ pub struct ImportDataset {
     context: ServerContext,
     player: MigrationCommandPlayer,
     ranges: SlotRanges,
+    infrastructure_memory: usize,
 }
 
 impl ImportDataset {
     pub fn new_like(serving: &DbSet, config: &RuntimeConfig, ranges: SlotRanges) -> Self {
+        let before = crate::foundation::memory::util_alloc::current_thread_allocated();
+        let dbs = serving.empty_like();
+        let context = ServerContext::new_import_context(dbs, config.clone());
+        let infrastructure_memory =
+            crate::foundation::memory::util_alloc::current_thread_allocated()
+                .saturating_sub(before);
         let mut dataset = Self {
-            context: ServerContext::new_import_context(serving.empty_like(), config.clone()),
+            context,
             player: MigrationCommandPlayer::new(),
             ranges,
+            infrastructure_memory,
         };
         dataset.preserve_expired_keys();
         dataset
     }
 
-    pub fn from_dbs(dbs: DbSet, config: &RuntimeConfig, ranges: SlotRanges) -> Self {
+    pub fn from_dbs(
+        dbs: DbSet,
+        config: &RuntimeConfig,
+        ranges: SlotRanges,
+        infrastructure_memory: usize,
+    ) -> Self {
+        let before = crate::foundation::memory::util_alloc::current_thread_allocated();
+        let context = ServerContext::new_import_context(dbs, config.clone());
+        let infrastructure_memory = infrastructure_memory.saturating_add(
+            crate::foundation::memory::util_alloc::current_thread_allocated()
+                .saturating_sub(before),
+        );
         let mut dataset = Self {
-            context: ServerContext::new_import_context(dbs, config.clone()),
+            context,
             player: MigrationCommandPlayer::new(),
             ranges,
+            infrastructure_memory,
         };
         dataset.preserve_expired_keys();
         dataset
@@ -40,6 +60,10 @@ impl ImportDataset {
 
     pub fn ranges(&self) -> &SlotRanges {
         &self.ranges
+    }
+
+    pub(crate) fn infrastructure_memory(&self) -> usize {
+        self.infrastructure_memory
     }
 
     pub fn apply(
@@ -74,6 +98,10 @@ impl ImportDataset {
 
     pub fn dbs(&self) -> &DbSet {
         self.context.dbs()
+    }
+
+    pub(crate) fn selected_db(&self) -> u32 {
+        self.player.selected_db()
     }
 
     pub fn dbs_mut(&mut self) -> &mut DbSet {

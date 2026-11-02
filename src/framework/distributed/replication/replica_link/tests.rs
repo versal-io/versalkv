@@ -498,11 +498,45 @@ fn transient_psync_replies_are_retryable_not_protocol_errors() {
 #[test]
 fn continue_records_one_shot_partial_resync_acceptance() {
     let mut link = link();
+    link.set_resume_position("cached-replid".to_string(), offset(42), 0);
     advance_to_waitpsyncreply(&mut link, 6380);
 
     link.on_bytes(b"+CONTINUE\r\n", 6380).unwrap();
 
     assert!(link.take_partial_resync_accepted());
+    assert!(!link.take_partial_resync_accepted());
+}
+
+#[test]
+fn continue_without_cached_primary_rejects_partial_resync() {
+    for reply in [
+        b"+CONTINUE\r\n".as_slice(),
+        b"+CONTINUE 0123456789abcdef0123456789abcdef01234567\r\n",
+    ] {
+        let mut link = link();
+        advance_to_waitpsyncreply(&mut link, 6380);
+        assert!(matches!(
+            link.on_bytes(reply, 6380),
+            Err(LinkError::TryLater)
+        ));
+        assert!(!link.is_streaming());
+        assert!(!link.take_partial_resync_accepted());
+        assert!(!link.can_resume_after_disconnect());
+    }
+}
+
+#[test]
+fn dual_continue_before_end_offset_rejects_partial_resync() {
+    let mut link = link();
+    advance_to_waitpsyncreply(&mut link, 6380);
+    link.on_bytes(b"+DUALCHANNELSYNC\r\n", 6380)
+        .expect("dual-channel negotiation must succeed");
+
+    assert!(matches!(
+        link.on_bytes(b"+CONTINUE\r\n", 6380),
+        Err(LinkError::TryLater)
+    ));
+    assert!(!link.is_streaming());
     assert!(!link.take_partial_resync_accepted());
 }
 

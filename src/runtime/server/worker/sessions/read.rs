@@ -291,6 +291,17 @@ impl ServerWorkerState {
                 }
             }
             self.process_dirty_keys_in_loop(token.0, fx);
+            if self
+                .ctx
+                .script()
+                .debug_modes
+                .get(&self.connection_registry[token].session_id())
+                == Some(&crate::engine::extension::script::ScriptDebugMode::Forked)
+            {
+                // Commit earlier pipeline replies before a later EVAL transfers
+                // this socket to a debugger child.
+                return self.connection_registry[token].parser.has_pending_data();
+            }
             if mode == ClientReadMode::DrainAfterHup
                 && parsed_commands >= crate::runtime::server::worker::HUP_CLIENT_COMMAND_BUDGET
             {
@@ -358,7 +369,36 @@ impl ServerWorkerState {
 
     fn schedule_client_read_continuation(&mut self, token: Token, yielded: bool) {
         if yielded && self.connection_registry.contains(token) {
+            let session = self.connection_registry[token].session_id();
+            let is_forked_debugger = self.ctx.script().debug_modes.get(&session)
+                == Some(&crate::engine::extension::script::ScriptDebugMode::Forked);
+            if is_forked_debugger
+                && (self.connection_registry[token].has_pending_output()
+                    || self.io_threads.is_write_inflight(token)
+                    || !self.socket_owned_by_main_thread(token))
+            {
+                return;
+            }
             self.schedule_client_read_runnable(token, true);
+        }
+    }
+
+    pub(crate) fn queue_forked_debugger_for_reprocessing(&mut self, token: Token) {
+        let should_queue = self
+            .connection_registry
+            .get(token)
+            .is_some_and(|connection| {
+                connection.state == ConnectionState::Connected
+                    && connection.blocked.is_none()
+                    && connection.parser.has_pending_data()
+                    && !connection.has_pending_output()
+                    && self.ctx.script().debug_modes.get(&connection.session_id())
+                        == Some(&crate::engine::extension::script::ScriptDebugMode::Forked)
+            })
+            && !self.io_threads.is_write_inflight(token)
+            && self.socket_owned_by_main_thread(token);
+        if should_queue {
+            self.schedule_client_read_runnable(token, false);
         }
     }
 
@@ -848,6 +888,88 @@ mod tests {
         );
 
         assert!(!runtime
+            .event_batch
+            .contains_runnable(RunnableKey::ClientRead(token)));
+    }
+
+    #[test]
+    fn script_debug_is_rejected_after_an_earlier_pipeline_reply() {
+        let (mut runtime, token) = runtime_with_fake_client();
+        crate::framework::commands::register_all(&mut runtime.registry);
+        runtime.connection_registry[token].authenticated = true;
+        runtime.connection_registry[token].ever_authenticated = true;
+        runtime.connection_registry[token].set_custom_reply_enabled(false);
+        let session = runtime.connection_registry[token].session_id();
+        runtime.process_client_read_outcome(
+            token,
+            ClientReadMode::Fair,
+            b"*1\r\n$4\r\nPING\r\n*3\r\n$6\r\nSCRIPT\r\n$5\r\nDEBUG\r\n$3\r\nYES\r\n".to_vec(),
+            ReadOutcome::Quiescent,
+        );
+
+        let output = runtime.connection_registry[token]
+            .take_threaded_write_snapshot()
+            .into_frames()
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        assert!(!runtime.ctx.script().debug_modes.contains_key(&session));
+        assert!(
+            String::from_utf8_lossy(&output)
+                .contains("ERR SCRIPT DEBUG must be called outside a pipeline"),
+            "unexpected pipeline output: {:?}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+
+    #[test]
+    fn script_debug_is_allowed_after_reply_skip_suppresses_pipeline_output() {
+        let (mut runtime, token) = runtime_with_fake_client();
+        crate::framework::commands::register_all(&mut runtime.registry);
+        runtime.connection_registry[token].authenticated = true;
+        runtime.connection_registry[token].ever_authenticated = true;
+        runtime.connection_registry[token].set_custom_reply_enabled(false);
+        let session = runtime.connection_registry[token].session_id();
+
+        runtime.process_client_read_outcome(
+            token,
+            ClientReadMode::Fair,
+            b"*3\r\n$6\r\nCLIENT\r\n$5\r\nREPLY\r\n$4\r\nSKIP\r\n*3\r\n$6\r\nSCRIPT\r\n$5\r\nDEBUG\r\n$3\r\nYES\r\n"
+                .to_vec(),
+            ReadOutcome::Quiescent,
+        );
+
+        assert_eq!(
+            runtime.ctx.script().debug_modes.get(&session),
+            Some(&crate::engine::extension::script::ScriptDebugMode::Forked)
+        );
+    }
+
+    #[test]
+    fn forked_debugger_continuation_waits_for_write_socket_lease_release() {
+        let (mut runtime, token) = runtime_with_fake_client();
+        let session = runtime.connection_registry[token].session_id();
+        runtime.ctx.script_mut().debug_modes.insert(
+            session,
+            crate::engine::extension::script::ScriptDebugMode::Forked,
+        );
+        runtime.connection_registry[token]
+            .parser
+            .feed(b"*1\r\n$4\r\nEVAL\r\n");
+        let operation = crate::runtime::server::worker::reactor::io_workers::IoOperationId {
+            token,
+            generation: 1,
+            sequence: 1,
+        };
+        runtime.acquire_io_worker_write_socket_lease(operation);
+
+        runtime.schedule_client_read_continuation(token, true);
+        assert!(!runtime
+            .event_batch
+            .contains_runnable(RunnableKey::ClientRead(token)));
+
+        runtime.release_io_worker_write_socket_lease(operation);
+        assert!(runtime
             .event_batch
             .contains_runnable(RunnableKey::ClientRead(token)));
     }

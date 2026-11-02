@@ -1015,6 +1015,11 @@ mod tests {
             .unwrap()
             .unwrap_err();
         assert!(err.contains("out of range"));
+        let err = reg
+            .try_set_startup(&mut rcfg, "cluster-config-file", "")
+            .unwrap()
+            .unwrap_err();
+        assert!(err.contains("cluster-config-file"));
         assert!(reg.try_set(&mut rcfg, "maxmemory", "2kb").is_none());
     }
 

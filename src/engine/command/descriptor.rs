@@ -1,5 +1,10 @@
-use super::{CmdFlags, CommandArgs, CommandName};
+use super::{CmdFlags, CommandArgs, CommandGetKeysFn, CommandName, CMD_MAY_REPLICATE, CMD_WRITE};
 use bytes::Bytes;
+
+pub(crate) fn command_may_mutate_dataset(name: &str, flags: CmdFlags) -> bool {
+    (flags & CMD_WRITE) != 0
+        || ((flags & CMD_MAY_REPLICATE) != 0 && matches!(name, "eval" | "evalsha" | "fcall"))
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct CommandKeyIndices {
@@ -22,7 +27,7 @@ impl Iterator for CommandKeyIndices {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct CommandDescriptor {
     pub name: CommandName,
     pub arity: i32,
@@ -30,8 +35,9 @@ pub struct CommandDescriptor {
     pub first_key: i32,
     pub last_key: i32,
     pub key_step: i32,
-    pub container: Option<&'static str>,
+    pub key_flags: &'static [&'static str],
     pub acl_categories: &'static [&'static str],
+    pub get_keys: Option<CommandGetKeysFn>,
 }
 
 #[derive(Clone)]
@@ -96,8 +102,27 @@ impl CommandDescriptor {
         })
     }
 
+    pub fn extract_key_accesses(
+        &self,
+        args: &CommandArgs,
+    ) -> Option<Vec<(Bytes, Vec<&'static str>)>> {
+        if let Some(get_keys) = self.get_keys {
+            return Some(
+                get_keys(&args.args)
+                    .into_iter()
+                    .map(|(key, flags)| (Bytes::copy_from_slice(key), flags))
+                    .collect(),
+            );
+        }
+        self.key_indices(args).map(|indices| {
+            indices
+                .map(|index| (args.args[index].clone(), self.key_flags.to_vec()))
+                .collect()
+        })
+    }
+
     pub fn extract_keys(&self, args: &CommandArgs) -> Option<Vec<Bytes>> {
-        self.key_indices(args)
-            .map(|indices| indices.map(|index| args.args[index].clone()).collect())
+        self.extract_key_accesses(args)
+            .map(|accesses| accesses.into_iter().map(|(key, _)| key).collect())
     }
 }

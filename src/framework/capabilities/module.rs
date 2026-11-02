@@ -357,6 +357,7 @@ pub(crate) fn complete_pending_module_call(
                 .iter()
                 .any(|candidate| candidate.as_ref() == key)
     });
+    let is_forkless = matches!(blocked.cmd, BlockedCmd::Forkless);
     let terminal_reply = match blocked.cmd {
         BlockedCmd::Wait {
             required,
@@ -378,14 +379,38 @@ pub(crate) fn complete_pending_module_call(
         }
         _ => None,
     };
-    if terminal_reply.is_none() && !is_timed_out && !has_ready_key {
+    if !is_forkless && terminal_reply.is_none() && !is_timed_out && !has_ready_key {
         ctx.module_registry_mut().pending_calls.insert(id, call);
         return effects;
     }
-    call.conn.set_blocked(None);
-    let result = if let Some(reply) = terminal_reply {
+    let mut registration_active = true;
+    let result = if is_forkless {
+        if ctx.command_would_block(&call.command, &blocked.orig_args, call.conn.selected_db()) {
+            ctx.module_registry_mut().pending_calls.insert(id, call);
+            return effects;
+        }
+        crate::framework::capabilities::runtime::unregister_pending_module_call(ctx, &call.conn);
+        registration_active = false;
+        call.conn.set_blocked(None);
+        let result =
+            ctx.execute_command(&blocked.orig_args.name, &mut call.conn, &blocked.orig_args);
+        let monitor_argv = crate::engine::extension::module::api::call::module_call_monitor_argv(
+            &call.conn,
+            &blocked.orig_args,
+        );
+        let monitor_source = if call.format.script_mode() { "lua" } else { "" };
+        ctx.record_internal_monitor(
+            call.command.clone(),
+            call.conn.selected_db(),
+            monitor_source,
+            monitor_argv,
+        );
+        result
+    } else if let Some(reply) = terminal_reply {
+        call.conn.set_blocked(None);
         reply
     } else if is_timed_out {
+        call.conn.set_blocked(None);
         match blocked.cmd {
             BlockedCmd::Blpop
             | BlockedCmd::Brpop
@@ -398,36 +423,46 @@ pub(crate) fn complete_pending_module_call(
             _ => Value::Null,
         }
     } else {
-        let result =
-            ctx.execute_command(&blocked.orig_args.name, &mut call.conn, &blocked.orig_args);
-        if let Some(reblocked) = call.conn.blocked().cloned() {
-            let mut preserved = reblocked;
+        call.conn.set_blocked(None);
+        ctx.execute_command(&blocked.orig_args.name, &mut call.conn, &blocked.orig_args)
+    };
+    if let Some(reblocked) = call.conn.blocked().cloned() {
+        let mut preserved = reblocked;
+        if !is_forkless {
             preserved.start_time_ms = blocked.start_time_ms;
             preserved.timeout_ms = blocked.timeout_ms;
-            call.conn.set_blocked(Some(preserved));
-            let partial = call.conn.take_call_effects(
-                &call.command,
-                &blocked.orig_args,
-                call.format.propagation_targets(),
-                false,
-            );
-            if !partial.is_empty() {
-                effects.push(partial);
-            }
-            // Keep the original queue position when a ready key cannot satisfy this call.
-            ctx.module_registry_mut().pending_calls.insert(id, call);
-            return effects;
         }
-        result
-    };
+        call.conn.set_blocked(Some(preserved));
+        let partial = call.conn.take_call_effects(
+            &call.command,
+            &blocked.orig_args,
+            call.format.propagation_targets(),
+            false,
+        );
+        if !partial.is_empty() {
+            effects.push(partial);
+        }
+        if !registration_active {
+            let _ = crate::framework::capabilities::runtime::register_pending_module_call(
+                ctx, &call.conn,
+            );
+        }
+        // Keep the original queue position when a ready key cannot satisfy this call.
+        ctx.module_registry_mut().pending_calls.insert(id, call);
+        return effects;
+    }
     call.conn.set_blocked(Some(blocked.clone()));
-    crate::framework::capabilities::runtime::unregister_pending_module_call(ctx, &call.conn);
+    if registration_active {
+        crate::framework::capabilities::runtime::unregister_pending_module_call(ctx, &call.conn);
+    }
     call.conn.set_blocked(None);
+    let is_success = !matches!(result, Value::Error(_))
+        && (is_forkless || (!is_timed_out && !matches!(result, Value::Null | Value::NullArray)));
     let completed_effects = call.conn.take_call_effects(
         &call.command,
         &blocked.orig_args,
         call.format.propagation_targets(),
-        !is_timed_out && !matches!(result, Value::Error(_) | Value::Null | Value::NullArray),
+        is_success,
     );
     if !completed_effects.is_empty() {
         effects.push(completed_effects);
@@ -452,6 +487,17 @@ pub(crate) fn complete_pending_module_call(
         let _ctx_scope = ActiveModuleContextScope::enter(invocation.module_ctx());
         let _runtime_scope = ActiveModuleRuntimeScope::enter(invocation.runtime_handle());
         let _registry_scope = ActiveModuleRegistryScope::enter(invocation.registry());
+        if is_forkless {
+            // SAFETY: invocation owns the live module context for this callback scope.
+            unsafe {
+                crate::engine::extension::module::api::call::dispatch_module_keyspace_event(
+                    invocation.module_ctx(),
+                    call.command.name.as_str().as_bytes(),
+                    &blocked.orig_args,
+                    &result,
+                );
+            }
+        }
         // SAFETY: the fresh invocation and copied callbacks remain live until completion ends.
         unsafe { call.complete(invocation.module_ctx(), result) };
     }
@@ -643,6 +689,51 @@ mod tests {
         assert_eq!(ctx.blocking_registry().count(), 1);
         assert!(outer.blocked().is_none());
         assert_eq!(outer.output_buffer_bytes(), 0);
+    }
+
+    #[test]
+    fn forkless_pending_module_call_replays_after_barrier_release() {
+        use super::complete_pending_module_call;
+        use crate::engine::command::context::{BlockedCmd, CommandConn};
+        use crate::engine::command::CommandArgs;
+        use crate::engine::extension::module::api::call::call_conn::ModuleCallConn;
+        use crate::engine::extension::module::api::call::pending::PendingModuleCall;
+        use crate::engine::extension::module::capability::ModuleRuntime;
+        use bytes::Bytes;
+
+        let mut ctx = ServerContext::new(1);
+        let mut registry = crate::framework::CommandRegistry::new();
+        crate::framework::commands::register_all(&mut registry);
+        ctx.set_command_registry_snapshot(&registry);
+        ctx.register_monitor_client(7);
+        let args = CommandArgs::from_parts(vec![
+            Bytes::from_static(b"SET"),
+            Bytes::from_static(b"key"),
+            Bytes::from_static(b"value"),
+            Bytes::from_static(b"GET"),
+        ]);
+        let command = registry.lookup(b"set").unwrap().descriptor();
+        let mut conn = ModuleCallConn::new(0);
+        conn.use_temporary_identity();
+        conn.set_deny_blocking(false);
+        conn.enter_blocking(BlockedCmd::Forkless, Vec::new(), 0, &args, 0);
+        let call = PendingModuleCall::from_test_command(conn, command, &args);
+        let id = ctx.retain_pending_module_call(call).unwrap();
+
+        let effects = complete_pending_module_call(&mut ctx, id, None);
+
+        assert!(!ctx.module_registry().pending_calls.contains_key(&id));
+        assert_eq!(ctx.blocking_registry().count(), 0);
+        assert_eq!(
+            ctx.db(0)
+                .unwrap()
+                .get_no_expire(b"key")
+                .map(|value| value.as_bytes()),
+            Some(b"value".as_slice())
+        );
+        assert!(!effects.is_empty());
+        assert!(effects.iter().any(|effect| !effect.propagation.is_empty()));
+        assert!(!ctx.script().pending_internal_monitor.is_empty());
     }
 
     #[test]

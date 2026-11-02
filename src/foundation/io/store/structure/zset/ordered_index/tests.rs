@@ -87,10 +87,9 @@ fn score_ranges_handle_exclusive_bounds_offsets_limits_and_reverse_order() {
             index.range_by_score((20.0, false), (60.0, false), 7, 19, rev),
             expected[7..26]
         );
-        assert_eq!(
-            index.range_by_score((20.0, false), (60.0, false), -7, 1, rev),
-            expected[..1]
-        );
+        assert!(index
+            .range_by_score((20.0, false), (60.0, false), -7, 1, rev)
+            .is_empty());
         for off in [39, 80, i64::MAX] {
             assert!(index
                 .range_by_score((20.0, false), (60.0, false), off, -1, rev)
@@ -132,13 +131,13 @@ fn rank_ranges_normalize_negative_and_extreme_indices() {
 fn lex_ranges_use_infinity_sentinels_and_treat_empty_bytes_as_literal_bounds() {
     let mut index = OrderedIndex::new();
     for (bytes, score) in [
-        (b"".as_slice(), 8.0),
-        (b"+", 4.0),
-        (b"-", 2.0),
-        (b"\x80", 1.0),
+        (b"".as_slice(), 0.0),
+        (b"+", 0.0),
+        (b"-", 0.0),
+        (b"\x80", 0.0),
         (b"\xff", 0.0),
-        (b"b", 3.0),
-        (b"b\0", 5.0),
+        (b"b", 0.0),
+        (b"b\0", 0.0),
     ] {
         index.insert(score, Bytes::copy_from_slice(bytes));
     }
@@ -167,7 +166,7 @@ fn lex_ranges_use_infinity_sentinels_and_treat_empty_bytes_as_literal_bounds() {
     assert!(index.range_by_lex(b"-", true, b"-", true, true).is_empty());
     assert_eq!(
         index.range_by_lex(b"", true, b"", true, false),
-        [(Bytes::new(), 8.0)]
+        [(Bytes::new(), 0.0)]
     );
     assert_eq!(index.count_in_lex_range(b"", true, b"", true), 1);
     assert_eq!(index.count_in_lex_range(b"", false, b"", true), 0);

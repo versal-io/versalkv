@@ -120,6 +120,7 @@ impl SnapshotValue {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn is_shared(&self) -> bool {
         matches!(self, Self::Shared(_))
     }

@@ -2,6 +2,14 @@ use super::ServerContext;
 use crate::engine::persistence::{AofState, PersistenceState};
 
 impl ServerContext {
+    pub(crate) fn prioritize_forkless_keys(
+        &mut self,
+        db_id: u32,
+        keys: impl IntoIterator<Item = Vec<u8>>,
+    ) -> bool {
+        self.persistence.prioritize_forkless_keys(db_id, keys)
+    }
+
     // ── Persistence ──
     pub fn persistence(&self) -> &PersistenceState {
         &self.persistence

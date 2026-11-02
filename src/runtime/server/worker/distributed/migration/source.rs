@@ -965,12 +965,10 @@ impl ServerWorkerState {
                             [crate::framework::capabilities::io::Token(connection_token)]
                         .slot_migration_role = None;
                     } else {
-                        // Keep the role until teardown so any already-buffered
-                        // migration protocol frame is suppressed instead of
-                        // being dispatched as a normal client command.
-                        self.connection_registry
-                            [crate::framework::capabilities::io::Token(connection_token)]
-                        .mark_closing();
+                        // Terminal migration cleanup matches C's async client
+                        // free semantics: discard pending protocol output so the
+                        // peer observes the terminal close without backpressure.
+                        self.remove_connection(connection_token);
                     }
                 }
             }

@@ -136,17 +136,11 @@ fn main() {
         return run_eval_mode(&opts, eval_file);
     }
 
-    let raw = opts.raw || !stdout_is_tty();
+    let raw = opts.raw || (!opts.no_raw && !stdout_is_tty());
     let is_interactive = opts.interactive || !opts.has_cmd;
 
     if is_interactive && !opts.has_cmd {
-        let mut repl = Repl::new(
-            opts.host.clone(),
-            opts.port,
-            opts.password.clone(),
-            opts.db,
-            raw,
-        );
+        let mut repl = repl_from_options(&opts, raw);
         match repl.run() {
             Ok(()) => {}
             Err(e) => {
@@ -164,13 +158,7 @@ fn main() {
             }
         }
     } else {
-        let mut repl = Repl::new(
-            opts.host.clone(),
-            opts.port,
-            opts.password.clone(),
-            opts.db,
-            raw,
-        );
+        let mut repl = repl_from_options(&opts, raw);
         match repl.run() {
             Ok(()) => {}
             Err(e) => {
@@ -185,8 +173,9 @@ struct CliOptions {
     host: String,
     port: u16,
     socket: Option<String>,
-    password: Option<String>,
-    user: Option<String>,
+    password: Option<Vec<u8>>,
+    auth_from_cli: bool,
+    user: Option<Vec<u8>>,
     db: u8,
     raw: bool,
     no_raw: bool,
@@ -197,6 +186,7 @@ struct CliOptions {
     askpass: bool,
     json: bool,
     quoted_json: bool,
+    json_requested_resp3: bool,
     latency: bool,
     latency_history: bool,
     latency_interval: u64,
@@ -206,6 +196,8 @@ struct CliOptions {
     memkeys: bool,
     memkeys_samples: u64,
     hotkeys: bool,
+    hotkeys_count: usize,
+    resp_version: Option<u8>,
     intrinsic_latency: Option<u64>,
     quoted_input: bool,
     stdin_cmd: bool,
@@ -234,7 +226,11 @@ fn parse_cli_args(args: &[String]) -> Result<CliOptions, String> {
         host: "127.0.0.1".to_string(),
         port: 6379,
         socket: None,
-        password: None,
+        password: std::env::var("VALKEYCLI_AUTH")
+            .or_else(|_| std::env::var("REDISCLI_AUTH"))
+            .map(String::into_bytes)
+            .ok(),
+        auth_from_cli: false,
         user: None,
         db: 0,
         raw: false,
@@ -246,6 +242,7 @@ fn parse_cli_args(args: &[String]) -> Result<CliOptions, String> {
         askpass: false,
         json: false,
         quoted_json: false,
+        json_requested_resp3: false,
         latency: false,
         latency_history: false,
         latency_interval: 15,
@@ -255,6 +252,8 @@ fn parse_cli_args(args: &[String]) -> Result<CliOptions, String> {
         memkeys: false,
         memkeys_samples: 0,
         hotkeys: false,
+        hotkeys_count: 16,
+        resp_version: None,
         intrinsic_latency: None,
         quoted_input: false,
         stdin_cmd: false,
@@ -282,6 +281,17 @@ fn parse_cli_args(args: &[String]) -> Result<CliOptions, String> {
     while i < args.len() {
         let arg = &args[i];
         match arg.as_str() {
+            "-2" | "-3" => {
+                let version = if arg == "-3" { 3 } else { 2 };
+                if opts
+                    .resp_version
+                    .is_some_and(|configured| configured != version)
+                {
+                    return Err("Options -2 and -3 are mutually exclusive".to_string());
+                }
+                opts.resp_version = Some(version);
+                i += 1;
+            }
             "-h" if i + 1 < args.len() => {
                 opts.host = args[i + 1].clone();
                 i += 2;
@@ -297,7 +307,8 @@ fn parse_cli_args(args: &[String]) -> Result<CliOptions, String> {
                 i += 2;
             }
             "-a" if i + 1 < args.len() => {
-                opts.password = Some(args[i + 1].clone());
+                opts.password = Some(args[i + 1].as_bytes().to_vec());
+                opts.auth_from_cli = true;
                 i += 2;
             }
             "-u" if i + 1 < args.len() => {
@@ -312,15 +323,15 @@ fn parse_cli_args(args: &[String]) -> Result<CliOptions, String> {
                 i += 2;
             }
             "--raw" => {
-                opts.raw = true;
+                set_output_mode(&mut opts, OutputMode::Raw);
                 i += 1;
             }
             "--no-raw" => {
-                opts.no_raw = true;
+                set_output_mode(&mut opts, OutputMode::Standard);
                 i += 1;
             }
             "--csv" => {
-                opts.csv = true;
+                set_output_mode(&mut opts, OutputMode::Csv);
                 i += 1;
             }
             "--mono" => {
@@ -374,7 +385,19 @@ fn parse_cli_args(args: &[String]) -> Result<CliOptions, String> {
             }
             "--hotkeys" => {
                 opts.hotkeys = true;
+                opts.hotkeys_count = 16;
                 i += 1;
+            }
+            "--hotkeys-count" if i + 1 < args.len() => {
+                opts.hotkeys_count = args[i + 1]
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|count| *count > 0 && *count <= i32::MAX as usize)
+                    .ok_or_else(|| {
+                        "Invalid hotkeys count. Must be a positive integer.".to_string()
+                    })?;
+                opts.hotkeys = true;
+                i += 2;
             }
             "--intrinsic-latency" if i + 1 < args.len() => {
                 let secs: u64 = args[i + 1]
@@ -384,13 +407,13 @@ fn parse_cli_args(args: &[String]) -> Result<CliOptions, String> {
                 i += 2;
             }
             "--json" => {
-                opts.json = true;
-                opts.raw = true;
+                opts.json_requested_resp3 = true;
+                set_output_mode(&mut opts, OutputMode::Json);
                 i += 1;
             }
             "--quoted-json" => {
-                opts.quoted_json = true;
-                opts.raw = true;
+                opts.json_requested_resp3 = true;
+                set_output_mode(&mut opts, OutputMode::QuotedJson);
                 i += 1;
             }
             "--quoted-input" => {
@@ -464,7 +487,7 @@ fn parse_cli_args(args: &[String]) -> Result<CliOptions, String> {
                 i += 2;
             }
             "--user" if i + 1 < args.len() => {
-                opts.user = Some(args[i + 1].clone());
+                opts.user = Some(args[i + 1].as_bytes().to_vec());
                 i += 2;
             }
             "--no-auth-warning" => {
@@ -497,8 +520,13 @@ fn parse_cli_args(args: &[String]) -> Result<CliOptions, String> {
 
     if let Ok(env_user) = std::env::var("VALKEYCLI_USER") {
         if opts.user.is_none() {
-            opts.user = Some(env_user);
+            opts.user = Some(env_user.into_bytes());
         }
+    }
+    if opts.auth_from_cli && !opts.no_auth_warning {
+        eprintln!(
+            "Warning: Using a password with '-a' or '-u' option on the command line interface may not be safe."
+        );
     }
 
     if opts.stdin_cmd && opts.stdin_tag.is_some() {
@@ -506,6 +534,25 @@ fn parse_cli_args(args: &[String]) -> Result<CliOptions, String> {
     }
 
     Ok(opts)
+}
+
+enum OutputMode {
+    Standard,
+    Raw,
+    Csv,
+    Json,
+    QuotedJson,
+}
+
+fn set_output_mode(opts: &mut CliOptions, mode: OutputMode) {
+    opts.raw = matches!(
+        mode,
+        OutputMode::Raw | OutputMode::Json | OutputMode::QuotedJson
+    );
+    opts.no_raw = matches!(mode, OutputMode::Standard);
+    opts.csv = matches!(mode, OutputMode::Csv);
+    opts.json = matches!(mode, OutputMode::Json);
+    opts.quoted_json = matches!(mode, OutputMode::QuotedJson);
 }
 
 fn parse_uri(uri: &str, opts: &mut CliOptions) -> Result<(), String> {
@@ -523,10 +570,12 @@ fn parse_uri(uri: &str, opts: &mut CliOptions) -> Result<(), String> {
     let rest = if let Some(idx) = rest.find('@') {
         let userinfo = &rest[..idx];
         if let Some(at) = userinfo.find(':') {
-            opts.password = Some(userinfo[at + 1..].to_string());
+            opts.user = Some(percent_decode_uri_component(&userinfo[..at])?);
+            opts.password = Some(percent_decode_uri_component(&userinfo[at + 1..])?);
         } else {
-            opts.password = Some(userinfo.to_string());
+            opts.password = Some(percent_decode_uri_component(userinfo)?);
         }
+        opts.auth_from_cli = true;
         &rest[idx + 1..]
     } else {
         rest
@@ -544,6 +593,38 @@ fn parse_uri(uri: &str, opts: &mut CliOptions) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn percent_decode_uri_component(value: &str) -> Result<Vec<u8>, String> {
+    let input = value.as_bytes();
+    let mut decoded = Vec::with_capacity(input.len());
+    let mut index = 0;
+    while index < input.len() {
+        if input[index] != b'%' {
+            decoded.push(input[index]);
+            index += 1;
+            continue;
+        }
+        if index + 2 >= input.len() {
+            return Err("Incomplete URI encoding".to_string());
+        }
+        let high = decode_hex_digit(input[index + 1])
+            .ok_or_else(|| "Illegal character in URI encoding".to_string())?;
+        let low = decode_hex_digit(input[index + 2])
+            .ok_or_else(|| "Illegal character in URI encoding".to_string())?;
+        decoded.push((high << 4) | low);
+        index += 3;
+    }
+    Ok(decoded)
+}
+
+fn decode_hex_digit(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn execute_single_command(opts: &CliOptions, raw: bool, is_tty: bool) -> Result<(), String> {
@@ -603,12 +684,13 @@ fn execute_single_command(opts: &CliOptions, raw: bool, is_tty: bool) -> Result<
                 opts.db,
                 &args_refs,
                 opts.cluster_mode,
+                requested_resp3(opts),
             )?
         } else {
             let mut conn = connect_with_opts(opts)?;
             conn.send_command(&args_refs)?
         };
-        let output = if raw || opts.json || opts.quoted_json || !is_tty {
+        let output = if raw || opts.csv || opts.json || opts.quoted_json || !is_tty {
             json::format_resp_for_command(&resp, opts, &cmd_parts)
         } else {
             resp.to_string_tty()
@@ -655,7 +737,7 @@ fn quoted_input_is_valid(args: &[String]) -> bool {
     })
 }
 
-fn resolve_password(opts: &CliOptions) -> Option<String> {
+fn resolve_password(opts: &CliOptions) -> Option<Vec<u8>> {
     opts.password.clone()
 }
 
@@ -673,10 +755,31 @@ fn connect_with_opts(opts: &CliOptions) -> Result<Connection, String> {
             opts.db,
         )?
     };
-    if opts.json || opts.quoted_json {
-        conn.switch_to_resp3(false)?;
+    if let Some(required) = requested_resp3(opts) {
+        conn.switch_to_resp3(required)?;
     }
     Ok(conn)
+}
+
+fn requested_resp3(opts: &CliOptions) -> Option<bool> {
+    match opts.resp_version {
+        Some(3) => Some(true),
+        Some(_) => None,
+        None => opts.json_requested_resp3.then_some(false),
+    }
+}
+
+fn repl_from_options(opts: &CliOptions, raw: bool) -> Repl {
+    let mut repl = Repl::new(
+        opts.host.clone(),
+        opts.port,
+        opts.password.clone(),
+        opts.user.clone(),
+        opts.db,
+        raw,
+    );
+    repl.resp3 = requested_resp3(opts);
+    repl
 }
 
 fn run_scan_mode(opts: &CliOptions) {
@@ -952,11 +1055,12 @@ fn run_eval_mode(opts: &CliOptions, eval_file: &str) {
 fn execute_with_redirects(
     host: &str,
     port: u16,
-    password: Option<&str>,
-    username: Option<&str>,
+    password: Option<&[u8]>,
+    username: Option<&[u8]>,
     db: u8,
     command: &[&[u8]],
     cluster_mode: bool,
+    resp3: Option<bool>,
 ) -> Result<RespValue, String> {
     let mut current_host = host.to_string();
     let mut current_port = port;
@@ -964,6 +1068,9 @@ fn execute_with_redirects(
     for _ in 0..16 {
         let mut connection =
             Connection::connect(&current_host, current_port, password, username, db)?;
+        if let Some(required) = resp3 {
+            connection.switch_to_resp3(required)?;
+        }
         if should_ask {
             match connection.send_command(&[b"ASKING"])? {
                 RespValue::SimpleString(ref v) if v == "OK" => {}
@@ -1293,7 +1400,7 @@ fn run_hotkeys_mode(opts: &CliOptions) -> ! {
         }
     }
     counts.sort_by_key(|(_, freq)| std::cmp::Reverse(*freq));
-    counts.truncate(16);
+    counts.truncate(opts.hotkeys_count);
     println!("\n-------- hot keys --------");
     for (key, freq) in counts {
         println!("\thot key found with counter: {} \tkeyname: {}", freq, key);
@@ -1341,7 +1448,10 @@ fn parse_cluster_redirect(error: &str, previous_host: &str) -> Option<(bool, Str
 #[cfg(test)]
 mod tests {
     use super::json::escape_json_bytes;
-    use super::{parse_cluster_redirect, quoted_input_is_valid};
+    use super::{
+        parse_cli_args, parse_cluster_redirect, quoted_input_is_valid, repl_from_options,
+        requested_resp3,
+    };
     use crate::repl::parse_inline_command;
 
     #[test]
@@ -1368,5 +1478,118 @@ mod tests {
         assert_eq!(parse_inline_command("\"one\" \"two\"").unwrap().len(), 2);
         assert!(!quoted_input_is_valid(&["\"unterminated".to_string()]));
         assert!(!quoted_input_is_valid(&["\"one\" \"two\"".to_string()]));
+    }
+
+    #[test]
+    fn uri_credentials_set_both_user_and_password() {
+        let options = parse_cli_args(&[
+            "-u".to_string(),
+            "redis://clienv:mypass@127.0.0.1:6379".to_string(),
+        ])
+        .unwrap();
+
+        assert_eq!(options.user.as_deref(), Some(b"clienv".as_slice()));
+        assert_eq!(options.password.as_deref(), Some(b"mypass".as_slice()));
+        assert!(options.auth_from_cli);
+    }
+
+    #[test]
+    fn uri_credentials_are_percent_decoded() {
+        let options = parse_cli_args(&[
+            "-u".to_string(),
+            "redis://client%3Aname:p%40ss%25word@127.0.0.1:6379".to_string(),
+        ])
+        .unwrap();
+
+        assert_eq!(options.user.as_deref(), Some(b"client:name".as_slice()));
+        assert_eq!(options.password.as_deref(), Some(b"p@ss%word".as_slice()));
+    }
+
+    #[test]
+    fn uri_credentials_reject_invalid_percent_encoding() {
+        for uri in [
+            "redis://client%ZZ:password@127.0.0.1:6379",
+            "redis://client%4:password@127.0.0.1:6379",
+        ] {
+            assert!(parse_cli_args(&["-u".to_string(), uri.to_string()]).is_err());
+        }
+    }
+
+    #[test]
+    fn uri_credentials_preserve_empty_username_and_non_utf8_bytes() {
+        let empty_user = parse_cli_args(&[
+            "-u".to_string(),
+            "redis://:secret@127.0.0.1:6379".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(empty_user.user.as_deref(), Some(b"".as_slice()));
+        assert_eq!(empty_user.password.as_deref(), Some(b"secret".as_slice()));
+
+        let binary_password = parse_cli_args(&[
+            "-u".to_string(),
+            "redis://user:p%FF@127.0.0.1:6379".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(binary_password.user.as_deref(), Some(b"user".as_slice()));
+        assert_eq!(
+            binary_password.password.as_deref(),
+            Some(b"p\xff".as_slice())
+        );
+    }
+
+    #[test]
+    fn resp2_and_resp3_options_are_mutually_exclusive() {
+        let error = match parse_cli_args(&["-2".to_string(), "-3".to_string()]) {
+            Ok(_) => panic!("conflicting RESP versions must be rejected"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error, "Options -2 and -3 are mutually exclusive");
+    }
+
+    #[test]
+    fn last_output_mode_option_wins() {
+        let csv = parse_cli_args(&["--json".to_string(), "--csv".to_string()]).unwrap();
+        assert!(csv.csv);
+        assert!(!csv.raw);
+        assert!(!csv.no_raw);
+        assert!(!csv.json);
+        assert!(!csv.quoted_json);
+        assert_eq!(requested_resp3(&csv), Some(false));
+
+        let raw = parse_cli_args(&["--csv".to_string(), "--raw".to_string()]).unwrap();
+        assert!(raw.raw);
+        assert!(!raw.no_raw);
+        assert!(!raw.csv);
+        assert!(!raw.json);
+        assert!(!raw.quoted_json);
+
+        let standard = parse_cli_args(&["--raw".to_string(), "--no-raw".to_string()]).unwrap();
+        assert!(!standard.raw);
+        assert!(standard.no_raw);
+        assert!(!standard.csv);
+        assert!(!standard.json);
+        assert!(!standard.quoted_json);
+    }
+
+    #[test]
+    fn interactive_repl_preserves_cli_and_uri_acl_usernames() {
+        for (args, expected_user) in [
+            (
+                vec!["--user".to_string(), "alice".to_string()],
+                b"alice".as_slice(),
+            ),
+            (
+                vec![
+                    "-u".to_string(),
+                    "redis://bob:secret@127.0.0.1:6379".to_string(),
+                ],
+                b"bob".as_slice(),
+            ),
+        ] {
+            let options = parse_cli_args(&args).unwrap();
+            let repl = repl_from_options(&options, false);
+            assert_eq!(repl.username.as_deref(), Some(expected_user));
+        }
     }
 }

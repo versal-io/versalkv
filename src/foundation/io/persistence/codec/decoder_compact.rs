@@ -1,5 +1,6 @@
 pub(crate) fn lzf_decompress(input: &[u8], expected_len: usize) -> Option<Vec<u8>> {
-    let mut out: Vec<u8> = Vec::with_capacity(expected_len);
+    let mut out = Vec::new();
+    out.try_reserve_exact(expected_len).ok()?;
     let mut ip = 0usize;
     while ip < input.len() {
         let ctrl = input[ip] as usize;

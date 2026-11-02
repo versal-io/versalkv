@@ -148,9 +148,13 @@ impl ServerWorkerState {
         self.retry_pending_transport_removals();
         let was_forkless_capturing = self.ctx.persistence().forkless_capture_in_progress();
         let released_forkless_key = self.ctx.drive_forkless_feed();
-        if released_forkless_key
-            || (was_forkless_capturing && !self.ctx.persistence().forkless_capture_in_progress())
-        {
+        let capture_finished =
+            was_forkless_capturing && !self.ctx.persistence().forkless_capture_in_progress();
+        if released_forkless_key || capture_finished {
+            let configured_delay = self.ctx.config().persistence.rdb_key_save_delay;
+            self.ctx
+                .persistence()
+                .set_forkless_key_delay(configured_delay);
             self.release_forkless_clients();
         }
         self.drive_slot_migration_actions();
@@ -890,18 +894,37 @@ impl ServerWorkerState {
 
     pub(crate) fn run_eviction(&mut self) {
         let outcome = self.perform_evictions();
-        for (db_idx, key) in outcome.evicted {
-            let mut pending_publish = Vec::new();
-            self._propagate_background_unlink(db_idx, &key);
+        self.apply_background_evictions(outcome.evicted);
+    }
+
+    pub(crate) fn apply_background_evictions(&mut self, evicted: Vec<(u32, Bytes)>) {
+        if evicted.is_empty() {
+            return;
+        }
+        let mut pending_publish = Vec::new();
+        let mut pending_tracking = Vec::new();
+        self.collect_tracking_invalidations(&evicted, None, &mut pending_tracking);
+        for (db_idx, key) in &evicted {
+            for (_, connection) in self.connection_registry.iter_mut() {
+                if !connection.transaction.watched_keys().is_empty() {
+                    connection
+                        .transaction
+                        .touch_watched_key(*db_idx, key, false);
+                }
+            }
+            self._propagate_background_unlink(*db_idx, key);
             crate::runtime::server::worker::flows::maintenance::enqueue_evicted_key_notifications(
                 self.ctx.config(),
                 &mut pending_publish,
-                db_idx,
-                &key,
+                *db_idx,
+                key,
             );
-            if !pending_publish.is_empty() {
-                self.deliver_published(pending_publish, Vec::new());
-            }
+        }
+        if !pending_publish.is_empty() {
+            self.deliver_published(pending_publish, Vec::new());
+        }
+        for (target_id, frame) in pending_tracking {
+            self.queue_client_reply(Token(target_id), frame);
         }
     }
 
@@ -2251,6 +2274,27 @@ mod tests {
         _assert_unwrapped_unlink(&sequenced.aof_frames, &[select, unlink], "AOF");
         assert_eq!(backend.ctx.repl_seldb(), 10);
         assert_eq!(backend.ctx.persistence().aof_selected_db(), 10);
+    }
+
+    #[test]
+    fn active_expiry_reuses_the_physical_cursor_after_one_explicit_select() {
+        let mut backend = ServerWorkerState::new(16).unwrap();
+        backend.ctx.replication_mut().backlog.activate();
+        backend
+            .ctx
+            .db_mut(10)
+            .unwrap()
+            .active_expired_deletions
+            .extend([b"first".to_vec(), b"second".to_vec()]);
+        let select = encode_command(&[b"SELECT", b"10"]);
+        let first = encode_command(&[b"UNLINK", b"first"]);
+        let second = encode_command(&[b"UNLINK", b"second"]);
+
+        backend.process_expired_deletions();
+
+        let backlog = &backend.ctx.replication().backlog;
+        let bytes = backlog.read_from(backlog.first_byte_cursor()).unwrap();
+        assert_eq!(bytes, [select, first, second].concat());
     }
 
     #[test]

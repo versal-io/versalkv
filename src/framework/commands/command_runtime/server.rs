@@ -553,8 +553,8 @@ fn apply_server_event(
         | "xgroup-setid"
         | "xsetid"
         | "xtrim" => NOTIFY_STREAM,
-        "copy_to" | "del" | "expire" | "move_from" | "move_to" | "rename_from" | "rename_to"
-        | "restore" | "sortstore" => NOTIFY_GENERIC,
+        "copy_to" | "del" | "expire" | "move_from" | "move_to" | "persist" | "rename_from"
+        | "rename_to" | "restore" | "sortstore" => NOTIFY_GENERIC,
         _ => return,
     };
     keyspace::notify_keyspace_event(conn, ctx, notification_type, event.kind, db_idx, &event.key);
@@ -668,6 +668,10 @@ mod tests {
                     kind: "zrem",
                     key: Bytes::from_static(b"zset"),
                 },
+                CoreEvent {
+                    kind: "persist",
+                    key: Bytes::from_static(b"string"),
+                },
             ],
             db_events: vec![(
                 1,
@@ -686,6 +690,9 @@ mod tests {
         }));
         assert!(conn.pending_notifications().iter().any(|(channel, value)| {
             channel.as_ref() == b"__keyspace@0__:zset" && value.as_ref() == b"zrem"
+        }));
+        assert!(conn.pending_notifications().iter().any(|(channel, value)| {
+            channel.as_ref() == b"__keyspace@0__:string" && value.as_ref() == b"persist"
         }));
         assert!(conn.pending_notifications().iter().any(|(channel, value)| {
             channel.as_ref() == b"__keyspace@1__:moved" && value.as_ref() == b"move_to"

@@ -30,6 +30,78 @@ fn run_hosted(conn: &mut Connection, ctx: &mut ServerContext, args: Vec<Bytes>) 
 }
 
 #[test]
+fn script_debug_sync_prepares_a_synchronous_debug_task() {
+    let mut conn = connection();
+    let mut ctx = ServerContext::new(1);
+    let debug = CommandArgs::from_parts(vec![
+        Bytes::from_static(b"SCRIPT"),
+        Bytes::from_static(b"DEBUG"),
+        Bytes::from_static(b"SYNC"),
+    ]);
+    assert_eq!(script_cmd(&mut conn, &debug, &mut ctx), Value::ok());
+    let eval = CommandArgs::from_parts(vec![
+        Bytes::from_static(b"EVAL"),
+        Bytes::from_static(b"return 'hello'"),
+        Bytes::from_static(b"0"),
+    ]);
+
+    let PreparedHostTask::Lua(task) = prepare_lua_task(&mut conn, &eval, &mut ctx).unwrap() else {
+        panic!("expected Lua task");
+    };
+
+    assert!(task.is_synchronous_debug());
+    assert!(!task.is_forked_debug());
+}
+
+#[test]
+fn script_debug_rejects_evalsha_and_evalsha_ro() {
+    struct LuaRuntimeReset;
+
+    impl Drop for LuaRuntimeReset {
+        fn drop(&mut self) {
+            reset_lua_runtime();
+        }
+    }
+
+    reset_lua_runtime();
+    let _reset = LuaRuntimeReset;
+    let mut conn = connection();
+    let mut ctx = ServerContext::new(1);
+    let load = CommandArgs::from_parts(vec![
+        Bytes::from_static(b"SCRIPT"),
+        Bytes::from_static(b"LOAD"),
+        Bytes::from_static(b"return 'cached'"),
+    ]);
+    let Value::Bulk(digest) = script_cmd(&mut conn, &load, &mut ctx) else {
+        panic!("SCRIPT LOAD must return the script digest");
+    };
+    let debug = CommandArgs::from_parts(vec![
+        Bytes::from_static(b"SCRIPT"),
+        Bytes::from_static(b"DEBUG"),
+        Bytes::from_static(b"SYNC"),
+    ]);
+    assert_eq!(script_cmd(&mut conn, &debug, &mut ctx), Value::ok());
+
+    for command in [b"EVALSHA".as_slice(), b"EVALSHA_RO".as_slice()] {
+        let evalsha = CommandArgs::from_parts(vec![
+            Bytes::copy_from_slice(command),
+            digest.clone(),
+            Bytes::from_static(b"0"),
+        ]);
+        match prepare_lua_task(&mut conn, &evalsha, &mut ctx) {
+            Err(error) => assert_eq!(
+                error,
+                Value::error("ERR Please use EVAL instead of EVALSHA for debugging")
+            ),
+            Ok(_) => panic!(
+                "{} must not prepare a Lua task while debugging",
+                String::from_utf8_lossy(command)
+            ),
+        }
+    }
+}
+
+#[test]
 fn hosted_eval_reuses_one_compilation_across_argument_variants() {
     reset_lua_runtime();
     let script = Bytes::from_static(

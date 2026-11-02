@@ -47,7 +47,9 @@ pub fn hincrbyfloat(
     };
     let new_val = cur + incr;
     if new_val.is_nan() || new_val.is_infinite() {
-        return CommandOutcome::reply(Value::error("ERR value is NaN or Infinity"));
+        return CommandOutcome::reply(Value::error(
+            "ERR increment would produce NaN or Infinity",
+        ));
     }
     let s = format_float(new_val);
     if db

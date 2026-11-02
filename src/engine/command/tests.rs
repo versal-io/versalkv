@@ -146,8 +146,9 @@ fn command_descriptor_carries_handler_independent_metadata() {
         first_key: 1,
         last_key: 1,
         key_step: 1,
-        container: None,
+        key_flags: &[],
         acl_categories: &["STRING", "WRITE"],
+        get_keys: None,
     };
 
     assert_eq!(descriptor.name.as_str(), "set");

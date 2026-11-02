@@ -839,7 +839,18 @@ impl ServerWorkerState {
         context: &DispatchContext,
     ) -> DispatchOutcome {
         if !matches!(context, DispatchContext::Normal) {
-            self.child_registry.defer_completion(completion.child);
+            if self.child_registry.defer_completion(completion.child) {
+                self.event_batch
+                    .push_ready_next_turn(EventLoopEvent::child_completion(completion));
+            }
+            return DispatchOutcome::Requeued;
+        }
+        self.child_registry.resume_completion(completion.child);
+        if matches!(
+            self.child_registry.owner(completion.child),
+            Some(crate::runtime::server::worker::reactor::sources::ChildOwner::ScriptDebugger)
+        ) {
+            self.finalize_child_registry_entry(completion.child);
             return DispatchOutcome::Handled;
         }
         if matches!(

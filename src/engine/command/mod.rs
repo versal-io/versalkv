@@ -12,6 +12,8 @@ mod session;
 pub use args::parse_hex_or_float;
 pub use args::{CommandArgs, CommandError};
 #[cfg(not(feature = "wasm"))]
+pub(crate) use descriptor::command_may_mutate_dataset;
+#[cfg(not(feature = "wasm"))]
 pub use descriptor::{CommandDescriptor, CommandKeyIndices, ResolvedCommand};
 pub use metadata::*;
 #[cfg(not(feature = "wasm"))]

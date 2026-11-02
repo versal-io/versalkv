@@ -33,6 +33,114 @@ mod replica_apply;
 
 mod timeout;
 
+const REPLICATION_LOG_MESSAGE_MAX_BYTES: usize = 4096;
+
+struct BoundedReplicationLog {
+    output: String,
+}
+
+impl BoundedReplicationLog {
+    fn new() -> Self {
+        Self {
+            output: String::with_capacity(REPLICATION_LOG_MESSAGE_MAX_BYTES),
+        }
+    }
+
+    fn push_ascii(&mut self, value: &str) {
+        let remaining = REPLICATION_LOG_MESSAGE_MAX_BYTES.saturating_sub(self.output.len());
+        self.output.push_str(&value[..value.len().min(remaining)]);
+    }
+
+    fn push_sanitized(&mut self, mut value: &[u8]) {
+        while !value.is_empty() && self.output.len() < REPLICATION_LOG_MESSAGE_MAX_BYTES {
+            let (character, consumed) = next_lossy_character(value);
+            let character = if matches!(character, '\r' | '\n') {
+                ' '
+            } else {
+                character
+            };
+            if self.output.len() + character.len_utf8() > REPLICATION_LOG_MESSAGE_MAX_BYTES {
+                break;
+            }
+            self.output.push(character);
+            value = &value[consumed..];
+        }
+    }
+
+    fn push_arguments(&mut self, args: &crate::engine::command::CommandArgs) {
+        if args.args.is_empty() {
+            return;
+        }
+        self.push_ascii(", with args beginning with: ");
+        for (index, argument) in args.args.iter().take(8).enumerate() {
+            if self.output.len() == REPLICATION_LOG_MESSAGE_MAX_BYTES {
+                break;
+            }
+            if index != 0 {
+                self.push_ascii(" ");
+            }
+            self.push_ascii("'");
+            self.push_sanitized(argument);
+            self.push_ascii("'");
+        }
+    }
+
+    fn finish(self) -> String {
+        self.output
+    }
+}
+
+fn next_lossy_character(value: &[u8]) -> (char, usize) {
+    if value[0].is_ascii() {
+        return (char::from(value[0]), 1);
+    }
+    let probe = &value[..value.len().min(4)];
+    match std::str::from_utf8(probe) {
+        Ok(valid) => valid
+            .chars()
+            .next()
+            .map(|character| (character, character.len_utf8()))
+            .unwrap_or(('\u{fffd}', 1)),
+        Err(error) if error.valid_up_to() > 0 => {
+            let valid = std::str::from_utf8(&probe[..error.valid_up_to()]).ok();
+            valid
+                .and_then(|valid| valid.chars().next())
+                .map(|character| (character, character.len_utf8()))
+                .unwrap_or(('\u{fffd}', 1))
+        }
+        Err(error) => ('\u{fffd}', error.error_len().unwrap_or(probe.len()).max(1)),
+    }
+}
+
+pub(crate) fn render_replication_error_for_log(
+    error: &[u8],
+    args: &crate::engine::command::CommandArgs,
+    hide_user_data: bool,
+) -> String {
+    if hide_user_data {
+        return "*redacted*".to_string();
+    }
+    let mut renderer = BoundedReplicationLog::new();
+    renderer.push_sanitized(error);
+    renderer.push_arguments(args);
+    renderer.finish()
+}
+
+pub(crate) fn render_unknown_replication_command_for_log(
+    args: &crate::engine::command::CommandArgs,
+    hide_user_data: bool,
+) -> String {
+    if hide_user_data {
+        return "*redacted*".to_string();
+    }
+    let mut renderer = BoundedReplicationLog::new();
+    renderer.push_ascii("ERR unknown command '");
+    renderer.push_sanitized(&args.name);
+    renderer.push_ascii("'");
+    renderer.push_arguments(args);
+    renderer.finish()
+}
+
 #[derive(Default)]
 pub(crate) struct FullSyncCoordinator {
     pub(crate) next_transfer_id: u64,

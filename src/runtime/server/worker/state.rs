@@ -87,6 +87,9 @@ pub(crate) struct ServerWorkerState {
     /// deregister. Nothing else in the runtime needs to inspect this map.
     pub(in crate::runtime::server) pending_transport_removals:
         HashMap<Token, PendingTransportRemoval>,
+    /// Tokens currently executing business-state teardown. This transient guard
+    /// prevents nested failure callbacks from retiring one connection twice.
+    pub(in crate::runtime::server) retiring_connections: HashSet<Token>,
     pub(in crate::runtime::server) socket_owners: HashMap<Token, SocketIoOwner>,
     pub(in crate::runtime::server) full_sync: FullSyncCoordinator,
     pub(in crate::runtime::server) client_hup_drains: HashSet<Token>,
@@ -227,6 +230,7 @@ impl ServerWorkerState {
             tls_reload: super::tls::TlsReloadState::default(),
             connection_registry: ConnectionRegistry::default(),
             pending_transport_removals: HashMap::new(),
+            retiring_connections: HashSet::new(),
             socket_owners: HashMap::new(),
             full_sync: FullSyncCoordinator::default(),
             client_hup_drains: HashSet::new(),
@@ -399,15 +403,20 @@ impl ServerWorkerState {
         &mut self,
         id: IoOperationId,
     ) {
-        match self.socket_owner(id.token) {
+        let was_released = match self.socket_owner(id.token) {
             SocketIoOwner::IoWorkerWrite(write) if write == id => {
                 self.socket_owners.remove(&id.token);
+                true
             }
             SocketIoOwner::IoWorkerReadWrite { read, write } if write == id => {
                 self.socket_owners
                     .insert(id.token, SocketIoOwner::IoWorkerRead(read));
+                true
             }
-            _ => {}
+            _ => false,
+        };
+        if was_released {
+            self.queue_forked_debugger_for_reprocessing(id.token);
         }
     }
 
@@ -705,10 +714,6 @@ impl ServerWorkerState {
         self.data_lazyfree
             .configure_cpu_affinity(affinity.clone())?;
         self.replication_lazyfree.configure_cpu_affinity(affinity)
-    }
-
-    pub(crate) fn set_cluster_config_path(&mut self, path: std::path::PathBuf) {
-        self.cluster_config.path = Some(path);
     }
 
     pub(crate) fn bind_cluster_bus_listener(

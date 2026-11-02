@@ -69,7 +69,8 @@ impl super::ServerContext {
         };
         let not_counted = replication_not_counted
             .saturating_add(aof_not_counted)
-            .saturating_add(self.slot_export_output_memory);
+            .saturating_add(self.slot_export_output_memory)
+            .saturating_add(self.slot_import_infrastructure_memory);
         let maxmemory = usize::try_from(self.config().server.maxmemory).unwrap_or(usize::MAX);
         MaxmemoryState::from_parts(reported, maxmemory, not_counted)
     }

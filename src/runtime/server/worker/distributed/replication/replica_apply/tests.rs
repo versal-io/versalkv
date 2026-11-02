@@ -2,6 +2,7 @@ use super::*;
 use crate::engine::command::context::{BlockedCmd, BlockedState, WatchedKey};
 use crate::engine::distributed::cluster::migration::{MigrationJob, MigrationJobId, SlotRanges};
 use crate::engine::distributed::cluster::{ClusterState, NodeId, SlotRange};
+use crate::foundation::io::protocol::Value;
 use crate::foundation::io::store::structure::list::ListValue;
 use crate::foundation::io::store::Robj;
 use crate::framework::capabilities::connection::Connection;
@@ -18,6 +19,84 @@ use std::net::{TcpListener, TcpStream};
 
 fn offset(value: i64) -> ReplicationOffset {
     ReplicationOffset::try_from(value).expect("valid test offset")
+}
+
+fn no_command_host(
+    request: crate::engine::host::HostRequest<'_>,
+) -> Result<crate::engine::host::HostReply, crate::engine::host::HostError> {
+    match request {
+        crate::engine::host::HostRequest::Yield(_) => Ok(crate::engine::host::HostReply::Continue),
+        _ => Err(crate::engine::host::HostError::Runtime(
+            "unexpected host request".to_string(),
+        )),
+    }
+}
+
+fn call_registered_function(backend: &ServerWorkerState, name: &str) -> Value {
+    let compiled = backend
+        .ctx
+        .script()
+        .function_registry
+        .find_function(name)
+        .expect("function remains registered")
+        .clone();
+    let engine = backend
+        .ctx
+        .script()
+        .function_registry
+        .function_engine(&compiled)
+        .expect("function engine exists");
+    let mut run = crate::engine::extension::script::ScriptRunCtx::new_bare_for_test(compiled.flags);
+    let mut host = no_command_host;
+    engine
+        .call(&compiled, &mut run, &[], &[], &mut host)
+        .expect("function remains callable")
+}
+
+#[test]
+fn unknown_replication_command_log_obeys_user_data_policy() {
+    let args = CommandArgs::from_parts(vec![
+        Bytes::from_static(b"notacommand"),
+        Bytes::from_static(b"secretvalue"),
+    ]);
+
+    assert_eq!(
+        replication_unknown_command_error(&args, false),
+        "ERR unknown command 'notacommand', with args beginning with: 'secretvalue'"
+    );
+    assert_eq!(replication_unknown_command_error(&args, true), "*redacted*");
+}
+
+#[test]
+fn unknown_replication_command_log_truncates_on_utf8_boundary() {
+    let prefix = "ERR unknown command 'cmd', with args beginning with: '";
+    let mut argument = vec![b'x'; 4095 - prefix.len()];
+    argument.extend_from_slice("é".as_bytes());
+    argument.extend_from_slice(&vec![b'y'; 1024 * 1024]);
+    let args = CommandArgs::from_parts(vec![Bytes::from_static(b"cmd"), Bytes::from(argument)]);
+
+    let rendered = replication_unknown_command_error(&args, false);
+
+    assert!(rendered.len() <= 4096);
+    assert!(rendered.is_char_boundary(rendered.len()));
+}
+
+#[test]
+fn known_replication_command_error_obeys_user_data_policy() {
+    let args = CommandArgs::from_parts(vec![
+        Bytes::from_static(b"INCR"),
+        Bytes::from_static(b"not-an-integer"),
+    ]);
+
+    assert_eq!(
+        replication_command_error_for_log(b"ERR secret\r\nline", &args, true),
+        "*redacted*"
+    );
+    let rendered = replication_command_error_for_log(b"ERR secret\r\nline", &args, false);
+    assert_eq!(
+        rendered,
+        "ERR secret  line, with args beginning with: 'not-an-integer'"
+    );
 }
 
 fn add_watching_client(
@@ -1430,4 +1509,115 @@ fn invalid_function_keeps_full_sync_dataset_and_registry_unpublished() {
         .function_registry
         .get_library("oldlib")
         .is_some());
+}
+
+#[test]
+fn function_install_resource_failure_returns_error_and_preserves_state() {
+    use crate::engine::extension::lua::{reset_lua_runtime, with_lua_runtime};
+    use crate::engine::extension::script::ScriptError;
+    use crate::foundation::memory::metrics::memory_stats;
+
+    let _memory_guard = memory_stats::lock_global_for_test();
+    reset_lua_runtime();
+    let test_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut backend = ServerWorkerState::new(1).unwrap();
+        backend
+            .ctx
+            .db_mut(0)
+            .unwrap()
+            .set(b"old".to_vec(), Robj::string("value"));
+        let old_function = "#!lua name=oldlib\nlocal counter = 0\nserver.register_function('oldfn', function() counter = counter + 1 return counter end)";
+        backend
+            .ctx
+            .script_mut()
+            .function_registry
+            .load_library("oldlib", old_function)
+            .unwrap();
+        assert_eq!(
+            call_registered_function(&backend, "oldfn"),
+            Value::Integer(1)
+        );
+
+        let payload = "x".repeat(512 * 1024);
+        let incoming_code = format!(
+            "#!lua name=newlib\nlocal payload = '{payload}'\nserver.register_function('newfn', function() return payload end)"
+        );
+        let function_codes = vec![incoming_code.into_bytes()];
+        with_lua_runtime(false, |lua| {
+            lua.set_memory_limit(lua.used_memory().saturating_add(4096))
+                .map(|_| ())
+                .map_err(|error| ScriptError::Runtime(error.to_string()))
+        })
+        .unwrap();
+
+        let install_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            backend.install_prepared_functions(&function_codes)
+        }));
+        (backend, install_outcome)
+    }));
+
+    let limit_cleanup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        with_lua_runtime(false, |lua| {
+            lua.set_memory_limit(0)
+                .map(|_| ())
+                .map_err(|error| ScriptError::Runtime(error.to_string()))
+        })
+    }));
+
+    let (backend, install_outcome) = match test_outcome {
+        Ok(outcome) => outcome,
+        Err(payload) => {
+            let _ = limit_cleanup;
+            drop(_memory_guard);
+            std::panic::resume_unwind(payload);
+        }
+    };
+    match limit_cleanup {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            drop(backend);
+            drop(_memory_guard);
+            panic!("failed to clear Lua memory limit: {error}");
+        }
+        Err(payload) => {
+            drop(backend);
+            drop(_memory_guard);
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    let (did_panic, returned_error) = match install_outcome {
+        Ok(result) => (false, result.is_err()),
+        Err(_) => (true, false),
+    };
+    let old_key_is_visible = backend.ctx.db(0).unwrap().get_no_expire(b"old").is_some();
+    let old_library_is_visible = backend
+        .ctx
+        .script()
+        .function_registry
+        .get_library("oldlib")
+        .is_some();
+    let old_function_is_visible = backend
+        .ctx
+        .script()
+        .function_registry
+        .find_function("oldfn")
+        .is_some();
+    let old_function_result = call_registered_function(&backend, "oldfn");
+    drop(backend);
+    reset_lua_runtime();
+    drop(_memory_guard);
+
+    assert!(
+        !did_panic,
+        "function installation failure must return Err instead of panicking"
+    );
+    assert!(
+        returned_error,
+        "constrained function installation must return Err"
+    );
+    assert!(old_key_is_visible);
+    assert!(old_library_is_visible);
+    assert!(old_function_is_visible);
+    assert_eq!(old_function_result, Value::Integer(2));
 }

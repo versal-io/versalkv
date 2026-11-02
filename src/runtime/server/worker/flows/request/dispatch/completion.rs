@@ -342,13 +342,28 @@ impl ServerWorkerState {
             return false;
         }
         if let Value::Error(error) = reply {
+            let rendered = replica_error_for_log(
+                error,
+                invocation.args,
+                self.ctx.config().server.hide_user_data_from_log,
+            );
+            let command = replica_command_name_for_log(
+                invocation.name,
+                invocation.args,
+                self.ctx.config().server.hide_user_data_from_log,
+            );
             crate::server_log!(
                 warning,
-                "== CRITICAL == This primary is sending an error to its replica: {}",
-                String::from_utf8_lossy(error)
+                "== CRITICAL == This primary is sending an error to its replica: '{}' after processing the command '{}'",
+                rendered,
+                command,
             );
         }
-        let command = client_last_command_name(invocation.name, invocation.args);
+        let command = replica_command_name_for_log(
+            invocation.name,
+            invocation.args,
+            self.ctx.config().server.hide_user_data_from_log,
+        );
         let connection = &mut self.connection_registry
             [crate::framework::capabilities::io::Token(connection_token)];
         crate::server_log!(
@@ -487,6 +502,30 @@ impl ServerWorkerState {
     }
 }
 
+fn replica_error_for_log(
+    error: &[u8],
+    args: &crate::engine::command::CommandArgs,
+    hide_user_data: bool,
+) -> String {
+    crate::runtime::server::worker::distributed::replication::render_replication_error_for_log(
+        error,
+        args,
+        hide_user_data,
+    )
+}
+
+pub(super) fn replica_command_name_for_log(
+    name: &str,
+    args: &crate::engine::command::CommandArgs,
+    hide_user_data: bool,
+) -> String {
+    if hide_user_data {
+        super::command_exec::bounded_command_name(name, None)
+    } else {
+        client_last_command_name(name, args)
+    }
+}
+
 fn connection_info_flags(
     connection: &crate::framework::capabilities::connection::Connection,
 ) -> String {
@@ -545,4 +584,25 @@ pub(crate) fn redacted_argv(
         }
     }));
     argv
+}
+
+#[cfg(test)]
+mod replication_log_tests {
+    use super::replica_error_for_log;
+    use crate::engine::command::CommandArgs;
+    use bytes::Bytes;
+
+    #[test]
+    fn replica_error_log_truncates_on_utf8_boundary() {
+        let suffix = ", with args beginning with: '";
+        let error = vec![b'x'; 4095 - suffix.len()];
+        let mut argument = "é".as_bytes().to_vec();
+        argument.extend_from_slice(&vec![b'y'; 1024 * 1024]);
+        let args = CommandArgs::from_parts(vec![Bytes::from_static(b"set"), Bytes::from(argument)]);
+
+        let rendered = replica_error_for_log(&error, &args, false);
+
+        assert!(rendered.len() <= 4096);
+        assert!(rendered.is_char_boundary(rendered.len()));
+    }
 }

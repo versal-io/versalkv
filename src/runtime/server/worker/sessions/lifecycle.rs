@@ -145,6 +145,19 @@ impl ServerWorkerState {
         token_value: usize,
         reconnect_cause: Option<MasterReconnectCause>,
     ) {
+        self.retire_connection(token_value, reconnect_cause, false);
+    }
+
+    pub(crate) fn detach_debugger_connection(&mut self, token: Token) {
+        self.retire_connection(token.0, None, true);
+    }
+
+    fn retire_connection(
+        &mut self,
+        token_value: usize,
+        reconnect_cause: Option<MasterReconnectCause>,
+        is_socket_inherited: bool,
+    ) {
         let token = Token(token_value);
         // Match C networking.c freeClient(): protected command owners survive
         // nested event processing and are retired after the outer command unwinds.
@@ -166,6 +179,9 @@ impl ServerWorkerState {
             return;
         }
         if self.io_threads.is_close_pending(Token(token_value)) {
+            return;
+        }
+        if !self.retiring_connections.insert(token) {
             return;
         }
         self.retire_runtime_source(token);
@@ -201,7 +217,7 @@ impl ServerWorkerState {
             replication_role,
             self.ctx.persistence().has_active_child()
         );
-        if self.ctx.persistence().has_active_child() {
+        if self.ctx.persistence().has_active_child() && !is_socket_inherited {
             if let Some(connection_token) = self
                 .connection_registry
                 .contains(crate::framework::capabilities::io::Token(token_value))
@@ -227,6 +243,7 @@ impl ServerWorkerState {
         if !defer_transport_removal {
             self.deregister_or_defer(token, PendingRemovalOwner::Client);
         }
+        self.retiring_connections.remove(&token);
     }
 
     fn finalize_connection_removal(
@@ -234,6 +251,12 @@ impl ServerWorkerState {
         token_value: usize,
         reconnect_cause: Option<MasterReconnectCause>,
     ) {
+        if let Some(connection) = self.connection_registry.get(Token(token_value)) {
+            self.ctx
+                .script_mut()
+                .debug_modes
+                .remove(&connection.session_id());
+        }
         let plan = self.gather_connection_teardown_plan(token_value);
         self.execute_connection_teardown(plan, reconnect_cause);
     }
@@ -280,7 +303,8 @@ impl ServerWorkerState {
                         phase,
                         Some(MigrationPhase::Export(ExportPhase::FailoverGranted))
                     );
-                let fail_message = if preserve_granted_export {
+                let is_terminal = phase.is_some_and(MigrationPhase::is_terminal);
+                let fail_message = if preserve_granted_export || is_terminal {
                     None
                 } else if has_recorded_failure {
                     // A readiness failure may already have consumed SO_ERROR and
@@ -1972,6 +1996,11 @@ mod tests {
                 port: 6379,
             },
         );
+        link.set_resume_position(
+            "0123456789abcdef0123456789abcdef01234567".to_string(),
+            offset(42),
+            0,
+        );
         link.connected(None, None);
         link.on_bytes(b"+PONG\r\n+OK\r\n+OK\r\n", 6379)
             .expect("advance handshake to PSYNC");
@@ -2003,6 +2032,11 @@ mod tests {
                 host: "127.0.0.1".to_string(),
                 port: 6379,
             },
+        );
+        link.set_resume_position(
+            "0123456789abcdef0123456789abcdef01234567".to_string(),
+            offset(42),
+            0,
         );
         link.connected(None, None);
         link.on_bytes(b"+PONG\r\n+OK\r\n+OK\r\n", 6379)
