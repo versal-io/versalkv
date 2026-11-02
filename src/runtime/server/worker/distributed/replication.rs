@@ -1764,6 +1764,12 @@ impl ServerWorkerState {
                     self.connection_registry
                         [crate::framework::capabilities::io::Token(connection_token)]
                     .queue_reply(frame);
+                    // Submit the resumed PSYNC before another ready RDB read
+                    // can observe EOF and tear down the paired main socket.
+                    self.handle_writable(token);
+                    if !self.connection_registry.contains(token) {
+                        return;
+                    }
                     main_has_output = true;
                 }
                 ReplicaAction::OpenRdbChannel { initial_frames } => {

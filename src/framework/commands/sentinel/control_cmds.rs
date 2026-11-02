@@ -244,26 +244,31 @@ pub fn is_master_down_by_addr(
         Ok(request) => request,
         Err(error) => return error,
     };
-    if ctx.sentinel_state_mut().tilt {
-        return empty_down_reply();
-    }
     let name = match master_name_for_addr(ctx, &request.addr) {
         Some(name) => name,
         None => return empty_down_reply(),
     };
     let master_id = ctx.sentinel_state().registry.master(&name).unwrap().id;
-    crate::framework::distributed::sentinel::timer::check_sdown(
-        ctx,
-        master_id,
-        crate::foundation::io::sys::time::mstime(),
-    );
+    let is_tilt = ctx.sentinel_state().tilt;
+    if !is_tilt {
+        crate::framework::distributed::sentinel::timer::check_sdown(
+            ctx,
+            master_id,
+            crate::foundation::io::sys::time::mstime(),
+        );
+    }
     let mut master = ctx
         .sentinel_state()
         .registry
         .take_master_snapshot(&name)
         .unwrap();
     let now = crate::foundation::io::sys::time::mstime();
-    let down_state = reported_down(ctx, &master, now);
+    // TILT suppresses down-state reports, but C still records requested votes.
+    let down_state = if is_tilt {
+        0
+    } else {
+        reported_down(ctx, &master, now)
+    };
     let (leader, leader_epoch) = record_requested_vote(ctx, &mut master, &request, now);
     ctx.sentinel_state_mut()
         .registry

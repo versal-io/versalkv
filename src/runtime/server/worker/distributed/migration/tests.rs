@@ -90,9 +90,15 @@ fn setup_streaming_export_runtime() -> (ServerWorkerState, std::net::TcpStream, 
 }
 
 fn setup_registered_import_runtime() -> (ServerWorkerState, std::net::TcpStream, MigrationJobId) {
+    setup_registered_import_runtime_with_dbs(1)
+}
+
+fn setup_registered_import_runtime_with_dbs(
+    num_dbs: u32,
+) -> (ServerWorkerState, std::net::TcpStream, MigrationJobId) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let source_addr = listener.local_addr().unwrap();
-    let mut runtime = ServerWorkerState::new(1).unwrap();
+    let mut runtime = ServerWorkerState::new(num_dbs).unwrap();
     let source = runtime
         .transport
         .connect_tcp(source_addr)
@@ -1481,6 +1487,55 @@ fn terminal_cleanup_closes_export_socket_without_draining_pending_output() {
     peer.read_to_end(&mut received)
         .expect("terminal cleanup must close the export socket");
     assert!(received.is_empty());
+}
+
+#[test]
+fn import_commands_preserve_pending_read_batch_propagation_order() {
+    use crate::engine::distributed::replication::protocol::encode_command;
+
+    let (mut runtime, _peer, id) = setup_registered_import_runtime_with_dbs(3);
+    crate::framework::commands::register_all(&mut runtime.registry);
+    let ranges = SlotRanges::new(vec![SlotRange::new(1, 1).unwrap()]).unwrap();
+    runtime.ctx.create_slot_import(id, &ranges);
+    let token = runtime
+        .connection_registry
+        .iter()
+        .find(|(_, connection)| connection.slot_migration_role.is_some())
+        .map(|(token, _)| token)
+        .unwrap();
+    runtime.ctx.replication_mut().backlog.activate();
+    let start = runtime.ctx.replication().backlog.next_stream_cursor();
+    let select_one = encode_command(&[b"SELECT", b"1"]);
+    let unlink = encode_command(&[b"UNLINK", b"evicted"]);
+    let mut effects = ReadBatchEffects::default();
+    // ESTABLISH can leave command-time evictions queued in this read batch.
+    effects.replication_only = vec![select_one.clone(), unlink.clone()];
+    runtime.ctx.set_repl_seldb(1);
+
+    for parts in [vec![b"SELECT".as_slice(), b"2"], vec![b"PING".as_slice()]] {
+        let args = crate::engine::command::CommandArgs::from_parts(
+            parts
+                .into_iter()
+                .map(bytes::Bytes::copy_from_slice)
+                .collect(),
+        );
+        let name = String::from_utf8_lossy(&args.name).to_ascii_lowercase();
+        runtime.process_parsed_command(token, args, name, false, &mut effects);
+    }
+    runtime.finalize_handle_readable(token.0, token.0, effects);
+
+    let expected = [
+        select_one,
+        unlink,
+        encode_command(&[b"SELECT", b"2"]),
+        encode_command(&[b"PING"]),
+    ]
+    .concat();
+    assert_eq!(
+        runtime.ctx.replication().backlog.read_from(start),
+        Some(expected),
+        "pending DB1 evictions must precede DB2 import frames exactly once"
+    );
 }
 
 #[test]

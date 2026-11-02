@@ -22,7 +22,7 @@ impl ServerWorkerState {
         }
     }
 
-    fn queue_command_propagation(&mut self, effects: &ReadBatchEffects) {
+    pub(super) fn queue_command_propagation(&mut self, effects: &mut ReadBatchEffects) {
         // C `shouldPropagate(PROPAGATE_REPL)` only feeds a local command to
         // the replication stream when this server has no upstream primary.
         // A writable replica may accept local writes, but those writes must
@@ -30,12 +30,14 @@ impl ServerWorkerState {
         // former primary after failover. Upstream frames take the separate
         // replica-apply relay path and remain eligible for chaining.
         if !self.ctx.replication().is_replica() {
-            for frame in &effects.replication_only {
-                self.propagate_to_replicas(frame);
+            for frame in effects.replication_only.drain(..) {
+                self.propagate_to_replicas(&frame);
             }
+        } else {
+            effects.replication_only.clear();
         }
-        for frame in &effects.aof_only {
-            self.feed_aof(frame);
+        for frame in effects.aof_only.drain(..) {
+            self.feed_aof(&frame);
         }
         self.reject_blocked_waitaof_local_if_aof_disabled();
     }
@@ -178,7 +180,7 @@ impl ServerWorkerState {
         }
         self.promote_default_user_authentication();
         self.evict_tracking_table_if_needed(&mut fx.tracking);
-        self.queue_command_propagation(&fx);
+        self.queue_command_propagation(&mut fx);
 
         let is_slot_export =
             self.queue_origin_replies(connection_token, token_value, &mut fx.replies);

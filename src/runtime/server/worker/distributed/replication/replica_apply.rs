@@ -959,14 +959,15 @@ impl ServerWorkerState {
     ) -> Result<(), ()> {
         if !continuation.selected_db_applied {
             link.reset_applied_offset_to_dual_snapshot();
-            // Restore the snapshot's selected database without counting an
-            // internal setup action as a command received from the wire.
-            self.apply_replication_command_now(
-                connection_token,
-                link,
-                ReplicationApply::Select(pending.selected_db()),
-                true,
-            )?;
+            let selected_db = pending.selected_db();
+            if self.ctx.db(selected_db).is_none() {
+                return Err(());
+            }
+            // Snapshot selection is local setup, not an upstream SELECT frame.
+            // Keep the AOF cursor unchanged so its next write selects this DB.
+            link.set_selected_db(selected_db);
+            self.connection_registry[Token(connection_token)].selected_db = selected_db;
+            self.ctx.set_repl_seldb(i64::from(selected_db));
             continuation.selected_db_applied = true;
         }
         let interval = self
@@ -1678,6 +1679,101 @@ mod boundary_tests {
 
     fn offset(value: i64) -> ReplicationOffset {
         ReplicationOffset::try_from(value).expect("valid test offset")
+    }
+
+    #[test]
+    fn dual_snapshot_database_restore_preserves_replication_history() {
+        use crate::framework::capabilities::connection::Connection;
+        use crate::framework::capabilities::io::Token;
+        use crate::framework::distributed::replication::{
+            PendingReplicationBuffer, ProvisionalPrimary,
+        };
+        use crate::runtime::server::worker::reactor::blocked_events::PendingReplayContinuation;
+
+        let mut runtime = ServerWorkerState::new(16).unwrap();
+        crate::framework::commands::register_all(&mut runtime.registry);
+        runtime.ctx.config_mut().persistence.aof_enabled = true;
+        runtime
+            .ctx
+            .persistence_mut()
+            .begin_aof_rewrite_child(123, 1_000)
+            .unwrap();
+        let mut connection = Connection::new_fake();
+        connection.set_token_for_test(Token(40));
+        runtime.connection_registry.insert(connection);
+        let replid = "0123456789abcdef0123456789abcdef01234567";
+        runtime
+            .ctx
+            .replication_mut()
+            .backlog
+            .adopt_primary_from_rdb(replid, offset(100))
+            .unwrap();
+        runtime.ctx.replication_mut().backlog.activate();
+        let mut link = ReplicaLink::streaming(
+            ConnectionId(40),
+            MasterInfo {
+                host: "127.0.0.1".to_string(),
+                port: 6379,
+            },
+            replid.to_string(),
+            offset(100),
+        );
+        link.provisional_primary = Some(ProvisionalPrimary {
+            replid: replid.to_string(),
+            end_offset: offset(100),
+            db_id: 9,
+            rdb_client_id: 0,
+        });
+        let frame = crate::engine::distributed::replication::protocol::encode_command(&[b"PING"]);
+        let end_offset = offset(100 + frame.len() as i64);
+        let mut pending = PendingReplicationBuffer::new(1024, offset(100), 9);
+        let (events, _) = link.on_bytes(&frame, 6379).unwrap();
+        for event in events {
+            pending.push(event).unwrap();
+        }
+        let mut continuation = PendingReplayContinuation::new(
+            ConnectionId(40),
+            link.session_id(),
+            crate::foundation::io::sys::time::mstime(),
+        );
+
+        runtime
+            .apply_pending_replay_entries(40, &mut link, &mut pending, &mut continuation)
+            .unwrap();
+        let aof_cursor_after_restore = runtime.ctx.persistence().aof_selected_db();
+        let aof_after_restore = runtime.ctx.aof().rewrite.buffer.clone();
+        let replicated_set = crate::engine::distributed::replication::protocol::encode_command(&[
+            b"SET", b"key", b"value",
+        ]);
+        let (events, _) = link.on_bytes(&replicated_set, 6379).unwrap();
+        runtime.apply_replica_events(40, &mut link, events).unwrap();
+        let aof = runtime.ctx.aof().rewrite.buffer.clone();
+        runtime.ctx.persistence_mut().abort_child();
+
+        assert_eq!(runtime.connection_registry[Token(40)].selected_db, 9);
+        assert_eq!(link.selected_db(), 9);
+        assert_eq!(runtime.ctx.repl_seldb(), 9);
+        let final_offset = end_offset.checked_advance(replicated_set.len()).unwrap();
+        assert_eq!(link.applied_position(), final_offset);
+        assert_eq!(
+            runtime.ctx.replication().backlog.reported_offset(),
+            final_offset
+        );
+        let backlog = &runtime.ctx.replication().backlog;
+        let mut expected_history = frame;
+        expected_history.extend_from_slice(&replicated_set);
+        assert_eq!(
+            backlog.read_from(backlog.first_byte_cursor()),
+            Some(expected_history)
+        );
+        assert_eq!(aof_cursor_after_restore, -1);
+        assert!(aof_after_restore.is_empty());
+        let mut expected_aof =
+            crate::engine::distributed::replication::protocol::encode_command(&[b"SELECT", b"9"]);
+        expected_aof.extend_from_slice(&replicated_set);
+        assert_eq!(aof, expected_aof);
+        assert!(runtime.ctx.db(9).unwrap().get_no_expire(b"key").is_some());
+        assert!(runtime.ctx.db(0).unwrap().get_no_expire(b"key").is_none());
     }
 
     #[test]

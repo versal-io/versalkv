@@ -97,6 +97,45 @@ fn down_by_addr_matches_wildcard_primary_address_by_resolved_endpoint() {
 }
 
 #[test]
+fn down_by_addr_records_a_vote_during_tilt() {
+    let mut ctx = crate::framework::context::ServerContext::new(1);
+    let mut master = SentinelInstance::new_master(1, "primary", "127.0.0.1:6379", 1);
+    master.down_state = DownState::SDown;
+    ctx.sentinel_state_mut()
+        .registry
+        .insert_master(master.name.clone(), master)
+        .unwrap();
+    ctx.sentinel_state_mut().tilt = true;
+    let mut conn = crate::framework::capabilities::connection::Connection::new_fake();
+    let args = CommandArgs::from_parts(vec![
+        Bytes::from_static(b"SENTINEL"),
+        Bytes::from_static(b"IS-MASTER-DOWN-BY-ADDR"),
+        Bytes::from_static(b"127.0.0.1"),
+        Bytes::from_static(b"6379"),
+        Bytes::from_static(b"99"),
+        Bytes::from_static(b"candidate"),
+    ]);
+
+    assert_eq!(
+        super::is_master_down_by_addr(&mut conn, &args, &mut ctx),
+        Value::Array(vec![
+            Value::Integer(0),
+            Value::bulk(Bytes::from_static(b"candidate")),
+            Value::Integer(99),
+        ])
+    );
+    assert_eq!(ctx.sentinel_state().current_epoch, 99);
+    assert_eq!(
+        ctx.sentinel_state().registry.master("primary").unwrap().leader,
+        "candidate"
+    );
+    assert_eq!(
+        ctx.sentinel_state().registry.master("primary").unwrap().down_state,
+        DownState::SDown
+    );
+}
+
+#[test]
 fn manual_failover_requires_a_healthy_replica_before_starting() {
     let master = SentinelInstance::new_master(1, "primary", "127.0.0.1:6379", 1);
     let mut instances = std::collections::HashMap::new();

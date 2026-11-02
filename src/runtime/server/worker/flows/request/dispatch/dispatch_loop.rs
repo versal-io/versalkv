@@ -2,6 +2,7 @@ use super::super::super::ServerWorkerState;
 use super::side_effects::{CommandEffects, ReadBatchEffects};
 use super::types::{CmdPreconditions, LoopAction};
 use crate::engine::command::{CommandArgs, CommandError, DispatchGroup};
+use crate::engine::distributed::cluster::migration::SlotMigrationConnectionRole;
 use crate::foundation::io::protocol::serializer::{serialize_to_vec_resp2, serialize_to_vec_resp3};
 use crate::foundation::io::protocol::Value;
 use crate::framework::capabilities::connection::{CommandEffectDrain, ConnectionState};
@@ -54,6 +55,15 @@ impl ServerWorkerState {
         resp3: bool,
         batch: &mut ReadBatchEffects,
     ) -> LoopAction {
+        if matches!(
+            self.connection_registry[token].slot_migration_role,
+            Some(SlotMigrationConnectionRole::Import(_))
+        ) && (!batch.replication_only.is_empty() || !batch.aof_only.is_empty())
+        {
+            // Import commands propagate immediately. Publish earlier commands
+            // before that path changes either stream's selected database.
+            self.queue_command_propagation(batch);
+        }
         self.refresh_connection_priorities();
         let is_priority = self.is_priority_connection(token);
         let previous_token = self.priority_command_token.replace(token);

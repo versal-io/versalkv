@@ -8,6 +8,9 @@ use std::net::TcpListener;
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 
+#[path = "shared_output_limit.rs"]
+mod shared_output_limit;
+
 fn classic_blocked_rdb_receiver() -> (ServerWorkerState, Token, std::net::TcpStream) {
     let mut backend = ServerWorkerState::new(1).unwrap();
     crate::framework::commands::register_all(&mut backend.registry);

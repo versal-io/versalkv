@@ -2214,6 +2214,30 @@ mod tests {
     }
 
     #[test]
+    fn synced_upstream_at_zero_offset_clears_a_previous_full_sync_request() {
+        let mut runtime = ReplicationRuntime::new();
+        let master = MasterInfo {
+            host: "127.0.0.1".to_string(),
+            port: 6379,
+        };
+        runtime.clear_replica_resume();
+        runtime.set_replica_link(ReplicaLink::streaming(
+            ConnectionId(9),
+            master.clone(),
+            "replid".to_string(),
+            offset(0),
+        ));
+
+        runtime.remove_connection(ConnectionId(9));
+
+        assert_eq!(
+            runtime.replica_resume_for(&master),
+            Some(("replid", offset(0), 0))
+        );
+        assert!(!runtime.force_full_sync_pending());
+    }
+
+    #[test]
     fn removing_synced_upstream_captures_selected_db() {
         // A dropped master link must remember the DB its stream had reached so a
         // partial-resync reconnect can resume on the right DB (§5.6).
