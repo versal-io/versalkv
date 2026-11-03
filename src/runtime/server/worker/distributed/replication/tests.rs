@@ -2573,8 +2573,10 @@ fn eof_marker_only_on_rdb_channel_in_dual_mode() {
 mod direct_child;
 mod dual;
 mod full_sync;
+mod import_tracking;
 mod paused_dual;
 mod regression;
+mod transaction_relay;
 
 fn boundary_replconf(backend: &mut ServerWorkerState, token: usize, parts: Vec<Bytes>) {
     let args = CommandArgs {
