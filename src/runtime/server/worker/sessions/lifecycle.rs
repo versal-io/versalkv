@@ -472,12 +472,14 @@ impl ServerWorkerState {
                         {
                             match link.dual_state() {
                                 crate::framework::distributed::replication::PrimaryDualChannelState::WaitingForMainPsync => {
-                                    link.rdb_channel_wait_deadline_ms = Some(deadline);
-                                    self.replication_runtime
-                                        .set_grace_psync_wait_deadline(main, deadline);
+                                    if had_psync_wait == Some(main) {
+                                        link.rdb_channel_wait_deadline_ms = Some(deadline);
+                                        self.replication_runtime
+                                            .set_grace_psync_wait_deadline(main, deadline);
+                                    }
                                 }
                                 crate::framework::distributed::replication::PrimaryDualChannelState::WaitingForReplicaAck
-                                    if had_psync_wait == Some(main) => {
+                                    if !link.dual_terminal_ack_received() => {
                                     link.rdb_channel_wait_deadline_ms = Some(deadline);
                                     self.replication_runtime
                                         .start_grace_psync_wait_for_main(main, deadline);

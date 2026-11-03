@@ -121,7 +121,6 @@ impl ReplicationRuntime {
                     if let Some(link) = self.replica_link_mut() {
                         link.mark_rdb_transfer_failed();
                     }
-                    self.clear_replica_resume();
                 }
                 self.replica_rdb_link = None;
                 self.channel_pairs.remove(&connection_id);

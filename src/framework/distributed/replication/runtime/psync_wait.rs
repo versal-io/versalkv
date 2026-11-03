@@ -563,14 +563,6 @@ impl ReplicationRuntime {
                 pin_cursor,
             },
         );
-        crate::server_log!(
-            debug,
-            "dual-rdb grace start: main={} deadline={} pin={:?} map_len={}",
-            main.0,
-            deadline_ms,
-            pin_cursor,
-            self.grace_psync_pin_by_main.len()
-        );
     }
 
     pub fn clear_grace_psync_wait_for_main(&mut self, main: ConnectionId) {
