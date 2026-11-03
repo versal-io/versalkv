@@ -2793,7 +2793,10 @@ fn boundary_dual_same_filter_max_starts_before_deadline() {
     let waits = backend.replication_runtime.psync_wait_owner_count();
     backend.abort_diskless_relay_for_dataset_flush();
 
-    assert!(relay_started, "same-filter max must start a pipe relay");
+    assert!(
+        !relay_started,
+        "filtered same-cohort sync must complete without a pipe relay"
+    );
     assert_eq!(waits, 2);
     for target in [&mut first_target, &mut second_target] {
         assert_eq!(
@@ -2840,7 +2843,10 @@ fn boundary_dual_expired_group_starts_with_two_waiting_mains() {
     let waits = backend.replication_runtime.psync_wait_owner_count();
     backend.abort_diskless_relay_for_dataset_flush();
 
-    assert!(relay_started, "expired cohort must start a pipe relay");
+    assert!(
+        !relay_started,
+        "filtered expired cohort must complete without a pipe relay"
+    );
     assert_eq!(waits, 1);
     assert_eq!(
         boundary_read_endoff(&mut target).offset,

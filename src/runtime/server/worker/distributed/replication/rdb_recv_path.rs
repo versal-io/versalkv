@@ -820,6 +820,16 @@ impl ServerWorkerState {
     /// reconnect/backoff scheduled by `remove_connection` drives a fresh full
     /// sync.
     pub(crate) fn tear_down_master_link(&mut self, token_value: usize) {
+        let aborting_dual_rdb = self
+            .replication_runtime
+            .replica_link()
+            .is_some_and(|link| link.has_pending_rdb_receive() || link.is_dual_rdb_mode_active());
+        if aborting_dual_rdb {
+            // Match C's replicationAbortDualChannelSyncTransfer: an
+            // incomplete dual-channel RDB must not leave a cached primary
+            // eligible for partial resynchronization.
+            self.replication_runtime.clear_replica_resume();
+        }
         crate::server_log!(
             debug,
             "dual-rdb master teardown: token={} role={:?} paired_rdb={:?}",

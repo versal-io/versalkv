@@ -42,6 +42,17 @@ impl ReplicationRuntime {
         self.psync_wait_owner_count() != 0
     }
 
+    pub fn has_psync_wait_for_main(&self, main: ConnectionId) -> bool {
+        self.rdb_psync_waits
+            .values()
+            .any(|wait| wait.main == Some(main))
+            || self
+                .retained_rdb_psync_waits
+                .values()
+                .any(|retained| retained.wait.main == Some(main))
+            || self.grace_psync_pin_by_main.contains_key(&main)
+    }
+
     #[cfg(test)]
     pub(crate) fn unassociated_retained_rdb_owners(&self) -> Vec<UnassociatedRetainedRdbOwner> {
         self.retained_rdb_psync_waits

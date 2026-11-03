@@ -34,6 +34,8 @@ pub struct ReplicaLink {
     state: ReplicaLinkState,
     #[allow(dead_code)] // Wired into dual-channel negotiation in a later slice.
     rdb_channel_state: ReplicaRdbChannelState,
+    rdb_transfer_failed: bool,
+    dual_main_psync_paused: bool,
     input: Vec<u8>,
     compression_mode: String,
     compression_decoder: Option<StreamDecoder>,
@@ -91,6 +93,8 @@ impl ReplicaLink {
             master,
             state: ReplicaLinkState::Connecting,
             rdb_channel_state: ReplicaRdbChannelState::None,
+            rdb_transfer_failed: false,
+            dual_main_psync_paused: false,
             input: Vec::new(),
             compression_mode: "no".to_string(),
             compression_decoder: None,
@@ -1178,11 +1182,18 @@ impl ReplicaLink {
     pub fn can_resume_after_disconnect(&self) -> bool {
         self.is_streaming()
             && self.ack_enabled_after_rdb_commit
+            && !self.rdb_transfer_failed
             && !self.has_pending_rdb_receive()
             && matches!(
                 self.rdb_channel_state,
                 ReplicaRdbChannelState::None | ReplicaRdbChannelState::RdbLoaded
             )
+    }
+
+    pub fn mark_rdb_transfer_failed(&mut self) {
+        if self.rdb_channel_state != ReplicaRdbChannelState::RdbLoaded {
+            self.rdb_transfer_failed = true;
+        }
     }
 
     pub fn is_in_handshake(&self) -> bool {
@@ -1193,6 +1204,14 @@ impl ReplicaLink {
                 | ReplicaLinkState::ReceivingRdb { .. }
                 | ReplicaLinkState::ReceivingRdbEof { .. }
         )
+    }
+
+    pub fn mark_dual_main_psync_paused(&mut self) {
+        self.dual_main_psync_paused = true;
+    }
+
+    pub fn dual_main_psync_was_paused(&self) -> bool {
+        self.dual_main_psync_paused
     }
 
     pub fn is_receiving_rdb(&self) -> bool {

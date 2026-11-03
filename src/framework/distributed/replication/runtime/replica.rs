@@ -93,14 +93,13 @@ impl ReplicationRuntime {
                                 link.selected_db(),
                             );
                         }
-                    } else if let Some((replid, offset, selected_db)) =
-                        link.provisional_resume_position()
-                    {
-                        let can_replace_resume = self.replica_resume.as_ref().is_none();
-                        if can_replace_resume {
+                    } else if link.dual_main_psync_was_paused() && self.replica_resume.is_none() {
+                        if let Some((replid, offset, selected_db)) =
+                            link.provisional_resume_position()
+                        {
                             crate::server_log!(
                                 debug,
-                                "dual-rdb preserving provisional resume after main close: main={} replid={} offset={} rdb_state={:?}",
+                                "dual-rdb preserving handshake resume after main close: main={} replid={} offset={} rdb_state={:?}",
                                 connection_id.0,
                                 replid,
                                 offset.get(),
@@ -118,6 +117,12 @@ impl ReplicationRuntime {
                 self.channel_pairs.remove(&connection_id);
             }
             if is_replica_side_rdb {
+                if is_active_replica_side_rdb {
+                    if let Some(link) = self.replica_link_mut() {
+                        link.mark_rdb_transfer_failed();
+                    }
+                    self.clear_replica_resume();
+                }
                 self.replica_rdb_link = None;
                 self.channel_pairs.remove(&connection_id);
             }

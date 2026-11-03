@@ -295,6 +295,7 @@ impl ReplicationRuntime {
         self.channel_pairs.remove(&rdb_connection_id);
         self.channel_pairs.remove(&main);
         self.channel_records.remove(&rdb_connection_id);
+        let had_wait = wait.is_some();
         let pin = wait.and_then(|wait| wait.pin_cursor);
         crate::server_log!(
             debug,
@@ -307,12 +308,14 @@ impl ReplicationRuntime {
         // succeeds. After that point the RDB socket may close while the
         // terminal ACK is still pending, but it must not remain in
         // `replicas_waiting_psync`.
-        if self.primary_for_connection(main).is_some_and(|link| {
-            matches!(
-                link.dual_state(),
-                PrimaryDualChannelState::WaitingForMainPsync
-            )
-        }) {
+        if had_wait
+            && self.primary_for_connection(main).is_some_and(|link| {
+                matches!(
+                    link.dual_state(),
+                    PrimaryDualChannelState::WaitingForMainPsync
+                )
+            })
+        {
             // The Rust socket is gone, so carry the C protected-client pin
             // under the paired main connection until grace expiry.
             self.grace_psync_pin_by_main.insert(

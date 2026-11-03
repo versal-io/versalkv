@@ -1676,6 +1676,55 @@ impl ServerWorkerState {
             }
             return;
         };
+        if filter_mode != RdbFilterMode::All {
+            let slot_imports = self.ctx.slot_import_dbs();
+            let functions = if filter_mode == RdbFilterMode::Empty {
+                Vec::new()
+            } else {
+                self.ctx
+                    .script()
+                    .function_registry
+                    .list_libraries()
+                    .into_iter()
+                    .map(|library| library.code.as_bytes().to_vec())
+                    .collect()
+            };
+            let replication = self.ctx.rdb_full_sync_replication_info();
+            let rdb =
+                crate::foundation::io::persistence::rdb::serialize::serialize_replication_snapshot(
+                    self.ctx.dbs(),
+                    self.ctx.config().persistence.rdb_key_save_delay,
+                    &functions,
+                    false,
+                    Some(&replication),
+                    &slot_imports,
+                    snapshot,
+                );
+            let marker = crate::engine::distributed::replication::protocol::generate_replid();
+            let mut payload = format!("$EOF:{}\r\n", marker).into_bytes();
+            payload.extend_from_slice(&rdb);
+            payload.extend_from_slice(marker.as_bytes());
+            for rdb_connection_id in fork_targets {
+                let token = rdb_connection_id.0;
+                if let Some(connection) = self.connection_registry.get_mut(Token(token)) {
+                    connection.queue_reply(payload.clone());
+                }
+                if !matches!(self.flush_connection_output(token), WriteOutcome::Complete) {
+                    self.remove_connection(token);
+                    continue;
+                }
+                if let Some(replica_id) = self
+                    .replication_runtime
+                    .replica_id_for_connection(rdb_connection_id)
+                {
+                    if let Some(link) = self.replication_runtime.primary_link_mut(replica_id) {
+                        link.mark_dual_rdb_complete();
+                    }
+                }
+            }
+            self.refresh_replication_view();
+            return;
+        }
         let Some((read_end, marker, release)) = self.try_begin_diskless_fork_with_options(
             &function_codes,
             snapshot,
@@ -1763,6 +1812,9 @@ impl ServerWorkerState {
                 ReplicaAction::SendDualPsync(frame) => {
                     self.pause_before_replica_psync();
                     if self.consume_debug_pause_after_fork() {
+                        if let Some(link) = self.replication_runtime.replica_link_mut() {
+                            link.mark_dual_main_psync_paused();
+                        }
                         crate::server_log!(
                             debug,
                             "dual-rdb replica main PSYNC pause: token={} phase=before-sigstop bytes={}",

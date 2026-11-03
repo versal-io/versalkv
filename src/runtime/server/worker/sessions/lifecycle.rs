@@ -447,6 +447,14 @@ impl ServerWorkerState {
         }
         if let Some(peer) = plan.peer {
             if plan.preserve_main_after_rdb_close {
+                let had_psync_wait = self
+                    .replication_runtime
+                    .channel_pair_for(plan.connection_id)
+                    .and_then(|main| {
+                        self.replication_runtime
+                            .has_psync_wait_for_main(main)
+                            .then_some(main)
+                    });
                 if let Some(main) = self
                     .replication_runtime
                     .detach_rdb_channel_preserving_main(plan.connection_id)
@@ -468,7 +476,8 @@ impl ServerWorkerState {
                                     self.replication_runtime
                                         .set_grace_psync_wait_deadline(main, deadline);
                                 }
-                                crate::framework::distributed::replication::PrimaryDualChannelState::WaitingForReplicaAck => {
+                                crate::framework::distributed::replication::PrimaryDualChannelState::WaitingForReplicaAck
+                                    if had_psync_wait == Some(main) => {
                                     link.rdb_channel_wait_deadline_ms = Some(deadline);
                                     self.replication_runtime
                                         .start_grace_psync_wait_for_main(main, deadline);
