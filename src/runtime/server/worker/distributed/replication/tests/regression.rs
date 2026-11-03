@@ -1,5 +1,4 @@
 use super::*;
-use crate::runtime::server::worker::distributed::replication::diskless_child::DirectDualRdbChild;
 use std::fs::File;
 #[cfg(target_os = "linux")]
 use std::io::ErrorKind;
@@ -7,9 +6,6 @@ use std::io::Write;
 use std::net::TcpListener;
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
-
-#[path = "shared_output_limit.rs"]
-mod shared_output_limit;
 
 fn classic_blocked_rdb_receiver() -> (ServerWorkerState, Token, std::net::TcpStream) {
     let mut backend = ServerWorkerState::new(1).unwrap();
@@ -2701,76 +2697,6 @@ fn active_diskless_relay_reaps_abnormally_exited_child() {
 }
 
 #[test]
-fn replica_output_hard_limit_applies_after_direct_child_marker() {
-    use crate::framework::commands::server::save::DirectDualRdbChildPhase;
-    use crate::runtime::server::worker::distributed::replication::diskless_child::DirectDualRdbChild;
-    use std::fs::File;
-
-    let mut backend = ServerWorkerState::new(1).unwrap();
-    let main_token = 47;
-    let rdb_token = 48;
-    let main_slab = add_connection(&mut backend, main_token);
-    add_connection(&mut backend, rdb_token);
-    backend.ctx.config_mut().server.repl_backlog_size = 1;
-    backend
-        .ctx
-        .config_mut()
-        .replication
-        .replica_output_buffer_hard_limit = 1_024;
-
-    let replica_id = backend.replication_runtime.register_primary(
-        ConnectionId(main_token),
-        ReplicaConnectionInfo {
-            ip: "127.0.0.1".to_string(),
-            port: 6381,
-            capability: vec!["dual-channel".to_string()],
-            rdb_filter_mode: crate::framework::distributed::replication::RdbFilterMode::All,
-        },
-    );
-    backend
-        .replication_runtime
-        .primary_link_mut(replica_id)
-        .unwrap()
-        .transition_to_waiting_for_rdb_channel()
-        .unwrap();
-    backend.associate_waiting_rdb_for_test(ConnectionId(main_token), ConnectionId(rdb_token));
-    backend
-        .replication_runtime
-        .primary_link_mut(replica_id)
-        .unwrap()
-        .transition_to_waiting_for_main_psync()
-        .unwrap();
-    backend.connection_registry[crate::framework::capabilities::io::Token(main_slab)]
-        .queue_reply(vec![b'x'; 1_025]);
-    let child = backend.install_test_child(
-        crate::runtime::server::worker::reactor::sources::ChildOwner::DirectDualRdb,
-        0,
-    );
-    backend.full_sync.direct_dual_rdb_child = Some(DirectDualRdbChild {
-        pid: 0,
-        child,
-        rdb_connections: vec![ConnectionId(rdb_token)],
-        targets: vec![replica_id],
-        shared_replication_buffer_bytes: 0,
-        reaped_successfully: false,
-        metric_read_end: File::open("/dev/null").unwrap(),
-        phase_read_end: File::open("/dev/null").unwrap(),
-        phase_source: None,
-        phases: vec![DirectDualRdbChildPhase::MarkerSent],
-        completion_state: crate::runtime::server::worker::distributed::replication::diskless_child::DirectDualCompletionState::default(),
-    });
-
-    backend.enforce_replica_output_buffer_limits();
-
-    assert!(
-        !backend
-            .connection_registry
-            .contains(crate::framework::capabilities::io::Token(main_token)),
-        "after the direct child marker, the main channel must obey the COB limit"
-    );
-}
-
-#[test]
 fn replicated_spublish_delivers_to_replica_shard_subscribers() {
     let mut backend = ServerWorkerState::new(1).unwrap();
     crate::framework::commands::register_all(&mut backend.registry);
@@ -3862,132 +3788,5 @@ fn replica_buffer_memory_excludes_tcp_kernel_send_queue() {
         backend.ctx.replication().replica_output_buffer_bytes,
         0,
         "kernel TCP send queue is not server-owned replication-buffer memory"
-    );
-}
-
-#[test]
-fn direct_dual_cohort_reports_live_shared_replication_memory() {
-    let mut backend = ServerWorkerState::new(1).unwrap();
-    let main_token = 11_001;
-    let _main_slab = add_connection(&mut backend, main_token);
-    let replica_id = backend.replication_runtime.register_primary(
-        ConnectionId(main_token),
-        ReplicaConnectionInfo {
-            ip: "127.0.0.1".to_string(),
-            port: 6381,
-            capability: dual_channel_caps(),
-            rdb_filter_mode: crate::framework::distributed::replication::RdbFilterMode::All,
-        },
-    );
-    backend
-        .replication_runtime
-        .primary_link_mut(replica_id)
-        .unwrap()
-        .set_state(PrimaryLinkState::Streaming);
-    let child = backend.install_test_child(
-        crate::runtime::server::worker::reactor::sources::ChildOwner::DirectDualRdb,
-        0,
-    );
-    backend.full_sync.direct_dual_rdb_child = Some(DirectDualRdbChild {
-        pid: 0,
-        child,
-        rdb_connections: Vec::new(),
-        targets: vec![replica_id],
-        shared_replication_buffer_bytes: 0,
-        reaped_successfully: false,
-        metric_read_end: File::open("/dev/null").unwrap(),
-        phase_read_end: File::open("/dev/null").unwrap(),
-        phase_source: None,
-        phases: Vec::new(),
-        completion_state: crate::runtime::server::worker::distributed::replication::diskless_child::DirectDualCompletionState::default(),
-    });
-    backend.ctx.replication_mut().backlog.activate();
-    backend
-        .ctx
-        .replication_mut()
-        .backlog
-        .append(&vec![b'x'; 128 * 1024])
-        .unwrap();
-    backend.refresh_replica_output_buffer_bytes();
-    let cohort_memory = backend.ctx.replication().replica_output_buffer_bytes;
-    assert_eq!(cohort_memory, 128 * 1024);
-
-    backend
-        .ctx
-        .replication_mut()
-        .backlog
-        .set_capacity(64 * 1024);
-    backend.refresh_replica_output_buffer_bytes();
-    assert_eq!(
-        backend.ctx.replication().replica_output_buffer_bytes,
-        64 * 1024,
-        "direct-dual memory must shrink when the shared backlog is released"
-    );
-
-    backend.full_sync.direct_dual_rdb_child = None;
-    backend.refresh_replica_output_buffer_bytes();
-    assert_eq!(
-        backend.ctx.replication().replica_output_buffer_bytes,
-        64 * 1024
-    );
-}
-
-#[test]
-fn direct_dual_snapshot_target_output_does_not_raise_shared_replication_memory() {
-    let mut backend = ServerWorkerState::new(1).unwrap();
-    let main_token = 11_101;
-    let main_slab = add_connection(&mut backend, main_token);
-    let replica_id = backend.replication_runtime.register_primary(
-        ConnectionId(main_token),
-        ReplicaConnectionInfo {
-            ip: "127.0.0.1".to_string(),
-            port: 6381,
-            capability: dual_channel_caps(),
-            rdb_filter_mode: crate::framework::distributed::replication::RdbFilterMode::All,
-        },
-    );
-    backend
-        .replication_runtime
-        .primary_link_mut(replica_id)
-        .unwrap()
-        .set_state(PrimaryLinkState::SendingRdb);
-    backend.ctx.replication_mut().backlog.activate();
-    backend
-        .ctx
-        .replication_mut()
-        .backlog
-        .set_capacity(16 * 1024);
-    backend
-        .ctx
-        .replication_mut()
-        .backlog
-        .append(&vec![b'b'; 16 * 1024])
-        .unwrap();
-    let child = backend.install_test_child(
-        crate::runtime::server::worker::reactor::sources::ChildOwner::DirectDualRdb,
-        0,
-    );
-    backend.full_sync.direct_dual_rdb_child = Some(DirectDualRdbChild {
-        pid: 0,
-        child,
-        rdb_connections: Vec::new(),
-        targets: vec![replica_id],
-        shared_replication_buffer_bytes: 0,
-        reaped_successfully: false,
-        metric_read_end: File::open("/dev/null").unwrap(),
-        phase_read_end: File::open("/dev/null").unwrap(),
-        phase_source: None,
-        phases: Vec::new(),
-        completion_state: crate::runtime::server::worker::distributed::replication::diskless_child::DirectDualCompletionState::default(),
-    });
-    backend.connection_registry[crate::framework::capabilities::io::Token(main_slab)]
-        .queue_replication_reply(vec![b'c'; 471]);
-
-    backend.refresh_replica_output_buffer_bytes();
-
-    assert_eq!(
-        backend.ctx.replication().replica_output_buffer_bytes,
-        16 * 1024,
-        "direct-dual target control output must not inflate C's shared replication buffer projection"
     );
 }

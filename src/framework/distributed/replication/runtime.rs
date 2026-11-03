@@ -732,7 +732,6 @@ mod tests {
         assert!(runtime
             .take_endoff_for_rdb_candidate_if_unambiguous(rdb, true, &mut backlog)
             .is_some());
-        runtime.activate_waiting_psync_pins_for_rdb_connections(&[rdb], &mut backlog);
         assert_eq!(
             runtime
                 .primary_link(replica_id)
@@ -1131,7 +1130,6 @@ mod tests {
             1
         );
 
-        runtime.activate_waiting_psync_pins_for_rdb_connections(&[rdb], &mut backlog);
         assert!(runtime.has_psync_wait_owners());
         assert_eq!(runtime.psync_wait_owner_count(), 1);
         assert_eq!(runtime.rdb_psync_waits[&rdb].pin_cursor, None);
@@ -1186,7 +1184,6 @@ mod tests {
         );
         assert_eq!(runtime.min_protected_backlog_cursor(), None);
 
-        runtime.activate_waiting_psync_pins_for_rdb_connections(&rdbs, &mut backlog);
         assert!(runtime.has_psync_wait_owners());
         assert_eq!(runtime.min_protected_backlog_cursor(), None);
         assert_eq!(runtime.backfill_waiting_psync_pins(cursor(42)), rdbs);
@@ -1495,7 +1492,7 @@ mod tests {
         assert_eq!(
             runtime.min_protected_backlog_cursor(),
             Some(cursor(42)),
-            "direct child completion must not release the main backlog pin before terminal ACK"
+            "RDB completion must not release the main backlog pin before terminal ACK"
         );
         {
             let link = runtime.primary_link_mut(id).unwrap();
@@ -2445,6 +2442,73 @@ mod tests {
         );
         assert_eq!(runtime.replica_resume_for(&next_master), None);
         assert!(!runtime.take_force_full_sync());
+    }
+
+    #[test]
+    fn dropping_dual_main_after_endoff_preserves_provisional_resume_position() {
+        let mut runtime = ReplicationRuntime::new();
+        let master = MasterInfo {
+            host: "127.0.0.1".to_string(),
+            port: 6379,
+        };
+        let mut link = ReplicaLink::new(ConnectionId(9), master.clone());
+        link.transition_rdb_channel_state(ReplicaRdbChannelState::Connecting)
+            .unwrap();
+        link.transition_rdb_channel_state(ReplicaRdbChannelState::Handshake)
+            .unwrap();
+        link.transition_rdb_channel_state(ReplicaRdbChannelState::WaitingForEndOffset)
+            .unwrap();
+        link.transition_rdb_channel_state(ReplicaRdbChannelState::ReceivingRdb)
+            .unwrap();
+        link.provisional_primary = Some(ProvisionalPrimary {
+            replid: "replid".to_string(),
+            end_offset: offset(42),
+            db_id: 3,
+            rdb_client_id: 7,
+        });
+        runtime.set_replica_link(link);
+
+        runtime.remove_connection(ConnectionId(9));
+
+        assert_eq!(
+            runtime.replica_resume_for(&master),
+            Some(("replid", offset(42), 3)),
+            "a dual-channel reconnect should first try the advertised ENDOFF position"
+        );
+    }
+
+    #[test]
+    fn dropping_dual_main_after_endoff_keeps_rebound_resume_position() {
+        let mut runtime = ReplicationRuntime::new();
+        let master = MasterInfo {
+            host: "127.0.0.1".to_string(),
+            port: 6379,
+        };
+        let mut link = ReplicaLink::new(ConnectionId(9), master.clone());
+        link.transition_rdb_channel_state(ReplicaRdbChannelState::Connecting)
+            .unwrap();
+        link.transition_rdb_channel_state(ReplicaRdbChannelState::Handshake)
+            .unwrap();
+        link.transition_rdb_channel_state(ReplicaRdbChannelState::WaitingForEndOffset)
+            .unwrap();
+        link.transition_rdb_channel_state(ReplicaRdbChannelState::ReceivingRdb)
+            .unwrap();
+        link.provisional_primary = Some(ProvisionalPrimary {
+            replid: "new-replid".to_string(),
+            end_offset: offset(42),
+            db_id: 3,
+            rdb_client_id: 7,
+        });
+        runtime.set_replica_resume(master.clone(), "old-rebound".to_string(), offset(7), 0);
+        runtime.set_replica_link(link);
+
+        runtime.remove_connection(ConnectionId(9));
+
+        assert_eq!(
+            runtime.replica_resume_for(&master),
+            Some(("old-rebound", offset(7), 0)),
+            "an uncommitted replacement RDB must not overwrite a rebound cached primary"
+        );
     }
 
     #[test]

@@ -1,14 +1,15 @@
 //! Owned process capabilities used by persistence and replication orchestration.
 
-use crate::foundation::io::sys::process::{exit_immediately, send_signal, ProcessSignal};
 #[cfg(test)]
-use crate::foundation::io::sys::process::{wait_blocking, wait_nonblocking, WaitOutcome};
+use crate::foundation::io::sys::process::wait_nonblocking;
+use crate::foundation::io::sys::process::{
+    exit_immediately, send_signal, wait_blocking, ProcessSignal, WaitOutcome,
+};
 use std::fs::File;
 use std::io;
 use std::os::fd::RawFd;
-use std::time::Duration;
 #[cfg(test)]
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[derive(Debug)]
 pub(crate) struct ForkChild {
@@ -40,7 +41,6 @@ impl ForkChild {
         wait_nonblocking(self.pid)
     }
 
-    #[cfg(test)]
     pub(crate) fn wait(&mut self) -> io::Result<WaitOutcome> {
         wait_blocking(self.pid)
     }
@@ -164,72 +164,29 @@ pub(crate) fn wait_for_pipe_eof(read_end: File) {
     drop(read_end);
 }
 
-#[cfg(test)]
-pub(crate) fn send_all(fd: RawFd, bytes: &[u8], timeout: Duration) -> bool {
-    send_all_counted(fd, bytes, timeout).0
-}
-
-pub(crate) fn send_all_counted(fd: RawFd, bytes: &[u8], timeout: Duration) -> (bool, usize) {
-    let mut offset = 0;
-    while offset < bytes.len() {
-        // SAFETY: bytes exposes a live region for the duration of send(2).
-        let written = unsafe {
-            libc::send(
-                fd,
-                bytes[offset..].as_ptr().cast::<libc::c_void>(),
-                bytes.len() - offset,
-                libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
-            )
-        };
-        if written > 0 {
-            offset += written as usize;
-            continue;
-        }
-        let error = crate::foundation::io::sys::os::errno();
-        if written == 0
-            || (error != libc::EINTR && error != libc::EAGAIN && error != libc::EWOULDBLOCK)
-        {
-            return (false, offset);
-        }
-        if error == libc::EINTR {
-            continue;
-        }
-        let mut descriptor = crate::foundation::io::sys::os::PollDescriptor::new(fd, libc::POLLOUT);
-        match crate::foundation::io::sys::os::poll_descriptors(
-            std::slice::from_mut(&mut descriptor),
-            timeout,
-        ) {
-            Ok(ready) if ready > 0 => {}
-            _ => return (false, offset),
-        }
-    }
-    (true, offset)
-}
-
-pub(crate) fn set_send_timeout(fd: RawFd, timeout: Duration) -> io::Result<()> {
-    let timeout = libc::timeval {
-        tv_sec: timeout.as_secs().min(libc::time_t::MAX as u64) as libc::time_t,
-        tv_usec: timeout.subsec_micros() as libc::suseconds_t,
-    };
-    // SAFETY: timeout is initialized for the exact SO_SNDTIMEO size.
-    let result = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_SNDTIMEO,
-            (&timeout as *const libc::timeval).cast::<libc::c_void>(),
-            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
-        )
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
 pub(crate) fn stop_current_process() -> io::Result<()> {
     send_signal(std::process::id() as i32, ProcessSignal::Stop)
+}
+
+pub(crate) fn stop_current_process_temporarily(resume_after_ms: u64) -> io::Result<()> {
+    let parent_pid = std::process::id() as i32;
+    let mut child = match fork_process()? {
+        ForkBranch::Parent(child) => child,
+        ForkBranch::Child => {
+            let micros = resume_after_ms.saturating_mul(1_000);
+            // SAFETY: usleep takes a scalar duration and affects only this short-lived helper.
+            unsafe { libc::usleep(micros.min(libc::useconds_t::MAX as u64) as libc::useconds_t) };
+            let status = if send_signal(parent_pid, ProcessSignal::Continue).is_ok() {
+                0
+            } else {
+                1
+            };
+            exit_immediately(status);
+        }
+    };
+    stop_current_process()?;
+    let _ = child.wait();
+    Ok(())
 }
 
 #[cfg(test)]

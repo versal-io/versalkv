@@ -29,9 +29,7 @@ impl SourceRoute {
                 EventDependencies::safe_producer()
             }
             SourceOwner::InternalPipe(
-                InternalPipeOwner::DisklessRdb { .. }
-                | InternalPipeOwner::SlotSnapshot { .. }
-                | InternalPipeOwner::DirectDualPhase { .. },
+                InternalPipeOwner::DisklessRdb { .. } | InternalPipeOwner::SlotSnapshot { .. },
             ) => EventDependencies::safe_producer(),
             SourceOwner::Listener => EventDependencies::safe_producer(),
             SourceOwner::Connection | SourceOwner::ClusterBus | SourceOwner::Sentinel => {
@@ -106,7 +104,6 @@ pub(crate) enum ChildSignalOwner {
 pub(crate) enum InternalPipeOwner {
     DisklessRdb { transfer_id: TransferId },
     SlotSnapshot { job_id: MigrationJobId },
-    DirectDualPhase { child: ChildHandle },
 }
 
 // Tasks 9-11 assign transfer identifiers when the current internal pipe pumps
@@ -132,7 +129,6 @@ pub(crate) enum ChildOwner {
     DisklessReplication,
     DiskSyncReplication,
     SlotSnapshot(MigrationJobId),
-    DirectDualRdb,
     ScriptDebugger,
 }
 

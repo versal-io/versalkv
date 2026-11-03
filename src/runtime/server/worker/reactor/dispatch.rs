@@ -871,12 +871,6 @@ impl ServerWorkerState {
         ) {
             return self.on_disk_sync_child_completed(completion.child, completion.outcome);
         }
-        if matches!(
-            self.child_registry.owner(completion.child),
-            Some(crate::runtime::server::worker::reactor::sources::ChildOwner::DirectDualRdb)
-        ) {
-            return self.on_direct_dual_child_completed(completion.child, completion.outcome);
-        }
         DispatchOutcome::Handled
     }
 
@@ -894,15 +888,12 @@ impl ServerWorkerState {
         owner: crate::runtime::server::worker::reactor::sources::InternalPipeOwner,
     ) -> DispatchOutcome {
         match owner {
-            crate::runtime::server::worker::reactor::sources::InternalPipeOwner::DisklessRdb { transfer_id } => {
-                self.on_diskless_pipe_readable(transfer_id)
-            }
-            crate::runtime::server::worker::reactor::sources::InternalPipeOwner::SlotSnapshot { job_id } => {
-                self.on_slot_snapshot_pipe_readable(job_id)
-            }
-            crate::runtime::server::worker::reactor::sources::InternalPipeOwner::DirectDualPhase { child } => {
-                self.on_direct_dual_phase_readable(child)
-            }
+            crate::runtime::server::worker::reactor::sources::InternalPipeOwner::DisklessRdb {
+                transfer_id,
+            } => self.on_diskless_pipe_readable(transfer_id),
+            crate::runtime::server::worker::reactor::sources::InternalPipeOwner::SlotSnapshot {
+                job_id,
+            } => self.on_slot_snapshot_pipe_readable(job_id),
         }
     }
 
@@ -1292,11 +1283,6 @@ fn is_terminal_failure(owner: &SourceOwner, ready: ReadyEvent) -> bool {
         ) => ready.error,
         SourceOwner::InternalPipe(
             crate::runtime::server::worker::reactor::sources::InternalPipeOwner::SlotSnapshot {
-                ..
-            },
-        ) => ready.error,
-        SourceOwner::InternalPipe(
-            crate::runtime::server::worker::reactor::sources::InternalPipeOwner::DirectDualPhase {
                 ..
             },
         ) => ready.error,

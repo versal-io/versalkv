@@ -93,6 +93,26 @@ impl ReplicationRuntime {
                                 link.selected_db(),
                             );
                         }
+                    } else if let Some((replid, offset, selected_db)) =
+                        link.provisional_resume_position()
+                    {
+                        let can_replace_resume = self.replica_resume.as_ref().is_none();
+                        if can_replace_resume {
+                            crate::server_log!(
+                                debug,
+                                "dual-rdb preserving provisional resume after main close: main={} replid={} offset={} rdb_state={:?}",
+                                connection_id.0,
+                                replid,
+                                offset.get(),
+                                link.rdb_channel_state()
+                            );
+                            self.set_replica_resume(
+                                link.master().clone(),
+                                replid.to_string(),
+                                offset,
+                                selected_db,
+                            );
+                        }
                     }
                 }
                 self.channel_pairs.remove(&connection_id);

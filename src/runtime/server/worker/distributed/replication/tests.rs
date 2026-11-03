@@ -2062,7 +2062,7 @@ fn stale_rdb_token_on_association_does_not_panic() {
 }
 
 #[test]
-fn unpaired_rdb_candidate_starts_direct_child_after_endoff_flush() {
+fn unpaired_rdb_candidate_starts_pipe_relay_after_endoff_flush() {
     let _fork_guard = crate::framework::commands::server::save::diskless_fork_test_guard();
     let mut backend = ServerWorkerState::new(1).unwrap();
     let main_token = 63usize;
@@ -2124,7 +2124,7 @@ fn unpaired_rdb_candidate_starts_direct_child_after_endoff_flush() {
     backend.drive_pending_dual_rdb_snapshots();
 
     assert!(
-        backend.full_sync.direct_dual_rdb_child.is_some(),
+        backend.full_sync.diskless_relay.is_some(),
         "once ENDOFF is flushed, the snapshot must start at the same boundary instead of waiting for main association"
     );
     rdb_target
@@ -2147,14 +2147,13 @@ fn unpaired_rdb_candidate_starts_direct_child_after_endoff_flush() {
     let endoff = protocol::parse_end_offset(&queued_rdb[..line_end])
         .expect("the first frame must be ENDOFF");
     assert_eq!(endoff.offset, expected_boundary.reported_offset());
-    let child = backend
+    let relay = backend
         .full_sync
-        .direct_dual_rdb_child
+        .diskless_relay
         .as_ref()
-        .expect("direct child must be retained while the main association catches up");
-    assert_eq!(child.rdb_connections, vec![rdb_id]);
+        .expect("pipe relay must be retained while the main association catches up");
     assert!(
-        child.targets.is_empty(),
+        relay.targets.is_empty(),
         "the replica target is attached only after set-rdb-client-id proves ownership"
     );
 
@@ -2166,7 +2165,7 @@ fn unpaired_rdb_candidate_starts_direct_child_after_endoff_flush() {
         .replication_runtime
         .finalize_dual_channel_rdb_association(ConnectionId(main_token), rdb_id)
         .unwrap();
-    backend.associate_direct_dual_rdb_child_target(rdb_id, ConnectionId(main_token));
+    backend.associate_diskless_relay_target(rdb_id, ConnectionId(main_token));
     assert_eq!(
         backend
             .replication_runtime
@@ -2187,24 +2186,15 @@ fn unpaired_rdb_candidate_starts_direct_child_after_endoff_flush() {
     assert!(
         backend
             .full_sync
-            .direct_dual_rdb_child
+            .diskless_relay
             .as_ref()
-            .expect("direct child must survive association")
+            .expect("pipe relay must survive association")
             .targets
             .contains(&replica_id),
-        "late main association must attach the already-started direct child target"
+        "late main association must attach the already-started pipe relay target"
     );
 
-    if let Some(child) = backend.full_sync.direct_dual_rdb_child.take() {
-        backend.release_child_socket_leases(child.child);
-        let _ = crate::foundation::io::sys::process::send_signal(
-            child.pid,
-            crate::foundation::io::sys::process::ProcessSignal::Kill,
-        );
-        let _ = crate::foundation::io::sys::process::wait_blocking(child.pid);
-        backend.ctx.persistence_mut().complete_diskless_child();
-        backend.finalize_child_registry_entry(child.child);
-    }
+    backend.abort_diskless_relay_for_dataset_flush();
 }
 
 #[test]
@@ -2249,8 +2239,8 @@ fn paired_rdb_channel_waits_for_unpaired_cohort_member_before_fork() {
     backend.drive_pending_dual_rdb_snapshots();
 
     assert!(
-        backend.full_sync.direct_dual_rdb_child.is_none(),
-        "cohort must not fork while another ready RDB candidate has not received ENDOFF"
+        backend.full_sync.diskless_relay.is_none(),
+        "cohort must not start a relay while another ready RDB candidate has not received ENDOFF"
     );
     assert!(
         backend
@@ -2570,7 +2560,6 @@ fn eof_marker_only_on_rdb_channel_in_dual_mode() {
     );
 }
 
-mod direct_child;
 mod dual;
 mod full_sync;
 mod import_tracking;
@@ -2736,8 +2725,7 @@ fn boundary_dual_candidates_keep_other_filter_deadlines_and_waits() {
             .get(&Token(other))
             .is_some_and(|pending| pending.1.is_empty());
         let waits = backend.replication_runtime.psync_wait_owner_count();
-        let no_child = backend.full_sync.direct_dual_rdb_child.is_none();
-        backend.abort_direct_dual_rdb_child_for_shutdown();
+        let no_relay = backend.full_sync.diskless_relay.is_none();
         other_target.set_nonblocking(true).unwrap();
         let mut byte = [0];
         let no_other_wire = matches!(other_target.read(&mut byte), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock);
@@ -2748,11 +2736,11 @@ fn boundary_dual_candidates_keep_other_filter_deadlines_and_waits() {
             preserved_after_release,
             no_other_endoff,
             waits,
-            no_child,
+            no_relay,
             no_other_wire,
         ));
     }
-    for (associate, sync_deadline, future, release_deadline, no_endoff, waits, no_child, no_wire) in
+    for (associate, sync_deadline, future, release_deadline, no_endoff, waits, no_relay, no_wire) in
         observations
     {
         assert_eq!(
@@ -2762,7 +2750,7 @@ fn boundary_dual_candidates_keep_other_filter_deadlines_and_waits() {
                 release_deadline,
                 no_endoff,
                 waits,
-                no_child,
+                no_relay,
                 no_wire
             ),
             (true, true, true, true, usize::from(associate), true, true),
@@ -2798,23 +2786,14 @@ fn boundary_dual_same_filter_max_starts_before_deadline() {
         backend.full_sync.pending_dual_rdb_snapshots[&Token(first)].0
             > crate::foundation::io::sys::time::mstime()
     );
-    let (second, mut second_target) = boundary_sync_candidate(&mut backend, b"functions");
+    let (_second, mut second_target) = boundary_sync_candidate(&mut backend, b"functions");
     let boundary = backend.ctx.replication().backlog.snapshot_boundary();
     backend.drive_pending_dual_rdb_snapshots();
-    let child_connections = backend
-        .full_sync
-        .direct_dual_rdb_child
-        .as_ref()
-        .map(|child| child.rdb_connections.clone());
+    let relay_started = backend.full_sync.diskless_relay.is_some();
     let waits = backend.replication_runtime.psync_wait_owner_count();
-    backend.abort_direct_dual_rdb_child_for_shutdown();
+    backend.abort_diskless_relay_for_dataset_flush();
 
-    let mut child_connections = child_connections.expect("same-filter max must start a snapshot");
-    child_connections.sort_by_key(|connection| connection.0);
-    assert_eq!(
-        child_connections,
-        vec![ConnectionId(first), ConnectionId(second)]
-    );
+    assert!(relay_started, "same-filter max must start a pipe relay");
     assert_eq!(waits, 2);
     for target in [&mut first_target, &mut second_target] {
         assert_eq!(
@@ -2857,19 +2836,11 @@ fn boundary_dual_expired_group_starts_with_two_waiting_mains() {
         .0 = crate::foundation::io::sys::time::mstime().saturating_sub(1);
     let boundary = backend.ctx.replication().backlog.snapshot_boundary();
     backend.drive_pending_dual_rdb_snapshots();
-    let child_connections = backend
-        .full_sync
-        .direct_dual_rdb_child
-        .as_ref()
-        .map(|child| child.rdb_connections.clone());
+    let relay_started = backend.full_sync.diskless_relay.is_some();
     let waits = backend.replication_runtime.psync_wait_owner_count();
-    backend.abort_direct_dual_rdb_child_for_shutdown();
+    backend.abort_diskless_relay_for_dataset_flush();
 
-    assert_eq!(
-        child_connections,
-        Some(vec![ConnectionId(rdb)]),
-        "expired cohort must not depend on waiting-main count"
-    );
+    assert!(relay_started, "expired cohort must start a pipe relay");
     assert_eq!(waits, 1);
     assert_eq!(
         boundary_read_endoff(&mut target).offset,

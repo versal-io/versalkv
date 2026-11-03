@@ -13,9 +13,7 @@ use crate::framework::distributed::replication::{
     ReplicationConnection, ReplicationTickFacts,
 };
 use crate::runtime::server::worker::distributed::replication::disk_sync_batch::DiskSyncBatch;
-use crate::runtime::server::worker::distributed::replication::diskless_child::{
-    DirectDualRdbChild, DisklessRelay,
-};
+use crate::runtime::server::worker::distributed::replication::diskless_child::DisklessRelay;
 use crate::runtime::server::worker::reactor::blocked_events::BlockedOperation;
 use crate::runtime::server::worker::reactor::sources::SourceOwner;
 use std::collections::HashMap;
@@ -147,8 +145,6 @@ pub(crate) struct FullSyncCoordinator {
     pub(crate) pending_dual_rdb_snapshots: HashMap<Token, (i64, Vec<u8>)>,
     /// One fork pipe streaming an RDB to a cohort of EOF-capable replicas.
     pub(crate) diskless_relay: Option<DisklessRelay>,
-    /// A direct dual-channel child whose RDB sockets are owned by the child.
-    pub(crate) direct_dual_rdb_child: Option<DirectDualRdbChild>,
     /// A shared disk snapshot served to independent replica cursors.
     pub(crate) disk_sync_batch: Option<DiskSyncBatch>,
     pub(crate) disk_snapshot_options:
@@ -344,7 +340,7 @@ impl ServerWorkerState {
         // C backfills RDB clients that entered the wait-PSYNC set with an
         // empty replication buffer as soon as the first block is created.
         let delayed_snapshot_without_child = !self.full_sync.pending_dual_rdb_snapshots.is_empty()
-            && self.full_sync.direct_dual_rdb_child.is_none();
+            && self.full_sync.diskless_relay.is_none();
         let mut protected = if delayed_snapshot_without_child {
             self.replication_runtime
                 .min_protected_backlog_cursor_without_psync_wait()
@@ -1434,9 +1430,7 @@ impl ServerWorkerState {
     }
 
     pub(crate) fn drive_pending_dual_rdb_snapshots(&mut self) {
-        if self.ctx.persistence().has_active_child()
-            || self.full_sync.direct_dual_rdb_child.is_some()
-        {
+        if self.ctx.persistence().has_active_child() || self.full_sync.diskless_relay.is_some() {
             return;
         }
         let now = crate::foundation::io::sys::time::mstime();
@@ -1676,13 +1670,40 @@ impl ServerWorkerState {
                 .map(|library| library.code.as_bytes().to_vec())
                 .collect()
         };
-        if self.try_begin_direct_dual_fork(&function_codes, &fork_targets) {
+        let Some(snapshot) = snapshot else {
+            for rdb_connection_id in fork_targets {
+                self.remove_connection(rdb_connection_id.0);
+            }
             return;
+        };
+        let Some((read_end, marker, release)) = self.try_begin_diskless_fork_with_options(
+            &function_codes,
+            snapshot,
+            "dual-channel",
+            false,
+        ) else {
+            for rdb_connection_id in fork_targets {
+                self.remove_connection(rdb_connection_id.0);
+            }
+            return;
+        };
+        let mut header = b"$EOF:".to_vec();
+        header.extend_from_slice(&marker);
+        header.extend_from_slice(b"\r\n");
+        for rdb_connection_id in &fork_targets {
+            if let Some(connection) = self.connection_registry.get_mut(Token(rdb_connection_id.0)) {
+                connection.queue_reply(header.clone());
+            }
         }
-
-        for rdb_connection_id in fork_targets {
-            self.remove_connection(rdb_connection_id.0);
+        for rdb_connection_id in &fork_targets {
+            if !matches!(
+                self.flush_connection_output(rdb_connection_id.0),
+                WriteOutcome::Complete
+            ) {
+                self.remove_connection(rdb_connection_id.0);
+            }
         }
+        self.store_diskless_relay(read_end, release, marker, Vec::new(), false, 0);
     }
 
     pub(crate) fn is_replica_connection(&self, token_value: usize) -> bool {
@@ -1984,7 +2005,7 @@ impl ServerWorkerState {
                 })
         });
         let fork = if batch_is_diskless && has_all_target {
-            self.try_begin_diskless_fork_with_options(&libs, snapshot)
+            self.try_begin_diskless_fork_with_options(&libs, snapshot, "normal sync", true)
         } else {
             None
         };

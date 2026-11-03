@@ -87,7 +87,8 @@ impl ReplicationRuntime {
     /// Move a marker-complete, unpaired wait away from its closing transport.
     /// Validation precedes removal so duplicate public ids or already-paired
     /// waits cannot lose the live owner.
-    pub fn retain_completed_unpaired_rdb_wait(
+    #[cfg(test)]
+    pub(crate) fn retain_completed_unpaired_rdb_wait(
         &mut self,
         rdb_connection_id: ConnectionId,
         public_client_id: u64,
@@ -186,33 +187,6 @@ impl ReplicationRuntime {
             }
         }
         expired
-    }
-
-    pub(crate) fn activate_waiting_psync_pins_for_rdb_connections(
-        &mut self,
-        rdb_connections: &[ConnectionId],
-        backlog: &mut ReplicationBacklog,
-    ) {
-        // An empty backlog has a wait owner but no block to reference.
-        // The first propagated frame backfills the pin before byte eviction.
-        if backlog.history_len() == 0 {
-            return;
-        }
-        let pin = backlog.tail_block_start_cursor();
-        for &rdb in rdb_connections {
-            if let Some(wait) = self.rdb_psync_waits.get_mut(&rdb) {
-                if wait.pin_cursor.is_none() {
-                    wait.pin_cursor = Some(pin);
-                    crate::server_log!(
-                        debug,
-                        "Attach replica rdb client {} to repl buf block",
-                        rdb.0
-                    );
-                }
-            }
-        }
-        backlog.set_min_protected_cursor(self.min_protected_backlog_cursor());
-        self.repl_buffer_tail_exists = true;
     }
 
     /// Build `$ENDOFF` for an unpaired RDB candidate after its REPLCONF reply
@@ -565,6 +539,42 @@ impl ReplicationRuntime {
                 retained.deadline_ms = deadline_ms;
             }
         }
+    }
+
+    pub fn start_grace_psync_wait_for_main(&mut self, main: ConnectionId, deadline_ms: i64) {
+        let pin_cursor = self
+            .primary_for_connection(main)
+            .and_then(|link| link.dual_main_backlog_pin_cursor());
+        self.grace_psync_pin_by_main.insert(
+            main,
+            GracePsyncWait {
+                deadline_ms,
+                pin_cursor,
+            },
+        );
+        crate::server_log!(
+            debug,
+            "dual-rdb grace start: main={} deadline={} pin={:?} map_len={}",
+            main.0,
+            deadline_ms,
+            pin_cursor,
+            self.grace_psync_pin_by_main.len()
+        );
+    }
+
+    pub fn clear_grace_psync_wait_for_main(&mut self, main: ConnectionId) {
+        if self.grace_psync_pin_by_main.remove(&main).is_some() {
+            crate::server_log!(
+                debug,
+                "dual-rdb grace clear: main={} map_len={}",
+                main.0,
+                self.grace_psync_pin_by_main.len()
+            );
+        }
+    }
+
+    pub fn has_grace_psync_wait_for_main(&self, main: ConnectionId) -> bool {
+        self.grace_psync_pin_by_main.contains_key(&main)
     }
 
     #[cfg(test)]

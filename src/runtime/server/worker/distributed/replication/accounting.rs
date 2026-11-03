@@ -132,7 +132,7 @@ impl ServerWorkerState {
     pub(crate) fn refresh_replication_buffer_accounting(&mut self) {
         self.replication_buffer_accounting_dirty = false;
         let protected = if !self.full_sync.pending_dual_rdb_snapshots.is_empty()
-            && self.full_sync.direct_dual_rdb_child.is_none()
+            && self.full_sync.diskless_relay.is_none()
         {
             self.replication_runtime
                 .min_protected_backlog_cursor_without_psync_wait()
@@ -165,13 +165,6 @@ impl ServerWorkerState {
         }
         if let Some(batch) = &self.full_sync.disk_sync_batch {
             targets.extend(batch.target_ids());
-        }
-        if let Some(child) = &self.full_sync.direct_dual_rdb_child {
-            if !child.phases.contains(
-                &crate::framework::commands::server::save::DirectDualRdbChildPhase::MarkerSent,
-            ) {
-                targets.extend(child.targets.iter().copied());
-            }
         }
         targets
             .into_iter()
@@ -209,13 +202,11 @@ impl ServerWorkerState {
                 .replication_runtime
                 .primary_links()
                 .values()
-                .filter(|link| !self.is_direct_dual_snapshot_target(link.connection_id()))
                 .filter_map(|link| self.connection_registry.get(Token(link.connection_id().0)))
                 .map(|conn| conn.replication_output_bytes())
                 .max()
                 .unwrap_or(0);
-            let shared = self.direct_dual_logical_replication_buffer_bytes(backlog_bytes);
-            shared.max(queued)
+            backlog_bytes.max(queued)
         };
         let allocation = if self.ctx.replication().is_replica() {
             self.replication_runtime
@@ -245,22 +236,6 @@ impl ServerWorkerState {
         replication.replica_output_buffer_allocation_bytes = allocation.saturating_add(codecs);
         replication.replica_output_buffer_peak =
             replication.replica_output_buffer_peak.max(live_total);
-    }
-
-    fn is_direct_dual_snapshot_target(&self, connection_id: ConnectionId) -> bool {
-        self.replication_runtime
-            .replica_id_for_connection(connection_id)
-            .is_some_and(|id| {
-                self.full_sync
-                    .direct_dual_rdb_child
-                    .as_ref()
-                    .is_some_and(|child| {
-                        child.targets.contains(&id)
-                            && !child.phases.contains(
-                                &crate::framework::commands::server::save::DirectDualRdbChildPhase::MarkerSent,
-                            )
-                    })
-            })
     }
 
     fn collect_main_output_buffer_entries(
@@ -425,16 +400,6 @@ impl ServerWorkerState {
                         .disk_sync_batch
                         .as_ref()
                         .is_some_and(|batch| batch.contains_target(id))
-                    || self
-                        .full_sync
-                        .direct_dual_rdb_child
-                        .as_ref()
-                        .is_some_and(|child| {
-                            child.targets.contains(&id)
-                                && !child.phases.contains(
-                                    &crate::framework::commands::server::save::DirectDualRdbChildPhase::MarkerSent,
-                                )
-                        })
             })
     }
 
@@ -518,17 +483,6 @@ impl ServerWorkerState {
                 // Before main PSYNC, the protected RDB client owns the shared
                 // backlog. Release that failed snapshot while leaving the main
                 // socket alive to receive the normal lack-of-backlog rejection.
-                if let Some(id) = self
-                    .replication_runtime
-                    .replica_id_for_connection(violation.owner_connection_id)
-                {
-                    if let Some(child) = self.full_sync.direct_dual_rdb_child.as_mut() {
-                        child.targets.retain(|target| *target != id);
-                        child
-                            .rdb_connections
-                            .retain(|connection| *connection != rdb);
-                    }
-                }
                 self.replication_runtime
                     .detach_rdb_channel_preserving_main(rdb);
                 self.replication_runtime

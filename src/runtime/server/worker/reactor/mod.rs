@@ -531,7 +531,6 @@ impl super::ServerWorkerState {
                 self.save_cluster_config_before_exit();
                 crate::server_log!(notice, "Shutdown requested, exiting event loop");
                 self.cancel_disk_sync_batch();
-                self.abort_direct_dual_rdb_child_for_shutdown();
                 self.close_listeners_for_shutdown();
                 self.shutdown_io_threads();
                 crate::server_log!(
@@ -551,7 +550,6 @@ impl super::ServerWorkerState {
         self.save_cluster_config_before_exit();
         crate::server_log!(notice, "Shutdown requested, exiting event loop");
         self.cancel_disk_sync_batch();
-        self.abort_direct_dual_rdb_child_for_shutdown();
         self.close_listeners_for_shutdown();
         self.shutdown_io_threads();
         crate::server_log!(

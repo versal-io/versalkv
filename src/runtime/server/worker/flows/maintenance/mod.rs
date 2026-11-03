@@ -188,7 +188,6 @@ impl ServerWorkerState {
         // The relay EOF path clears the relay before waitpid(WNOHANG) can
         // observe the child's exit; ordering this before drive_replication
         // prevents the stale child slot from forcing a synchronous RDB fallback.
-        self.reap_direct_dual_rdb_child();
         self.collect_idle_diskless_child_exit();
         self.send_replication_keepalives();
         self.send_replica_periodic_ack();

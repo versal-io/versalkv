@@ -1230,13 +1230,12 @@ mod tests {
             .full_sync
             .pending_dual_rdb_snapshots
             .contains_key(&Token(rdb.0)));
-        let child = backend
+        let relay = backend
             .full_sync
-            .direct_dual_rdb_child
+            .diskless_relay
             .as_ref()
-            .expect("the released child slot must start the direct dual snapshot");
-        assert_eq!(child.rdb_connections, vec![rdb]);
-        let child_pid = child.pid;
+            .expect("the released child slot must start the pipe relay");
+        assert!(relay.targets.is_empty());
         rdb_target
             .set_read_timeout(Some(Duration::from_secs(1)))
             .unwrap();
@@ -1270,22 +1269,19 @@ mod tests {
         assert_eq!(
             backend
                 .full_sync
-                .direct_dual_rdb_child
+                .diskless_relay
                 .as_ref()
-                .map(|child| child.targets.len()),
+                .map(|relay| relay.targets.len()),
             Some(1),
-            "the direct snapshot must attach the associated primary target"
+            "the pipe relay must attach the associated primary target"
         );
+        let relay_child_pid = backend.ctx.persistence().diskless_child_pid();
 
         backend.drive_pending_dual_rdb_snapshots();
 
         assert_eq!(
-            backend
-                .full_sync
-                .direct_dual_rdb_child
-                .as_ref()
-                .map(|child| child.pid),
-            Some(child_pid),
+            backend.ctx.persistence().diskless_child_pid(),
+            relay_child_pid,
             "a repeated scheduler drive must not start a second snapshot"
         );
         assert_eq!(
@@ -1298,7 +1294,7 @@ mod tests {
             "a repeated scheduler drive must not replace the ENDOFF boundary"
         );
 
-        backend.abort_direct_dual_rdb_child_for_shutdown();
+        backend.abort_diskless_relay_for_dataset_flush();
     }
 
     #[test]
@@ -2251,7 +2247,7 @@ mod tests {
         assert_eq!(link.dual_endoff_boundary(), Some(boundary));
         assert!(link.dual_rdb_complete());
         assert!(backend.full_sync.pending_dual_rdb_snapshots.is_empty());
-        assert!(backend.full_sync.direct_dual_rdb_child.is_none());
+        assert!(backend.full_sync.diskless_relay.is_none());
 
         replies.clear();
         assert!(!backend.handle_replconf(main.0, main.0, &associate, false, &mut replies));

@@ -68,7 +68,6 @@ pub(in crate::runtime::server) enum SocketIoOwner {
         read: IoOperationId,
         write: IoOperationId,
     },
-    Child(crate::runtime::server::worker::reactor::sources::ChildHandle),
 }
 
 pub(crate) struct ServerWorkerState {
@@ -323,36 +322,6 @@ impl ServerWorkerState {
         )
     }
 
-    pub(in crate::runtime::server) fn acquire_child_socket_leases(
-        &mut self,
-        child: crate::runtime::server::worker::reactor::sources::ChildHandle,
-        tokens: &[Token],
-    ) -> std::io::Result<()> {
-        if let Some(token) = tokens
-            .iter()
-            .copied()
-            .find(|token| !self.socket_owned_by_main_thread(*token))
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::WouldBlock,
-                format!("socket {} is already leased", token.0),
-            ));
-        }
-        for token in tokens {
-            self.socket_owners
-                .insert(*token, SocketIoOwner::Child(child));
-        }
-        Ok(())
-    }
-
-    pub(in crate::runtime::server) fn release_child_socket_leases(
-        &mut self,
-        child: crate::runtime::server::worker::reactor::sources::ChildHandle,
-    ) {
-        self.socket_owners
-            .retain(|_, owner| *owner != SocketIoOwner::Child(child));
-    }
-
     pub(in crate::runtime::server) fn acquire_io_worker_read_socket_lease(
         &mut self,
         id: IoOperationId,
@@ -363,7 +332,6 @@ impl ServerWorkerState {
                 SocketIoOwner::IoWorkerReadWrite { read: id, write }
             }
             SocketIoOwner::IoWorkerRead(_) | SocketIoOwner::IoWorkerReadWrite { .. } => return,
-            SocketIoOwner::Child(_) => return,
         };
         self.socket_owners.insert(id.token, owner);
     }
@@ -378,7 +346,6 @@ impl ServerWorkerState {
                 SocketIoOwner::IoWorkerReadWrite { read, write: id }
             }
             SocketIoOwner::IoWorkerWrite(_) | SocketIoOwner::IoWorkerReadWrite { .. } => return,
-            SocketIoOwner::Child(_) => return,
         };
         self.socket_owners.insert(id.token, owner);
     }

@@ -276,7 +276,6 @@ fn child_registry_tracks_every_planned_owner_kind() {
         (ChildOwner::DisklessReplication, 2003),
         (ChildOwner::DiskSyncReplication, 2004),
         (ChildOwner::SlotSnapshot(slot_job), 2005),
-        (ChildOwner::DirectDualRdb, 2006),
     ];
 
     for (owner, pid) in cases {

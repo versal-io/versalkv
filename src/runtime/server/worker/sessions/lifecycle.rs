@@ -12,7 +12,6 @@ use std::io::Write;
 struct ConnectionTeardownPlan {
     token_value: usize,
     connection_id: ConnectionId,
-    public_client_id: Option<u64>,
     migration: Option<MigrationTeardown>,
     was_master_link: bool,
     master_link_was_established: bool,
@@ -20,8 +19,6 @@ struct ConnectionTeardownPlan {
     preserve_serving_db_on_short_read: bool,
     lost_replica_name: Option<String>,
     relayed_replica: Option<ReplicaId>,
-    direct_child_main_target: bool,
-    direct_child_rdb_target: bool,
     preserve_main_after_rdb_close: bool,
     defer_main_close_pin: bool,
     peer: Option<ConnectionId>,
@@ -268,10 +265,6 @@ impl ServerWorkerState {
         use crate::framework::distributed::replication::ReplicationConnection;
         let token = Token(token_value);
         let connection_id = ConnectionId(token_value);
-        let public_client_id = self
-            .connection_registry
-            .get(token)
-            .map(|connection| connection.client_id());
         let migration = self
             .connection_registry
             .get(token)
@@ -356,9 +349,8 @@ impl ServerWorkerState {
             .replication_runtime
             .primary_for_connection(connection_id)
             .map(|link| link.replica().display_name());
-        let has_relay_target = self.full_sync.diskless_relay.is_some()
-            || self.full_sync.direct_dual_rdb_child.is_some()
-            || self.full_sync.disk_sync_batch.is_some();
+        let has_relay_target =
+            self.full_sync.diskless_relay.is_some() || self.full_sync.disk_sync_batch.is_some();
         let relayed_replica = has_relay_target
             .then(|| {
                 self.replication_runtime
@@ -366,20 +358,6 @@ impl ServerWorkerState {
             })
             .flatten();
         let role = self.replication_runtime.role(connection_id);
-        let direct_child_main_target = matches!(role, Some(ReplicationConnection::Primary(_)))
-            && relayed_replica.is_some_and(|id| {
-                self.full_sync
-                    .direct_dual_rdb_child
-                    .as_ref()
-                    .is_some_and(|child| child.targets.contains(&id))
-            });
-        let direct_child_rdb_target =
-            matches!(role, Some(ReplicationConnection::RdbChannel { .. }))
-                && self
-                    .full_sync
-                    .direct_dual_rdb_child
-                    .as_ref()
-                    .is_some_and(|child| child.rdb_connections.contains(&connection_id));
         let preserve_main_after_rdb_close = matches!(
             role,
             Some(ReplicationConnection::RdbChannel { main }) if self
@@ -408,7 +386,6 @@ impl ServerWorkerState {
         ConnectionTeardownPlan {
             token_value,
             connection_id,
-            public_client_id,
             migration,
             was_master_link,
             master_link_was_established,
@@ -416,8 +393,6 @@ impl ServerWorkerState {
             preserve_serving_db_on_short_read,
             lost_replica_name,
             relayed_replica,
-            direct_child_main_target,
-            direct_child_rdb_target,
             preserve_main_after_rdb_close,
             defer_main_close_pin,
             peer,
@@ -442,33 +417,6 @@ impl ServerWorkerState {
             }
         }
         // 2. Cancel full-sync/child ownership.
-        self.direct_dual_rdb_child_marker_sent();
-        let direct_child_drop = self.drop_direct_dual_rdb_child_connection(plan.connection_id);
-        if direct_child_drop
-            == crate::runtime::server::worker::distributed::replication::diskless_child::DirectDualRdbDropOutcome::CompletedUnpaired
-        {
-            let grace_sec = dual_psync_grace_seconds(
-                self.ctx.config().server.debug_delay_rdb_client_free_seconds,
-                self.ctx.config().replication.repl_diskless_sync_delay,
-            );
-            let deadline = crate::foundation::io::sys::time::mstime()
-                .saturating_add(grace_sec.saturating_mul(1_000));
-            let retained = plan.public_client_id.is_some_and(|public_client_id| {
-                self.replication_runtime
-                    .retain_completed_unpaired_rdb_wait(
-                        plan.connection_id,
-                        public_client_id,
-                        deadline,
-                    )
-            });
-            if !retained {
-                crate::server_log!(
-                    warning,
-                    "Unable to retain completed unpaired RDB wait for connection {}",
-                    plan.connection_id.0
-                );
-            }
-        }
         if plan.was_master_link {
             self.take_and_dispose_replica_pending_buffer();
         }
@@ -509,25 +457,30 @@ impl ServerWorkerState {
                     );
                     let grace_ms = grace_sec.saturating_mul(1_000);
                     if grace_ms > 0 {
+                        let deadline =
+                            crate::foundation::io::sys::time::mstime().saturating_add(grace_ms);
                         if let Some(link) =
                             self.replication_runtime.primary_for_connection_mut(main)
                         {
-                            if matches!(
-                                link.dual_state(),
-                                crate::framework::distributed::replication::PrimaryDualChannelState::WaitingForMainPsync
-                            ) {
-                                let deadline = crate::foundation::io::sys::time::mstime()
-                                    .saturating_add(grace_ms);
-                                link.rdb_channel_wait_deadline_ms = Some(deadline);
-                                self.replication_runtime
-                                    .set_grace_psync_wait_deadline(main, deadline);
-                                crate::server_log!(
-                                    debug,
-                                    "dual-rdb grace: postpone main={} RDB client release for {}ms",
-                                    main.0,
-                                    grace_ms
-                                );
+                            match link.dual_state() {
+                                crate::framework::distributed::replication::PrimaryDualChannelState::WaitingForMainPsync => {
+                                    link.rdb_channel_wait_deadline_ms = Some(deadline);
+                                    self.replication_runtime
+                                        .set_grace_psync_wait_deadline(main, deadline);
+                                }
+                                crate::framework::distributed::replication::PrimaryDualChannelState::WaitingForReplicaAck => {
+                                    link.rdb_channel_wait_deadline_ms = Some(deadline);
+                                    self.replication_runtime
+                                        .start_grace_psync_wait_for_main(main, deadline);
+                                }
+                                _ => {}
                             }
+                            crate::server_log!(
+                                debug,
+                                "dual-rdb grace: postpone main={} RDB client release for {}ms",
+                                main.0,
+                                grace_ms
+                            );
                         }
                     }
                 }
@@ -564,14 +517,6 @@ impl ServerWorkerState {
             crate::server_log!(notice, "Connection with replica {} lost.", name);
         }
         if let Some(id) = plan.relayed_replica {
-            // A completed RDB close retains the surviving main target until
-            // child reaping publishes completion, even if MarkerSent is pending.
-            if (plan.direct_child_main_target || plan.direct_child_rdb_target)
-                && direct_child_drop
-                    != crate::runtime::server::worker::distributed::replication::diskless_child::DirectDualRdbDropOutcome::CompletedPaired
-            {
-                self.drop_direct_dual_rdb_child_target(id);
-            }
             let _ = self.on_diskless_target_closed(id);
             self.drop_disk_sync_batch_target(id);
             self.refresh_replication_view();
@@ -798,7 +743,6 @@ mod tests {
     };
     use crate::framework::CommandArgs;
     use bytes::Bytes;
-    use std::fs::File;
     use std::net::SocketAddr;
 
     fn offset(value: i64) -> ReplicationOffset {
@@ -1389,498 +1333,6 @@ mod tests {
             Some(crate::framework::distributed::replication::ReplicationConnection::Primary(_))
         ));
         assert_eq!(backend.ctx.replication().view.connected_replica_count, 1);
-    }
-
-    #[test]
-    fn removing_one_dual_rdb_channel_before_marker_keeps_remaining_cohort() {
-        use crate::runtime::server::worker::distributed::replication::diskless_child::DirectDualRdbChild;
-        use std::fs::File;
-
-        let mut backend = ServerWorkerState::new(1).unwrap();
-        let peer_addr = SocketAddr::from(([127, 0, 0, 1], 0));
-        let main_listener = backend.transport.bind_tcp(peer_addr).unwrap();
-        let rdb_listener = backend.transport.bind_tcp(peer_addr).unwrap();
-        backend.add_connection(RuntimeConnectedPeer {
-            token: main_listener.token,
-            peer_addr,
-        });
-        backend.add_connection(RuntimeConnectedPeer {
-            token: rdb_listener.token,
-            peer_addr,
-        });
-
-        let main = ConnectionId(main_listener.token.0);
-        let rdb = ConnectionId(rdb_listener.token.0);
-        let replica_id = backend.replication_runtime.register_primary(
-            main,
-            ReplicaConnectionInfo {
-                ip: "127.0.0.1".to_string(),
-                port: 6380,
-                capability: Vec::new(),
-                rdb_filter_mode: crate::framework::distributed::replication::RdbFilterMode::All,
-            },
-        );
-        backend.associate_waiting_rdb_for_test(main, rdb);
-        backend
-            .replication_runtime
-            .primary_link_mut(replica_id)
-            .unwrap()
-            .transition_to_waiting_for_main_psync()
-            .unwrap();
-        let child = backend.install_test_child(
-            crate::runtime::server::worker::reactor::sources::ChildOwner::DirectDualRdb,
-            0,
-        );
-        backend.full_sync.direct_dual_rdb_child = Some(DirectDualRdbChild {
-            pid: 0,
-            child,
-            rdb_connections: vec![rdb],
-            targets: vec![
-                replica_id,
-                crate::framework::distributed::replication::ReplicaId(999),
-            ],
-            shared_replication_buffer_bytes: 0,
-            reaped_successfully: false,
-            metric_read_end: File::open("/dev/null").unwrap(),
-            phase_read_end: File::open("/dev/null").unwrap(),
-            phase_source: None,
-            phases: Vec::new(),
-            completion_state: crate::runtime::server::worker::distributed::replication::diskless_child::DirectDualCompletionState::default(),
-        });
-
-        backend.remove_connection(rdb.0);
-
-        assert_eq!(
-            backend
-                .full_sync
-                .direct_dual_rdb_child
-                .as_ref()
-                .map(|child| child.targets.clone()),
-            Some(vec![crate::framework::distributed::replication::ReplicaId(
-                999
-            )])
-        );
-        assert_eq!(backend.replication_runtime.role(rdb), None);
-        assert!(matches!(
-            backend.replication_runtime.role(main),
-            Some(crate::framework::distributed::replication::ReplicationConnection::Primary(_))
-        ));
-    }
-
-    #[test]
-    fn removing_unrelated_replica_does_not_abort_active_direct_dual_child() {
-        use crate::runtime::server::worker::distributed::replication::diskless_child::DirectDualRdbChild;
-        use std::fs::File;
-
-        let mut backend = ServerWorkerState::new(1).unwrap();
-        let peer_addr = SocketAddr::from(([127, 0, 0, 1], 0));
-        let online_listener = backend.transport.bind_tcp(peer_addr).unwrap();
-        let syncing_listener = backend.transport.bind_tcp(peer_addr).unwrap();
-        let rdb_listener = backend.transport.bind_tcp(peer_addr).unwrap();
-        for token in [
-            online_listener.token,
-            syncing_listener.token,
-            rdb_listener.token,
-        ] {
-            backend.add_connection(RuntimeConnectedPeer { token, peer_addr });
-        }
-
-        let online = ConnectionId(online_listener.token.0);
-        let syncing = ConnectionId(syncing_listener.token.0);
-        let rdb = ConnectionId(rdb_listener.token.0);
-        let online_id = backend.replication_runtime.register_primary(
-            online,
-            ReplicaConnectionInfo {
-                ip: "127.0.0.1".to_string(),
-                port: 6380,
-                capability: Vec::new(),
-                rdb_filter_mode: crate::framework::distributed::replication::RdbFilterMode::All,
-            },
-        );
-        backend
-            .replication_runtime
-            .primary_link_mut(online_id)
-            .unwrap()
-            .set_state(PrimaryLinkState::Streaming);
-        let syncing_id = backend.replication_runtime.register_primary(
-            syncing,
-            ReplicaConnectionInfo {
-                ip: "127.0.0.1".to_string(),
-                port: 6381,
-                capability: Vec::new(),
-                rdb_filter_mode: crate::framework::distributed::replication::RdbFilterMode::All,
-            },
-        );
-        backend.associate_waiting_rdb_for_test(syncing, rdb);
-        backend
-            .replication_runtime
-            .primary_link_mut(syncing_id)
-            .unwrap()
-            .transition_to_waiting_for_main_psync()
-            .unwrap();
-        let child = backend.install_test_child(
-            crate::runtime::server::worker::reactor::sources::ChildOwner::DirectDualRdb,
-            0,
-        );
-        backend.full_sync.direct_dual_rdb_child = Some(DirectDualRdbChild {
-            pid: 0,
-            child,
-            rdb_connections: vec![rdb],
-            targets: vec![syncing_id],
-            shared_replication_buffer_bytes: 0,
-            reaped_successfully: false,
-            metric_read_end: File::open("/dev/null").unwrap(),
-            phase_read_end: File::open("/dev/null").unwrap(),
-            phase_source: None,
-            phases: Vec::new(),
-            completion_state: crate::runtime::server::worker::distributed::replication::diskless_child::DirectDualCompletionState::default(),
-        });
-
-        backend.remove_connection(online.0);
-
-        assert_eq!(backend.replication_runtime.role(online), None);
-        assert!(matches!(
-            backend.replication_runtime.role(syncing),
-            Some(crate::framework::distributed::replication::ReplicationConnection::Primary(_))
-        ));
-        assert!(matches!(
-            backend.replication_runtime.role(rdb),
-            Some(
-                crate::framework::distributed::replication::ReplicationConnection::RdbChannel { .. }
-            )
-        ));
-        assert!(backend.full_sync.direct_dual_rdb_child.is_some());
-    }
-
-    #[test]
-    fn removing_one_direct_dual_main_keeps_remaining_child_target() {
-        use crate::runtime::server::worker::distributed::replication::diskless_child::DirectDualRdbChild;
-        use std::fs::File;
-
-        let mut backend = ServerWorkerState::new(1).unwrap();
-        let peer_addr = SocketAddr::from(([127, 0, 0, 1], 0));
-        let first_listener = backend.transport.bind_tcp(peer_addr).unwrap();
-        let second_listener = backend.transport.bind_tcp(peer_addr).unwrap();
-        for token in [first_listener.token, second_listener.token] {
-            backend.add_connection(RuntimeConnectedPeer { token, peer_addr });
-        }
-
-        let first = ConnectionId(first_listener.token.0);
-        let second = ConnectionId(second_listener.token.0);
-        let first_id = backend.replication_runtime.register_primary(
-            first,
-            ReplicaConnectionInfo {
-                ip: "127.0.0.1".to_string(),
-                port: 6380,
-                capability: Vec::new(),
-                rdb_filter_mode: crate::framework::distributed::replication::RdbFilterMode::All,
-            },
-        );
-        let second_id = backend.replication_runtime.register_primary(
-            second,
-            ReplicaConnectionInfo {
-                ip: "127.0.0.1".to_string(),
-                port: 6381,
-                capability: Vec::new(),
-                rdb_filter_mode: crate::framework::distributed::replication::RdbFilterMode::All,
-            },
-        );
-        let child = backend.install_test_child(
-            crate::runtime::server::worker::reactor::sources::ChildOwner::DirectDualRdb,
-            0,
-        );
-        backend.full_sync.direct_dual_rdb_child = Some(DirectDualRdbChild {
-            pid: 0,
-            child,
-            rdb_connections: Vec::new(),
-            targets: vec![first_id, second_id],
-            shared_replication_buffer_bytes: 0,
-            reaped_successfully: false,
-            metric_read_end: File::open("/dev/null").unwrap(),
-            phase_read_end: File::open("/dev/null").unwrap(),
-            phase_source: None,
-            phases: Vec::new(),
-            completion_state: crate::runtime::server::worker::distributed::replication::diskless_child::DirectDualCompletionState::default(),
-        });
-
-        backend.remove_connection(first.0);
-
-        assert_eq!(backend.replication_runtime.role(first), None);
-        assert!(matches!(
-            backend.replication_runtime.role(second),
-            Some(crate::framework::distributed::replication::ReplicationConnection::Primary(_))
-        ));
-        assert_eq!(
-            backend
-                .full_sync
-                .direct_dual_rdb_child
-                .as_ref()
-                .map(|child| child.targets.clone()),
-            Some(vec![second_id])
-        );
-    }
-
-    #[test]
-    fn removing_dual_rdb_after_child_marker_keeps_target_for_reap() {
-        use crate::framework::commands::server::save::DirectDualRdbChildPhase;
-        use crate::runtime::server::worker::distributed::replication::diskless_child::DirectDualRdbChild;
-        use std::io::Write;
-
-        let phase_pipe = crate::foundation::io::sys::fd::pipe(
-            crate::foundation::io::sys::fd::PipeFlags::NONBLOCK,
-        )
-        .expect("create phase pipe");
-        let (phase_read_end, mut phase_write_end) = phase_pipe.into_parts();
-        phase_write_end
-            .write_all(&[DirectDualRdbChildPhase::MarkerSent.as_byte()])
-            .unwrap();
-
-        let mut backend = ServerWorkerState::new(1).unwrap();
-        let peer_addr = SocketAddr::from(([127, 0, 0, 1], 0));
-        let main_listener = backend.transport.bind_tcp(peer_addr).unwrap();
-        let rdb_listener = backend.transport.bind_tcp(peer_addr).unwrap();
-        backend.add_connection(RuntimeConnectedPeer {
-            token: main_listener.token,
-            peer_addr,
-        });
-        backend.add_connection(RuntimeConnectedPeer {
-            token: rdb_listener.token,
-            peer_addr,
-        });
-        let main = ConnectionId(main_listener.token.0);
-        let rdb = ConnectionId(rdb_listener.token.0);
-        let replica_id = backend.replication_runtime.register_primary(
-            main,
-            ReplicaConnectionInfo {
-                ip: "127.0.0.1".to_string(),
-                port: 6380,
-                capability: Vec::new(),
-                rdb_filter_mode: crate::framework::distributed::replication::RdbFilterMode::All,
-            },
-        );
-        backend.associate_waiting_rdb_for_test(main, rdb);
-        backend
-            .replication_runtime
-            .primary_link_mut(replica_id)
-            .unwrap()
-            .transition_to_waiting_for_main_psync()
-            .unwrap();
-        let child = backend.install_test_child(
-            crate::runtime::server::worker::reactor::sources::ChildOwner::DirectDualRdb,
-            0,
-        );
-        backend.full_sync.direct_dual_rdb_child = Some(DirectDualRdbChild {
-            pid: 0,
-            child,
-            rdb_connections: vec![rdb],
-            targets: vec![replica_id],
-            shared_replication_buffer_bytes: 0,
-            reaped_successfully: false,
-            metric_read_end: File::open("/dev/null").unwrap(),
-            phase_read_end,
-            phase_source: None,
-            phases: Vec::new(),
-            completion_state: crate::runtime::server::worker::distributed::replication::diskless_child::DirectDualCompletionState::default(),
-        });
-
-        backend.remove_connection(rdb.0);
-
-        assert_eq!(
-            backend
-                .full_sync
-                .direct_dual_rdb_child
-                .as_ref()
-                .map(|child| child.targets.clone()),
-            Some(vec![replica_id]),
-            "a child that already sent EOF must finish and promote the main link"
-        );
-    }
-
-    #[test]
-    fn completed_unpaired_direct_rdb_close_removes_transport_but_retains_wait_owner() {
-        use crate::framework::commands::server::save::DirectDualRdbChildPhase;
-        use crate::runtime::server::worker::distributed::replication::diskless_child::DirectDualRdbChild;
-        use std::fs::File;
-
-        let mut backend = ServerWorkerState::new(1).unwrap();
-        backend
-            .ctx
-            .config_mut()
-            .server
-            .debug_delay_rdb_client_free_seconds = 5;
-        let peer_addr = SocketAddr::from(([127, 0, 0, 1], 0));
-        let main_listener = backend.transport.bind_tcp(peer_addr).unwrap();
-        let rdb_listener = backend.transport.bind_tcp(peer_addr).unwrap();
-        for token in [main_listener.token, rdb_listener.token] {
-            backend.add_connection(RuntimeConnectedPeer { token, peer_addr });
-        }
-        let main = ConnectionId(main_listener.token.0);
-        let rdb = ConnectionId(rdb_listener.token.0);
-        let public_client_id = backend.connection_registry[rdb_listener.token].client_id();
-        let replica_id = backend.replication_runtime.register_primary(
-            main,
-            ReplicaConnectionInfo {
-                ip: "127.0.0.1".to_string(),
-                port: 6380,
-                capability: vec!["dual-channel".to_string()],
-                rdb_filter_mode: crate::framework::distributed::replication::RdbFilterMode::All,
-            },
-        );
-        backend
-            .replication_runtime
-            .primary_link_mut(replica_id)
-            .unwrap()
-            .transition_to_waiting_for_rdb_channel()
-            .unwrap();
-        backend
-            .replication_runtime
-            .register_rdb_candidate(rdb)
-            .unwrap();
-        let wait_boundary = backend.ctx.replication().backlog.snapshot_boundary();
-        assert!(backend
-            .replication_runtime
-            .take_endoff_for_rdb_candidate_if_unambiguous(
-                rdb,
-                true,
-                &mut backend.ctx.replication_mut().backlog,
-            )
-            .is_some());
-        backend
-            .replication_runtime
-            .backfill_waiting_psync_pins(backend.ctx.replication().backlog.next_stream_cursor());
-        let child = backend.install_test_child(
-            crate::runtime::server::worker::reactor::sources::ChildOwner::DirectDualRdb,
-            0,
-        );
-        backend.full_sync.direct_dual_rdb_child = Some(DirectDualRdbChild {
-            pid: 0,
-            child,
-            rdb_connections: vec![rdb],
-            targets: Vec::new(),
-            shared_replication_buffer_bytes: 0,
-            reaped_successfully: false,
-            metric_read_end: File::open("/dev/null").unwrap(),
-            phase_read_end: File::open("/dev/null").unwrap(),
-            phase_source: None,
-            phases: vec![DirectDualRdbChildPhase::MarkerSent],
-            completion_state: crate::runtime::server::worker::distributed::replication::diskless_child::DirectDualCompletionState::default(),
-        });
-
-        backend.remove_connection(rdb.0);
-
-        assert!(!backend.connection_registry.contains(rdb_listener.token));
-        assert_eq!(
-            backend
-                .connection_registry
-                .token_for_client_id(public_client_id),
-            None,
-            "generic client-id lookup must not expose retained replication waits"
-        );
-        assert!(!backend.transport.is_registered(rdb_listener.token));
-        assert_eq!(backend.replication_runtime.role(rdb), None);
-        assert!(backend.ctx.client_info(rdb.0).is_none());
-        assert_eq!(backend.replication_runtime.psync_wait_owner_count(), 1);
-        assert_eq!(
-            backend.replication_runtime.min_protected_backlog_cursor(),
-            Some(wait_boundary.stream_cursor())
-        );
-        assert!(backend.full_sync.direct_dual_rdb_child.is_some());
-
-        assert!(backend
-            .replication_runtime
-            .try_associate_retained_rdb_wait(
-                main,
-                public_client_id,
-                crate::foundation::io::sys::time::mstime(),
-            )
-            .is_ok());
-        let link = backend
-            .replication_runtime
-            .primary_for_connection(main)
-            .unwrap();
-        assert_eq!(
-            link.dual_state(),
-            crate::framework::distributed::replication::PrimaryDualChannelState::WaitingForMainPsync
-        );
-        assert_eq!(link.dual_endoff_boundary(), Some(wait_boundary));
-        assert!(link.dual_rdb_complete());
-    }
-
-    #[test]
-    fn pre_marker_unpaired_direct_rdb_close_does_not_retain_wait() {
-        use crate::runtime::server::worker::distributed::replication::diskless_child::DirectDualRdbChild;
-        use std::fs::File;
-
-        let mut backend = ServerWorkerState::new(1).unwrap();
-        let peer_addr = SocketAddr::from(([127, 0, 0, 1], 0));
-        let main_listener = backend.transport.bind_tcp(peer_addr).unwrap();
-        let rdb_listener = backend.transport.bind_tcp(peer_addr).unwrap();
-        for token in [main_listener.token, rdb_listener.token] {
-            backend.add_connection(RuntimeConnectedPeer { token, peer_addr });
-        }
-        let main = ConnectionId(main_listener.token.0);
-        let rdb = ConnectionId(rdb_listener.token.0);
-        let public_client_id = backend.connection_registry[rdb_listener.token].client_id();
-        let replica_id = backend.replication_runtime.register_primary(
-            main,
-            ReplicaConnectionInfo {
-                ip: "127.0.0.1".to_string(),
-                port: 6380,
-                capability: vec!["dual-channel".to_string()],
-                rdb_filter_mode: crate::framework::distributed::replication::RdbFilterMode::All,
-            },
-        );
-        backend
-            .replication_runtime
-            .primary_link_mut(replica_id)
-            .unwrap()
-            .transition_to_waiting_for_rdb_channel()
-            .unwrap();
-        backend
-            .replication_runtime
-            .register_rdb_candidate(rdb)
-            .unwrap();
-        assert!(backend
-            .replication_runtime
-            .take_endoff_for_rdb_candidate_if_unambiguous(
-                rdb,
-                true,
-                &mut backend.ctx.replication_mut().backlog,
-            )
-            .is_some());
-        let child = backend.install_test_child(
-            crate::runtime::server::worker::reactor::sources::ChildOwner::DirectDualRdb,
-            0,
-        );
-        backend.full_sync.direct_dual_rdb_child = Some(DirectDualRdbChild {
-            pid: 0,
-            child,
-            rdb_connections: vec![rdb],
-            targets: Vec::new(),
-            shared_replication_buffer_bytes: 0,
-            reaped_successfully: false,
-            metric_read_end: File::open("/dev/null").unwrap(),
-            phase_read_end: File::open("/dev/null").unwrap(),
-            phase_source: None,
-            phases: Vec::new(),
-            completion_state: crate::runtime::server::worker::distributed::replication::diskless_child::DirectDualCompletionState::default(),
-        });
-
-        backend.remove_connection(rdb.0);
-
-        assert_eq!(backend.replication_runtime.psync_wait_owner_count(), 0);
-        assert_eq!(
-            backend.replication_runtime.min_protected_backlog_cursor(),
-            None
-        );
-        assert!(backend
-            .replication_runtime
-            .try_associate_retained_rdb_wait(
-                main,
-                public_client_id,
-                crate::foundation::io::sys::time::mstime(),
-            )
-            .is_err());
     }
 
     #[test]

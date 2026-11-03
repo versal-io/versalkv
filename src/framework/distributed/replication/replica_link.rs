@@ -155,6 +155,12 @@ impl ReplicaLink {
         self.provisional_primary.as_ref()
     }
 
+    pub fn provisional_resume_position(&self) -> Option<(&str, ReplicationOffset, u32)> {
+        self.provisional_primary
+            .as_ref()
+            .map(|primary| (primary.replid.as_str(), primary.end_offset, primary.db_id))
+    }
+
     pub fn clear_provisional_primary(&mut self) {
         self.provisional_primary = None;
     }

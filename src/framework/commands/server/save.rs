@@ -13,7 +13,6 @@ static CLUSTER_CONFIG_LOCK_FD: AtomicI32 = AtomicI32::new(-1);
 
 mod fullsync_fork;
 pub use fullsync_fork::{
-    fork_direct_diskless_rdb_child,
     fork_disk_rdb_file_child_with_options, fork_diskless_rdb_child_with_options,
     pause_parent_after_replication_fork, DiskSyncChildExit,
 };
@@ -21,9 +20,6 @@ pub use fullsync_fork::{
 pub use fullsync_fork::{fork_diskless_rdb_child, fork_disk_rdb_file_child};
 #[cfg(test)]
 pub use fullsync_fork::reap_disk_sync_file_child;
-pub(crate) use fullsync_fork::{
-    drain_direct_dual_rdb_phase_pipe, DirectDualRdbChildPhase,
-};
 
 #[cfg(test)]
 static DISKLESS_FORK_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
