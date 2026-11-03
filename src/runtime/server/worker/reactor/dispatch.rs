@@ -794,7 +794,7 @@ impl ServerWorkerState {
                     if self.replication_runtime.role(connection_id).is_none() {
                         self.trace_turn_for_test(TurnTracePoint::OrdinaryWrite);
                     }
-                    self.handle_writable(token);
+                    self.handle_pending_write(token);
                 }
             }
             RunnableKey::SlotExportWrite(token) => {

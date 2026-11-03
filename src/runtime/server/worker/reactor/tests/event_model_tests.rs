@@ -233,8 +233,8 @@ fn pending_runtime_work_is_deduplicated_by_runnable_key_and_slot() {
         keys,
         vec![
             RunnableKey::ClientRead(Token(11)),
-            RunnableKey::ClientWrite(Token(12)),
             RunnableKey::SlotExportWrite(Token(13)),
+            RunnableKey::ClientWrite(Token(12)),
         ]
     );
 }
@@ -456,8 +456,8 @@ fn before_poll_slots_follow_the_fixed_barrier_order() {
             RunnableKey::Test(6),
             RunnableKey::Test(5),
             RunnableKey::Test(4),
-            RunnableKey::Test(1),
             RunnableKey::Test(3),
+            RunnableKey::Test(1),
             RunnableKey::Test(0),
         ]
     );

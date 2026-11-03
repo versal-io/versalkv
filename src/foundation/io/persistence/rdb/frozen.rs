@@ -298,7 +298,7 @@ impl ForklessFeed {
                     };
                     self.scheduled_keys.insert(completion.clone());
                     self.captured_keys.push(completion.clone());
-                    self.queued_keys.push(completion);
+                    self.track_entry_handoff(completion, &entry.value);
                     match self.feeder.try_send(FrozenWorkItem::Entry(entry)) {
                         Ok(()) => {}
                         Err(FeedError::Full(item)) => {
@@ -384,19 +384,21 @@ impl ForklessFeed {
                 else {
                     continue;
                 };
-                let item = FrozenWorkItem::Entry(FrozenEntry {
+                let entry = FrozenEntry {
                     key: key.clone(),
                     value,
                     expire_ms,
                     hash_field_expires: db.hash_field_expires_for(&key).cloned(),
                     completion: Some(completion.clone()),
-                });
+                };
                 self.captured_keys.push(completion.clone());
                 if was_priority {
                     self.scheduled_keys.insert(completion.clone());
                 }
+                // Ordinary iteration keeps the C-compatible in-use marker.
+                // Only independent early copies may release waiting writers.
                 self.queued_keys.push(completion);
-                match self.feeder.try_send(item) {
+                match self.feeder.try_send(FrozenWorkItem::Entry(entry)) {
                     Ok(()) => {}
                     Err(FeedError::Full(item)) => {
                         self.pending = Some(*item);
@@ -411,6 +413,15 @@ impl ForklessFeed {
             }
         }
         false
+    }
+
+    fn track_entry_handoff(&mut self, item: ForklessItemId, value: &SnapshotValue) {
+        // Shared values still require the serializer to release live storage.
+        // Independent copies can release writers as soon as they are captured.
+        match value {
+            SnapshotValue::Shared(_) => self.queued_keys.push(item),
+            SnapshotValue::Owned(_) => self.resolved_keys.push(item),
+        }
     }
 
     pub(crate) fn take_queued_keys(&mut self) -> Vec<ForklessItemId> {
@@ -1082,11 +1093,13 @@ mod tests {
     }
 
     #[test]
-    fn priority_owned_key_waits_for_background_serialization() {
+    fn priority_shared_key_waits_for_background_serialization() {
         let mut dbs = DbSet::new(1);
         dbs.get_mut(0).unwrap().set(
             b"owned".to_vec(),
-            Robj::string_raw(Bytes::from_static(b"value")),
+            Robj::ListQuicklist(ListValue::from_vecdeque(
+                (0..8_192).map(|_| Bytes::from_static(b"value")).collect(),
+            )),
         );
         let frozen =
             FrozenRdb::capture_header(&dbs, &[], &[], None, RdbSerializeOptions::default());
@@ -1126,6 +1139,56 @@ mod tests {
         task.control().cancel();
         let _ = task.finish();
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn priority_owned_key_releases_writer_before_background_serialization() {
+        let mut dbs = DbSet::new(1);
+        dbs.get_mut(0).unwrap().set(
+            b"owned".to_vec(),
+            Robj::string_raw(Bytes::from_static(b"value")),
+        );
+        let frozen =
+            FrozenRdb::capture_header(&dbs, &[], &[], None, RdbSerializeOptions::default());
+        let dir = std::env::temp_dir().join(format!(
+            "versal-forkless-priority-owned-release-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut task, feeder) = BackgroundRdbSave::start_incremental(
+            frozen.total_keys(),
+            dir.clone(),
+            "dump.rdb".to_string(),
+            1,
+            10_000_000,
+            false,
+            RdbSnapshotOptions {
+                compression: RdbCompression::No,
+                checksum: true,
+            },
+        )
+        .unwrap();
+        let mut feed = frozen.into_incremental_feed(feeder, 0, true);
+        let owned = ForklessItemId {
+            dataset_id: None,
+            db_id: 0,
+            key: b"owned".to_vec(),
+        };
+
+        assert!(feed.prioritize_keys(0, [owned.key.clone()]));
+        assert!(!feed.drive(&mut dbs, &mut [], 1));
+        let resolved = feed.take_resolved_keys();
+        let queued = feed.take_queued_keys();
+        let processed = task.control().progress().processed;
+        drop(feed);
+        task.control().cancel();
+        let _ = task.finish();
+        let _ = std::fs::remove_dir_all(dir);
+
+        assert_eq!(resolved, vec![owned]);
+        assert!(queued.is_empty());
+        assert_eq!(processed, 0);
     }
 
     #[test]

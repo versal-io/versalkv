@@ -471,7 +471,42 @@ impl ServerWorkerState {
     }
 
     pub(crate) fn handle_writable(&mut self, token: Token) {
+        self.handle_writable_with_replication_barrier(token, true);
+    }
+
+    pub(crate) fn handle_pending_write(&mut self, token: Token) {
+        // The scheduled write phase follows a bounded replication batch.
+        // Retained replica work must not keep ordinary replies from progressing.
+        self.handle_writable_with_replication_barrier(token, false);
+    }
+
+    fn handle_writable_with_replication_barrier(
+        &mut self,
+        token: Token,
+        should_wait_for_replication: bool,
+    ) {
         if !self.socket_write_owned_by_main_thread(token) {
+            return;
+        }
+        if should_wait_for_replication
+            && self.is_scheduleable_ordinary_write(token.0)
+            && self
+                .replication_runtime
+                .primary_links()
+                .values()
+                .any(|link| {
+                    link.state()
+                        == crate::framework::distributed::replication::PrimaryLinkState::Streaming
+                        && self.event_batch.contains_runnable(
+                            crate::runtime::server::worker::reactor::RunnableKey::ClientWrite(
+                                Token(link.connection_id().0),
+                            ),
+                        )
+                })
+        {
+            // A polled read must not send its reply before queued replication
+            // receives the same bounded write attempt as in beforeSleep.
+            self.schedule_ordinary_write(token.0);
             return;
         }
         let Some(context) = self.prepare_writable_context(token) else {

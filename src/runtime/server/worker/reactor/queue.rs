@@ -253,6 +253,19 @@ impl EventBatch {
                 self.roll_phase_to_next_turn(EventPhase::BeforePoll);
                 return None;
             }
+            if slot == BeforePollSlot::DistributedWrites
+                && self.limits.max_events_per_phase_per_turn > 1
+                && !self.before_poll[BeforePollSlot::OrdinaryWrites.index()]
+                    .nodes
+                    .is_empty()
+                && self.dispatched_events_by_phase[EventPhase::BeforePoll.index()]
+                    >= self.limits.max_events_per_phase_per_turn - 1
+            {
+                // Retain a write opportunity for ordinary clients even when
+                // sustained replica fanout fills the distributed write queue.
+                self.finish_before_poll_slot(slot);
+                return None;
+            }
             let (sequence, ()) = self.before_poll[slot.index()].pop_front()?;
             let target = QueueTarget::BeforePoll(slot);
             if self.owner_budget_exhausted(sequence) {
@@ -774,8 +787,8 @@ impl BeforePollSlot {
             1 => Self::PreAof,
             2 => Self::Maintenance,
             3 => Self::AofBarrier,
-            4 => Self::OrdinaryWrites,
-            5 => Self::DistributedWrites,
+            4 => Self::DistributedWrites,
+            5 => Self::OrdinaryWrites,
             6 => Self::PollPreparation,
             _ => unreachable!("before-poll slot index is bounded by the queue array"),
         }

@@ -67,8 +67,8 @@ pub(crate) enum BeforePollSlot {
     PreAof,
     Maintenance,
     AofBarrier,
-    OrdinaryWrites,
     DistributedWrites,
+    OrdinaryWrites,
     PollPreparation,
 }
 

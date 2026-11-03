@@ -128,8 +128,8 @@ impl ServerWorkerState {
 
     pub(super) fn prepare_blocked_round_write_phase(&mut self, _round: usize) {
         self.event_batch.activate_next_turn_before_poll_slots(&[
-            crate::runtime::server::worker::reactor::BeforePollSlot::OrdinaryWrites,
             crate::runtime::server::worker::reactor::BeforePollSlot::DistributedWrites,
+            crate::runtime::server::worker::reactor::BeforePollSlot::OrdinaryWrites,
         ]);
     }
 
@@ -149,9 +149,9 @@ impl ServerWorkerState {
             .connection_registry
             .iter()
             .any(|(_, connection)| connection.has_pending_output());
-        self.drain_current_ordinary_writes();
-        self.drain_current_slot_export_writes();
         self.schedule_pending_replica_writes_before_sleep();
+        self.drain_current_slot_export_writes();
+        self.drain_current_ordinary_writes();
         has_pending_writes
     }
 

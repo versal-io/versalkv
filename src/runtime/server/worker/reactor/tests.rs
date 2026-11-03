@@ -98,6 +98,148 @@ fn queue_pending_request(
 }
 
 #[test]
+fn polled_write_attempts_replication_before_flushing_the_origin_reply() {
+    for is_writable in [false, true] {
+        let mut backend = ServerWorkerState::new(1).expect("create runtime");
+        crate::framework::commands::register_all(&mut backend.registry);
+        backend.ctx.replication_mut().backlog.activate();
+        let (mut client, client_token) = connected_test_client(&mut backend);
+        let (mut replica, replica_token) = connected_test_client(&mut backend);
+        let replica_id = backend.replication_runtime.register_primary(
+            ConnectionId(replica_token.0),
+            ReplicaConnectionInfo {
+                ip: "127.0.0.1".to_string(),
+                port: 6380,
+                capability: Vec::new(),
+                rdb_filter_mode: RdbFilterMode::All,
+            },
+        );
+        backend
+            .replication_runtime
+            .primary_link_mut(replica_id)
+            .expect("registered replica")
+            .set_state(PrimaryLinkState::Streaming);
+        client
+            .write_all(b"SET replication-order value\r\n")
+            .expect("send write");
+        backend.transport.wait_readable_for_test(client_token);
+        backend.dispatch_transport_event(
+            ReadyEvent {
+                token: client_token,
+                readable: true,
+                writable: is_writable,
+                error: false,
+                read_hup: false,
+            },
+            true,
+        );
+
+        client
+            .set_nonblocking(true)
+            .expect("set client nonblocking");
+        let mut byte = [0];
+        let error = client
+            .read(&mut byte)
+            .expect_err("origin reply must wait for the pending replication write");
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        backend
+            .dispatch_before_poll_slot(
+                super::BeforePollSlot::DistributedWrites,
+                super::DispatchContext::Normal,
+            )
+            .expect("attempt pending replication writes");
+        backend.drive_pending_ordinary_writes();
+        client
+            .set_nonblocking(false)
+            .expect("restore client blocking mode");
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("set client deadline");
+        let mut reply = [0; 5];
+        client.read_exact(&mut reply).expect("read origin reply");
+        assert_eq!(&reply, b"+OK\r\n");
+        replica
+            .set_nonblocking(true)
+            .expect("set replica nonblocking");
+        let mut frame = [0; 256];
+        let received = replica
+            .read(&mut frame)
+            .expect("replication must be attempted before the origin reply");
+        assert!(
+            frame[..received]
+                .windows(b"replication-order".len())
+                .any(|part| part == b"replication-order"),
+            "the preceding write must already be on the replication socket"
+        );
+    }
+}
+
+#[test]
+fn pending_replication_writes_leave_progress_for_ordinary_replies() {
+    let mut backend = ServerWorkerState::new(1).expect("create runtime");
+    backend.event_batch = EventBatch::with_limits(EventLimits {
+        max_events_per_phase_per_turn: 2,
+        max_same_owner_events_per_turn: 64,
+    });
+    backend.ctx.replication_mut().backlog.activate();
+    let (mut client, client_token) = connected_test_client(&mut backend);
+    client
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .expect("set client deadline");
+    let mut replicas = Vec::new();
+    for _ in 0..3 {
+        let (replica, token) = connected_test_client(&mut backend);
+        replica
+            .set_nonblocking(true)
+            .expect("set replica nonblocking");
+        let id = backend.replication_runtime.register_primary(
+            ConnectionId(token.0),
+            ReplicaConnectionInfo {
+                ip: "127.0.0.1".to_string(),
+                port: 6380,
+                capability: Vec::new(),
+                rdb_filter_mode: RdbFilterMode::All,
+            },
+        );
+        backend
+            .replication_runtime
+            .primary_link_mut(id)
+            .expect("registered replica")
+            .set_state(PrimaryLinkState::Streaming);
+        replicas.push((replica, 0));
+    }
+    for _ in 0..6 {
+        backend.propagate_to_replicas(b"*1\r\n$4\r\nPING\r\n");
+        backend.queue_client_reply(client_token, b"+OK\r\n".to_vec());
+        assert_eq!(
+            backend
+                .run_before_poll_phase()
+                .expect("run bounded write phase"),
+            LoopControl::Continue
+        );
+        let mut reply = [0; 5];
+        client
+            .read_exact(&mut reply)
+            .expect("ordinary replies must progress despite retained replication writes");
+        assert_eq!(&reply, b"+OK\r\n");
+        for (replica, received) in &mut replicas {
+            let mut bytes = [0; 256];
+            match replica.read(&mut bytes) {
+                Ok(count) => *received += count,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("read replica output: {error}"),
+            }
+        }
+        backend.event_batch.begin_next_turn();
+        backend.writes.ordinary.begin_turn();
+    }
+    assert!(
+        replicas.iter().all(|(_, received)| *received > 0),
+        "every retained replica must also make progress"
+    );
+}
+
+#[test]
 fn listener_accept_budget_applies_once_per_event_loop_cycle() {
     let mut backend = ServerWorkerState::new(1).expect("create runtime");
     backend
