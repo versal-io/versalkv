@@ -462,6 +462,7 @@ impl ClusterState {
         };
         if let Some(node) = self.nodes.get_mut(node_id) {
             node.flags &= !(CLUSTER_NODE_NOADDR | CLUSTER_NODE_FAIL | CLUSTER_NODE_PFAIL);
+            node.fail_time = 0;
         }
         if self.myself.is_replica() && self.myself.replicaof == node_id {
             self.clear_local_primary_failure_view();
@@ -475,6 +476,7 @@ impl ClusterState {
         if let Some(node) = self.nodes.get_mut(node_id) {
             node.flags &= !CLUSTER_NODE_PFAIL;
             node.flags |= CLUSTER_NODE_NOADDR | CLUSTER_NODE_FAIL;
+            node.fail_time = crate::foundation::io::sys::time::mstime();
             node.endpoints.update_bus_address(String::new(), 0, 0);
             node.endpoints.set_tls_port(0);
             node.endpoints.set_client_port(0);
@@ -508,18 +510,6 @@ impl ClusterState {
                 node.asymmetric_meet_started_at = now_ms;
             }
         }
-    }
-
-    pub(crate) fn observe_gossip_handshake(&mut self, node_id: &str, now_ms: i64) -> bool {
-        use crate::engine::distributed::cluster::node::CLUSTER_NODE_HANDSHAKE;
-        let Some(node) = self.nodes.get_mut(node_id) else {
-            return false;
-        };
-        if node.has_flag(CLUSTER_NODE_HANDSHAKE) {
-            node.pong_received = now_ms;
-            node.asymmetric_meet_started_at = now_ms;
-        }
-        true
     }
 
     pub(crate) fn promote_local_update_owner(&mut self, epoch: u64) {

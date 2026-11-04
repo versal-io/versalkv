@@ -118,23 +118,23 @@ struct SenderExtensions<'a> {
 impl<'a> SenderExtensions<'a> {
     fn parse(extensions: &'a [ClusterExtension]) -> Self {
         Self {
-            hostname: extension_string(extensions, |item| match item {
+            hostname: extension_string(extensions, 0, |item| match item {
                 ClusterExtension::Hostname(value) => Some(value.as_str()),
                 _ => None,
             }),
-            human_name: extension_string(extensions, |item| match item {
+            human_name: extension_string(extensions, 1, |item| match item {
                 ClusterExtension::HumanNodeName(value) => Some(value.as_str()),
                 _ => None,
             }),
-            client_ipv4: extension_string(extensions, |item| match item {
+            client_ipv4: extension_string(extensions, 4, |item| match item {
                 ClusterExtension::ClientIpv4(value) => Some(value.as_str()),
                 _ => None,
             }),
-            client_ipv6: extension_string(extensions, |item| match item {
+            client_ipv6: extension_string(extensions, 5, |item| match item {
                 ClusterExtension::ClientIpv6(value) => Some(value.as_str()),
                 _ => None,
             }),
-            availability_zone: extension_string(extensions, |item| match item {
+            availability_zone: extension_string(extensions, 8, |item| match item {
                 ClusterExtension::AvailabilityZone(value) => Some(value.as_str()),
                 _ => None,
             }),
@@ -146,7 +146,7 @@ impl<'a> SenderExtensions<'a> {
                 ClusterExtension::ClientTlsPort(port) => Some(*port),
                 _ => None,
             }),
-            shard_id: extensions.iter().find_map(|item| match item {
+            shard_id: extensions.iter().rev().find_map(|item| match item {
                 ClusterExtension::ShardId(node_id) => Some(node_id.to_string()),
                 _ => None,
             }),
@@ -261,7 +261,8 @@ impl ClusterBusManager {
             state.request_shard_slot_cleanup(slot);
         }
 
-        topology_changed |= Self::apply_gossip_observations(state, msg);
+        topology_changed |=
+            Self::apply_gossip_observations(state, msg, crate::foundation::io::sys::time::mstime());
         state.advance_current_epoch(msg.current_epoch);
         Self::resolve_gossip_epoch_collision(state, msg);
         if topology_changed {
@@ -270,8 +271,15 @@ impl ClusterBusManager {
         }
     }
 
-    fn apply_gossip_observations(state: &mut ClusterState, msg: &ClusterMsg) -> bool {
-        let now_ms = crate::foundation::io::sys::time::mstime();
+    pub(super) fn apply_gossip_observations(
+        state: &mut ClusterState,
+        msg: &ClusterMsg,
+        now_ms: i64,
+    ) -> bool {
+        let is_trusted_sender = state
+            .nodes
+            .get(&msg.sender_id)
+            .is_some_and(|node| !node.has_flag(CLUSTER_NODE_HANDSHAKE));
         let mut topology_changed = false;
         for entry in msg.gossip() {
             if entry.node_id.is_empty()
@@ -280,13 +288,17 @@ impl ClusterBusManager {
             {
                 continue;
             }
-            if state.nodes.contains_key(&entry.node_id) {
+            if is_trusted_sender && state.nodes.contains_key(&entry.node_id) {
                 topology_changed |= Self::update_gossip_node(state, entry, now_ms);
-            } else {
+            } else if is_trusted_sender
+                && entry.flags & crate::engine::distributed::cluster::node::CLUSTER_NODE_NOADDR == 0
+            {
                 Self::insert_gossip_node(state, entry, now_ms);
                 topology_changed = true;
             }
-            Self::apply_gossip_failure_report(state, msg, entry, now_ms);
+            if is_trusted_sender {
+                Self::apply_gossip_failure_report(state, msg, entry, now_ms);
+            }
         }
         topology_changed
     }
@@ -306,7 +318,10 @@ impl ClusterBusManager {
             Self::apply_sender_role(&mut node, plan, apply_slot_bitmap);
         outcome.topology_changed |= role_changed;
         outcome.lost_primary_slots = lost_slots;
-        outcome.topology_changed |= Self::apply_sender_replication(&mut node, plan);
+        let claimed_primary_known = msg.replicaof == state.myself.name
+            || (!msg.replicaof.is_empty() && state.nodes.contains_key(&msg.replicaof));
+        outcome.topology_changed |=
+            Self::apply_sender_replication(&mut node, plan, claimed_primary_known);
         if msg.replicaof.is_empty() && msg.config_epoch > node.config_epoch {
             node.config_epoch = msg.config_epoch;
             outcome.topology_changed = true;
@@ -662,14 +677,20 @@ impl ClusterBusManager {
         }
     }
 
-    fn apply_sender_replication(node: &mut ClusterNode, plan: &NodeUpdatePlan<'_>) -> bool {
+    fn apply_sender_replication(
+        node: &mut ClusterNode,
+        plan: &NodeUpdatePlan<'_>,
+        claimed_primary_known: bool,
+    ) -> bool {
         use crate::engine::distributed::cluster::node::{
             CLUSTER_NODE_PRIMARY, CLUSTER_NODE_REPLICA,
         };
         let msg = plan.observation.message;
         let before = (node.replicaof.clone(), node.shard_id.clone(), node.flags);
         if plan.observation.role == ObservedRole::Replica && !plan.stale_sender_role {
-            node.replicaof = msg.replicaof.clone();
+            if claimed_primary_known {
+                node.replicaof = msg.replicaof.clone();
+            }
             node.flags &= !CLUSTER_NODE_PRIMARY;
             node.flags |= CLUSTER_NODE_REPLICA;
             if let Some(shard_id) = plan
@@ -756,7 +777,9 @@ impl ClusterBusManager {
         if plan.observation.role == ObservedRole::Replica {
             node.flags &= !crate::engine::distributed::cluster::node::CLUSTER_NODE_PRIMARY;
             node.flags |= crate::engine::distributed::cluster::node::CLUSTER_NODE_REPLICA;
-            node.replicaof = msg.replicaof.clone();
+            if plan.replicated_shard_id.is_some() {
+                node.replicaof = msg.replicaof.clone();
+            }
             if let Some(shard_id) = &plan.replicated_shard_id {
                 node.shard_id = shard_id.clone();
             }
@@ -1064,14 +1087,25 @@ impl ClusterBusManager {
 
 fn extension_string<'a>(
     extensions: &'a [ClusterExtension],
+    kind: u16,
     select: impl Fn(&'a ClusterExtension) -> Option<&'a str>,
 ) -> &'a str {
-    extensions.iter().find_map(select).unwrap_or_default()
+    extensions
+        .iter()
+        .rev()
+        .find_map(|extension| match extension {
+            ClusterExtension::Unknown {
+                kind: extension_kind,
+                ..
+            } if *extension_kind == kind => Some(""),
+            _ => select(extension),
+        })
+        .unwrap_or_default()
 }
 
 fn extension_port(
     extensions: &[ClusterExtension],
     select: impl Fn(&ClusterExtension) -> Option<u16>,
 ) -> u16 {
-    extensions.iter().find_map(select).unwrap_or_default()
+    extensions.iter().rev().find_map(select).unwrap_or_default()
 }

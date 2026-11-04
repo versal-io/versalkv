@@ -2,6 +2,7 @@ use crate::engine::command::{CommandArgs, CommandError};
 use crate::engine::core::CommandOutcome;
 use crate::foundation::io::protocol::Value;
 use crate::foundation::io::store::Robj;
+use crate::foundation::io::store::structure::zset::LexBound;
 use crate::framework::commands::command_runtime::CommandRuntime;
 use crate::framework::commands::zset::basic::{parse_lex_bound, parse_score_range, score_value};
 use bytes::Bytes;
@@ -18,8 +19,8 @@ pub(super) enum ZRangeMode {
         max: (f64, bool),
     },
     Lex {
-        min: (Bytes, bool),
-        max: (Bytes, bool),
+        min: LexBound,
+        max: LexBound,
     },
 }
 
@@ -218,24 +219,18 @@ pub(super) fn collect_range_entries(zset: &Robj, request: &ZRangeRequest) -> Vec
             zset.zset_range_by_score(*min, *max, limit.offset, limit.count, request.reverse)
         }
         ZRangeMode::Lex { min, max } => {
-            let entries = zset.zset_range_by_lex(&min.0, min.1, &max.0, max.1, request.reverse);
-            apply_lex_limit(entries, request.limit)
+            let limit = request.limit.unwrap_or(ZRangeLimit {
+                offset: 0,
+                count: -1,
+            });
+            zset.zset_range_by_lex_bounds_with_limit(
+                min.clone(),
+                max.clone(),
+                limit.offset,
+                limit.count,
+                request.reverse,
+            )
         }
-    }
-}
-
-fn apply_lex_limit(entries: Vec<(Bytes, f64)>, limit: Option<ZRangeLimit>) -> Vec<(Bytes, f64)> {
-    let Some(limit) = limit else { return entries };
-    if limit.count < 0 {
-        return entries;
-    }
-    let len = entries.len() as i64;
-    let start = limit.offset.max(0);
-    let end = (start + limit.count).min(len);
-    if start >= len {
-        Vec::new()
-    } else {
-        entries[start as usize..end as usize].to_vec()
     }
 }
 
@@ -348,11 +343,123 @@ pub(super) fn execute_zrange_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::foundation::io::store::structure::zset::{ZSetLp, ZSetSl};
 
     fn args(parts: &[&'static [u8]]) -> CommandArgs {
         let mut argv = vec![Bytes::from_static(b"ZRANGE")];
         argv.extend(parts.iter().map(|part| Bytes::from_static(part)));
         CommandArgs::from_parts(argv)
+    }
+
+    #[test]
+    fn score_bounds_accept_c_numeric_syntax_and_reject_trailing_data() {
+        for (input, expected) in [
+            (b"0x1.8".as_slice(), Some((1.5, true))),
+            (b"( \t0x1p1", Some((2.0, false))),
+            (b"\x0b3", Some((3.0, true))),
+            (b"-INFINITY", Some((f64::NEG_INFINITY, true))),
+            (b"3 ", None),
+            (b"0x1tail", None),
+            (b"NaN", None),
+            (b"(", None),
+            (b"", None),
+        ] {
+            assert_eq!(parse_score_range(input), expected, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn score_range_negative_offsets_are_empty_in_both_encodings() {
+        for mut zset in [
+            Robj::ZSetListpack(ZSetLp::new()),
+            Robj::ZSetSkiplist(ZSetSl::new()),
+        ] {
+            zset.zset_add(b"a", 1.0);
+            for reverse in [false, true] {
+                for offset in [-1, i64::MIN, i64::MAX] {
+                    assert!(zset
+                        .zset_range_by_score((0.0, true), (2.0, true), offset, -1, reverse)
+                        .is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lex_ranges_follow_score_order_with_limits_in_both_encodings() {
+        for mut zset in [
+            Robj::ZSetListpack(ZSetLp::new()),
+            Robj::ZSetSkiplist(ZSetSl::new()),
+        ] {
+            for (member, score) in [(b"b", 0.0), (b"d", 0.0), (b"a", 1.0), (b"c", 1.0), (b"e", 2.0)] {
+                zset.zset_add(member, score);
+            }
+            assert_eq!(zset.zset_count_by_lex(b"a", true, b"c", true), 1);
+            assert_eq!(zset.zset_count_by_lex(b"c", true, b"+", true), 4);
+            for (min, max, reverse, offset, count, expected) in [
+                (b"[a".as_slice(), b"[c".as_slice(), false, 0, -1, vec!["b"]),
+                (b"[c", b"+", false, 0, -1, vec!["d", "a", "c", "e"]),
+                (b"-", b"[c", true, 0, -1, vec!["c", "a", "d", "b"]),
+                (b"(b", b"(e", true, 0, -1, vec!["c"]),
+                (b"[a", b"[c", false, 2, -1, vec!["a", "c"]),
+                (b"(b", b"(e", true, 2, -1, vec!["d"]),
+                (b"-", b"+", false, 1, -1, vec!["d", "a", "c", "e"]),
+                (b"-", b"+", false, -1, 3, vec![]),
+                (b"-", b"+", true, -1, -1, vec![]),
+                (b"-", b"+", false, i64::MAX, i64::MAX, vec![]),
+                (b"-", b"+", false, 1, i64::MAX, vec!["d", "a", "c", "e"]),
+                (b"-", b"+", false, 0, 0, vec![]),
+                (b"[d", b"[c", false, 0, -1, vec![]),
+                (b"-", b"[a", true, 0, -1, vec![]),
+            ] {
+                let request = ZRangeRequest {
+                    key: Bytes::from_static(b"z"),
+                    mode: ZRangeMode::Lex {
+                        min: parse_lex_bound(min).unwrap(),
+                        max: parse_lex_bound(max).unwrap(),
+                    },
+                    reverse,
+                    limit: Some(ZRangeLimit { offset, count }),
+                    with_scores: false,
+                    should_require_key: false,
+                };
+                let actual: Vec<_> = collect_range_entries(&zset, &request)
+                    .into_iter()
+                    .map(|(member, _)| String::from_utf8(member.to_vec()).unwrap())
+                    .collect();
+                assert_eq!(actual, expected, "{min:?} {max:?} {reverse} {offset} {count}");
+            }
+        }
+    }
+
+    #[test]
+    fn lex_ranges_distinguish_literal_sign_members_from_infinity_sentinels() {
+        for mut zset in [
+            Robj::ZSetListpack(ZSetLp::new()),
+            Robj::ZSetSkiplist(ZSetSl::new()),
+        ] {
+            zset.zset_add(b"-", 0.0);
+            zset.zset_add(b"+", 0.0);
+            for (bound, expected) in [(b"[-".as_slice(), b"-"), (b"[+", b"+")] {
+                let request = ZRangeRequest {
+                    key: Bytes::from_static(b"z"),
+                    mode: ZRangeMode::Lex {
+                        min: parse_lex_bound(bound).unwrap(),
+                        max: parse_lex_bound(bound).unwrap(),
+                    },
+                    reverse: false,
+                    limit: None,
+                    with_scores: false,
+                    should_require_key: false,
+                };
+                let members: Vec<_> = collect_range_entries(&zset, &request)
+                    .into_iter()
+                    .map(|(member, _)| member)
+                    .collect();
+
+                assert_eq!(members, vec![Bytes::copy_from_slice(expected)]);
+            }
+        }
     }
 
     #[test]

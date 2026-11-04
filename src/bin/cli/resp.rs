@@ -230,6 +230,17 @@ impl RespParser {
     }
 
     fn parse_value(&mut self) -> Result<RespValue, String> {
+        while self.buf.get(self.pos) == Some(&b'|') {
+            self.pos += 1;
+            let count = std::str::from_utf8(self.read_line()?)
+                .map_err(|_| "Invalid attribute length".to_string())?
+                .parse::<usize>()
+                .map_err(|_| "Invalid attribute length".to_string())?;
+            for _ in 0..count {
+                self.parse_value()?;
+                self.parse_value()?;
+            }
+        }
         if self.pos >= self.buf.len() {
             return Err("incomplete".to_string());
         }

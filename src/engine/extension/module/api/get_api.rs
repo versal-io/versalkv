@@ -280,7 +280,7 @@ module_api_entries! {
         "ValkeyModule_RandomKey" => call::ValkeyModule_RandomKey as *mut c_void,
         "ValkeyModule_Assert" => call::ValkeyModule_Assert as *mut c_void,
         "ValkeyModule_Call" => VM_Call as *mut c_void,
-        "ValkeyModule_CallArgv" => call::VM_CallArgv as *mut c_void,
+        "ValkeyModule_CallArgv" => call::ValkeyModule_CallArgv as *mut c_void,
         "ValkeyModule_CallArgvAbort" => call::VM_CallArgvAbort as *mut c_void,
         "ValkeyModule_Replicate" => VM_Replicate as *mut c_void,
         "ValkeyModule_ReplicateVerbatim" => call::ValkeyModule_ReplicateVerbatim as *mut c_void,

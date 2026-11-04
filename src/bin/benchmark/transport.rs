@@ -170,7 +170,10 @@ impl Write for ConnectionStream {
 }
 
 fn parse_moved_target(err: &str) -> Option<(String, u16)> {
-    let mut parts = err.split_whitespace();
+    let mut parts = err
+        .strip_prefix("Error from server: ")
+        .unwrap_or(err)
+        .split_whitespace();
     let kind = parts.next()?;
     if !kind.ends_with("MOVED") && kind != "-MOVED" && kind != "MOVED" {
         return None;
@@ -189,6 +192,10 @@ mod tests {
     fn parses_moved_target() {
         assert_eq!(
             parse_moved_target("-MOVED 8338 127.0.0.1:21113"),
+            Some(("127.0.0.1".to_string(), 21113))
+        );
+        assert_eq!(
+            parse_moved_target("Error from server: -MOVED 8338 127.0.0.1:21113"),
             Some(("127.0.0.1".to_string(), 21113))
         );
     }

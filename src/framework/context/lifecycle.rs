@@ -92,6 +92,7 @@ impl ServerContext {
             sentinel_state: SentinelState::new(),
             cluster_state: None,
             slot_imports: std::collections::HashMap::new(),
+            slot_import_infrastructure_memory: 0,
             module_registry,
             client_pause: ClientPauseState {
                 action: PauseAction::None,

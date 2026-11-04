@@ -265,12 +265,18 @@ ValkeyModuleCallReply* VM_Call(
 
     // Call the Rust implementation
     ValkeyModuleCallReply* reply = VM_CallWithReply(ctx, argv, idx, flags);
+    int call_errno = errno;
+    if (call_errno && !(flags & (FLAG_ERRORS_AS_REPL | FLAG_DRY_RUN)) && reply) {
+        VM_FreeCallReply(reply);
+        reply = NULL;
+    }
 
     release_argv(argv, idx);
     if (argv != argv_stack) {
         free(argv);
     }
 
+    errno = call_errno;
     return reply;
 
 call_build_failed:

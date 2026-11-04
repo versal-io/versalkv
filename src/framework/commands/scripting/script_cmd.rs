@@ -6,13 +6,6 @@ use crate::foundation::io::protocol::Value;
 use crate::framework::commands::scripting::script_cache::ScriptCache;
 use crate::framework::context::ServerContext;
 use crate::framework::{CommandArgs, CommandError};
-use std::sync::atomic::{AtomicBool, Ordering};
-
-static SCRIPT_DEBUG_ENABLED: AtomicBool = AtomicBool::new(false);
-
-pub(crate) fn script_debug_enabled() -> bool {
-    SCRIPT_DEBUG_ENABLED.load(Ordering::Relaxed)
-}
 
 #[command("SCRIPT")]
 pub fn script_cmd(
@@ -36,8 +29,22 @@ pub fn script_cmd(
         "show" => script_show(args, ctx),
         "kill" => script_kill(conn, ctx),
         "debug" => {
-            ctx.script_mut().debug_session = None;
-            script_debug(args)
+            let result = script_debug(args);
+            if result == Value::ok() {
+                ctx.script_mut().debug_session = None;
+                let session = conn.session_id();
+                if args.args[1].eq_ignore_ascii_case(b"no") {
+                    ctx.script_mut().debug_modes.remove(&session);
+                } else {
+                    let mode = if args.args[1].eq_ignore_ascii_case(b"yes") {
+                        crate::engine::extension::script::ScriptDebugMode::Forked
+                    } else {
+                        crate::engine::extension::script::ScriptDebugMode::Synchronous
+                    };
+                    ctx.script_mut().debug_modes.insert(session, mode);
+                }
+            }
+            result
         }
         _ => Value::error(format!("ERR Unknown subcommand '{}'", subcmd)),
     }
@@ -206,24 +213,27 @@ fn script_kill(_conn: &mut dyn CommandConn, ctx: &mut ServerContext) -> Value {
 }
 
 /// SCRIPT DEBUG <mode>
-/// Set the debugger mode. The Rust port does not expose the interactive
-/// debugger, but keeps the command contract so scripts can run in compatibility
-/// test suites.
+/// Validate the debugger mode before recording it on the calling session.
 fn script_debug(args: &CommandArgs) -> Value {
-    if args.args.len() != 2 {
+    if !matches!(args.args.len(), 2 | 3) {
         return CommandError::wrong_arity("script|debug");
     }
-    match args.args[1].as_ref() {
-        b"yes" | b"sync" => {
-            SCRIPT_DEBUG_ENABLED.store(true, Ordering::Relaxed);
-            Value::ok()
-        }
-        b"no" => {
-            SCRIPT_DEBUG_ENABLED.store(false, Ordering::Relaxed);
-            Value::ok()
-        }
-        _ => Value::error("ERR Use SCRIPT DEBUG YES/SYNC/NO"),
+    let mode = &args.args[1];
+    if !mode.eq_ignore_ascii_case(b"yes")
+        && !mode.eq_ignore_ascii_case(b"sync")
+        && !mode.eq_ignore_ascii_case(b"no")
+    {
+        return Value::error("ERR Use SCRIPT DEBUG YES/SYNC/NO");
     }
+    if let Some(engine) = args.args.get(2) {
+        if !engine.eq_ignore_ascii_case(b"lua") {
+            return Value::error(format!(
+                "ERR No scripting engine found with name '{}' to enable debug",
+                String::from_utf8_lossy(engine)
+            ));
+        }
+    }
+    Value::ok()
 }
 
 #[cfg(test)]
@@ -340,25 +350,46 @@ mod tests {
     #[test]
     fn script_debug_accepts_c_compatible_modes() {
         let _guard = crate::foundation::memory::metrics::memory_stats::lock_global_for_test();
-        for mode in [b"yes".as_slice(), b"sync", b"no"] {
-            let args = CommandArgs {
+        fn debug_args<const N: usize>(parts: [&'static [u8]; N]) -> CommandArgs {
+            CommandArgs {
                 name: bytes::Bytes::from_static(b"SCRIPT"),
-                args: vec![
-                    bytes::Bytes::from_static(b"debug"),
-                    bytes::Bytes::copy_from_slice(mode),
-                ],
-            };
-            assert_eq!(script_debug(&args), Value::ok());
+                args: parts.into_iter().map(bytes::Bytes::from_static).collect(),
+            }
         }
-        let args = CommandArgs {
-            name: bytes::Bytes::from_static(b"SCRIPT"),
-            args: vec![
-                bytes::Bytes::from_static(b"debug"),
-                bytes::Bytes::from_static(b"invalid"),
-            ],
-        };
+
+        for parts in [
+            [b"debug".as_slice(), b"yes".as_slice()],
+            [b"debug".as_slice(), b"sync".as_slice()],
+            [b"debug".as_slice(), b"no".as_slice()],
+        ] {
+            assert_eq!(script_debug(&debug_args(parts)), Value::ok());
+        }
+        for parts in [
+            [b"debug".as_slice(), b"YES".as_slice(), b"lua".as_slice()],
+            [b"debug".as_slice(), b"SYNC".as_slice(), b"LUA".as_slice()],
+            [b"debug".as_slice(), b"NO".as_slice(), b"lua".as_slice()],
+        ] {
+            assert_eq!(script_debug(&debug_args(parts)), Value::ok());
+        }
         assert_eq!(
-            script_debug(&args),
+            script_debug(&debug_args([
+                b"debug".as_slice(),
+                b"sync".as_slice(),
+                b"unknown".as_slice(),
+            ])),
+            Value::error("ERR No scripting engine found with name 'unknown' to enable debug")
+        );
+        assert_eq!(
+            script_debug(&debug_args([
+                b"debug".as_slice(),
+                b"sync".as_slice(),
+                b"lua".as_slice(),
+                b"extra".as_slice(),
+            ])),
+            crate::framework::CommandError::wrong_arity("script|debug")
+        );
+        assert_eq!(
+            script_debug(&debug_args([b"debug".as_slice(), b"invalid".as_slice(),])),
             Value::error("ERR Use SCRIPT DEBUG YES/SYNC/NO")
         );
     }

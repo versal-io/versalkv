@@ -34,10 +34,7 @@ use crate::engine::command::{CommandArgs, CMD_MAY_REPLICATE, CMD_WRITE};
 use crate::foundation::io::protocol::Value;
 use crate::framework::context::ServerContext;
 
-pub(crate) fn command_may_mutate_dataset(name: &str, flags: u64) -> bool {
-    (flags & CMD_WRITE) != 0
-        || ((flags & CMD_MAY_REPLICATE) != 0 && matches!(name, "eval" | "evalsha" | "fcall"))
-}
+pub(crate) use crate::engine::command::command_may_mutate_dataset;
 
 impl ServerWorkerState {
     pub(crate) fn pre_dispatch_exec(

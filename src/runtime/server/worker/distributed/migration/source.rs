@@ -830,16 +830,6 @@ impl ServerWorkerState {
             .and_then(|state| state.migrations.get(id))
             .map(|job| job.ranges.clone());
         let Some(ranges) = ranges else { return };
-        let snapshot = match self.ctx.slot_import_snapshot(id, &ranges) {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                self.fail_slot_migration(
-                    id,
-                    &format!("Failed to serialize imported data: {error}"),
-                );
-                return;
-            }
-        };
         if let Err(error) = self.ctx.commit_slot_import(id, &ranges) {
             self.fail_slot_migration(id, &format!("Failed to commit slot import: {error:?}"));
             return;
@@ -858,6 +848,8 @@ impl ServerWorkerState {
                 }
             }
             cluster.finalize_slot_changes();
+            // Slot ownership changes must be announced even if the epoch was already ahead.
+            cluster.request_topology_broadcast();
             let actions = cluster
                 .transition_migration(
                     id,
@@ -870,15 +862,10 @@ impl ServerWorkerState {
         });
         *self.ctx.cluster_state_mut() = state;
         if committed {
-            if !snapshot.is_empty() {
-                self.propagate_to_replicas(&snapshot);
-                if self.ctx.config().persistence.aof_enabled {
-                    self.feed_aof(&snapshot);
-                    self.flush_aof_if_needed();
-                }
-                self.ctx.set_repl_seldb(-1);
-                self.ctx.persistence_mut().reset_aof_selected_db();
-            }
+            self.flush_pending_topology_broadcast();
+            self.flush_cluster_bus_writes();
+            // Import commands are already replicated and journaled as they arrive.
+            // Finish immediately so replicas can expose the imported keys.
             self.drive_slot_migration_actions();
         } else {
             self.fail_slot_migration(id, "Failed to commit slot ownership");
@@ -965,12 +952,10 @@ impl ServerWorkerState {
                             [crate::framework::capabilities::io::Token(connection_token)]
                         .slot_migration_role = None;
                     } else {
-                        // Keep the role until teardown so any already-buffered
-                        // migration protocol frame is suppressed instead of
-                        // being dispatched as a normal client command.
-                        self.connection_registry
-                            [crate::framework::capabilities::io::Token(connection_token)]
-                        .mark_closing();
+                        // Terminal migration cleanup matches C's async client
+                        // free semantics: discard pending protocol output so the
+                        // peer observes the terminal close without backpressure.
+                        self.remove_connection(connection_token);
                     }
                 }
             }

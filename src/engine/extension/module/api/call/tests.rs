@@ -1,6 +1,6 @@
 use super::super::VM_ReplyRaw;
 use super::test_support::{record_proto_len, TestReplyHandlers};
-use super::{VM_CallArgv, VM_CallWithReply, ValkeyModule_FreeCallReply};
+use super::{module_call_argv, VM_CallArgv, VM_CallWithReply, ValkeyModule_FreeCallReply};
 use crate::engine::command::context::CommandConn;
 use crate::engine::command::{
     CmdFlags, CommandArgs, CommandDescriptor, CMD_DENYOOM, CMD_READONLY, CMD_WRITE,
@@ -30,6 +30,13 @@ struct TrackingRuntime {
 }
 
 impl ModuleRuntime for TrackingRuntime {
+    fn retain_pending_module_call(
+        &mut self,
+        _call: super::pending::PendingModuleCall,
+    ) -> Option<usize> {
+        Some(1)
+    }
+
     fn num_dbs(&self) -> usize {
         self.dbs.num_dbs()
     }
@@ -44,6 +51,17 @@ impl ModuleRuntime for TrackingRuntime {
 
     fn uses_lfu(&self) -> bool {
         false
+    }
+
+    fn command_would_block(
+        &self,
+        _command: &CommandDescriptor,
+        args: &CommandArgs,
+        _db_idx: u32,
+    ) -> bool {
+        args.args
+            .first()
+            .is_some_and(|key| key.as_ref() == b"forkless-held")
     }
 
     fn is_oom(&self) -> bool {
@@ -139,8 +157,9 @@ impl ModuleRuntime for TrackingRuntime {
                 first_key: 1,
                 last_key: 1,
                 key_step: 1,
-                container: None,
+                key_flags: &[],
                 acl_categories: &["STRING", "WRITE"],
+                get_keys: None,
             });
         }
         if name.eq_ignore_ascii_case(b"get") {
@@ -151,8 +170,22 @@ impl ModuleRuntime for TrackingRuntime {
                 first_key: 1,
                 last_key: 1,
                 key_step: 1,
-                container: None,
+                key_flags: &[],
                 acl_categories: &["READ", "STRING"],
+                get_keys: None,
+            });
+        }
+        if name.eq_ignore_ascii_case(b"blpop") {
+            return Some(CommandDescriptor {
+                name: crate::engine::command::CommandName::Static("blpop"),
+                arity: -3,
+                flags: CMD_WRITE,
+                first_key: 1,
+                last_key: -2,
+                key_step: 1,
+                key_flags: &[],
+                acl_categories: &["WRITE", "LIST", "BLOCKING"],
+                get_keys: None,
             });
         }
         name.eq_ignore_ascii_case(b"publish")
@@ -163,8 +196,9 @@ impl ModuleRuntime for TrackingRuntime {
                 first_key: 0,
                 last_key: 0,
                 key_step: 0,
-                container: None,
+                key_flags: &[],
                 acl_categories: &["FAST", "PUBSUB"],
+                get_keys: None,
             })
     }
 
@@ -221,6 +255,15 @@ impl ModuleRuntime for TrackingRuntime {
         if name.eq_ignore_ascii_case(b"publish") {
             conn.record_notification((args.args[0].clone(), args.args[1].clone()));
             return Value::integer(1);
+        }
+        if name.eq_ignore_ascii_case(b"blpop") {
+            return conn.enter_blocking(
+                crate::engine::command::context::BlockedCmd::Blpop,
+                vec![args.args[0].clone()],
+                0,
+                args,
+                0,
+            );
         }
         Value::bulk(Bytes::from_static(b"value"))
     }
@@ -337,6 +380,345 @@ fn lifecycle_context(
     ))))
 }
 
+#[derive(Default)]
+struct PublicCallObservation {
+    callbacks: usize,
+    proto: Vec<u8>,
+    errno: i32,
+}
+
+extern "C" fn observe_public_call(
+    reply_ctx: *mut libc::c_void,
+    _ctx: *mut crate::engine::extension::module::ValkeyModuleCtx,
+    proto: *const libc::c_char,
+    len: usize,
+) -> libc::c_int {
+    // SAFETY: the synchronous test call retains the observation and reply bytes.
+    unsafe {
+        let observation = &mut *reply_ctx.cast::<PublicCallObservation>();
+        observation.callbacks += 1;
+        if len != 0 {
+            observation.proto = std::slice::from_raw_parts(proto.cast::<u8>(), len).to_vec();
+        }
+        observation.errno = crate::foundation::io::sys::os::errno();
+    }
+    crate::foundation::io::sys::os::set_errno(libc::EINTR);
+    0
+}
+
+#[derive(Default)]
+struct PendingCallObservation {
+    callbacks: usize,
+    errno: i32,
+    handle: usize,
+}
+
+extern "C" fn observe_pending_call(
+    reply_ctx: *mut libc::c_void,
+    _ctx: *mut crate::engine::extension::module::ValkeyModuleCtx,
+    handle: *mut libc::c_void,
+) {
+    // SAFETY: the pending callback receives the live observation supplied by this test.
+    unsafe {
+        let observation = &mut *reply_ctx.cast::<PendingCallObservation>();
+        observation.callbacks += 1;
+        observation.errno = crate::foundation::io::sys::os::errno();
+        observation.handle = handle.addr();
+    }
+    crate::foundation::io::sys::os::set_errno(libc::EINTR);
+}
+
+#[test]
+fn internal_call_argv_pending_callback_preserves_call_errno() {
+    let mut runtime = lifecycle_runtime();
+    let mut handle = Box::new(ModuleRuntimeHandle::new(&mut runtime));
+    let ctx = lifecycle_context(&mut handle);
+    let mut strings = [
+        Box::into_raw(ValkeyModuleString::from_bytes(b"BLPOP")),
+        Box::into_raw(ValkeyModuleString::from_bytes(b"key")),
+        Box::into_raw(ValkeyModuleString::from_bytes(b"0")),
+    ];
+    let handlers = TestReplyHandlers::with_on_blocked(observe_pending_call);
+    let mut observation = PendingCallObservation::default();
+    crate::foundation::io::sys::os::set_errno(libc::EIO);
+
+    // SAFETY: context, arguments and callback storage remain live through onBlocked.
+    let status = unsafe {
+        VM_CallArgv(
+            ctx,
+            strings.as_mut_ptr(),
+            strings.len() as i32,
+            1 << 11,
+            (&handlers as *const TestReplyHandlers).cast(),
+            (&mut observation as *mut PendingCallObservation).cast(),
+        )
+    };
+    let call_errno = crate::foundation::io::sys::os::errno();
+
+    // SAFETY: each owned string and context is released exactly once.
+    unsafe {
+        for string in strings {
+            ValkeyModuleString::release(string);
+        }
+        free_module_ctx(ctx);
+    }
+    drop(handle);
+
+    assert_eq!(status, crate::engine::extension::module::VALKEYMODULE_OK);
+    assert_eq!(observation.callbacks, 1);
+    assert_eq!(observation.errno, 0);
+    assert_eq!(observation.handle, 1);
+    assert_eq!(call_errno, 0);
+    assert_eq!(runtime.command_calls, 1);
+}
+
+#[test]
+fn internal_call_argv_defers_forkless_conflicts_before_execution() {
+    let mut runtime = lifecycle_runtime();
+    let mut handle = Box::new(ModuleRuntimeHandle::new(&mut runtime));
+    let ctx = lifecycle_context(&mut handle);
+    let mut strings = [
+        Box::into_raw(ValkeyModuleString::from_bytes(b"SET")),
+        Box::into_raw(ValkeyModuleString::from_bytes(b"forkless-held")),
+        Box::into_raw(ValkeyModuleString::from_bytes(b"value")),
+    ];
+    let handlers = TestReplyHandlers::with_on_blocked(observe_pending_call);
+    let mut observation = PendingCallObservation::default();
+
+    // SAFETY: context, arguments and callback storage remain live through onBlocked.
+    let status = unsafe {
+        VM_CallArgv(
+            ctx,
+            strings.as_mut_ptr(),
+            strings.len() as i32,
+            1 << 11,
+            (&handlers as *const TestReplyHandlers).cast(),
+            (&mut observation as *mut PendingCallObservation).cast(),
+        )
+    };
+    let command_calls = runtime.command_calls;
+
+    // SAFETY: each owned string and context is released exactly once.
+    unsafe {
+        for string in strings {
+            ValkeyModuleString::release(string);
+        }
+        free_module_ctx(ctx);
+    }
+    drop(handle);
+
+    assert_eq!(status, crate::engine::extension::module::VALKEYMODULE_OK);
+    assert_eq!(observation.callbacks, 1);
+    assert_eq!(observation.errno, 0);
+    assert_eq!(command_calls, 0);
+}
+
+#[test]
+fn public_call_argv_preserves_validation_and_callback_contracts() {
+    use super::call_api::ValkeyModule_CallArgv;
+    const ERRORS: i32 = 1 << 8;
+    const DRY_RUN: i32 = 1 << 10;
+    for (
+        args,
+        flags,
+        expected_status,
+        expected_errno,
+        expected_callbacks,
+        expected_empty_proto,
+        calls,
+    ) in [
+        (vec![b"GET".as_slice(), b"key"], 0, 0, 0, 1, false, 1),
+        (vec![b"GET".as_slice(), b"key"], DRY_RUN, 0, 0, 0, true, 0),
+        (vec![b"missing".as_slice()], 0, 1, libc::ENOENT, 0, true, 0),
+        (vec![b"GET".as_slice()], 0, 1, libc::EINVAL, 1, true, 0),
+        (
+            vec![b"GET".as_slice()],
+            ERRORS,
+            0,
+            libc::EINVAL,
+            1,
+            false,
+            0,
+        ),
+        (
+            vec![b"GET".as_slice()],
+            DRY_RUN,
+            0,
+            libc::EINVAL,
+            1,
+            false,
+            0,
+        ),
+        (vec![b"GET".as_slice()], 1 << 11, 1, libc::EBADF, 0, true, 0),
+        (vec![b"GET".as_slice()], 1 << 30, 1, libc::EBADF, 0, true, 0),
+    ] {
+        let mut runtime = lifecycle_runtime();
+        let mut handle = Box::new(ModuleRuntimeHandle::new(&mut runtime));
+        let ctx = lifecycle_context(&mut handle);
+        let mut strings: Vec<_> = args
+            .iter()
+            .map(|arg| Box::into_raw(ValkeyModuleString::from_bytes(arg)))
+            .collect();
+        let handlers = TestReplyHandlers::with_on_resp_available(observe_public_call);
+        let mut observation = PublicCallObservation::default();
+        crate::foundation::io::sys::os::set_errno(libc::EIO);
+        // SAFETY: context, arguments and the ABI-compatible callback table are live.
+        let status = unsafe {
+            ValkeyModule_CallArgv(
+                ctx,
+                strings.as_mut_ptr(),
+                strings.len() as i32,
+                flags,
+                (&handlers as *const TestReplyHandlers).cast(),
+                (&mut observation as *mut PublicCallObservation).cast(),
+            )
+        };
+        let call_errno = crate::foundation::io::sys::os::errno();
+        // SAFETY: each owned string and context is released exactly once.
+        unsafe {
+            for string in strings {
+                ValkeyModuleString::release(string);
+            }
+            free_module_ctx(ctx);
+        }
+        drop(handle);
+        assert_eq!(status, expected_status, "{args:?}, flags={flags}");
+        assert_eq!(call_errno, expected_errno, "{args:?}, flags={flags}");
+        assert_eq!(
+            observation.callbacks, expected_callbacks,
+            "{args:?}, flags={flags}"
+        );
+        assert_eq!(
+            observation.proto.is_empty(),
+            expected_empty_proto,
+            "{args:?}, flags={flags}"
+        );
+        if expected_callbacks != 0 {
+            assert_eq!(observation.errno, expected_errno);
+        }
+        assert_eq!(runtime.command_calls, calls);
+    }
+}
+
+#[test]
+fn internal_call_argv_preserves_error_and_dry_run_contracts() {
+    const ERRORS_AS_REPLIES: i32 = 1 << 8;
+    const ALLOW_BLOCK: i32 = 1 << 11;
+    const DRY_RUN: i32 = 1 << 10;
+    for (
+        args,
+        flags,
+        expected_status,
+        expected_errno,
+        expected_callbacks,
+        expected_empty_proto,
+        expected_calls,
+    ) in [
+        (
+            vec![b"missing".as_slice()],
+            0,
+            crate::engine::extension::module::VALKEYMODULE_ERR,
+            libc::ENOENT,
+            0,
+            true,
+            0,
+        ),
+        (
+            vec![b"GET".as_slice()],
+            0,
+            crate::engine::extension::module::VALKEYMODULE_ERR,
+            libc::EINVAL,
+            1,
+            true,
+            0,
+        ),
+        (
+            vec![b"GET".as_slice()],
+            ERRORS_AS_REPLIES,
+            crate::engine::extension::module::VALKEYMODULE_OK,
+            libc::EINVAL,
+            1,
+            false,
+            0,
+        ),
+        (
+            vec![b"GET".as_slice(), b"forkless-held"],
+            0,
+            crate::engine::extension::module::VALKEYMODULE_ERR,
+            libc::EAGAIN,
+            0,
+            true,
+            0,
+        ),
+        (
+            vec![b"GET".as_slice(), b"forkless-held"],
+            ALLOW_BLOCK,
+            crate::engine::extension::module::VALKEYMODULE_OK,
+            0,
+            0,
+            true,
+            0,
+        ),
+        (
+            vec![b"GET".as_slice(), b"key"],
+            DRY_RUN,
+            crate::engine::extension::module::VALKEYMODULE_OK,
+            0,
+            0,
+            true,
+            0,
+        ),
+    ] {
+        let mut runtime = lifecycle_runtime();
+        let mut handle = Box::new(ModuleRuntimeHandle::new(&mut runtime));
+        let ctx = lifecycle_context(&mut handle);
+        let mut strings: Vec<_> = args
+            .iter()
+            .map(|arg| Box::into_raw(ValkeyModuleString::from_bytes(arg)))
+            .collect();
+        let handlers = TestReplyHandlers::with_on_resp_available(observe_public_call);
+        let mut observation = PublicCallObservation::default();
+        crate::foundation::io::sys::os::set_errno(libc::EIO);
+
+        // SAFETY: context, arguments and callback storage remain live for the call.
+        let status = unsafe {
+            module_call_argv(
+                ctx,
+                strings.as_mut_ptr(),
+                strings.len() as i32,
+                flags,
+                (&handlers as *const TestReplyHandlers).cast(),
+                (&mut observation as *mut PublicCallObservation).cast(),
+            )
+        };
+        let call_errno = crate::foundation::io::sys::os::errno();
+        // SAFETY: each owned string and context is released exactly once.
+        unsafe {
+            for string in strings {
+                ValkeyModuleString::release(string);
+            }
+            free_module_ctx(ctx);
+        }
+        drop(handle);
+
+        assert_eq!(status, expected_status, "{args:?}, flags={flags}");
+        assert_eq!(call_errno, expected_errno, "{args:?}, flags={flags}");
+        assert_eq!(
+            observation.callbacks, expected_callbacks,
+            "{args:?}, flags={flags}"
+        );
+        assert_eq!(
+            observation.proto.is_empty(),
+            expected_empty_proto,
+            "{args:?}, flags={flags}"
+        );
+        if expected_callbacks != 0 {
+            assert_eq!(observation.errno, expected_errno);
+        }
+        assert_eq!(runtime.command_calls, expected_calls);
+    }
+}
+
 #[test]
 fn lifecycle_call_registers_all_nonempty_exits_and_balances_shim_slots() {
     use super::super::lifecycle_tests::shim_functions;
@@ -354,9 +736,9 @@ fn lifecycle_call_registers_all_nonempty_exits_and_balances_shim_slots() {
         let string = ValkeyModule_CreateString(ctx, b"key".as_ptr().cast(), 3);
         for (command, format) in [
             (c"GET", c"s"),
-            (c"missing", c"s"),
-            (c"SET", c"s"),
-            (c"SET", c"sW"),
+            (c"missing", c"sE"),
+            (c"SET", c"sE"),
+            (c"SET", c"sWE"),
         ] {
             let reply = call(ctx, command.as_ptr(), format.as_ptr(), string);
             assert!(!reply.is_null());
@@ -385,7 +767,7 @@ fn lifecycle_call_registers_all_nonempty_exits_and_balances_shim_slots() {
         let large = call(
             ctx,
             c"GET".as_ptr(),
-            c"vs".as_ptr(),
+            c"vsE".as_ptr(),
             vector.as_mut_ptr(),
             vector.len(),
             string,
@@ -1397,7 +1779,7 @@ fn module_call_argv_dry_run_succeeds_without_invoking_handler() {
 }
 
 #[test]
-fn module_call_argv_dry_run_reports_an_empty_protocol_reply() {
+fn module_call_argv_dry_run_does_not_invoke_reply_callback() {
     let mut runtime = TrackingRuntime {
         dbs: DbSet::new(1),
         tracked: Vec::new(),
@@ -1451,7 +1833,7 @@ fn module_call_argv_dry_run_reports_an_empty_protocol_reply() {
     drop(handle);
 
     assert_eq!(result, crate::engine::extension::module::VALKEYMODULE_OK);
-    assert_eq!(observed_len, 0);
+    assert_eq!(observed_len, usize::MAX);
     assert_eq!(runtime.command_calls, 0);
 }
 

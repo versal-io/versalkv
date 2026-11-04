@@ -75,7 +75,7 @@ pub struct Connection {
     pub stream: StreamType,
     parser: RespParser,
     buf: [u8; 8192],
-    username: Option<String>,
+    username: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -93,8 +93,8 @@ impl Connection {
     pub fn connect(
         host: &str,
         port: u16,
-        password: Option<&str>,
-        username: Option<&str>,
+        password: Option<&[u8]>,
+        username: Option<&[u8]>,
         db: u8,
     ) -> Result<Self, String> {
         let addr = format!("{}:{}", host, port);
@@ -130,15 +130,15 @@ impl Connection {
             stream,
             parser: RespParser::new(),
             buf: [0u8; 8192],
-            username: username.map(|s| s.to_string()),
+            username: username.map(<[u8]>::to_vec),
         };
 
         if let Some(pwd) = password {
             let user = conn.username.clone();
             let resp = if let Some(ref user) = user {
-                conn.send_command(&[b"AUTH", user.as_bytes(), pwd.as_bytes()])?
+                conn.send_command(&[b"AUTH", user, pwd])?
             } else {
-                conn.send_command(&[b"AUTH", pwd.as_bytes()])?
+                conn.send_command(&[b"AUTH", pwd])?
             };
             match resp {
                 RespValue::SimpleString(ref s) if s == "OK" => {}
@@ -166,8 +166,8 @@ impl Connection {
     #[cfg(unix)]
     pub fn connect_unix(
         path: &str,
-        password: Option<&str>,
-        username: Option<&str>,
+        password: Option<&[u8]>,
+        username: Option<&[u8]>,
         db: u8,
     ) -> Result<Self, String> {
         let unix_stream = UnixStream::connect(path)
@@ -183,15 +183,15 @@ impl Connection {
             stream: StreamType::Unix(unix_stream),
             parser: RespParser::new(),
             buf: [0u8; 8192],
-            username: username.map(|s| s.to_string()),
+            username: username.map(<[u8]>::to_vec),
         };
 
         if let Some(pwd) = password {
             let user = conn.username.clone();
             let resp = if let Some(ref user) = user {
-                conn.send_command(&[b"AUTH", user.as_bytes(), pwd.as_bytes()])?
+                conn.send_command(&[b"AUTH", user, pwd])?
             } else {
-                conn.send_command(&[b"AUTH", pwd.as_bytes()])?
+                conn.send_command(&[b"AUTH", pwd])?
             };
             match resp {
                 RespValue::SimpleString(ref s) if s == "OK" => {}

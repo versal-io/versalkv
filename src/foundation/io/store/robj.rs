@@ -9,7 +9,7 @@ use crate::foundation::io::store::structure::set::{IntSet, SetLp, ValkeySet};
 use crate::foundation::io::store::structure::stream::{StreamLp, ValkeyStream};
 use crate::foundation::io::store::structure::string::encoding::int_encodable;
 use crate::foundation::io::store::structure::string::{StrEmbstr, StrInt, StrRaw};
-use crate::foundation::io::store::structure::zset::{ZSetLp, ZSetSl};
+use crate::foundation::io::store::structure::zset::{LexBound, LexRange, ZSetLp, ZSetSl};
 use crate::foundation::memory::value::{
     Encoding, EncodingChange, HashOps, ListOps, SetOps, StreamOps, Type, ZSetOps,
 };
@@ -882,6 +882,9 @@ impl Robj {
         limit: i64,
         rev: bool,
     ) -> Vec<(Bytes, f64)> {
+        if offset < 0 {
+            return Vec::new();
+        }
         match self {
             Robj::ZSetSkiplist(z) => z.range_by_score(min, max, offset, limit, rev),
             Robj::ZSetListpack(_) => {
@@ -896,11 +899,11 @@ impl Robj {
                 if rev {
                     entries.reverse();
                 }
-                let skip = offset.max(0) as usize;
+                let skip = usize::try_from(offset).unwrap_or(usize::MAX);
                 let take = if limit < 0 {
                     usize::MAX
                 } else {
-                    limit as usize
+                    usize::try_from(limit).unwrap_or(usize::MAX)
                 };
                 entries.into_iter().skip(skip).take(take).collect()
             }
@@ -933,34 +936,40 @@ impl Robj {
         max_inclusive: bool,
         rev: bool,
     ) -> Vec<(Bytes, f64)> {
+        self.zset_range_by_lex_with_limit((min, min_inclusive), (max, max_inclusive), 0, -1, rev)
+    }
+
+    pub fn zset_range_by_lex_with_limit(
+        &self,
+        min: (&[u8], bool),
+        max: (&[u8], bool),
+        offset: i64,
+        limit: i64,
+        rev: bool,
+    ) -> Vec<(Bytes, f64)> {
+        self.zset_range_by_lex_bounds_with_limit(
+            LexBound::from_parts(min.0, min.1),
+            LexBound::from_parts(max.0, max.1),
+            offset,
+            limit,
+            rev,
+        )
+    }
+
+    pub(crate) fn zset_range_by_lex_bounds_with_limit(
+        &self,
+        min: LexBound,
+        max: LexBound,
+        offset: i64,
+        limit: i64,
+        rev: bool,
+    ) -> Vec<(Bytes, f64)> {
         match self {
-            Robj::ZSetSkiplist(z) => z.range_by_lex(min, min_inclusive, max, max_inclusive, rev),
+            Robj::ZSetSkiplist(z) => z
+                .ordered_index()
+                .range_by_lex_bounds_with_limit(min, max, offset, limit, rev),
             Robj::ZSetListpack(_) => {
-                let mut entries = self
-                    .zset_entries()
-                    .into_iter()
-                    .filter(|(member, _)| {
-                        let meets_min = min == b"-"
-                            || (min != b"+"
-                                && if min_inclusive {
-                                    member.as_ref() >= min
-                                } else {
-                                    member.as_ref() > min
-                                });
-                        let meets_max = max == b"+"
-                            || (max != b"-"
-                                && if max_inclusive {
-                                    member.as_ref() <= max
-                                } else {
-                                    member.as_ref() < max
-                                });
-                        meets_min && meets_max
-                    })
-                    .collect::<Vec<_>>();
-                if rev {
-                    entries.reverse();
-                }
-                entries
+                LexRange { min, max }.collect(&self.zset_entries(), rev, offset, limit)
             }
             _ => panic!("Robj::zset_range_by_lex called on non-zset type"),
         }
@@ -973,29 +982,18 @@ impl Robj {
         max: &[u8],
         max_inclusive: bool,
     ) -> usize {
+        self.zset_count_by_lex_bounds(
+            LexBound::from_parts(min, min_inclusive),
+            LexBound::from_parts(max, max_inclusive),
+        )
+    }
+
+    pub(crate) fn zset_count_by_lex_bounds(&self, min: LexBound, max: LexBound) -> usize {
         match self {
-            Robj::ZSetSkiplist(zset) => zset.count_by_lex(min, min_inclusive, max, max_inclusive),
-            Robj::ZSetListpack(zset) => zset
-                .all_pairs()
-                .into_iter()
-                .filter(|(member, _)| {
-                    let meets_min = min == b"-"
-                        || (min != b"+"
-                            && if min_inclusive {
-                                member.as_slice() >= min
-                            } else {
-                                member.as_slice() > min
-                            });
-                    let meets_max = max == b"+"
-                        || (max != b"-"
-                            && if max_inclusive {
-                                member.as_slice() <= max
-                            } else {
-                                member.as_slice() < max
-                            });
-                    meets_min && meets_max
-                })
-                .count(),
+            Robj::ZSetSkiplist(zset) => zset.ordered_index().count_in_lex_bounds(min, max),
+            Robj::ZSetListpack(_) => LexRange { min, max }
+                .indices(&self.zset_entries(), false, 0, -1)
+                .len(),
             _ => panic!("Robj::zset_count_by_lex called on non-zset type"),
         }
     }
@@ -1083,19 +1081,22 @@ impl Robj {
         max: &[u8],
         max_inclusive: bool,
     ) -> usize {
-        match self {
-            Robj::ZSetSkiplist(zset) => {
-                zset.remove_range_by_lex(min, min_inclusive, max, max_inclusive)
-            }
-            Robj::ZSetListpack(_) => {
-                let members = self.zset_range_by_lex(min, min_inclusive, max, max_inclusive, false);
-                for (member, _) in &members {
-                    self.zset_remove(member);
-                }
-                members.len()
-            }
-            _ => panic!("Robj::zset_remove_range_by_lex called on non-zset type"),
+        self.zset_remove_range_by_lex_bounds(
+            LexBound::from_parts(min, min_inclusive),
+            LexBound::from_parts(max, max_inclusive),
+        )
+    }
+
+    pub(crate) fn zset_remove_range_by_lex_bounds(
+        &mut self,
+        min: LexBound,
+        max: LexBound,
+    ) -> usize {
+        let members = self.zset_range_by_lex_bounds_with_limit(min, max, 0, -1, false);
+        for (member, _) in &members {
+            self.zset_remove(member);
         }
+        members.len()
     }
 
     // ---- Stream typed methods ----

@@ -78,7 +78,7 @@ fn parse_float(value: &[u8]) -> Option<f64> {
     if value.is_empty() || value.trim() != value {
         return None;
     }
-    value.parse::<f64>().ok()
+    value.parse::<f64>().ok().filter(|value| !value.is_nan())
 }
 
 fn format_float(value: f64) -> String {

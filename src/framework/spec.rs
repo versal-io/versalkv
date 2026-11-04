@@ -106,10 +106,89 @@ impl CommandSpec {
             first_key: self.first_key,
             last_key: self.last_key,
             key_step: self.key_step,
-            container: self.container,
+            key_flags: self.key_flags,
             acl_categories: self.acl_categories,
+            get_keys: self.get_keys,
         }
     }
+}
+
+pub(crate) fn effective_command_flags_for_call(
+    name: &str,
+    base_flags: CmdFlags,
+    args: &CommandArgs,
+    ctx: &ServerContext,
+) -> CmdFlags {
+    let subcommand_flags = args
+        .args
+        .first()
+        .and_then(|subcommand| std::str::from_utf8(subcommand).ok())
+        .map(|subcommand| subcommand.to_ascii_lowercase())
+        .and_then(|subcommand| {
+            crate::framework::generated::commands::SUBCOMMAND_GATE_FLAGS
+                .iter()
+                .find(|(container, candidate, _)| *container == name && *candidate == subcommand)
+                .map(|(_, _, flags)| *flags)
+        })
+        .unwrap_or_default();
+    effective_script_command_flags(name, base_flags | subcommand_flags, args, ctx)
+}
+
+fn effective_script_command_flags(
+    name: &str,
+    base_flags: CmdFlags,
+    args: &CommandArgs,
+    ctx: &ServerContext,
+) -> CmdFlags {
+    use crate::engine::command::{CMD_DENYOOM, CMD_MAY_REPLICATE, CMD_STALE, CMD_WRITE};
+    use crate::engine::extension::script::{
+        SCRIPT_ALLOW_OOM, SCRIPT_ALLOW_STALE, SCRIPT_NO_WRITES, SCRIPT_READ_ONLY,
+    };
+
+    let name = name.to_ascii_lowercase();
+    let script_flags = match name.as_str() {
+        "eval" | "eval_ro" => args
+            .args
+            .first()
+            .and_then(|body| std::str::from_utf8(body).ok())
+            .and_then(extract_valid_shebang_flags),
+        "evalsha" | "evalsha_ro" => args
+            .args
+            .first()
+            .and_then(|sha| std::str::from_utf8(sha).ok())
+            .and_then(|sha| ctx.script().script_cache.peek(sha))
+            .and_then(extract_valid_shebang_flags),
+        "fcall" | "fcall_ro" => args
+            .args
+            .first()
+            .and_then(|func| std::str::from_utf8(func).ok())
+            .and_then(|func| ctx.script().function_registry.find_function(func))
+            .map(|func| func.flags),
+        _ => None,
+    };
+    let Some(script_flags) = script_flags else {
+        return base_flags;
+    };
+
+    let mut flags = base_flags & !(CMD_STALE | CMD_DENYOOM | CMD_WRITE | CMD_MAY_REPLICATE);
+    let no_writes = script_flags & (SCRIPT_NO_WRITES | SCRIPT_READ_ONLY) != 0;
+    if script_flags & SCRIPT_ALLOW_OOM == 0 && !no_writes {
+        flags |= CMD_DENYOOM;
+    }
+    if !no_writes {
+        flags |= CMD_WRITE;
+    }
+    if script_flags & SCRIPT_ALLOW_STALE != 0 {
+        flags |= CMD_STALE;
+    }
+    flags
+}
+
+fn extract_valid_shebang_flags(
+    body: &str,
+) -> Option<crate::engine::extension::script::ScriptFlags> {
+    let (_, flags, has_shebang) = crate::engine::extension::lua::parse_shebang(body, 0).ok()?;
+    has_shebang.then_some(flags)
 }
 
 pub(crate) fn effective_acl_categories(
@@ -125,11 +204,55 @@ pub(crate) fn effective_acl_categories(
         .unwrap_or(base_categories)
 }
 
+pub(crate) fn key_flags_to_acl_bits(flags: &[&'static str]) -> u8 {
+    let mut bits = 0u8;
+    for flag in flags {
+        match *flag {
+            "RO" | "access" => bits |= crate::engine::extension::acl::ACL_READ_PERMISSION,
+            "RW" => {}
+            "OW" | "insert" | "update" | "delete" => {
+                bits |= crate::engine::extension::acl::ACL_WRITE_PERMISSION;
+            }
+            _ => {}
+        }
+    }
+    bits
+}
+
+pub(crate) fn normalize_forkless_key_targets(
+    name: &str,
+    args: &CommandArgs,
+    selected_db: u32,
+    mut targets: Vec<(u32, Vec<u8>)>,
+) -> Vec<(u32, Vec<u8>)> {
+    let cross_db_target = match name {
+        "move" => crate::framework::commands::generic::r#move::target_db_and_key(args),
+        "copy" => crate::framework::commands::generic::copy::target_db_and_key(args, selected_db),
+        _ => None,
+    };
+    let Some((target_db, key)) = cross_db_target else {
+        return targets;
+    };
+    if name == "copy" && target_db != selected_db {
+        if let Some(destination) = args.args.get(1) {
+            targets.retain(|(db_id, key)| {
+                *db_id != selected_db || key.as_slice() != destination.as_ref()
+            });
+        }
+    }
+    let target = (target_db, key.to_vec());
+    if !targets.contains(&target) {
+        targets.push(target);
+    }
+    targets
+}
+
 #[cfg(test)]
 mod tests {
     use crate::engine::core::CommandOutcome;
     use crate::framework::commands::command_runtime::CommandRuntime;
     use crate::framework::{CommandArgs, CommandExecutor};
+    use bytes::Bytes;
 
     fn test_runtime_handler(
         _runtime: &mut dyn CommandRuntime,
@@ -170,5 +293,67 @@ mod tests {
         engine.sort_unstable();
 
         assert_eq!(generated, engine);
+    }
+
+    #[test]
+    fn key_flags_map_acl_read_and_write_permissions() {
+        use crate::engine::extension::acl::{ACL_READ_PERMISSION, ACL_WRITE_PERMISSION};
+
+        assert_eq!(
+            super::key_flags_to_acl_bits(crate::framework::generated::commands::GET_META.key_flags),
+            ACL_READ_PERMISSION
+        );
+        assert_eq!(
+            super::key_flags_to_acl_bits(
+                crate::framework::generated::commands::LPUSH_META.key_flags
+            ),
+            ACL_WRITE_PERMISSION
+        );
+        assert_eq!(
+            super::key_flags_to_acl_bits(crate::framework::generated::commands::SET_META.key_flags),
+            ACL_READ_PERMISSION | ACL_WRITE_PERMISSION
+        );
+    }
+
+    #[test]
+    fn command_descriptors_preserve_dynamic_key_extractors() {
+        let sort_args = CommandArgs::from_parts(vec![
+            Bytes::from_static(b"SORT"),
+            Bytes::from_static(b"source"),
+            Bytes::from_static(b"STORE"),
+            Bytes::from_static(b"destination"),
+        ]);
+        let xgroup_args = CommandArgs::from_parts(vec![
+            Bytes::from_static(b"XGROUP"),
+            Bytes::from_static(b"CREATE"),
+            Bytes::from_static(b"stream"),
+            Bytes::from_static(b"group"),
+            Bytes::from_static(b"0"),
+        ]);
+
+        assert_eq!(
+            crate::framework::commands::generic::sort::SORT_SPEC
+                .descriptor()
+                .extract_keys(&sort_args),
+            Some(vec![
+                Bytes::from_static(b"source"),
+                Bytes::from_static(b"destination"),
+            ])
+        );
+        assert_eq!(
+            crate::framework::commands::stream::xgroup::XGROUP_SPEC
+                .descriptor()
+                .extract_keys(&xgroup_args),
+            Some(vec![Bytes::from_static(b"stream")])
+        );
+        assert_eq!(
+            crate::framework::commands::generic::sort::SORT_SPEC
+                .descriptor()
+                .extract_key_accesses(&sort_args),
+            Some(vec![
+                (Bytes::from_static(b"source"), vec!["RO", "access"],),
+                (Bytes::from_static(b"destination"), vec!["OW", "update"],),
+            ])
+        );
     }
 }

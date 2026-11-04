@@ -1,9 +1,9 @@
 mod registry;
 
-pub(crate) use registry::parse_engine_name;
 #[cfg(test)]
 pub(crate) use registry::EngineManager;
-pub use registry::{FunctionLib, FunctionRegistry};
+pub use registry::FunctionRegistry;
+pub(crate) use registry::{parse_engine_name, FunctionLib};
 
 #[cfg(test)]
 mod tests;

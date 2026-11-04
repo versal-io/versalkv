@@ -553,11 +553,6 @@ impl ServerWorkerState {
                     .full_sync
                     .pending_dual_rdb_snapshots
                     .contains_key(&Token(request.connection_id.0))
-                || self
-                    .full_sync
-                    .direct_dual_rdb_child
-                    .as_ref()
-                    .is_some_and(|child| child.rdb_connections.contains(&request.connection_id))
             {
                 self.reject_psync(
                     request.command.name(),
@@ -989,9 +984,12 @@ impl ServerWorkerState {
         };
         self.replication_runtime
             .freeze_full_sync_snapshot_options(connection_id, snapshot);
-        let Some((read_end, marker, release)) =
-            self.try_begin_diskless_fork_with_options(function_codes, snapshot)
-        else {
+        let Some((read_end, marker, release)) = self.try_begin_diskless_fork_with_options(
+            function_codes,
+            snapshot,
+            "normal sync",
+            true,
+        ) else {
             return false;
         };
         let mut header = b"$EOF:".to_vec();
@@ -1008,7 +1006,7 @@ impl ServerWorkerState {
         options: FullSyncOptions,
         replies: &mut Vec<Vec<u8>>,
     ) -> bool {
-        if !self.ctx.persistence().has_active_child() {
+        if !self.ctx.persistence().has_active_child() && self.full_sync.diskless_relay.is_none() {
             return false;
         }
         crate::server_log!(

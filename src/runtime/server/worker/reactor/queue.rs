@@ -224,6 +224,11 @@ impl EventBatch {
         self.insert_next_turn(QueueTarget::BeforePoll(slot), event);
     }
 
+    pub(crate) fn push_ready_next_turn(&mut self, mut event: EventLoopEvent) {
+        event.phase = EventPhase::Ready;
+        self.insert_next_turn(QueueTarget::Ready(event.lane), event);
+    }
+
     pub(crate) fn push_time(&mut self, deadline: MonotonicInstant, mut event: EventLoopEvent) {
         let EventOwner::Timer(id) = event.owner else {
             panic!("time events require a timer owner");
@@ -246,6 +251,19 @@ impl EventBatch {
         loop {
             if self.dispatch_budget_exhausted(EventPhase::BeforePoll) {
                 self.roll_phase_to_next_turn(EventPhase::BeforePoll);
+                return None;
+            }
+            if slot == BeforePollSlot::DistributedWrites
+                && self.limits.max_events_per_phase_per_turn > 1
+                && !self.before_poll[BeforePollSlot::OrdinaryWrites.index()]
+                    .nodes
+                    .is_empty()
+                && self.dispatched_events_by_phase[EventPhase::BeforePoll.index()]
+                    >= self.limits.max_events_per_phase_per_turn - 1
+            {
+                // Retain a write opportunity for ordinary clients even when
+                // sustained replica fanout fills the distributed write queue.
+                self.finish_before_poll_slot(slot);
                 return None;
             }
             let (sequence, ()) = self.before_poll[slot.index()].pop_front()?;
@@ -769,8 +787,8 @@ impl BeforePollSlot {
             1 => Self::PreAof,
             2 => Self::Maintenance,
             3 => Self::AofBarrier,
-            4 => Self::OrdinaryWrites,
-            5 => Self::DistributedWrites,
+            4 => Self::DistributedWrites,
+            5 => Self::OrdinaryWrites,
             6 => Self::PollPreparation,
             _ => unreachable!("before-poll slot index is bounded by the queue array"),
         }

@@ -74,6 +74,33 @@ pub fn set_errno(value: i32) {
     }
 }
 
+#[cfg(unix)]
+pub fn try_lock_file_exclusive(file: &std::fs::File) -> io::Result<()> {
+    // SAFETY: flock only inspects the live descriptor and does not retain it.
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(unix)]
+pub fn is_file_descriptor_open(fd: i32) -> bool {
+    // SAFETY: F_GETFD only inspects the integer descriptor and does not retain it.
+    unsafe { libc::fcntl(fd, libc::F_GETFD) != -1 }
+}
+
+#[cfg(not(unix))]
+pub fn is_file_descriptor_open(fd: i32) -> bool {
+    fd >= 0
+}
+
+#[cfg(not(unix))]
+pub fn try_lock_file_exclusive(_file: &std::fs::File) -> io::Result<()> {
+    Ok(())
+}
+
 pub fn pipe2(fds: &mut [libc::c_int; 2], flags: libc::c_int) -> libc::c_int {
     #[cfg(target_os = "linux")]
     // SAFETY: fds points to writable storage for exactly two pipe descriptors.

@@ -108,6 +108,12 @@ fn parse_csv(content: &str) -> Result<Vec<Vec<String>>, String> {
 
     while let Some(ch) = chars.next() {
         match ch {
+            '"' if !in_quotes
+                && field.is_empty()
+                && matches!(chars.peek(), None | Some('\r' | '\n')) =>
+            {
+                field.push('"');
+            }
             '"' if in_quotes && chars.peek() == Some(&'"') => {
                 field.push('"');
                 chars.next();

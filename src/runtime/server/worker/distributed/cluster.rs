@@ -12,6 +12,7 @@ use crate::runtime::server::worker::PendingRemovalOwner;
 use crate::runtime::server::worker::ServerWorkerState;
 use std::io::Write;
 use std::net::SocketAddr;
+use std::os::fd::AsRawFd;
 
 #[path = "cluster/io.rs"]
 mod io;
@@ -19,8 +20,29 @@ mod io;
 #[derive(Default)]
 pub(crate) struct ClusterConfigFile {
     pub path: Option<std::path::PathBuf>,
+    pub lock: Option<ClusterConfigLock>,
     pub last_best_effort_warning_ms: i64,
     pub writer: Option<crate::runtime::server::worker::flows::maintenance::ClusterConfigWriter>,
+    pub pending_best_effort_saves: usize,
+}
+
+pub(crate) struct ClusterConfigLock {
+    file: std::fs::File,
+}
+
+impl ClusterConfigLock {
+    pub(crate) fn new(file: std::fs::File) -> Self {
+        crate::framework::commands::server::save::register_cluster_config_lock_fd(file.as_raw_fd());
+        Self { file }
+    }
+}
+
+impl Drop for ClusterConfigLock {
+    fn drop(&mut self) {
+        crate::framework::commands::server::save::unregister_cluster_config_lock_fd(
+            self.file.as_raw_fd(),
+        );
+    }
 }
 
 impl ServerWorkerState {

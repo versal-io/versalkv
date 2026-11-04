@@ -27,9 +27,7 @@ pub const RDB_TYPE_PATH_HASH: u8 = 23;
 pub(crate) const QUICKLIST_NODE_CONTAINER_PLAIN: u64 = 1;
 pub(crate) const QUICKLIST_NODE_CONTAINER_PACKED: u64 = 2;
 
-#[cfg(not(feature = "wasm"))]
 pub(crate) const RDB_FOREIGN_VERSION_MIN: u16 = 12;
-#[cfg(not(feature = "wasm"))]
 pub(crate) const RDB_FOREIGN_VERSION_MAX: u16 = 79;
 #[cfg(not(feature = "wasm"))]
 pub(crate) const RDB_FOREIGN_TYPE_MIN: u8 = 22;
@@ -45,6 +43,30 @@ pub const RDB_OPCODE_EXPIRETIME_MS: u8 = 252;
 pub const RDB_OPCODE_EXPIRETIME: u8 = 253;
 pub const RDB_OPCODE_SELECTDB: u8 = 254;
 pub const RDB_OPCODE_EOF: u8 = 255;
+
+pub(crate) fn is_rdb_version_accepted(
+    rdbver: i32,
+    is_valkey: bool,
+    is_redis: bool,
+    strict: bool,
+) -> bool {
+    if rdbver < 1 {
+        return false;
+    }
+    if is_valkey && rdbver <= RDB_FOREIGN_VERSION_MAX as i32 {
+        return false;
+    }
+    if is_redis && rdbver > RDB_FOREIGN_VERSION_MAX as i32 {
+        return false;
+    }
+    if strict
+        && (rdbver > RDB_VERSION as i32
+            || (RDB_FOREIGN_VERSION_MIN as i32..=RDB_FOREIGN_VERSION_MAX as i32).contains(&rdbver))
+    {
+        return false;
+    }
+    true
+}
 
 pub(crate) const RDB_6BITLEN: u8 = 0;
 pub(crate) const RDB_14BITLEN: u8 = 1;

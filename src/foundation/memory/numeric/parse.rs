@@ -8,8 +8,50 @@ pub fn parse_long_double(input: &[u8]) -> Result<LongDouble, NumericParseError> 
     parse_float(input)
 }
 
+/// Parse a complete C double token, allowing leading C whitespace and range
+/// overflow/underflow, as required by sorted-set range bounds.
+pub fn parse_double(input: &[u8]) -> Result<f64, NumericParseError> {
+    let first = input
+        .iter()
+        .position(|byte| !matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c))
+        .ok_or(NumericParseError)?;
+    let token = &input[first..];
+    let unsigned = token
+        .strip_prefix(b"+")
+        .or_else(|| token.strip_prefix(b"-"))
+        .unwrap_or(token);
+    let uses_libc_compat = first != 0 || unsigned.starts_with(b"0x") || unsigned.starts_with(b"0X");
+    if uses_libc_compat && input.len() >= 5 * 1024 {
+        return Err(NumericParseError);
+    }
+    if !uses_libc_compat {
+        if !token.is_ascii() {
+            return Err(NumericParseError);
+        }
+        if unsigned.eq_ignore_ascii_case(b"infinity") {
+            return Ok(if token.starts_with(b"-") {
+                f64::NEG_INFINITY
+            } else {
+                f64::INFINITY
+            });
+        }
+        let text = std::str::from_utf8(token).map_err(|_| NumericParseError)?;
+        let value = text.parse::<f64>().map_err(|_| NumericParseError)?;
+        return (!value.is_nan()).then_some(value).ok_or(NumericParseError);
+    }
+    let value = parse_float_with_range_check::<rustc_apfloat::ieee::Double>(token, false)?;
+    Ok(f64::from_bits(value.to_bits() as u64))
+}
+
 pub(super) fn parse_float<F: Float>(input: &[u8]) -> Result<F, NumericParseError> {
-    if input.is_empty() || input.len() >= 5 * 1024 || !input.is_ascii() {
+    parse_float_with_range_check(input, true)
+}
+
+fn parse_float_with_range_check<F: Float>(
+    input: &[u8],
+    should_check_range: bool,
+) -> Result<F, NumericParseError> {
+    if input.is_empty() || (should_check_range && input.len() >= 5 * 1024) || !input.is_ascii() {
         return Err(NumericParseError);
     }
     let mut index = usize::from(matches!(input[0], b'+' | b'-'));
@@ -78,11 +120,11 @@ pub(super) fn parse_float<F: Float>(input: &[u8]) -> Result<F, NumericParseError
     };
     let parsed = F::from_str_r(text, Round::NearestTiesToEven).map_err(|_| NumericParseError)?;
     if parsed.value.is_nan()
-        || parsed.value.is_infinite()
-        || parsed
-            .status
-            .intersects(Status::INVALID_OP | Status::OVERFLOW)
-        || parsed.value.is_zero()
+        || parsed.status.intersects(Status::INVALID_OP)
+        || (should_check_range
+            && (parsed.value.is_infinite()
+                || parsed.status.intersects(Status::OVERFLOW)
+                || parsed.value.is_zero()))
     {
         return Err(NumericParseError);
     }
@@ -163,5 +205,30 @@ mod tests {
     fn decimal_x87_parser_syntax_and_range() {
         check_syntax::<X87DoubleExtended>();
         check_range::<X87DoubleExtended>(-16445, "0x1.fffffffffffffffep16383");
+    }
+
+    #[test]
+    fn c_double_parser_rejects_oversized_tokens() {
+        let mut decimal = vec![b' '; 1];
+        decimal.extend(std::iter::repeat_n(b'0', 5 * 1024));
+        assert!(parse_double(&decimal).is_err());
+
+        let mut hexadecimal = b" 0x".to_vec();
+        hexadecimal.extend(std::iter::repeat_n(b'0', 5 * 1024));
+        assert!(parse_double(&hexadecimal).is_err());
+    }
+
+    #[test]
+    fn c_double_parser_handles_oversized_plain_decimals_without_big_float_work() {
+        let overflow = vec![b'9'; 1024 * 1024];
+        assert_eq!(parse_double(&overflow), Ok(f64::INFINITY));
+
+        let mut underflow = b"0.".to_vec();
+        underflow.extend(std::iter::repeat_n(b'0', 1024 * 1024));
+        underflow.push(b'1');
+        assert_eq!(parse_double(&underflow), Ok(0.0));
+
+        assert!(parse_double(b"nan").is_err());
+        assert_eq!(parse_double(b"+INFINITY"), Ok(f64::INFINITY));
     }
 }

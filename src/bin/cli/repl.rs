@@ -10,9 +10,11 @@ pub struct Repl {
     pub history: VecDeque<String>,
     pub host: String,
     pub port: u16,
-    pub password: Option<String>,
+    pub password: Option<Vec<u8>>,
+    pub username: Option<Vec<u8>>,
     pub db: u8,
     pub raw: bool,
+    pub resp3: Option<bool>,
     pub subscribed: bool,
     pub subscribed_count: usize,
     pub shard_subscribed_count: usize,
@@ -20,14 +22,23 @@ pub struct Repl {
 }
 
 impl Repl {
-    pub fn new(host: String, port: u16, password: Option<String>, db: u8, raw: bool) -> Self {
+    pub fn new(
+        host: String,
+        port: u16,
+        password: Option<Vec<u8>>,
+        username: Option<Vec<u8>>,
+        db: u8,
+        raw: bool,
+    ) -> Self {
         Repl {
             history: VecDeque::new(),
             host: host.clone(),
             port,
             password,
+            username,
             db,
             raw,
+            resp3: None,
             subscribed: false,
             subscribed_count: 0,
             shard_subscribed_count: 0,
@@ -40,9 +51,12 @@ impl Repl {
             &self.host,
             self.port,
             self.password.as_deref(),
-            None,
+            self.username.as_deref(),
             self.db,
         )?;
+        if let Some(required) = self.resp3 {
+            conn.switch_to_resp3(required)?;
+        }
 
         let is_tty = super::stdout_is_tty();
         let show_prompt = super::stdin_is_tty();
@@ -242,8 +256,16 @@ impl Repl {
             let new_port: u16 = String::from_utf8_lossy(&args[2])
                 .parse()
                 .map_err(|_| "Invalid port")?;
-            *conn =
-                Connection::connect(&new_host, new_port, self.password.as_deref(), None, self.db)?;
+            *conn = Connection::connect(
+                &new_host,
+                new_port,
+                self.password.as_deref(),
+                self.username.as_deref(),
+                self.db,
+            )?;
+            if let Some(required) = self.resp3 {
+                conn.switch_to_resp3(required)?;
+            }
             self.host = new_host;
             self.port = new_port;
             self.server_addr = (self.host.clone(), self.port);
@@ -259,9 +281,12 @@ impl Repl {
                     &self.host,
                     self.port,
                     self.password.as_deref(),
-                    None,
+                    self.username.as_deref(),
                     self.db,
                 )?;
+                if let Some(required) = self.resp3 {
+                    conn.switch_to_resp3(required)?;
+                }
                 return Err("Reconnected to server".to_string());
             }
         };

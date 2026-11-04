@@ -183,7 +183,16 @@ impl ServerWorkerState {
             })
             .collect();
         for (token, has_output) in clients {
-            let interest = if has_output {
+            if self.pause_dual_relay_client_if_needed(token) {
+                continue;
+            }
+            let interest = if self.replica_main_read_is_paused(token) {
+                if has_output {
+                    crate::foundation::io::transport::Interest::Writable
+                } else {
+                    crate::foundation::io::transport::Interest::None
+                }
+            } else if has_output {
                 crate::foundation::io::transport::Interest::ReadWritable
             } else {
                 crate::foundation::io::transport::Interest::Readable
@@ -255,6 +264,53 @@ mod tests {
 
     fn offset(value: i64) -> ReplicationOffset {
         ReplicationOffset::try_from(value).expect("valid test offset")
+    }
+
+    #[test]
+    fn nested_interest_rearm_keeps_a_detached_main_read_paused() {
+        use crate::foundation::io::transport::Interest;
+
+        for has_output in [false, true] {
+            let mut backend = ServerWorkerState::new(1).unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let connected = backend.transport.connect_tcp(addr).unwrap();
+            let (_peer, _) = listener.accept().unwrap();
+            backend.add_connection(RuntimeConnectedPeer {
+                token: connected.token,
+                peer_addr: addr,
+            });
+            backend
+                .replication_runtime
+                .set_replica_link(ReplicaLink::new(
+                    ConnectionId(connected.token.0),
+                    MasterInfo {
+                        host: "127.0.0.1".to_string(),
+                        port: 6379,
+                    },
+                ));
+            let _owner = backend.replication_runtime.take_replica_link().unwrap();
+            backend
+                .replication_runtime
+                .set_replica_main_read_paused(true);
+            if has_output {
+                backend.connection_registry[connected.token].queue_reply(b"\n".to_vec());
+            }
+            backend.transport.clear_interest_requests_for_test();
+
+            backend.rearm_client_read_interests(Token(usize::MAX));
+
+            let expected = if has_output {
+                Interest::Writable
+            } else {
+                Interest::None
+            };
+            assert_eq!(
+                backend.transport.last_set_interest_calls_for_test().last(),
+                Some(&(connected.token, expected))
+            );
+            assert!(backend.replication_runtime.replica_main_read_paused());
+        }
     }
 
     fn ready(
@@ -725,7 +781,7 @@ mod tests {
             transfer_id,
             source: Some(source),
             child_release_write_end: None,
-            targets: vec![replica_id],
+            targets: vec![replica_id.into()],
             marker: marker.clone(),
             complete_full_resync: false,
             not_before_ms: 0,
@@ -743,6 +799,17 @@ mod tests {
             false,
         )]);
 
+        backend
+            .full_sync
+            .diskless_relay
+            .as_mut()
+            .unwrap()
+            .completion_state
+            .apply_fact(
+                crate::runtime::server::worker::distributed::replication::diskless_child::DisklessFact::ChildExited(
+                    crate::runtime::server::worker::reactor::sources::ChildExitOutcome::Exited(0),
+                ),
+            );
         backend.process_events_while_command_blocked_with_timeout(
             Token(usize::MAX),
             Some(std::time::Duration::ZERO),

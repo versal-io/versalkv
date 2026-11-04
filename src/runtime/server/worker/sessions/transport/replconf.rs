@@ -166,6 +166,10 @@ impl ServerWorkerState {
                 }
             });
         if let Some((sync_mode, replica)) = promotion {
+            if sync_mode == "dual" && !self.ctx.config().server.debug_pause_after_fork {
+                self.replication_runtime
+                    .clear_grace_psync_wait_for_main(connection_id);
+            }
             if let Some(replica_id) = self
                 .replication_runtime
                 .replica_id_for_connection(connection_id)
@@ -181,6 +185,20 @@ impl ServerWorkerState {
                     },
                 );
             }
+        } else if self.ctx.config().server.debug_pause_after_fork
+            && self
+                .replication_runtime
+                .has_grace_psync_wait_for_main(connection_id)
+            && self
+                .replication_runtime
+                .primary_for_connection(connection_id)
+                .is_some_and(|link| {
+                    link.dual_state()
+                        == crate::framework::distributed::replication::PrimaryDualChannelState::Online
+                })
+        {
+            self.replication_runtime
+                .clear_grace_psync_wait_for_main(connection_id);
         }
         self.refresh_replication_view();
         self.check_wait_replica_wakeups();
@@ -479,11 +497,18 @@ impl ServerWorkerState {
         self.replication_runtime
             .associate_rdb_channel(connection_id, rdb_connection_id)
             .map_err(|_| format!("ERR Unrecognized RDB client id {public_client_id}"))?;
-        self.associate_direct_dual_rdb_child_target(rdb_connection_id, connection_id);
         self.finalize_replconf_rdb_association(connection_id, rdb_connection_id);
         self.release_full_dual_snapshot_batch();
         self.log_replconf_rdb_association(connection_id, rdb_connection_id);
         self.drive_zero_delay_dual_snapshot(rdb_connection_id);
+        if self.dual_relay_parent_pause_pending() {
+            // Install the barrier at association, before another command in
+            // the same batch can change PSYNC state or produce a later reply.
+            self.full_sync
+                .paused_dual_main_replies
+                .entry(crate::framework::capabilities::io::Token(connection_id.0))
+                .or_default();
+        }
         Ok(())
     }
 
@@ -638,7 +663,7 @@ impl ServerWorkerState {
         connection_id: ConnectionId,
         configured_delay_ms: i64,
     ) {
-        if self.full_sync.direct_dual_rdb_child.is_some() {
+        if self.ctx.persistence().has_active_child() || self.full_sync.diskless_relay.is_some() {
             crate::server_log!(
                 notice,
                 "Current BGSAVE has socket target. Waiting for next BGSAVE for SYNC"

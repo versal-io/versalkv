@@ -253,6 +253,10 @@ impl ServerWorkerState {
                     self.remove_connection(token.0);
                     return;
                 }
+                if self.pause_dual_relay_client_if_needed(token) {
+                    self.release_io_worker_write_socket_lease(id);
+                    return;
+                }
                 if self.connection_registry[Token(connection_token)].has_pending_output() {
                     if matches!(outcome, WriteOutcome::BudgetExhausted) {
                         self.schedule_runtime_runnable_next_turn(
@@ -404,6 +408,9 @@ impl ServerWorkerState {
     /// (replication.c:1902-1908).
     pub(crate) fn flush_connection_output(&mut self, connection_token: usize) -> WriteOutcome {
         let token_value = self.connection_registry[Token(connection_token)].token().0;
+        if self.pause_dual_relay_client_if_needed(Token(token_value)) {
+            return WriteOutcome::Backpressured;
+        }
         let is_master_link = self.is_master_link(token_value);
         let is_slot_export =
             is_slot_export_connection(&self.connection_registry[Token(connection_token)]);
@@ -471,7 +478,45 @@ impl ServerWorkerState {
     }
 
     pub(crate) fn handle_writable(&mut self, token: Token) {
+        self.handle_writable_with_replication_barrier(token, true);
+    }
+
+    pub(crate) fn handle_pending_write(&mut self, token: Token) {
+        // The scheduled write phase follows a bounded replication batch.
+        // Retained replica work must not keep ordinary replies from progressing.
+        self.handle_writable_with_replication_barrier(token, false);
+    }
+
+    fn handle_writable_with_replication_barrier(
+        &mut self,
+        token: Token,
+        should_wait_for_replication: bool,
+    ) {
+        if self.pause_dual_relay_client_if_needed(token) {
+            return;
+        }
         if !self.socket_write_owned_by_main_thread(token) {
+            return;
+        }
+        if should_wait_for_replication
+            && self.is_scheduleable_ordinary_write(token.0)
+            && self
+                .replication_runtime
+                .primary_links()
+                .values()
+                .any(|link| {
+                    link.state()
+                        == crate::framework::distributed::replication::PrimaryLinkState::Streaming
+                        && self.event_batch.contains_runnable(
+                            crate::runtime::server::worker::reactor::RunnableKey::ClientWrite(
+                                Token(link.connection_id().0),
+                            ),
+                        )
+                })
+        {
+            // A polled read must not send its reply before queued replication
+            // receives the same bounded write attempt as in beforeSleep.
+            self.schedule_ordinary_write(token.0);
             return;
         }
         let Some(context) = self.prepare_writable_context(token) else {
@@ -507,8 +552,8 @@ impl ServerWorkerState {
             self.finish_partial_writable(&context, &flush.result);
         }
         if matches!(&flush.result, WriteOutcome::Complete) {
+            self.on_diskless_connection_writable(context.token);
             if let Some(id) = replica_target {
-                let _ = self.on_diskless_target_writable(id);
                 let _ = self.on_disk_sync_batch_target_writable(id);
             }
             if context.is_slot_export() {
@@ -799,16 +844,14 @@ impl ServerWorkerState {
             self.remove_connection(context.token.0);
         } else if flushed_dual_rdb_client_id && !keep_master_paused {
             self.read_dual_rdb_ack_after_flush(context.token);
+        } else {
+            self.queue_forked_debugger_for_reprocessing(context.token);
         }
     }
 
     fn rearm_drained_writable(&mut self, token: Token, keep_master_paused: bool) -> bool {
         let interest = if keep_master_paused {
-            if self.ctx.persistence().forkless_capture_in_progress() {
-                Interest::None
-            } else {
-                Interest::Writable
-            }
+            Interest::None
         } else {
             Interest::Readable
         };

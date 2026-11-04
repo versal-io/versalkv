@@ -285,7 +285,8 @@ impl ServerWorkerState {
         match key {
             RunnableKey::ClientRead(_)
             | RunnableKey::DeferredReadiness(_)
-            | RunnableKey::ReplicationAction(_) => BeforePollSlot::PreAof,
+            | RunnableKey::ReplicationAction(_)
+            | RunnableKey::ReplicaRdbDecode(_) => BeforePollSlot::PreAof,
             RunnableKey::ClientWrite(token) => {
                 let connection_id =
                     crate::framework::distributed::replication::ConnectionId(token.0);
@@ -747,7 +748,8 @@ impl ServerWorkerState {
                 }
                 super::RunnableKey::DeferredReadiness(_) => EventDependencies::safe_producer(),
                 super::RunnableKey::ClusterBeforeSleep
-                | super::RunnableKey::ReplicationAction(_) => EventDependencies::safe_producer(),
+                | super::RunnableKey::ReplicationAction(_)
+                | super::RunnableKey::ReplicaRdbDecode(_) => EventDependencies::safe_producer(),
                 #[cfg(test)]
                 super::RunnableKey::Test(_) => EventDependencies::none(),
             },
@@ -794,7 +796,7 @@ impl ServerWorkerState {
                     if self.replication_runtime.role(connection_id).is_none() {
                         self.trace_turn_for_test(TurnTracePoint::OrdinaryWrite);
                     }
-                    self.handle_writable(token);
+                    self.handle_pending_write(token);
                 }
             }
             RunnableKey::SlotExportWrite(token) => {
@@ -811,6 +813,9 @@ impl ServerWorkerState {
             RunnableKey::ClusterBeforeSleep => self.recompute_cluster_state_before_sleep(),
             RunnableKey::ReplicationAction(action) => {
                 self.drive_pending_replication_action(action);
+            }
+            RunnableKey::ReplicaRdbDecode(session_id) => {
+                self.drive_pending_replica_rdb_decode(session_id);
             }
             #[cfg(test)]
             RunnableKey::Test(_) => {}
@@ -839,7 +844,18 @@ impl ServerWorkerState {
         context: &DispatchContext,
     ) -> DispatchOutcome {
         if !matches!(context, DispatchContext::Normal) {
-            self.child_registry.defer_completion(completion.child);
+            if self.child_registry.defer_completion(completion.child) {
+                self.event_batch
+                    .push_ready_next_turn(EventLoopEvent::child_completion(completion));
+            }
+            return DispatchOutcome::Requeued;
+        }
+        self.child_registry.resume_completion(completion.child);
+        if matches!(
+            self.child_registry.owner(completion.child),
+            Some(crate::runtime::server::worker::reactor::sources::ChildOwner::ScriptDebugger)
+        ) {
+            self.finalize_child_registry_entry(completion.child);
             return DispatchOutcome::Handled;
         }
         if matches!(
@@ -860,12 +876,6 @@ impl ServerWorkerState {
         ) {
             return self.on_disk_sync_child_completed(completion.child, completion.outcome);
         }
-        if matches!(
-            self.child_registry.owner(completion.child),
-            Some(crate::runtime::server::worker::reactor::sources::ChildOwner::DirectDualRdb)
-        ) {
-            return self.on_direct_dual_child_completed(completion.child, completion.outcome);
-        }
         DispatchOutcome::Handled
     }
 
@@ -883,15 +893,12 @@ impl ServerWorkerState {
         owner: crate::runtime::server::worker::reactor::sources::InternalPipeOwner,
     ) -> DispatchOutcome {
         match owner {
-            crate::runtime::server::worker::reactor::sources::InternalPipeOwner::DisklessRdb { transfer_id } => {
-                self.on_diskless_pipe_readable(transfer_id)
-            }
-            crate::runtime::server::worker::reactor::sources::InternalPipeOwner::SlotSnapshot { job_id } => {
-                self.on_slot_snapshot_pipe_readable(job_id)
-            }
-            crate::runtime::server::worker::reactor::sources::InternalPipeOwner::DirectDualPhase { child } => {
-                self.on_direct_dual_phase_readable(child)
-            }
+            crate::runtime::server::worker::reactor::sources::InternalPipeOwner::DisklessRdb {
+                transfer_id,
+            } => self.on_diskless_pipe_readable(transfer_id),
+            crate::runtime::server::worker::reactor::sources::InternalPipeOwner::SlotSnapshot {
+                job_id,
+            } => self.on_slot_snapshot_pipe_readable(job_id),
         }
     }
 
@@ -1281,11 +1288,6 @@ fn is_terminal_failure(owner: &SourceOwner, ready: ReadyEvent) -> bool {
         ) => ready.error,
         SourceOwner::InternalPipe(
             crate::runtime::server::worker::reactor::sources::InternalPipeOwner::SlotSnapshot {
-                ..
-            },
-        ) => ready.error,
-        SourceOwner::InternalPipe(
-            crate::runtime::server::worker::reactor::sources::InternalPipeOwner::DirectDualPhase {
                 ..
             },
         ) => ready.error,

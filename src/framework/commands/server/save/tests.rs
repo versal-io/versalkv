@@ -21,98 +21,40 @@ fn close_listener_fds_closes_all_and_ignores_invalid() {
     assert_eq!(peer_b.read(&mut byte).unwrap(), 0);
 }
 
+#[cfg(unix)]
 #[test]
-fn direct_diskless_socket_send_timeout_matches_repl_timeout() {
-    use crate::foundation::io::sys::socket::send_timeout;
-    use std::os::fd::AsFd;
-    use std::os::unix::io::AsRawFd;
-    use std::os::unix::net::UnixStream;
+fn fork_child_cleanup_closes_registered_cluster_config_lock() {
+    use crate::foundation::io::sys::process::WaitOutcome;
+    use std::fs::OpenOptions;
+    use std::os::fd::AsRawFd;
 
-    let (writer, _reader) = UnixStream::pair().unwrap();
-    super::fullsync_fork::set_direct_diskless_send_timeout(writer.as_raw_fd(), 10_250)
-        .expect("SO_SNDTIMEO must be configured for direct diskless RDB sockets");
-
-    assert_eq!(
-        send_timeout(writer.as_fd()).expect("read SO_SNDTIMEO"),
-        std::time::Duration::from_millis(10_250)
-    );
-}
-
-#[test]
-fn direct_diskless_socket_write_keeps_parent_descriptor_nonblocking() {
-    use crate::foundation::io::sys::fd::is_nonblocking;
-    use std::io::Read;
-    use std::os::fd::{AsFd, AsRawFd};
-    use std::os::unix::net::UnixStream;
-
-    let (writer, mut reader) = UnixStream::pair().unwrap();
-    writer.set_nonblocking(true).expect("set nonblocking");
-
-    assert!(super::fullsync_fork::child_write_socket_all(
-        writer.as_raw_fd(),
-        b"rdb",
-        1_000
+    let path = std::env::temp_dir().join(format!(
+        "versal-cluster-lock-fork-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
     ));
-    assert!(
-        is_nonblocking(writer.as_fd()).expect("query nonblocking"),
-        "child writes must not change the parent transport descriptor to blocking"
-    );
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    let fd = file.as_raw_fd();
+    super::register_cluster_config_lock_fd(fd);
+    let mut child = crate::framework::capabilities::process::fork_owned_child(move || {
+        let closed = super::close_cluster_config_lock_in_child();
+        let is_closed = !crate::foundation::io::sys::os::is_file_descriptor_open(fd)
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::EBADF);
+        i32::from(!(closed && is_closed))
+    })
+    .unwrap();
 
-    let mut received = [0u8; 3];
-    reader.read_exact(&mut received).unwrap();
-    assert_eq!(received, *b"rdb");
-}
+    assert_eq!(child.wait().unwrap(), WaitOutcome::Exited(0));
+    assert!(crate::foundation::io::sys::os::is_file_descriptor_open(fd));
 
-#[test]
-fn direct_diskless_write_keeps_surviving_socket_after_peer_disconnects() {
-    use std::io::Read;
-    use std::os::unix::io::AsRawFd;
-    use std::os::unix::net::UnixStream;
-
-    let (dropped_writer, dropped_reader) = UnixStream::pair().unwrap();
-    let (live_writer, mut live_reader) = UnixStream::pair().unwrap();
-    drop(dropped_reader);
-    let mut fds = [dropped_writer.as_raw_fd(), live_writer.as_raw_fd()];
-
-    assert!(super::fullsync_fork::child_write_active_sockets(
-        &mut fds, b"rdb", 1_000
-    ));
-    assert_eq!(fds[0], -1, "the failed target must be retired");
-    assert_eq!(fds[1], live_writer.as_raw_fd());
-
-    let mut received = [0u8; 3];
-    live_reader.read_exact(&mut received).unwrap();
-    assert_eq!(received, *b"rdb");
-}
-
-#[test]
-fn direct_dual_rdb_phase_pipe_drains_completed_child_stages_without_blocking() {
-    use crate::foundation::io::sys::fd::{pipe, PipeFlags};
-    use std::io::Write;
-
-    let pipe = pipe(PipeFlags::CLOEXEC_NONBLOCK).expect("create phase pipe");
-    let (mut read_end, mut write_end) = pipe.into_parts();
-    let encoded = [
-        super::fullsync_fork::DirectDualRdbChildPhase::Forked.as_byte(),
-        super::fullsync_fork::DirectDualRdbChildPhase::Started.as_byte(),
-        super::fullsync_fork::DirectDualRdbChildPhase::HeaderSent.as_byte(),
-        super::fullsync_fork::DirectDualRdbChildPhase::SerializeDone.as_byte(),
-    ];
-    write_end.write_all(&encoded).expect("write phase bytes");
-
-    assert_eq!(
-        super::fullsync_fork::drain_direct_dual_rdb_phase_pipe(&mut read_end),
-        vec![
-            super::fullsync_fork::DirectDualRdbChildPhase::Forked,
-            super::fullsync_fork::DirectDualRdbChildPhase::Started,
-            super::fullsync_fork::DirectDualRdbChildPhase::HeaderSent,
-            super::fullsync_fork::DirectDualRdbChildPhase::SerializeDone,
-        ]
-    );
-    assert!(
-        super::fullsync_fork::drain_direct_dual_rdb_phase_pipe(&mut read_end).is_empty(),
-        "a pending child must not make the event loop block on an empty phase pipe"
-    );
+    super::unregister_cluster_config_lock_fd(fd);
+    drop(file);
+    let _ = std::fs::remove_file(path);
 }
 
 #[test]
@@ -224,6 +166,176 @@ fn forkless_save_releases_large_key_barrier_after_serialization() {
         !ctx.persistence().forkless_key_blocked(0, b"large"),
         "the key barrier must be released once the background worker drops its shared value"
     );
+
+    ctx.abort_forkless_save(crate::foundation::io::sys::time::mstime() / 1_000);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn forkless_save_keeps_original_database_identity_across_swapdb() {
+    use crate::engine::extension::config::persistence::BgsaveMethod;
+    use crate::foundation::io::persistence::snapshot::background::RdbSaveOutcome;
+    use crate::foundation::io::store::kv_engine::DbSet;
+    use crate::foundation::io::store::Robj;
+    use crate::framework::context::ServerContext;
+
+    let mut ctx = ServerContext::new(2);
+    for index in 0..256 {
+        ctx.db_mut(0).unwrap().set(
+            format!("left-{index}").into_bytes(),
+            Robj::string("left-value"),
+        );
+        ctx.db_mut(1).unwrap().set(
+            format!("right-{index}").into_bytes(),
+            Robj::string("right-value"),
+        );
+    }
+    let dir = std::env::temp_dir().join(format!(
+        "versal-forkless-swapdb-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    ctx.config_mut().persistence.dir = dir.to_string_lossy().into_owned();
+    ctx.config_mut().persistence.dbfilename = "dump.rdb".to_string();
+    ctx.config_mut().persistence.bgsave_default_method = BgsaveMethod::Forkless;
+
+    super::start_bgsave(&mut ctx).unwrap();
+    assert!(ctx.persistence().forkless_capture_in_progress());
+    ctx.swap_dbs(0, 1);
+    while ctx.persistence().forkless_capture_in_progress() {
+        ctx.drive_forkless_feed();
+    }
+    assert!(matches!(
+        ctx.finish_primary_forkless_save_for_test(),
+        Some(RdbSaveOutcome::Saved)
+    ));
+
+    let bytes = std::fs::read(dir.join("dump.rdb")).unwrap();
+    let mut restored = DbSet::new(2);
+    persistence::load_rdb_bytes_checked(&bytes, &mut restored, true).unwrap();
+    for index in 0..256 {
+        let left = format!("left-{index}");
+        let right = format!("right-{index}");
+        assert!(restored.get(0).unwrap().get_allow_expired(left.as_bytes()).is_some());
+        assert!(restored.get(0).unwrap().get_allow_expired(right.as_bytes()).is_none());
+        assert!(restored.get(1).unwrap().get_allow_expired(right.as_bytes()).is_some());
+        assert!(restored.get(1).unwrap().get_allow_expired(left.as_bytes()).is_none());
+    }
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn forkless_owned_snapshot_allows_deletion_before_serialization_finishes() {
+    use crate::engine::extension::config::persistence::BgsaveMethod;
+    use crate::foundation::io::persistence::snapshot::background::RdbSaveOutcome;
+    use crate::foundation::io::store::kv_engine::DbSet;
+    use crate::foundation::io::store::Robj;
+    use crate::framework::context::ServerContext;
+
+    let mut ctx = ServerContext::new(1);
+    for index in 0..256 {
+        ctx.db_mut(0).unwrap().set(
+            format!("owned-{index}").into_bytes(),
+            Robj::string_raw(Bytes::from_static(b"original")),
+        );
+    }
+    let dir = std::env::temp_dir().join(format!(
+        "versal-forkless-owned-delete-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    ctx.config_mut().persistence.dir = dir.to_string_lossy().into_owned();
+    ctx.config_mut().persistence.dbfilename = "dump.rdb".to_string();
+    ctx.config_mut().persistence.bgsave_default_method = BgsaveMethod::Forkless;
+    ctx.config_mut().persistence.rdb_key_save_delay = 100_000;
+    super::start_bgsave(&mut ctx).unwrap();
+
+    let captured = (0..256)
+        .map(|index| format!("owned-{index}").into_bytes())
+        .find(|key| !ctx.persistence().forkless_key_captured(0, key))
+        .expect("the bounded initial feed leaves a value for early capture");
+    assert!(ctx.prioritize_forkless_keys(0, [captured.clone()]));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !ctx.persistence().forkless_key_captured(0, &captured) {
+        assert!(std::time::Instant::now() < deadline, "early capture did not advance");
+        ctx.drive_forkless_feed();
+        std::thread::yield_now();
+    }
+    assert!(ctx.persistence().forkless_key_captured(0, &captured));
+    let is_blocked = ctx.persistence().forkless_key_blocked(0, &captured);
+    if is_blocked {
+        ctx.abort_forkless_save(0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    assert!(
+        !is_blocked,
+        "an independent snapshot copy must not wait behind unrelated serialization"
+    );
+    assert!(ctx.db_mut(0).unwrap().del(&captured));
+    assert!(ctx.persistence().forkless_save_in_progress());
+    assert!(ctx.persistence().forkless_capture_in_progress());
+    assert!(ctx.persistence().forkless_progress().unwrap().processed < 256);
+
+    ctx.persistence().set_forkless_key_delay(0);
+    while ctx.persistence().forkless_capture_in_progress() {
+        ctx.drive_forkless_feed();
+        std::thread::yield_now();
+    }
+    assert!(matches!(
+        ctx.finish_primary_forkless_save_for_test(),
+        Some(RdbSaveOutcome::Saved)
+    ));
+    let bytes = std::fs::read(dir.join("dump.rdb")).unwrap();
+    let mut restored = DbSet::new(1);
+    persistence::load_rdb_bytes_checked(&bytes, &mut restored, true).unwrap();
+    assert_eq!(restored.get(0).unwrap().dbsize(), 256);
+    assert_eq!(
+        restored.get(0).unwrap().get_allow_expired(&captured).unwrap().as_bytes(),
+        b"original"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn forkless_save_tracks_shared_key_barriers_across_swapdb() {
+    use crate::engine::extension::config::persistence::BgsaveMethod;
+    use crate::foundation::io::store::structure::list::ListValue;
+    use crate::foundation::io::store::Robj;
+    use crate::framework::context::ServerContext;
+    use std::collections::VecDeque;
+
+    let mut ctx = ServerContext::new(2);
+    ctx.db_mut(0).unwrap().set(
+        b"large".to_vec(),
+        Robj::ListQuicklist(ListValue::from_vecdeque(VecDeque::from(vec![
+            Bytes::from(vec![b'x'; 128]);
+            1_024
+        ]))),
+    );
+    let dir = std::env::temp_dir().join(format!(
+        "versal-forkless-swapdb-barrier-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    ctx.config_mut().persistence.dir = dir.to_string_lossy().into_owned();
+    ctx.config_mut().persistence.dbfilename = "dump.rdb".to_string();
+    ctx.config_mut().persistence.bgsave_default_method = BgsaveMethod::Forkless;
+    ctx.config_mut().persistence.rdb_key_save_delay = 10_000_000;
+
+    super::start_bgsave(&mut ctx).unwrap();
+    assert!(ctx.persistence().forkless_key_blocked(0, b"large"));
+    ctx.swap_dbs(0, 1);
+
+    assert!(!ctx.persistence().forkless_key_blocked(0, b"large"));
+    assert!(ctx.persistence().forkless_key_blocked(1, b"large"));
+    assert!(!ctx.persistence().forkless_key_captured(0, b"large"));
+    assert!(ctx.persistence().forkless_key_captured(1, b"large"));
 
     ctx.abort_forkless_save(crate::foundation::io::sys::time::mstime() / 1_000);
     let _ = std::fs::remove_dir_all(dir);

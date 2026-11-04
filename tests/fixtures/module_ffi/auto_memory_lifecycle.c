@@ -63,7 +63,7 @@ static int exercise(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
     ValkeyModule_CloseKey(key);
     if (!bytes_equal(item, "x\0y", 3)) return ValkeyModule_ReplyWithError(ctx, "ERR list output");
 
-    ValkeyModuleCallReply *error = ValkeyModule_Call(ctx, "missing.lifecycle.command", "");
+    ValkeyModuleCallReply *error = ValkeyModule_Call(ctx, "missing.lifecycle.command", "E");
     if (error == NULL || ValkeyModule_CallReplyType(error) != VALKEYMODULE_REPLY_ERROR)
         return ValkeyModule_ReplyWithError(ctx, "ERR error root");
     if (ValkeyModule_Call(ctx, "GET", "cD", "lifecycle:key") != NULL)

@@ -22,11 +22,31 @@ impl ServerWorkerState {
             bool,
         )],
     ) {
-        events.sort_by_key(|(token, _, _, _, _)| !self.is_master_link(token.0));
+        events.sort_by_key(|(token, _, _, _, _)| self.upstream_readiness_rank(*token));
     }
 
     fn prioritize_runtime_events(&self, events: &mut [RuntimeEvent]) {
-        events.sort_by_key(|event| !self.is_priority_connection(event.token));
+        events.sort_by_key(|event| {
+            (
+                !self.is_priority_connection(event.token),
+                self.upstream_readiness_rank(event.token),
+            )
+        });
+    }
+
+    fn upstream_readiness_rank(&self, token: crate::framework::capabilities::io::Token) -> u8 {
+        let connection_id = crate::framework::distributed::replication::ConnectionId(token.0);
+        if self
+            .replication_runtime
+            .replica_rdb_link()
+            .is_some_and(|link| link.connection_id() == connection_id)
+        {
+            0
+        } else if self.is_master_link(token.0) {
+            1
+        } else {
+            2
+        }
     }
 
     #[cfg(test)]

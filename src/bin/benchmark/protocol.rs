@@ -22,7 +22,10 @@ pub fn read_one_reply(stream: &mut impl Read, scratch: &mut Vec<u8>) -> Result<V
                 let reply = scratch[..consumed].to_vec();
                 scratch.drain(..consumed);
                 if reply.first() == Some(&b'-') {
-                    return Err(String::from_utf8_lossy(&reply).trim().to_string());
+                    return Err(format!(
+                        "Error from server: {}",
+                        String::from_utf8_lossy(&reply).trim()
+                    ));
                 }
                 return Ok(reply);
             }

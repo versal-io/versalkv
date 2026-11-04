@@ -397,9 +397,9 @@ impl ServerWorkerState {
         if let Some(received_rdb) = received_rdb {
             received_rdb.commit().map_err(|_| ())?;
         }
+        self.install_prepared_functions(&prepared.function_codes)?;
         self.install_prepared_dataset(link, &mut prepared, rdb_boundary);
         self.install_prepared_aux(&prepared.aux_fields);
-        self.install_prepared_functions(&prepared.function_codes);
         let reused_aof_base = aof_base.is_some();
         self.publish_prepared_aof_base(aof_base);
         if delete_received_rdb && !reused_aof_base {
@@ -593,18 +593,8 @@ impl ServerWorkerState {
         self.ctx.dbs_mut().set_replica_local_expire_only_all(false);
     }
 
-    fn install_prepared_functions(&mut self, function_codes: &[Vec<u8>]) {
-        self.ctx.script_mut().function_registry.flush();
-        for code in function_codes {
-            let code = String::from_utf8_lossy(code);
-            let name = crate::engine::extension::lua::shebang::extract_shebang_name(&code)
-                .expect("prevalidated function library must have a name");
-            self.ctx
-                .script_mut()
-                .function_registry
-                .load_library(&name, &code)
-                .expect("prevalidated function library must install");
-        }
+    fn install_prepared_functions(&mut self, function_codes: &[Vec<u8>]) -> Result<(), ()> {
+        crate::framework::host_tasks::replace_function_libraries(&mut self.ctx, function_codes)
     }
 
     fn finish_streamed_loading_state(&mut self, link: &ReplicaLink, reused_aof_base: bool) {
@@ -767,6 +757,11 @@ impl ServerWorkerState {
         connection_token: usize,
         link: &mut ReplicaLink,
     ) -> Result<(), ()> {
+        // Finish the already buffered local stream before admitting newer
+        // socket bytes, as C's dualChannelSyncSuccess does before rearming.
+        if self.replica_main_read_is_paused(Token(connection_token)) {
+            return Ok(());
+        }
         let Some(conn) = self
             .connection_registry
             .get(crate::framework::capabilities::io::Token(connection_token))
@@ -969,14 +964,15 @@ impl ServerWorkerState {
     ) -> Result<(), ()> {
         if !continuation.selected_db_applied {
             link.reset_applied_offset_to_dual_snapshot();
-            // Restore the snapshot's selected database without counting an
-            // internal setup action as a command received from the wire.
-            self.apply_replication_command_now(
-                connection_token,
-                link,
-                ReplicationApply::Select(pending.selected_db()),
-                true,
-            )?;
+            let selected_db = pending.selected_db();
+            if self.ctx.db(selected_db).is_none() {
+                return Err(());
+            }
+            // Snapshot selection is local setup, not an upstream SELECT frame.
+            // Keep the AOF cursor unchanged so its next write selects this DB.
+            link.set_selected_db(selected_db);
+            self.connection_registry[Token(connection_token)].selected_db = selected_db;
+            self.ctx.set_repl_seldb(i64::from(selected_db));
             continuation.selected_db_applied = true;
         }
         let interval = self
@@ -1106,7 +1102,9 @@ impl ServerWorkerState {
         let execution =
             match self.handle_replication_transaction_frame(connection_token, link, &apply) {
                 Ok(Some(duration_us)) => Ok(duration_us),
-                Ok(None) => self.apply_replication_command_now(connection_token, link, apply, true),
+                Ok(None) => {
+                    self.apply_replication_command_now(connection_token, link, apply, true, None)
+                }
                 Err(error) => Err(error),
             };
         let duration_us = execution?;
@@ -1139,12 +1137,10 @@ impl ServerWorkerState {
                 .map(Some),
             ReplicationApply::Command(args) if args.name.eq_ignore_ascii_case(b"MULTI") => Ok(None),
             ReplicationApply::Command(args) => {
-                let frame = encode_command_args(args);
                 self.connection_registry
                     [crate::framework::capabilities::io::Token(connection_token)]
                 .transaction
                 .queue(self.ctx.num_dbs(), args.clone());
-                self.relay_replication_transaction_frame(&frame);
                 Ok(Some(0))
             }
             ReplicationApply::Select(db) => {
@@ -1173,15 +1169,6 @@ impl ServerWorkerState {
                     Bytes::copy_from_slice(db_text.as_bytes()),
                 ]),
             );
-        let frame = crate::engine::distributed::replication::protocol::encode_command(&[
-            b"SELECT",
-            db_text.as_bytes(),
-        ]);
-        self.relay_replication_transaction_frame(&frame);
-        self.ctx.set_repl_seldb(i64::from(db));
-        self.ctx
-            .persistence_mut()
-            .set_aof_selected_db(i64::from(db));
         Ok(())
     }
 
@@ -1191,13 +1178,21 @@ impl ServerWorkerState {
         link: &mut ReplicaLink,
     ) -> Result<u64, ()> {
         let started = std::time::Instant::now();
-        let queued = {
+        let previous_aof_db = self.ctx.persistence().aof_selected_db();
+        let (queued, initial_db) = {
             let conn = &mut self.connection_registry
                 [crate::framework::capabilities::io::Token(connection_token)];
             let queued = conn.transaction.take_queued_commands();
             conn.transaction.end(TransactionEnd::ExecutionCompleted);
-            queued
+            (queued, conn.selected_db)
         };
+        let mut frame =
+            crate::engine::distributed::replication::protocol::encode_command(&[b"MULTI"]);
+        for args in &queued {
+            frame.extend(encode_command_args(args));
+        }
+        frame.extend(crate::engine::distributed::replication::protocol::encode_command(&[b"EXEC"]));
+        let mut dirty_keys = Vec::new();
         self.command_execution_depth += 1;
         let execution = (|| {
             for args in queued {
@@ -1212,24 +1207,60 @@ impl ServerWorkerState {
                 } else {
                     ReplicationApply::Command(args)
                 };
-                self.apply_replication_command_now(connection_token, link, apply, false)?;
+                self.apply_replication_command_now(
+                    connection_token,
+                    link,
+                    apply,
+                    false,
+                    Some(&mut dirty_keys),
+                )?;
             }
             Ok::<(), ()>(())
         })();
         self.command_execution_depth -= 1;
         execution?;
+        let exec = CommandArgs::from_parts(vec![Bytes::from_static(b"EXEC")]);
+        // MULTI also opens transactions in tracking imports. Complete those
+        // queues before subsequent replication commands can enter them.
+        crate::framework::distributed::migration::apply_tracking_import_command(
+            &exec,
+            &self.registry,
+            &mut self.ctx,
+        )
+        .map_err(|_| ())?;
         let duration_us = (started.elapsed().as_micros() as u64).max(1);
-        let frame = crate::engine::distributed::replication::protocol::encode_command(&[b"EXEC"]);
-        self.relay_replication_transaction_frame(&frame);
+        // A downstream snapshot must never split an uncommitted transaction.
+        // Publish its complete stream only after all queued commands have applied.
+        let final_db = self.connection_registry[Token(connection_token)].selected_db;
+        self.relay_replication_transaction_frame(frame, initial_db, previous_aof_db, final_db);
+        // Writable replica wakeups can generate local AOF writes of their own.
+        // Keep those effects after the committed transaction that made the keys ready.
+        // The wakeup loop pops keys from a stack, so preserve first-ready order.
+        dirty_keys.reverse();
+        self.wakeup_blocked_on_keys(&dirty_keys, None, None);
         Ok(duration_us)
     }
 
-    fn relay_replication_transaction_frame(&mut self, frame: &[u8]) {
-        self.propagate_replication_frame(frame);
+    fn relay_replication_transaction_frame(
+        &mut self,
+        frame: Vec<u8>,
+        initial_db: u32,
+        previous_aof_db: i64,
+        final_db: u32,
+    ) {
+        self.propagate_replication_frame(&frame);
         if self.ctx.config().persistence.aof_enabled {
-            self.feed_aof(frame);
+            let op = PropagationOp::new(initial_db, PropagationTargets::Aof, frame);
+            let sequenced = sequence_propagation(&[op], self.ctx.repl_seldb(), previous_aof_db);
+            for frame in &sequenced.aof_frames {
+                self.feed_aof(frame);
+            }
             self.flush_aof_if_needed();
         }
+        self.ctx.set_repl_seldb(i64::from(final_db));
+        self.ctx
+            .persistence_mut()
+            .set_aof_selected_db(i64::from(final_db));
     }
 
     fn apply_replication_command_now(
@@ -1238,6 +1269,7 @@ impl ServerWorkerState {
         link: &mut ReplicaLink,
         apply: ReplicationApply,
         relay_stream: bool,
+        pending_wakeup: Option<&mut Vec<(u32, Bytes)>>,
     ) -> Result<u64, ()> {
         let started = std::time::Instant::now();
         let duration_us = match apply {
@@ -1307,6 +1339,7 @@ impl ServerWorkerState {
                         &args,
                         outcome,
                         relay_stream,
+                        pending_wakeup,
                     );
                 }
                 duration_us
@@ -1389,10 +1422,14 @@ impl ServerWorkerState {
                     String::from_utf8_lossy(&args.name)
                 );
             }
+            let error = replication_unknown_command_error(
+                args,
+                self.ctx.config().server.hide_user_data_from_log,
+            );
             crate::server_log!(
                 warning,
-                "== CRITICAL == This primary is sending an error to its replica: unknown command '{}'",
-                String::from_utf8_lossy(&args.name)
+                "== CRITICAL == This primary is sending an error to its replica: '{}' after processing the command '<unknown>'",
+                error
             );
             self.propagate_and_aof(relay_stream, &frame);
             return Ok((0, None));
@@ -1462,6 +1499,17 @@ impl ServerWorkerState {
                 .config()
                 .replication
                 .should_panic_on_propagation_error(false);
+        let replication_error_log = match &result {
+            crate::foundation::io::protocol::Value::Error(error) => Some((
+                replication_command_error_for_log(
+                    error,
+                    args,
+                    self.ctx.config().server.hide_user_data_from_log,
+                ),
+                spec.name.as_str().to_ascii_lowercase(),
+            )),
+            _ => None,
+        };
         let (selected_db, dirty_keys, lazyfree_objects, swapdb, pending, pending_shard) = {
             let Some(conn) = self.connection_registry.get_mut(Token(connection_token)) else {
                 return Err(());
@@ -1472,12 +1520,12 @@ impl ServerWorkerState {
                 }
             }
             conn.import_source = false;
-            if let crate::foundation::io::protocol::Value::Error(error) = &result {
+            if let Some((error, command)) = &replication_error_log {
                 crate::server_log!(
                     warning,
                     "== CRITICAL == This primary is sending an error to its replica: '{}' after processing the command '{}'",
-                    String::from_utf8_lossy(error),
-                    String::from_utf8_lossy(&args.name)
+                    error,
+                    command
                 );
             }
             let mut effects = conn
@@ -1557,7 +1605,12 @@ impl ServerWorkerState {
         args: &CommandArgs,
         outcome: ReplicationCommandOutcome,
         relay_stream: bool,
+        pending_wakeup: Option<&mut Vec<(u32, Bytes)>>,
     ) {
+        let relay_stream = relay_stream
+            && !self.connection_registry[Token(connection_token)]
+                .transaction
+                .is_active();
         self.dispose_data_lazyfree_objects(outcome.lazyfree_objects);
         {
             let stat = self
@@ -1587,7 +1640,10 @@ impl ServerWorkerState {
         if let Some((db1, db2)) = outcome.swapdb {
             self.apply_swapdb_watch_state(db1, db2);
         }
-        self.wakeup_blocked_on_keys(&outcome.dirty_keys, None, None);
+        match pending_wakeup {
+            Some(keys) => keys.extend(outcome.dirty_keys),
+            None => self.wakeup_blocked_on_keys(&outcome.dirty_keys, None, None),
+        }
         if relay_stream {
             self.propagate_replication_frame(&outcome.frame);
         }
@@ -1607,7 +1663,6 @@ impl ServerWorkerState {
                 .set_aof_selected_db(sequenced.aof_selected_db);
             self.flush_aof_if_needed();
         }
-        let _ = connection_token;
     }
 
     fn propagate_and_aof(&mut self, relay_stream: bool, frame: &[u8]) {
@@ -1618,6 +1673,18 @@ impl ServerWorkerState {
             self.feed_aof(frame);
         }
     }
+}
+
+fn replication_unknown_command_error(args: &CommandArgs, hide_user_data: bool) -> String {
+    super::render_unknown_replication_command_for_log(args, hide_user_data)
+}
+
+fn replication_command_error_for_log(
+    error: &[u8],
+    args: &CommandArgs,
+    hide_user_data: bool,
+) -> String {
+    super::render_replication_error_for_log(error, args, hide_user_data)
 }
 
 /// Log an RDB decode failure on the replica full-sync load path with C's
@@ -1661,6 +1728,101 @@ mod boundary_tests {
 
     fn offset(value: i64) -> ReplicationOffset {
         ReplicationOffset::try_from(value).expect("valid test offset")
+    }
+
+    #[test]
+    fn dual_snapshot_database_restore_preserves_replication_history() {
+        use crate::framework::capabilities::connection::Connection;
+        use crate::framework::capabilities::io::Token;
+        use crate::framework::distributed::replication::{
+            PendingReplicationBuffer, ProvisionalPrimary,
+        };
+        use crate::runtime::server::worker::reactor::blocked_events::PendingReplayContinuation;
+
+        let mut runtime = ServerWorkerState::new(16).unwrap();
+        crate::framework::commands::register_all(&mut runtime.registry);
+        runtime.ctx.config_mut().persistence.aof_enabled = true;
+        runtime
+            .ctx
+            .persistence_mut()
+            .begin_aof_rewrite_child(123, 1_000)
+            .unwrap();
+        let mut connection = Connection::new_fake();
+        connection.set_token_for_test(Token(40));
+        runtime.connection_registry.insert(connection);
+        let replid = "0123456789abcdef0123456789abcdef01234567";
+        runtime
+            .ctx
+            .replication_mut()
+            .backlog
+            .adopt_primary_from_rdb(replid, offset(100))
+            .unwrap();
+        runtime.ctx.replication_mut().backlog.activate();
+        let mut link = ReplicaLink::streaming(
+            ConnectionId(40),
+            MasterInfo {
+                host: "127.0.0.1".to_string(),
+                port: 6379,
+            },
+            replid.to_string(),
+            offset(100),
+        );
+        link.provisional_primary = Some(ProvisionalPrimary {
+            replid: replid.to_string(),
+            end_offset: offset(100),
+            db_id: 9,
+            rdb_client_id: 0,
+        });
+        let frame = crate::engine::distributed::replication::protocol::encode_command(&[b"PING"]);
+        let end_offset = offset(100 + frame.len() as i64);
+        let mut pending = PendingReplicationBuffer::new(1024, offset(100), 9);
+        let (events, _) = link.on_bytes(&frame, 6379).unwrap();
+        for event in events {
+            pending.push(event).unwrap();
+        }
+        let mut continuation = PendingReplayContinuation::new(
+            ConnectionId(40),
+            link.session_id(),
+            crate::foundation::io::sys::time::mstime(),
+        );
+
+        runtime
+            .apply_pending_replay_entries(40, &mut link, &mut pending, &mut continuation)
+            .unwrap();
+        let aof_cursor_after_restore = runtime.ctx.persistence().aof_selected_db();
+        let aof_after_restore = runtime.ctx.aof().rewrite.buffer.clone();
+        let replicated_set = crate::engine::distributed::replication::protocol::encode_command(&[
+            b"SET", b"key", b"value",
+        ]);
+        let (events, _) = link.on_bytes(&replicated_set, 6379).unwrap();
+        runtime.apply_replica_events(40, &mut link, events).unwrap();
+        let aof = runtime.ctx.aof().rewrite.buffer.clone();
+        runtime.ctx.persistence_mut().abort_child();
+
+        assert_eq!(runtime.connection_registry[Token(40)].selected_db, 9);
+        assert_eq!(link.selected_db(), 9);
+        assert_eq!(runtime.ctx.repl_seldb(), 9);
+        let final_offset = end_offset.checked_advance(replicated_set.len()).unwrap();
+        assert_eq!(link.applied_position(), final_offset);
+        assert_eq!(
+            runtime.ctx.replication().backlog.reported_offset(),
+            final_offset
+        );
+        let backlog = &runtime.ctx.replication().backlog;
+        let mut expected_history = frame;
+        expected_history.extend_from_slice(&replicated_set);
+        assert_eq!(
+            backlog.read_from(backlog.first_byte_cursor()),
+            Some(expected_history)
+        );
+        assert_eq!(aof_cursor_after_restore, -1);
+        assert!(aof_after_restore.is_empty());
+        let mut expected_aof =
+            crate::engine::distributed::replication::protocol::encode_command(&[b"SELECT", b"9"]);
+        expected_aof.extend_from_slice(&replicated_set);
+        assert_eq!(aof, expected_aof);
+        assert!(runtime.ctx.db(9).unwrap().get_no_expire(b"key").is_some());
+        assert!(runtime.ctx.db(0).unwrap().get_no_expire(b"key").is_none());
     }
 
     #[test]

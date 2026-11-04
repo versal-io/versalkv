@@ -104,6 +104,9 @@ impl ServerWorkerState {
             self.handle_master_link_readable(token_value, connection_token);
             return;
         }
+        if self.pause_dual_relay_client_if_needed(Token(token_value)) {
+            return;
+        }
         let is_replica_side_rdb = self
             .replication_runtime
             .replica_rdb_link()
@@ -148,6 +151,7 @@ impl ServerWorkerState {
         outcome: ReadOutcome,
     ) {
         self.authenticate_tls_peer(token);
+        let read_failed = matches!(&outcome, ReadOutcome::Failed(_));
         let (close, yielded, error) = match outcome {
             ReadOutcome::Quiescent => (false, false, None),
             ReadOutcome::BudgetExhausted => (false, true, None),
@@ -173,7 +177,7 @@ impl ServerWorkerState {
         }
         self.process_client_read_result(token, effective_mode, read_data, close, yielded);
         if should_finish_hup {
-            self.finish_client_hup_drain_turn(token.0);
+            self.finish_client_hup_drain_turn(token.0, read_failed);
         }
     }
 
@@ -272,6 +276,9 @@ impl ServerWorkerState {
             {
                 return false;
             }
+            if self.pause_dual_relay_client_if_needed(token) {
+                return false;
+            }
             match self.parse_next_client_command(token) {
                 ClientParseResult::Command(args, name, resp3) => {
                     parsed_commands += 1;
@@ -291,6 +298,17 @@ impl ServerWorkerState {
                 }
             }
             self.process_dirty_keys_in_loop(token.0, fx);
+            if self
+                .ctx
+                .script()
+                .debug_modes
+                .get(&self.connection_registry[token].session_id())
+                == Some(&crate::engine::extension::script::ScriptDebugMode::Forked)
+            {
+                // Commit earlier pipeline replies before a later EVAL transfers
+                // this socket to a debugger child.
+                return self.connection_registry[token].parser.has_pending_data();
+            }
             if mode == ClientReadMode::DrainAfterHup
                 && parsed_commands >= crate::runtime::server::worker::HUP_CLIENT_COMMAND_BUDGET
             {
@@ -357,8 +375,40 @@ impl ServerWorkerState {
     }
 
     fn schedule_client_read_continuation(&mut self, token: Token, yielded: bool) {
+        if self.full_sync.paused_dual_clients.contains(&token) {
+            return;
+        }
         if yielded && self.connection_registry.contains(token) {
+            let session = self.connection_registry[token].session_id();
+            let is_forked_debugger = self.ctx.script().debug_modes.get(&session)
+                == Some(&crate::engine::extension::script::ScriptDebugMode::Forked);
+            if is_forked_debugger
+                && (self.connection_registry[token].has_pending_output()
+                    || self.io_threads.is_write_inflight(token)
+                    || !self.socket_owned_by_main_thread(token))
+            {
+                return;
+            }
             self.schedule_client_read_runnable(token, true);
+        }
+    }
+
+    pub(crate) fn queue_forked_debugger_for_reprocessing(&mut self, token: Token) {
+        let should_queue = self
+            .connection_registry
+            .get(token)
+            .is_some_and(|connection| {
+                connection.state == ConnectionState::Connected
+                    && connection.blocked.is_none()
+                    && connection.parser.has_pending_data()
+                    && !connection.has_pending_output()
+                    && self.ctx.script().debug_modes.get(&connection.session_id())
+                        == Some(&crate::engine::extension::script::ScriptDebugMode::Forked)
+            })
+            && !self.io_threads.is_write_inflight(token)
+            && self.socket_owned_by_main_thread(token);
+        if should_queue {
+            self.schedule_client_read_runnable(token, false);
         }
     }
 
@@ -628,10 +678,6 @@ impl ServerWorkerState {
 
     fn buffer_blocked_client_after_hup(&mut self, token_value: usize, connection_token: usize) {
         let (read_data, outcome) = self.read_from_connection_after_hup(connection_token);
-        if !read_data.is_empty() && !self.begin_client_read_batch(Token(token_value), &read_data) {
-            return;
-        }
-        let close = matches!(outcome, ReadOutcome::PeerClosed | ReadOutcome::Failed(_));
         if let ReadOutcome::Failed(error) = &outcome {
             crate::server_log!(
                 warning,
@@ -639,7 +685,13 @@ impl ServerWorkerState {
                 token_value,
                 error
             );
+            self.remove_connection(token_value);
+            return;
         }
+        if !read_data.is_empty() && !self.begin_client_read_batch(Token(token_value), &read_data) {
+            return;
+        }
+        let close = matches!(outcome, ReadOutcome::PeerClosed);
         if close
             && (self.connection_registry
                 [crate::framework::capabilities::io::Token(connection_token)]
@@ -670,21 +722,44 @@ impl ServerWorkerState {
         self.handle_readable(token_value, ClientReadMode::DrainAfterHup);
     }
 
-    fn finish_client_hup_drain_turn(&mut self, token_value: usize) {
+    fn finish_client_hup_drain_turn(&mut self, token_value: usize, read_failed: bool) {
         if !self
             .connection_registry
             .contains(crate::framework::capabilities::io::Token(token_value))
-            || self
-                .event_batch
-                .contains_runnable(RunnableKey::ClientRead(Token(token_value)))
         {
             return;
         }
-        let connection_token = token_value;
-        if self.connection_registry[crate::framework::capabilities::io::Token(connection_token)]
-            .blocked
-            .is_some()
+        if !read_failed
+            && self
+                .full_sync
+                .paused_dual_clients
+                .contains(&Token(token_value))
         {
+            // The paused parent has not admitted these buffered commands yet.
+            // Resume their EOF drain with the rest of the client pipeline.
+            return;
+        }
+        let connection_token = token_value;
+        let is_blocked = self.connection_registry
+            [crate::framework::capabilities::io::Token(connection_token)]
+        .blocked
+        .is_some();
+        if read_failed {
+            // A fatal read is terminal even when a bounded pipeline turn left
+            // a continuation. C marks this client for asynchronous closure;
+            // unlike EOF, it must not wait for another input or unblock turn.
+            self.cancel_runtime_runnable(RunnableKey::ClientRead(Token(token_value)));
+            self.client_hup_drains.remove(&Token(token_value));
+            self.remove_connection(token_value);
+            return;
+        }
+        if self
+            .event_batch
+            .contains_runnable(RunnableKey::ClientRead(Token(token_value)))
+        {
+            return;
+        }
+        if is_blocked {
             self.schedule_client_read_runnable(Token(token_value), true);
             return;
         }
@@ -853,6 +928,88 @@ mod tests {
     }
 
     #[test]
+    fn script_debug_is_rejected_after_an_earlier_pipeline_reply() {
+        let (mut runtime, token) = runtime_with_fake_client();
+        crate::framework::commands::register_all(&mut runtime.registry);
+        runtime.connection_registry[token].authenticated = true;
+        runtime.connection_registry[token].ever_authenticated = true;
+        runtime.connection_registry[token].set_custom_reply_enabled(false);
+        let session = runtime.connection_registry[token].session_id();
+        runtime.process_client_read_outcome(
+            token,
+            ClientReadMode::Fair,
+            b"*1\r\n$4\r\nPING\r\n*3\r\n$6\r\nSCRIPT\r\n$5\r\nDEBUG\r\n$3\r\nYES\r\n".to_vec(),
+            ReadOutcome::Quiescent,
+        );
+
+        let output = runtime.connection_registry[token]
+            .take_threaded_write_snapshot()
+            .into_frames()
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        assert!(!runtime.ctx.script().debug_modes.contains_key(&session));
+        assert!(
+            String::from_utf8_lossy(&output)
+                .contains("ERR SCRIPT DEBUG must be called outside a pipeline"),
+            "unexpected pipeline output: {:?}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+
+    #[test]
+    fn script_debug_is_allowed_after_reply_skip_suppresses_pipeline_output() {
+        let (mut runtime, token) = runtime_with_fake_client();
+        crate::framework::commands::register_all(&mut runtime.registry);
+        runtime.connection_registry[token].authenticated = true;
+        runtime.connection_registry[token].ever_authenticated = true;
+        runtime.connection_registry[token].set_custom_reply_enabled(false);
+        let session = runtime.connection_registry[token].session_id();
+
+        runtime.process_client_read_outcome(
+            token,
+            ClientReadMode::Fair,
+            b"*3\r\n$6\r\nCLIENT\r\n$5\r\nREPLY\r\n$4\r\nSKIP\r\n*3\r\n$6\r\nSCRIPT\r\n$5\r\nDEBUG\r\n$3\r\nYES\r\n"
+                .to_vec(),
+            ReadOutcome::Quiescent,
+        );
+
+        assert_eq!(
+            runtime.ctx.script().debug_modes.get(&session),
+            Some(&crate::engine::extension::script::ScriptDebugMode::Forked)
+        );
+    }
+
+    #[test]
+    fn forked_debugger_continuation_waits_for_write_socket_lease_release() {
+        let (mut runtime, token) = runtime_with_fake_client();
+        let session = runtime.connection_registry[token].session_id();
+        runtime.ctx.script_mut().debug_modes.insert(
+            session,
+            crate::engine::extension::script::ScriptDebugMode::Forked,
+        );
+        runtime.connection_registry[token]
+            .parser
+            .feed(b"*1\r\n$4\r\nEVAL\r\n");
+        let operation = crate::runtime::server::worker::reactor::io_workers::IoOperationId {
+            token,
+            generation: 1,
+            sequence: 1,
+        };
+        runtime.acquire_io_worker_write_socket_lease(operation);
+
+        runtime.schedule_client_read_continuation(token, true);
+        assert!(!runtime
+            .event_batch
+            .contains_runnable(RunnableKey::ClientRead(token)));
+
+        runtime.release_io_worker_write_socket_lease(operation);
+        assert!(runtime
+            .event_batch
+            .contains_runnable(RunnableKey::ClientRead(token)));
+    }
+
+    #[test]
     fn peer_close_drains_admitted_command_before_teardown() {
         let mut runtime = ServerWorkerState::new(1).expect("create runtime");
         crate::framework::commands::register_all(&mut runtime.registry);
@@ -918,7 +1075,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_read_drains_admitted_command_before_teardown() {
+    fn failed_read_does_not_retain_the_client_to_flush_unsent_replies() {
         let mut runtime = ServerWorkerState::new(1).expect("create runtime");
         crate::framework::commands::register_all(&mut runtime.registry);
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind peer listener");
@@ -944,11 +1101,147 @@ mod tests {
         );
 
         let mut response = [0_u8; 7];
-        target
-            .read_exact(&mut response)
-            .expect("read reply for command admitted before failure");
-        assert_eq!(&response, b"+PONG\r\n");
+        // C handleReadResult closes a failed transport without flushing queued
+        // replies. The orderly EOF test above still requires its PONG reply.
+        assert_eq!(
+            target
+                .read(&mut response)
+                .expect("observe closure after the terminal read failure"),
+            0
+        );
         assert!(!runtime.connection_registry.contains(peer.token));
         assert!(!runtime.transport.is_registered(peer.token));
+    }
+
+    #[test]
+    fn failed_read_drops_a_pipeline_continuation_at_the_terminal_boundary() {
+        for mode in [ClientReadMode::Fair, ClientReadMode::DrainAfterHup] {
+            let mut runtime = ServerWorkerState::new(1).unwrap();
+            crate::framework::commands::register_all(&mut runtime.registry);
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let peer = runtime.transport.connect_tcp(address).unwrap();
+            let (_target, _) = listener.accept().unwrap();
+            runtime.add_connection(RuntimeConnectedPeer {
+                token: peer.token,
+                peer_addr: address,
+            });
+            let commands = crate::runtime::server::worker::HUP_CLIENT_COMMAND_BUDGET + 1;
+            let mut input = b"*1\r\n$4\r\nPING\r\n".repeat(commands);
+            input.extend_from_slice(b"*1\r\n$4\r\nPI");
+
+            runtime.process_client_read_outcome(
+                peer.token,
+                mode,
+                input,
+                ReadOutcome::Failed(Error::new(
+                    ErrorKind::ConnectionReset,
+                    "peer reset a pipelined write load",
+                )),
+            );
+
+            assert!(
+                !runtime.connection_registry.contains(peer.token),
+                "a fatal read must not retain the client for another pipeline turn"
+            );
+            assert!(!runtime.transport.is_registered(peer.token));
+            assert!(!runtime.client_hup_drains.contains(&peer.token));
+            assert!(!runtime
+                .event_batch
+                .contains_runnable(RunnableKey::ClientRead(peer.token)));
+        }
+    }
+
+    #[test]
+    fn failed_read_removes_a_blocked_client_without_waiting_for_unblock() {
+        use crate::engine::command::context::{BlockedCmd, BlockedState};
+        use crate::engine::command::CommandArgs;
+        use bytes::Bytes;
+
+        let (mut runtime, token) = runtime_with_fake_client();
+        let key = Bytes::from_static(b"list");
+        runtime.connection_registry[token].blocked = Some(BlockedState {
+            cmd: BlockedCmd::Blpop,
+            keys: vec![key.clone()],
+            timeout_ms: 0,
+            start_time_ms: crate::foundation::io::sys::time::mstime(),
+            orig_args: CommandArgs::from_parts(vec![
+                Bytes::from_static(b"BLPOP"),
+                key.clone(),
+                Bytes::from_static(b"0"),
+            ]),
+            req_bytes: 32,
+            orig_wrapped: None,
+        });
+        let session = runtime.connection_registry[token].session_id();
+        runtime
+            .ctx
+            .blocking_registry_mut()
+            .register_client(0, &[key], session);
+        assert!(runtime.ctx.blocking_registry().is_client_blocked(&session));
+
+        runtime.process_client_read_outcome(
+            token,
+            ClientReadMode::Fair,
+            Vec::new(),
+            ReadOutcome::Failed(std::io::Error::new(
+                ErrorKind::ConnectionReset,
+                "peer reset a blocked connection",
+            )),
+        );
+
+        assert!(!runtime.connection_registry.contains(token));
+        assert!(!runtime.ctx.blocking_registry().is_client_blocked(&session));
+        assert_eq!(runtime.ctx.blocking_registry().count(), 0);
+    }
+
+    #[test]
+    fn failed_hup_drain_removes_a_blocked_client_with_pending_pipeline() {
+        use crate::engine::command::context::{BlockedCmd, BlockedState};
+        use crate::engine::command::CommandArgs;
+        use bytes::Bytes;
+
+        let (mut runtime, token) = runtime_with_fake_client();
+        let key = Bytes::from_static(b"list");
+        runtime.connection_registry[token].blocked = Some(BlockedState {
+            cmd: BlockedCmd::Blpop,
+            keys: vec![key.clone()],
+            timeout_ms: 0,
+            start_time_ms: crate::foundation::io::sys::time::mstime(),
+            orig_args: CommandArgs::from_parts(vec![
+                Bytes::from_static(b"BLPOP"),
+                key.clone(),
+                Bytes::from_static(b"0"),
+            ]),
+            req_bytes: 32,
+            orig_wrapped: None,
+        });
+        let session = runtime.connection_registry[token].session_id();
+        runtime
+            .ctx
+            .blocking_registry_mut()
+            .register_client(0, &[key], session);
+        runtime.connection_registry[token]
+            .parser
+            .feed(b"*1\r\n$4\r\nPING\r\n");
+        runtime.client_hup_drains.insert(token);
+        runtime.schedule_client_read_runnable(token, true);
+        assert!(runtime
+            .event_batch
+            .contains_runnable(RunnableKey::ClientRead(token)));
+
+        runtime.process_client_read_outcome(
+            token,
+            ClientReadMode::DrainAfterHup,
+            Vec::new(),
+            ReadOutcome::Failed(std::io::Error::new(
+                ErrorKind::ConnectionReset,
+                "peer reset during HUP drain",
+            )),
+        );
+
+        assert!(!runtime.connection_registry.contains(token));
+        assert!(!runtime.ctx.blocking_registry().is_client_blocked(&session));
+        assert_eq!(runtime.ctx.blocking_registry().count(), 0);
     }
 }

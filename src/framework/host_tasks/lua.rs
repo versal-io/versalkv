@@ -7,10 +7,12 @@ use crate::engine::extension::lua::{
     parse_shebang, LuaEngine,
 };
 use crate::engine::extension::script::{
-    CompiledFunction, ScriptEngine, ScriptRunCtx, SCRIPT_ALLOW_CROSS_SLOT, SCRIPT_ALLOW_OOM,
-    SCRIPT_ALLOW_STALE, SCRIPT_NO_CLUSTER, SCRIPT_NO_WRITES, SCRIPT_READ_ONLY,
+    CompiledFunction, ScriptEngine, ScriptError, ScriptRunCtx, SCRIPT_ALLOW_CROSS_SLOT,
+    SCRIPT_ALLOW_OOM, SCRIPT_ALLOW_STALE, SCRIPT_NO_CLUSTER, SCRIPT_NO_WRITES, SCRIPT_READ_ONLY,
 };
-use crate::engine::host::HostDispatcher;
+use crate::engine::host::{
+    dispatch_command, HostCommandOrigin, HostDispatcher, HostError, ScriptCallMode,
+};
 use crate::foundation::io::protocol::Value;
 use crate::framework::commands::scripting::script_cache::ScriptCache;
 use crate::framework::context::ServerContext;
@@ -22,6 +24,8 @@ pub(crate) struct LuaTask {
     run: ScriptRunCtx,
     original_db: u32,
     propagation_frame: Option<Vec<u8>>,
+    debug_mode: Option<crate::engine::extension::script::ScriptDebugMode>,
+    debug_globals_initialized: bool,
 }
 
 enum LuaProgram {
@@ -39,6 +43,131 @@ enum LuaProgram {
 }
 
 impl LuaTask {
+    pub(crate) fn is_forked_debug(&self) -> bool {
+        self.debug_mode == Some(crate::engine::extension::script::ScriptDebugMode::Forked)
+    }
+
+    pub(crate) fn is_synchronous_debug(&self) -> bool {
+        self.debug_mode == Some(crate::engine::extension::script::ScriptDebugMode::Synchronous)
+    }
+
+    pub(crate) fn debug_source(&self) -> &str {
+        match &self.program {
+            LuaProgram::Eval { code, .. } => code,
+            LuaProgram::Function { .. } => "",
+        }
+    }
+
+    pub(crate) fn initialize_debugger(&mut self) -> Result<(), ScriptError> {
+        let LuaProgram::Eval { keys, args, .. } = &self.program else {
+            return Err(ScriptError::Runtime(
+                "debugger initialization is only available for EVAL scripts".to_string(),
+            ));
+        };
+        crate::engine::extension::lua::bind_eval_globals(
+            self.run.lua_enable_insecure_api,
+            keys,
+            args,
+        )?;
+        self.debug_globals_initialized = true;
+        Ok(())
+    }
+
+    pub(crate) fn debug_eval(
+        &mut self,
+        fragment: &[u8],
+        dispatcher: &mut HostDispatcher<'_>,
+        output_limit: usize,
+    ) -> crate::engine::extension::lua::LuaFormatOutput {
+        let LuaProgram::Eval { .. } = &self.program else {
+            return crate::engine::extension::lua::LuaFormatOutput {
+                bytes: Bytes::from_static(
+                    b"<error> debugger eval is only available for EVAL scripts",
+                ),
+                truncated: false,
+            };
+        };
+        crate::engine::extension::lua::eval_fragment(
+            fragment,
+            &mut self.run,
+            dispatcher,
+            output_limit,
+        )
+    }
+
+    pub(crate) fn debug_command(
+        &mut self,
+        args: &CommandArgs,
+        dispatcher: &mut HostDispatcher<'_>,
+    ) -> Result<Value, HostError> {
+        dispatch_command(
+            dispatcher,
+            args,
+            HostCommandOrigin::Script {
+                run: &mut self.run,
+                mode: ScriptCallMode::Call,
+            },
+        )
+    }
+
+    pub(crate) fn debug_variable(
+        &self,
+        name: &[u8],
+        output_limit: usize,
+    ) -> Option<crate::engine::extension::lua::LuaFormatOutput> {
+        let global_name = if name.eq_ignore_ascii_case(b"KEYS") {
+            "KEYS"
+        } else if name.eq_ignore_ascii_case(b"ARGV") {
+            "ARGV"
+        } else {
+            return None;
+        };
+        let LuaProgram::Eval { .. } = &self.program else {
+            return None;
+        };
+        let prefix = b"<value> ";
+        Some(
+            match crate::engine::extension::lua::format_eval_global(
+                global_name,
+                self.run.lua_enable_insecure_api,
+                output_limit.saturating_sub(prefix.len()),
+            ) {
+                Ok(value) => {
+                    let mut log =
+                        Vec::with_capacity(output_limit.min(prefix.len() + value.bytes.len()));
+                    let prefix_len = output_limit.min(prefix.len());
+                    log.extend_from_slice(&prefix[..prefix_len]);
+                    let value_len = value
+                        .bytes
+                        .len()
+                        .min(output_limit.saturating_sub(log.len()));
+                    log.extend_from_slice(&value.bytes[..value_len]);
+                    crate::engine::extension::lua::LuaFormatOutput {
+                        bytes: Bytes::from(log),
+                        truncated: value.truncated
+                            || prefix_len < prefix.len()
+                            || value_len < value.bytes.len(),
+                    }
+                }
+                Err(error) => {
+                    let log = format!("<error> {error}").into_bytes();
+                    crate::engine::extension::lua::LuaFormatOutput {
+                        bytes: Bytes::copy_from_slice(&log[..log.len().min(output_limit)]),
+                        truncated: log.len() > output_limit,
+                    }
+                }
+            },
+        )
+    }
+
+    pub(crate) fn restart_timer(&mut self) {
+        self.run.start_timer();
+    }
+
+    pub(crate) fn rebase_debugger_db(&mut self, original_db: u32) {
+        self.original_db = original_db;
+    }
+
     pub(crate) fn control(&self) -> crate::engine::extension::script::ScriptControlHandle {
         self.run.control.clone()
     }
@@ -46,7 +175,11 @@ impl LuaTask {
     pub(crate) fn run(&mut self, dispatcher: &mut HostDispatcher<'_>) -> Value {
         match &self.program {
             LuaProgram::Eval { code, keys, args } => {
-                LuaEngine.eval_cached_with_host(code, &mut self.run, keys, args, dispatcher)
+                if self.debug_globals_initialized {
+                    LuaEngine.eval_cached_with_bound_globals(code, &mut self.run, dispatcher)
+                } else {
+                    LuaEngine.eval_cached_with_host(code, &mut self.run, keys, args, dispatcher)
+                }
             }
             LuaProgram::Function {
                 engine,
@@ -144,6 +277,16 @@ fn prepare_eval(
             "ERR Number of keys can't be greater than number of args",
         ));
     }
+    let session = conn.session_id();
+    let debug_mode = ctx.script().debug_modes.get(&session).copied();
+    if debug_mode.is_some() {
+        ctx.script_mut().debug_session = Some(session);
+        if sha {
+            return Err(Value::error(
+                "ERR Please use EVAL instead of EVALSHA for debugging",
+            ));
+        }
+    }
     let script = if sha {
         let digest = std::str::from_utf8(&args.args[0])
             .map_err(|_| Value::error("ERR SHA1 is not a valid UTF-8 string"))?;
@@ -209,10 +352,6 @@ fn prepare_eval(
     ctx.register_eval_script(digest.clone(), script.clone());
     run.func_name = digest;
     run.start_timer();
-    if crate::framework::commands::scripting::script_cmd::script_debug_enabled() {
-        ctx.script_mut().debug_session = Some(conn.session_id());
-    }
-
     let propagation_frame = (!readonly).then(|| {
         let mut parts: Vec<&[u8]> = Vec::with_capacity(3 + keys.len() + argv.len());
         parts.push(b"EVAL");
@@ -232,6 +371,8 @@ fn prepare_eval(
         run,
         original_db: conn.selected_db(),
         propagation_frame,
+        debug_mode,
+        debug_globals_initialized: false,
     }))
 }
 
@@ -335,6 +476,7 @@ fn prepare_fcall(
     });
 
     Ok(PreparedHostTask::Lua(LuaTask {
+        debug_mode: None,
         program: LuaProgram::Function {
             engine,
             compiled,
@@ -344,6 +486,7 @@ fn prepare_fcall(
         run,
         original_db: conn.selected_db(),
         propagation_frame,
+        debug_globals_initialized: false,
     }))
 }
 

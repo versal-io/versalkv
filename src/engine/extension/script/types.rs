@@ -117,6 +117,12 @@ pub enum KillSource {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScriptDebugMode {
+    Forked,
+    Synchronous,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScriptKind {
     Eval,
     Function,
@@ -255,7 +261,24 @@ pub trait ScriptEngine: Send + Sync {
         Ok(())
     }
 
+    fn begin_function_restore_transaction(&self) -> Result<(), ScriptError> {
+        Ok(())
+    }
+
+    fn commit_function_restore_transaction(&self) -> Result<(), ScriptError> {
+        Ok(())
+    }
+
+    fn rollback_function_restore_transaction(&self) -> Result<(), ScriptError> {
+        Ok(())
+    }
+
     fn clear_functions(&self) {}
+
+    /// Release engine-owned callbacks and metadata for a deleted library.
+    fn remove_functions(&self, _functions: &[CompiledFunction]) -> Result<(), ScriptError> {
+        Ok(())
+    }
 
     fn call(
         &self,

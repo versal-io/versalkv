@@ -1,8 +1,7 @@
 use crate::engine::command::{CommandArgs, CMD_ALL_DBS, CMD_NO_AUTH};
 use crate::engine::extension::acl::{
     add_acl_log_entry, AclCommand, AclDenial, AclUser, ACL_DENIED_CHANNEL, ACL_DENIED_CMD,
-    ACL_DENIED_DB, ACL_DENIED_KEY, ACL_LOG_CTX_MULTI, ACL_LOG_CTX_TOPLEVEL, ACL_READ_PERMISSION,
-    ACL_WRITE_PERMISSION,
+    ACL_DENIED_DB, ACL_DENIED_KEY, ACL_LOG_CTX_MULTI, ACL_LOG_CTX_TOPLEVEL,
 };
 use crate::foundation::io::protocol::Value;
 
@@ -286,13 +285,5 @@ fn rejected(call_flags: CmdCallFlags, message: String) -> DispatchOutcome {
 
 /// Translate keyspec flag tokens to required ACL permission bits.
 pub(super) fn key_flags_to_acl_bits(flags: &[&'static str]) -> u8 {
-    let mut bits = 0u8;
-    for f in flags {
-        match *f {
-            "access" => bits |= ACL_READ_PERMISSION,
-            "insert" | "update" | "delete" => bits |= ACL_WRITE_PERMISSION,
-            _ => {}
-        }
-    }
-    bits
+    crate::framework::spec::key_flags_to_acl_bits(flags)
 }

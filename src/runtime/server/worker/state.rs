@@ -68,7 +68,6 @@ pub(in crate::runtime::server) enum SocketIoOwner {
         read: IoOperationId,
         write: IoOperationId,
     },
-    Child(crate::runtime::server::worker::reactor::sources::ChildHandle),
 }
 
 pub(crate) struct ServerWorkerState {
@@ -87,6 +86,9 @@ pub(crate) struct ServerWorkerState {
     /// deregister. Nothing else in the runtime needs to inspect this map.
     pub(in crate::runtime::server) pending_transport_removals:
         HashMap<Token, PendingTransportRemoval>,
+    /// Tokens currently executing business-state teardown. This transient guard
+    /// prevents nested failure callbacks from retiring one connection twice.
+    pub(in crate::runtime::server) retiring_connections: HashSet<Token>,
     pub(in crate::runtime::server) socket_owners: HashMap<Token, SocketIoOwner>,
     pub(in crate::runtime::server) full_sync: FullSyncCoordinator,
     pub(in crate::runtime::server) client_hup_drains: HashSet<Token>,
@@ -227,6 +229,7 @@ impl ServerWorkerState {
             tls_reload: super::tls::TlsReloadState::default(),
             connection_registry: ConnectionRegistry::default(),
             pending_transport_removals: HashMap::new(),
+            retiring_connections: HashSet::new(),
             socket_owners: HashMap::new(),
             full_sync: FullSyncCoordinator::default(),
             client_hup_drains: HashSet::new(),
@@ -319,36 +322,6 @@ impl ServerWorkerState {
         )
     }
 
-    pub(in crate::runtime::server) fn acquire_child_socket_leases(
-        &mut self,
-        child: crate::runtime::server::worker::reactor::sources::ChildHandle,
-        tokens: &[Token],
-    ) -> std::io::Result<()> {
-        if let Some(token) = tokens
-            .iter()
-            .copied()
-            .find(|token| !self.socket_owned_by_main_thread(*token))
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::WouldBlock,
-                format!("socket {} is already leased", token.0),
-            ));
-        }
-        for token in tokens {
-            self.socket_owners
-                .insert(*token, SocketIoOwner::Child(child));
-        }
-        Ok(())
-    }
-
-    pub(in crate::runtime::server) fn release_child_socket_leases(
-        &mut self,
-        child: crate::runtime::server::worker::reactor::sources::ChildHandle,
-    ) {
-        self.socket_owners
-            .retain(|_, owner| *owner != SocketIoOwner::Child(child));
-    }
-
     pub(in crate::runtime::server) fn acquire_io_worker_read_socket_lease(
         &mut self,
         id: IoOperationId,
@@ -359,7 +332,6 @@ impl ServerWorkerState {
                 SocketIoOwner::IoWorkerReadWrite { read: id, write }
             }
             SocketIoOwner::IoWorkerRead(_) | SocketIoOwner::IoWorkerReadWrite { .. } => return,
-            SocketIoOwner::Child(_) => return,
         };
         self.socket_owners.insert(id.token, owner);
     }
@@ -374,7 +346,6 @@ impl ServerWorkerState {
                 SocketIoOwner::IoWorkerReadWrite { read, write: id }
             }
             SocketIoOwner::IoWorkerWrite(_) | SocketIoOwner::IoWorkerReadWrite { .. } => return,
-            SocketIoOwner::Child(_) => return,
         };
         self.socket_owners.insert(id.token, owner);
     }
@@ -399,15 +370,20 @@ impl ServerWorkerState {
         &mut self,
         id: IoOperationId,
     ) {
-        match self.socket_owner(id.token) {
+        let was_released = match self.socket_owner(id.token) {
             SocketIoOwner::IoWorkerWrite(write) if write == id => {
                 self.socket_owners.remove(&id.token);
+                true
             }
             SocketIoOwner::IoWorkerReadWrite { read, write } if write == id => {
                 self.socket_owners
                     .insert(id.token, SocketIoOwner::IoWorkerRead(read));
+                true
             }
-            _ => {}
+            _ => false,
+        };
+        if was_released {
+            self.queue_forked_debugger_for_reprocessing(id.token);
         }
     }
 
@@ -540,6 +516,10 @@ impl ServerWorkerState {
         token: Token,
         frame: Vec<u8>,
     ) -> bool {
+        if let Some(replies) = self.full_sync.paused_dual_main_replies.get_mut(&token) {
+            replies.push(frame);
+            return false;
+        }
         let Some(connection_token) = self
             .connection_registry
             .contains(crate::framework::capabilities::io::Token(token.0))
@@ -581,13 +561,7 @@ impl ServerWorkerState {
         if self.enforce_client_output_buffer_limit_for(token.0) {
             return false;
         }
-        let interest = if self.replication_runtime.replica_main_read_paused()
-            && self.ctx.persistence().forkless_capture_in_progress()
-            && self
-                .replication_runtime
-                .replica_link()
-                .is_some_and(|link| link.connection_id().0 == token.0)
-        {
+        let interest = if self.replica_main_read_is_paused(token) {
             crate::foundation::io::transport::Interest::Writable
         } else {
             crate::foundation::io::transport::Interest::ReadWritable
@@ -705,10 +679,6 @@ impl ServerWorkerState {
         self.data_lazyfree
             .configure_cpu_affinity(affinity.clone())?;
         self.replication_lazyfree.configure_cpu_affinity(affinity)
-    }
-
-    pub(crate) fn set_cluster_config_path(&mut self, path: std::path::PathBuf) {
-        self.cluster_config.path = Some(path);
     }
 
     pub(crate) fn bind_cluster_bus_listener(

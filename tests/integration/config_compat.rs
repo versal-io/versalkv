@@ -38,14 +38,6 @@ fn assert_config_value(client: &mut crate::common::Client, name: &[u8], value: &
     );
 }
 
-fn free_tcp_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 #[cfg(feature = "tls")]
 fn write_tls_credentials(stem: &str) -> (PathBuf, PathBuf) {
     let rsa = Rsa::generate(2048).unwrap();
@@ -778,12 +770,30 @@ fn stream_node_max_entries_controls_approximate_xadd_trimming() {
 fn port_config_set_rebinds_the_live_tcp_listener() {
     let server = TestServer::start_default();
     let mut client = server.connect();
-    let port = free_tcp_port();
+    let reservation = socket2::Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )
+    .expect("create port reservation socket");
+    reservation
+        .set_reuse_address(true)
+        .expect("allow listener address reuse");
+    reservation
+        .bind(&std::net::SocketAddr::from(([0, 0, 0, 0], 0)).into())
+        .expect("reserve replacement port");
+    let port = reservation
+        .local_addr()
+        .expect("read reserved port")
+        .as_socket()
+        .expect("reserved address must be an IP socket")
+        .port();
     let port_arg = port.to_string();
     assert_eq!(
         client.command(&[b"CONFIG", b"SET", b"port", port_arg.as_bytes()]),
         b"+OK\r\n"
     );
+    drop(reservation);
     assert_config_value(&mut client, b"port", &port_arg);
     let mut reconnected = crate::common::Client::connect_to(port);
     assert_eq!(reconnected.command(&[b"PING"]), b"+PONG\r\n");

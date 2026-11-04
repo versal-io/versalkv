@@ -6,8 +6,8 @@ use crate::foundation::io::sys::process::{
 };
 use crate::framework::capabilities::process::{fork_process, ForkBranch};
 use std::fs::File;
-use std::io::{BufWriter, Read, Write};
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::io::{BufWriter, Write};
+use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use crate::foundation::io::persistence::rdb::compression::{RdbCompression, RdbSnapshotOptions};
 
@@ -120,94 +120,17 @@ fn exit_child_if_parent_is_gone(expected_parent: libc::pid_t) {
 /// the parent immediately after forking the replication RDB child when
 /// `debug pause-after-fork` is set (replication.c). This SIGSTOPs the parent so
 /// tests can observe the primary paused (`T` state) right after fork, then
-/// resume it. Only the replication full-sync fork paths (disk / diskless /
-/// direct-dual) call this — never plain `BGSAVE` — matching C, where the pause
-/// lives in `startBgsaveForReplication` rather than the generic BGSAVE path.
-/// Returns `true` when the parent was paused (and has since been continued), so
-/// callers can log the crossing without duplicating the flag check.
+/// resume it. Only the replication full-sync fork paths call this — never plain
+/// `BGSAVE` — matching C, where the pause lives in
+/// `startBgsaveForReplication` rather than the generic BGSAVE path. Returns
+/// `true` when the parent was paused (and has since been continued), so callers
+/// can log the crossing without duplicating the flag check.
 pub fn pause_parent_after_replication_fork(ctx: &ServerContext) -> bool {
     if !ctx.config().server.debug_pause_after_fork {
         return false;
     }
     let _ = crate::framework::capabilities::process::stop_current_process();
     true
-}
-
-/// Progress markers emitted by a direct dual-channel RDB child. They cross the
-/// fork boundary through a non-blocking pipe so the parent can distinguish a
-/// stalled socket write from stalled serialization without child-side logging.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DirectDualRdbChildPhase {
-    Forked,
-    Started,
-    HeaderSent,
-    SerializeDone,
-    MarkerSent,
-}
-
-impl DirectDualRdbChildPhase {
-    pub(crate) const fn as_byte(self) -> u8 {
-        match self {
-            Self::Forked => b'F',
-            Self::Started => b'B',
-            Self::HeaderSent => b'H',
-            Self::SerializeDone => b'S',
-            Self::MarkerSent => b'M',
-        }
-    }
-
-    pub(crate) const fn from_byte(byte: u8) -> Option<Self> {
-        match byte {
-            b'F' => Some(Self::Forked),
-            b'B' => Some(Self::Started),
-            b'H' => Some(Self::HeaderSent),
-            b'S' => Some(Self::SerializeDone),
-            b'M' => Some(Self::MarkerSent),
-            _ => None,
-        }
-    }
-}
-
-/// Best-effort, non-blocking collection of child progress. The direct child
-/// writes at most three bytes, so draining to `WouldBlock` cannot monopolize
-/// the primary event loop.
-pub(crate) fn drain_direct_dual_rdb_phase_pipe(
-    read_end: &mut File,
-) -> Vec<DirectDualRdbChildPhase> {
-    let mut phases = Vec::new();
-    let mut buf = [0u8; 16];
-    loop {
-        match read_end.read(&mut buf) {
-            Ok(0) => return phases,
-            Ok(n) => phases.extend(
-                buf[..n]
-                    .iter()
-                    .filter_map(|&byte| DirectDualRdbChildPhase::from_byte(byte)),
-            ),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return phases,
-            Err(_) => return phases,
-        }
-    }
-}
-
-/// Fork-safe, best-effort phase write. The pipe is non-blocking and carries at
-/// most three bytes, so an `EAGAIN` can only lose diagnostics, never progress.
-fn child_write_direct_dual_rdb_phase(fd: RawFd, phase: DirectDualRdbChildPhase) {
-    let stderr_line: &[u8] = match phase {
-        DirectDualRdbChildPhase::Forked => b"direct dual RDB child phase=forked\n",
-        DirectDualRdbChildPhase::Started => b"direct dual RDB child phase=started\n",
-        DirectDualRdbChildPhase::HeaderSent => b"direct dual RDB child phase=header-sent\n",
-        DirectDualRdbChildPhase::SerializeDone => b"direct dual RDB child phase=serialize-done\n",
-        DirectDualRdbChildPhase::MarkerSent => b"direct dual RDB child phase=marker-sent\n",
-    };
-    crate::framework::capabilities::process::write_all_fd(fd, &[phase.as_byte()]);
-    // The primary is deliberately SIGSTOPed by the Tcl fixture immediately
-    // after fork, so it cannot drain the phase pipe until after the test's
-    // `Done loading RDB` checkpoint. This direct stderr write makes the same
-    // phase observable while the parent remains stopped.
-    // SAFETY: STDERR_FILENO is inherited across fork and this uses write(2),
-    // which is async-signal-safe with a valid static byte slice.
-    crate::framework::capabilities::process::write_all_fd(libc::STDERR_FILENO, stderr_line);
 }
 
 /// Write `buf` in full to a pipe `fd` from within a post-fork child, retrying on
@@ -224,63 +147,6 @@ fn child_write_all(fd: i32, buf: &[u8]) -> bool {
 
 fn child_wait_for_parent_release(read_end: File) {
     crate::framework::capabilities::process::wait_for_pipe_eof(read_end);
-}
-
-/// Write a direct RDB socket without changing the shared `O_NONBLOCK` flag.
-/// The parent keeps this file description registered with the polling backend, so changing it
-/// in the child can make a later parent-side read block.
-#[cfg(test)]
-pub(crate) fn child_write_socket_all(fd: RawFd, buf: &[u8], timeout_ms: u64) -> bool {
-    crate::framework::capabilities::process::send_all(
-        fd,
-        buf,
-        std::time::Duration::from_millis(timeout_ms),
-    )
-}
-
-/// Broadcast a direct diskless RDB chunk to all surviving sockets. A failed
-/// target is retired in-place so one disconnected replica does not abort the
-/// child transfer for the remaining cohort.
-/// Fork-safety: `fds` is allocated before `fork()`, and this function only
-/// mutates that inherited allocation while calling the async-signal-safe
-/// socket write/poll primitives used by `child_write_socket_all`.
-#[cfg(test)]
-pub(crate) fn child_write_active_sockets(fds: &mut [RawFd], buf: &[u8], timeout_ms: u64) -> bool {
-    child_write_active_sockets_counted(fds, buf, timeout_ms, &mut 0)
-}
-
-fn child_write_active_sockets_counted(
-    fds: &mut [RawFd],
-    buf: &[u8],
-    timeout_ms: u64,
-    bytes: &mut u64,
-) -> bool {
-    let mut still_active = false;
-    for fd in fds {
-        if *fd < 0 {
-            continue;
-        }
-        let (completed, written) = crate::framework::capabilities::process::send_all_counted(
-            *fd, buf, std::time::Duration::from_millis(timeout_ms),
-        );
-        *bytes = bytes.saturating_add(written as u64);
-        if completed {
-            still_active = true;
-        } else {
-            *fd = -1;
-        }
-    }
-    still_active
-}
-
-/// Match C `connSendTimeout()` for direct diskless RDB sockets. The timeout is
-/// installed before fork so the child inherits it when it switches the sockets
-/// to blocking mode for the RDB write.
-pub(crate) fn set_direct_diskless_send_timeout(fd: RawFd, timeout_ms: u64) -> std::io::Result<()> {
-    crate::framework::capabilities::process::set_send_timeout(
-        fd,
-        std::time::Duration::from_millis(timeout_ms),
-    )
 }
 
 /// Shared fork primitive for full-sync pipe children. Forks a child that
@@ -446,101 +312,6 @@ pub fn fork_diskless_rdb_child_with_options(
         child_release_write_end: child_release_write_end
             .expect("diskless fork must create a child release pipe"),
     })
-}
-
-pub fn fork_direct_diskless_rdb_child(
-    ctx: &mut ServerContext,
-    function_codes: &[Vec<u8>],
-    fds: &[RawFd],
-    marker: &[u8],
-    include_data: bool,
-    snapshot: RdbSnapshotOptions,
-) -> Option<(i32, File, File)> {
-    if fds.is_empty() {
-        return None;
-    }
-    let metric_pipe = pipe(PipeFlags::CLOEXEC).ok()?;
-    let phase_pipe = pipe(PipeFlags::CLOEXEC_NONBLOCK).ok()?;
-    let listener_fds = ctx.listener_fds().to_vec();
-    let replication = ctx.rdb_full_sync_replication_info();
-    let slot_imports = ctx.slot_import_dbs();
-    // Allocate before fork. The child mutates this inherited buffer to retire
-    // disconnected socket targets without invoking the allocator post-fork.
-    let mut child_fds = fds.to_vec();
-    let key_delay_us = ctx.config().persistence.rdb_key_save_delay;
-    let bgsave_affinity = match prepare_bgsave_cpu_affinity(&ctx.config().server.bgsave_cpulist) {
-        Ok(affinity) => affinity,
-        Err(error) => {
-            crate::server_log!(warning, "invalid bgsave-cpulist: {}", error);
-            return None;
-        }
-    };
-    let parent_pid = std::process::id() as libc::pid_t;
-    let send_timeout_ms = ctx.config().replication.repl_timeout.saturating_mul(1_000);
-    for &fd in fds {
-        if let Err(error) = set_direct_diskless_send_timeout(fd, send_timeout_ms) {
-            crate::server_log!(
-                warning,
-                "direct diskless RDB send timeout setup failed for fd {}: {}",
-                fd,
-                error
-            );
-            return None;
-        }
-    }
-    let started = std::time::Instant::now();
-    let child = match fork_process().ok()? {
-        ForkBranch::Parent(child) => child,
-        ForkBranch::Child => {
-            let (metric_read_end, metric_write_end) = metric_pipe.into_parts();
-            let (phase_read_end, phase_write_end) = phase_pipe.into_parts();
-            drop(metric_read_end);
-            drop(phase_read_end);
-            let metric_write_fd = metric_write_end.as_raw_fd();
-            let phase_write_fd = phase_write_end.as_raw_fd();
-
-        child_write_direct_dual_rdb_phase(phase_write_fd, DirectDualRdbChildPhase::Forked);
-        child_after_fork(ctx.config(), &listener_fds);
-        if let Some(affinity) = bgsave_affinity.as_ref() {
-            let _ = crate::foundation::io::sys::process::apply_prepared_cpu_affinity(affinity);
-        }
-        exit_child_if_parent_is_gone(parent_pid);
-        child_write_direct_dual_rdb_phase(phase_write_fd, DirectDualRdbChildPhase::Started);
-        let mut bytes = 0u64;
-        let mut ok = child_write_active_sockets_counted(&mut child_fds, b"$EOF:", send_timeout_ms, &mut bytes)
-            && child_write_active_sockets_counted(&mut child_fds, marker, send_timeout_ms, &mut bytes)
-            && child_write_active_sockets_counted(&mut child_fds, b"\r\n", send_timeout_ms, &mut bytes);
-        if ok {
-            child_write_direct_dual_rdb_phase(phase_write_fd, DirectDualRdbChildPhase::HeaderSent);
-        }
-        if ok {
-            ok = crate::foundation::io::persistence::rdb::serialize::serialize_replication_snapshot_streaming(ctx.dbs(), key_delay_us, function_codes, include_data, Some(&replication), &slot_imports, snapshot, |chunk| {
-                child_write_active_sockets_counted(&mut child_fds, chunk, send_timeout_ms, &mut bytes)
-            });
-        }
-        if ok {
-            child_write_direct_dual_rdb_phase(phase_write_fd, DirectDualRdbChildPhase::SerializeDone);
-        }
-        if ok {
-            ok = child_write_active_sockets_counted(&mut child_fds, marker, send_timeout_ms, &mut bytes);
-        }
-        if ok {
-            child_write_direct_dual_rdb_phase(phase_write_fd, DirectDualRdbChildPhase::MarkerSent);
-        }
-        let _ = child_write_all(metric_write_fd, &bytes.to_ne_bytes());
-            drop(metric_write_end);
-            drop(phase_write_end);
-            exit_immediately(if ok { 0 } else { 1 });
-        }
-    };
-    let pid = child.into_pid();
-    let (metric_read_end, metric_write_end) = metric_pipe.into_parts();
-    let (phase_read_end, phase_write_end) = phase_pipe.into_parts();
-    drop(metric_write_end);
-    drop(phase_write_end);
-    ctx.stats_mut()
-        .record_fork(started.elapsed().as_micros() as u64);
-    Some((pid, metric_read_end, phase_read_end))
 }
 
 /// Fork a disk-based full-sync child that writes one unframed RDB snapshot to a

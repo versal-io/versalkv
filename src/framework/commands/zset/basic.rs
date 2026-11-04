@@ -1,6 +1,7 @@
 use crate::engine::command::{CommandArgs, CommandError};
 use crate::foundation::io::protocol::Value;
 use crate::foundation::io::store::structure::hashtable::HashTable;
+use crate::foundation::io::store::structure::zset::LexBound;
 use bytes::Bytes;
 
 command_macros::portable_command_support!();
@@ -60,24 +61,27 @@ pub fn parse_score_range(b: &[u8]) -> Option<(f64, bool)> {
         inclusive = false;
         s = rest;
     }
-    let score = parse_score(s)?;
+    let score = crate::foundation::memory::numeric::parse_double(s).ok()?;
     Some((score, inclusive))
 }
 
-pub fn parse_lex_bound(b: &[u8]) -> Option<(Bytes, bool)> {
-    if b == b"-" || b == b"+" {
-        return Some((Bytes::copy_from_slice(b), true));
+pub fn parse_lex_bound(b: &[u8]) -> Option<LexBound> {
+    if b == b"-" {
+        return Some(LexBound::NegativeInfinity);
     }
-    let inclusive: bool;
-    let s = if let Some(rest) = b.strip_prefix(b"(") {
-        inclusive = false;
-        rest
-    } else {
-        let rest = b.strip_prefix(b"[")?;
-        inclusive = true;
-        rest
-    };
-    Some((Bytes::copy_from_slice(s), inclusive))
+    if b == b"+" {
+        return Some(LexBound::PositiveInfinity);
+    }
+    if let Some(value) = b.strip_prefix(b"(") {
+        return Some(LexBound::Value {
+            value: Bytes::copy_from_slice(value),
+            inclusive: false,
+        });
+    }
+    b.strip_prefix(b"[").map(|value| LexBound::Value {
+            value: Bytes::copy_from_slice(value),
+            inclusive: true,
+        })
 }
 
 pub fn sorted_entries(m: &HashTable<f64>) -> Vec<(Bytes, f64)> {

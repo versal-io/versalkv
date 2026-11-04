@@ -10,7 +10,8 @@ impl ServerWorkerState {
         let link = self.replication_runtime.replica_link()?;
         let token = Token(link.connection_id().0);
         (link.has_buffered_input()
-            && (link.has_pending_decompression()
+            && !self.replication_runtime.replica_main_read_paused()
+            && (link.has_pending_main_decompression()
                 || (!self.ctx.is_script_busy()
                     && link.has_pending_rdb_receive()
                     && !link.is_dual_rdb_mode_active()))

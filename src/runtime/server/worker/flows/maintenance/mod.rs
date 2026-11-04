@@ -148,9 +148,13 @@ impl ServerWorkerState {
         self.retry_pending_transport_removals();
         let was_forkless_capturing = self.ctx.persistence().forkless_capture_in_progress();
         let released_forkless_key = self.ctx.drive_forkless_feed();
-        if released_forkless_key
-            || (was_forkless_capturing && !self.ctx.persistence().forkless_capture_in_progress())
-        {
+        let capture_finished =
+            was_forkless_capturing && !self.ctx.persistence().forkless_capture_in_progress();
+        if released_forkless_key || capture_finished {
+            let configured_delay = self.ctx.config().persistence.rdb_key_save_delay;
+            self.ctx
+                .persistence()
+                .set_forkless_key_delay(configured_delay);
             self.release_forkless_clients();
         }
         self.drive_slot_migration_actions();
@@ -184,7 +188,6 @@ impl ServerWorkerState {
         // The relay EOF path clears the relay before waitpid(WNOHANG) can
         // observe the child's exit; ordering this before drive_replication
         // prevents the stale child slot from forcing a synchronous RDB fallback.
-        self.reap_direct_dual_rdb_child();
         self.collect_idle_diskless_child_exit();
         self.send_replication_keepalives();
         self.send_replica_periodic_ack();
@@ -262,6 +265,7 @@ impl ServerWorkerState {
         let Some(limit) = self.effective_client_memory_limit() else {
             return;
         };
+        self.drain_protected_clients();
         let mut total = self.ctx.normal_client_memory();
         if total <= limit {
             return;
@@ -890,18 +894,37 @@ impl ServerWorkerState {
 
     pub(crate) fn run_eviction(&mut self) {
         let outcome = self.perform_evictions();
-        for (db_idx, key) in outcome.evicted {
-            let mut pending_publish = Vec::new();
-            self._propagate_background_unlink(db_idx, &key);
+        self.apply_background_evictions(outcome.evicted);
+    }
+
+    pub(crate) fn apply_background_evictions(&mut self, evicted: Vec<(u32, Bytes)>) {
+        if evicted.is_empty() {
+            return;
+        }
+        let mut pending_publish = Vec::new();
+        let mut pending_tracking = Vec::new();
+        self.collect_tracking_invalidations(&evicted, None, &mut pending_tracking);
+        for (db_idx, key) in &evicted {
+            for (_, connection) in self.connection_registry.iter_mut() {
+                if !connection.transaction.watched_keys().is_empty() {
+                    connection
+                        .transaction
+                        .touch_watched_key(*db_idx, key, false);
+                }
+            }
+            self._propagate_background_unlink(*db_idx, key);
             crate::runtime::server::worker::flows::maintenance::enqueue_evicted_key_notifications(
                 self.ctx.config(),
                 &mut pending_publish,
-                db_idx,
-                &key,
+                *db_idx,
+                key,
             );
-            if !pending_publish.is_empty() {
-                self.deliver_published(pending_publish, Vec::new());
-            }
+        }
+        if !pending_publish.is_empty() {
+            self.deliver_published(pending_publish, Vec::new());
+        }
+        for (target_id, frame) in pending_tracking {
+            self.queue_client_reply(Token(target_id), frame);
         }
     }
 
@@ -1162,6 +1185,17 @@ mod tests {
         }
     }
 
+    fn run_expire_cycles_until_empty(runtime: &mut ServerWorkerState, db_id: u32) {
+        for _ in 0..64 {
+            if runtime.ctx.db(db_id).unwrap().dbsize() == 0 {
+                return;
+            }
+            runtime.run_expire_cycle();
+            runtime.process_expired_deletions();
+        }
+        assert_eq!(runtime.ctx.db(db_id).unwrap().dbsize(), 0);
+    }
+
     #[test]
     fn active_expiration_only_deletes_captured_keys_during_forkless_save() {
         let mut fixture = ForklessExpiryFixture::new();
@@ -1229,6 +1263,7 @@ mod tests {
         assert!(!runtime.ctx.persistence().forkless_capture_in_progress());
         assert!(!runtime.ctx.persistence().forkless_save_in_progress());
         runtime.run_expire_cycle();
+        run_expire_cycles_until_empty(runtime, 1);
         assert_eq!(runtime.ctx.db(0).unwrap().dbsize(), 1);
         assert_eq!(runtime.ctx.db(1).unwrap().dbsize(), 0);
         assert!(!fixture.dir.join("dump.rdb").exists());
@@ -1330,7 +1365,7 @@ mod tests {
                 Some(fixture.expire_at)
             );
         }
-        runtime.run_expire_cycle();
+        run_expire_cycles_until_empty(runtime, 1);
         assert_eq!(runtime.ctx.db(0).unwrap().dbsize(), 1);
         assert_eq!(runtime.ctx.db(1).unwrap().dbsize(), 0);
     }
@@ -1751,6 +1786,37 @@ mod tests {
             .connection_registry
             .contains(crate::framework::capabilities::io::Token(large_token.0)));
         assert_eq!(runtime.ctx.normal_client_memory(), expected_remaining);
+        assert_eq!(runtime.ctx.stats().evicted_clients, 1);
+    }
+
+    #[test]
+    fn client_eviction_applies_pending_debug_protection_before_selecting_candidates() {
+        use crate::framework::capabilities::connection::Connection;
+        use crate::framework::capabilities::io::Token;
+
+        let mut runtime = ServerWorkerState::new(1).unwrap();
+        runtime.ctx.config_mut().server.maxmemory_clients = "128kb".to_string();
+        let protected_token = Token(45);
+        let mut protected = Connection::new(protected_token, ([127, 0, 0, 1], 6380).into(), false);
+        protected.queue_reply(vec![b'x'; 200 * 1024]);
+        let protected_id = protected.client_id();
+        let protected_slab = runtime.connection_registry.insert(protected);
+        runtime.refresh_all_client_memory_usage();
+        runtime.ctx.protect_client(protected_id);
+
+        runtime.evict_clients();
+
+        assert!(runtime
+            .connection_registry
+            .contains(crate::framework::capabilities::io::Token(protected_slab)));
+        assert!(
+            runtime.connection_registry[crate::framework::capabilities::io::Token(protected_slab)]
+                .protected
+        );
+        assert!(
+            runtime.connection_registry[crate::framework::capabilities::io::Token(protected_slab)]
+                .is_async_close_pending
+        );
         assert_eq!(runtime.ctx.stats().evicted_clients, 1);
     }
 
@@ -2251,6 +2317,27 @@ mod tests {
         _assert_unwrapped_unlink(&sequenced.aof_frames, &[select, unlink], "AOF");
         assert_eq!(backend.ctx.repl_seldb(), 10);
         assert_eq!(backend.ctx.persistence().aof_selected_db(), 10);
+    }
+
+    #[test]
+    fn active_expiry_reuses_the_physical_cursor_after_one_explicit_select() {
+        let mut backend = ServerWorkerState::new(16).unwrap();
+        backend.ctx.replication_mut().backlog.activate();
+        backend
+            .ctx
+            .db_mut(10)
+            .unwrap()
+            .active_expired_deletions
+            .extend([b"first".to_vec(), b"second".to_vec()]);
+        let select = encode_command(&[b"SELECT", b"10"]);
+        let first = encode_command(&[b"UNLINK", b"first"]);
+        let second = encode_command(&[b"UNLINK", b"second"]);
+
+        backend.process_expired_deletions();
+
+        let backlog = &backend.ctx.replication().backlog;
+        let bytes = backlog.read_from(backlog.first_byte_cursor()).unwrap();
+        assert_eq!(bytes, [select, first, second].concat());
     }
 
     #[test]

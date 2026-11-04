@@ -25,6 +25,7 @@ use crate::framework::distributed::replication::{
     ReplicaRdbChannelState, ReplicationConnection,
 };
 use crate::runtime::server::worker::reactor::blocked_events::{BlockedOperation, ResumeDecision};
+use crate::runtime::server::worker::reactor::RunnableKey;
 use std::io::Read;
 
 const RDB_CHANNEL_READ_CHUNKS_PER_DISPATCH: usize = 1;
@@ -130,6 +131,9 @@ impl ServerWorkerState {
     /// `key-load-delay` sleep still paces consumption, so the socket fills, TCP
     /// back-pressures the primary, and the diskless relay gate engages (G2r-2 B).
     pub(crate) fn recv_streaming_rdb_chunk(&mut self, token_value: usize, connection_token: usize) {
+        if self.replica_main_read_is_paused(Token(token_value)) {
+            return;
+        }
         let listening_port = self
             .ctx
             .config()
@@ -146,6 +150,9 @@ impl ServerWorkerState {
         let mut peer_closed = false;
         let mut process_buffered_input = link.has_buffered_input();
         loop {
+            if self.replica_main_read_is_paused(Token(token_value)) {
+                break;
+            }
             let read_data = if process_buffered_input {
                 process_buffered_input = false;
                 Vec::new()
@@ -582,7 +589,10 @@ impl ServerWorkerState {
                 let step = recv.step(self.ctx.dbs_mut(), key_load_delay_us);
                 let consumed_delta = recv.consumed_bytes().saturating_sub(before);
                 match step {
-                    Ok(RdbStep::NeedInput) => return ResumeDecision::Resume(link),
+                    Ok(RdbStep::NeedInput) => {
+                        self.schedule_replica_rdb_decode(&link);
+                        return ResumeDecision::Resume(link);
+                    }
                     Ok(RdbStep::Finished(_)) => break,
                     Ok(RdbStep::RecordApplied) => {
                         link = match self.service_rdb_progress_boundary(
@@ -613,7 +623,60 @@ impl ServerWorkerState {
             self.tear_down_master_link(main.0);
             return ResumeDecision::Aborted;
         }
+        self.schedule_replica_rdb_decode(&link);
         ResumeDecision::Resume(link)
+    }
+
+    fn schedule_replica_rdb_decode(&mut self, link: &ReplicaLink) {
+        if link.is_dual_rdb_mode_active()
+            && link.rdb_framing_is_complete()
+            && link.has_pending_rdb_receive()
+            && link.has_pending_decompression()
+        {
+            // Download EOF can leave several decode budgets of local input.
+            // C's file loader keeps parsing without further primary traffic.
+            self.schedule_runtime_runnable_next_turn(RunnableKey::ReplicaRdbDecode(
+                link.session_id(),
+            ));
+        }
+    }
+
+    pub(crate) fn drive_pending_replica_rdb_decode(&mut self, session_id: u64) {
+        let Some(link) = self.replication_runtime.replica_link() else {
+            return;
+        };
+        if link.session_id() != session_id
+            || !link.is_dual_rdb_mode_active()
+            || !link.rdb_framing_is_complete()
+            || !link.has_pending_rdb_receive()
+        {
+            return;
+        }
+        if self.ctx.is_script_busy() {
+            self.schedule_runtime_runnable_next_turn(RunnableKey::ReplicaRdbDecode(session_id));
+            return;
+        }
+        let main = link.connection_id();
+        let Some(rdb) = self
+            .replication_runtime
+            .replica_rdb_link()
+            .map(|channel| channel.connection_id())
+        else {
+            return;
+        };
+        if !self.connection_registry.contains(Token(main.0))
+            || !self.connection_registry.contains(Token(rdb.0))
+        {
+            return;
+        }
+        let Some(link) = self.replication_runtime.take_replica_link() else {
+            return;
+        };
+        let operation = BlockedOperation::DualRdb { main, rdb };
+        if let ResumeDecision::Resume(link) = self.drive_replica_rdb_decode(link, rdb.0, operation)
+        {
+            self.replication_runtime.set_replica_link(link);
+        }
     }
 
     /// Drive the paced decode against the target `DbSet`. On the first drive it
@@ -1183,6 +1246,9 @@ impl ServerWorkerState {
         token_value: usize,
         connection_token: usize,
     ) -> Result<(), ()> {
+        if self.replica_main_read_is_paused(Token(token_value)) {
+            return Ok(());
+        }
         let (read_data, close) = self.read_dual_main_input(connection_token)?;
         if close && read_data.is_empty() {
             self.tear_down_master_link(token_value);

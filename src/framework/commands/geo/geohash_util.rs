@@ -164,7 +164,19 @@ fn polygon_centroid(vertices: &[(f64, f64)]) -> (f64, f64) {
 }
 
 pub fn make_polygon_shape(vertices: Vec<(f64, f64)>) -> GeoShape {
-    let (clon, clat) = polygon_centroid(&vertices);
+    let (mut clon, mut clat) = polygon_centroid(&vertices);
+    if !(GEO_LAT_MIN..=GEO_LAT_MAX).contains(&clat) {
+        // A spherical centroid at a pole cannot be encoded as a geohash.
+        // The bounding-box center stays within the validated vertex range.
+        let (min_lon, max_lon, min_lat, max_lat) = vertices.iter().fold(
+            (GEO_LONG_MAX, GEO_LONG_MIN, GEO_LAT_MAX, GEO_LAT_MIN),
+            |(min_lon, max_lon, min_lat, max_lat), &(lon, lat)| {
+                (min_lon.min(lon), max_lon.max(lon), min_lat.min(lat), max_lat.max(lat))
+            },
+        );
+        clon = (min_lon + max_lon) / 2.0;
+        clat = (min_lat + max_lat) / 2.0;
+    }
     GeoShape::Polygon {
         vertices,
         centroid_lon: clon,

@@ -42,6 +42,9 @@ impl ServerWorkerState {
     }
 
     pub(crate) fn schedule_ordinary_write(&mut self, token_value: usize) -> bool {
+        if self.pause_dual_relay_client_if_needed(Token(token_value)) {
+            return false;
+        }
         if !self.is_scheduleable_ordinary_write(token_value)
             || self.enforce_client_output_buffer_limit_for(token_value)
         {

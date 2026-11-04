@@ -325,11 +325,11 @@ impl ServerWorkerState {
                     acl_categories: spec.acl_categories,
                     get_keys: spec.get_keys,
                 };
-                let keys = Self::cluster_redirect_keys(&meta, command);
-                if keys.is_empty()
-                    || keys
-                        .iter()
-                        .any(|key| self.ctx.persistence().forkless_key_blocked(db_id, key))
+                let key_targets = Self::forkless_key_targets(&meta, command, db_id);
+                if key_targets.is_empty()
+                    || key_targets.iter().any(|(target_db, key)| {
+                        self.ctx.persistence().forkless_key_blocked(*target_db, key)
+                    })
                 {
                     return true;
                 }
@@ -397,6 +397,7 @@ impl ServerWorkerState {
         let was_blocked = self.connection_registry[state.token].blocked.is_some();
         self.ctx.begin_cmd();
         self.connection_registry[state.token].begin_nested_command_effects();
+        self.record_nonblocking_cluster_setslot_propagation(state.token, args);
         let reply = self.exec_invoke_queued_item(state.token, &spec, args);
         self.refresh_connection_priorities();
         let Some(token) = state.target.resolve(self) else {

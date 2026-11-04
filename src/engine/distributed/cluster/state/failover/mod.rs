@@ -142,6 +142,9 @@ impl ClusterState {
             let was = node.has_flag(CLUSTER_NODE_FAIL);
             node.flags &= !CLUSTER_NODE_PFAIL;
             node.flags |= CLUSTER_NODE_FAIL;
+            if !was {
+                node.fail_time = crate::foundation::io::sys::time::mstime();
+            }
             // Retain slot claims for the promotion payload; routing already
             // excludes FAIL owners until a replica reclaims those slots.
             !was

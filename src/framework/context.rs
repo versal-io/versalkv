@@ -65,6 +65,7 @@ pub struct ServerContext {
         crate::engine::distributed::cluster::migration::MigrationJobId,
         Box<crate::framework::distributed::migration::ImportDataset>,
     >,
+    slot_import_infrastructure_memory: usize,
     client_pause: ClientPauseState,
     // Match C's tail-queued `server.postponed_clients`: unpause must replay
     // commands in postponement order so an earlier blocking pop is registered

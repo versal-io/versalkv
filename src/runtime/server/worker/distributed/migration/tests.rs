@@ -90,9 +90,15 @@ fn setup_streaming_export_runtime() -> (ServerWorkerState, std::net::TcpStream, 
 }
 
 fn setup_registered_import_runtime() -> (ServerWorkerState, std::net::TcpStream, MigrationJobId) {
+    setup_registered_import_runtime_with_dbs(1)
+}
+
+fn setup_registered_import_runtime_with_dbs(
+    num_dbs: u32,
+) -> (ServerWorkerState, std::net::TcpStream, MigrationJobId) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let source_addr = listener.local_addr().unwrap();
-    let mut runtime = ServerWorkerState::new(1).unwrap();
+    let mut runtime = ServerWorkerState::new(num_dbs).unwrap();
     let source = runtime
         .transport
         .connect_tcp(source_addr)
@@ -510,6 +516,29 @@ fn slot_export_limit_counts_disconnect_once_and_preserves_peer_connection_loss_s
             "Connection lost to source. Check CLUSTER GETSLOTMIGRATIONS on the source node for more information."
         )
     );
+}
+
+#[test]
+fn migration_teardown_does_not_reenter_connection_removal() {
+    let (mut runtime, _peer, _id) = setup_registered_import_runtime();
+    let token = runtime
+        .connection_registry
+        .iter()
+        .find_map(|(_, connection)| {
+            matches!(
+                connection.slot_migration_role,
+                Some(SlotMigrationConnectionRole::Import(_))
+            )
+            .then_some(connection.token())
+        })
+        .expect("registered import connection");
+    runtime.transport.fail_remove_for_test();
+
+    runtime.remove_connection(token.0);
+
+    assert!(!runtime.connection_registry.contains(token));
+    assert!(runtime.transport.is_registered(token));
+    assert!(runtime.pending_transport_removals.contains_key(&token));
 }
 
 #[test]
@@ -1394,7 +1423,7 @@ fn cleanup_releases_export_allocation_before_clearing_a_retained_connection_role
 }
 
 #[test]
-fn cleanup_keeps_export_role_until_connection_is_closed() {
+fn cleanup_removes_terminal_export_connection_immediately() {
     let mut runtime = ServerWorkerState::new(1).unwrap();
     let id = MigrationJobId::parse(b"cccccccccccccccccccccccccccccccccccccccc").unwrap();
     let token = Token(92);
@@ -1411,16 +1440,361 @@ fn cleanup_keeps_export_role_until_connection_is_closed() {
 
     runtime.drive_slot_migration_actions();
 
+    assert!(!runtime
+        .connection_registry
+        .contains(crate::framework::capabilities::io::Token(connection_token)));
+    assert_eq!(runtime.slot_migration_runtime.export_connection(&id), None);
+}
+
+#[test]
+fn terminal_cleanup_closes_export_socket_without_draining_pending_output() {
+    let (mut runtime, mut peer, id) = setup_export_runtime();
+    peer.set_read_timeout(Some(std::time::Duration::from_secs(1)))
+        .unwrap();
+    let connection_id = runtime
+        .slot_migration_runtime
+        .export_connection(&id)
+        .expect("connected export has a runtime connection");
+    runtime.connection_registry[Token(connection_id)]
+        .queue_replication_reply(vec![b'x'; 128 * 1024]);
+    runtime.reconcile_slot_export_output_allocation(connection_id);
+    let actions = runtime
+        .ctx
+        .cluster_state_mut()
+        .as_deref_mut()
+        .unwrap()
+        .migrations
+        .finish(
+            &id,
+            crate::engine::distributed::cluster::migration::TerminalPhase::Cancelled,
+            None,
+            crate::foundation::io::sys::time::unixtime(),
+        )
+        .unwrap();
+    runtime
+        .ctx
+        .cluster_state_mut()
+        .as_deref_mut()
+        .unwrap()
+        .queue_migration_actions(actions);
+
+    runtime.drive_slot_migration_actions();
+
+    assert!(!runtime.connection_registry.contains(Token(connection_id)));
+    assert!(!runtime.transport.is_registered(Token(connection_id)));
+    assert_eq!(runtime.writes.slot_export_allocation_bytes, 0);
+    let mut received = Vec::new();
+    peer.read_to_end(&mut received)
+        .expect("terminal cleanup must close the export socket");
+    assert!(received.is_empty());
+}
+
+#[test]
+fn import_commands_preserve_pending_read_batch_propagation_order() {
+    use crate::engine::distributed::replication::protocol::encode_command;
+
+    let (mut runtime, _peer, id) = setup_registered_import_runtime_with_dbs(3);
+    crate::framework::commands::register_all(&mut runtime.registry);
+    let ranges = SlotRanges::new(vec![SlotRange::new(1, 1).unwrap()]).unwrap();
+    runtime.ctx.create_slot_import(id, &ranges);
+    let token = runtime
+        .connection_registry
+        .iter()
+        .find(|(_, connection)| connection.slot_migration_role.is_some())
+        .map(|(token, _)| token)
+        .unwrap();
+    runtime.ctx.replication_mut().backlog.activate();
+    let start = runtime.ctx.replication().backlog.next_stream_cursor();
+    let select_one = encode_command(&[b"SELECT", b"1"]);
+    let unlink = encode_command(&[b"UNLINK", b"evicted"]);
+    let mut effects = ReadBatchEffects::default();
+    // ESTABLISH can leave command-time evictions queued in this read batch.
+    effects.replication_only = vec![select_one.clone(), unlink.clone()];
+    runtime.ctx.set_repl_seldb(1);
+
+    for parts in [vec![b"SELECT".as_slice(), b"2"], vec![b"PING".as_slice()]] {
+        let args = crate::engine::command::CommandArgs::from_parts(
+            parts
+                .into_iter()
+                .map(bytes::Bytes::copy_from_slice)
+                .collect(),
+        );
+        let name = String::from_utf8_lossy(&args.name).to_ascii_lowercase();
+        runtime.process_parsed_command(token, args, name, false, &mut effects);
+    }
+    runtime.finalize_handle_readable(token.0, token.0, effects);
+
+    let expected = [
+        select_one,
+        unlink,
+        encode_command(&[b"SELECT", b"2"]),
+        encode_command(&[b"PING"]),
+    ]
+    .concat();
     assert_eq!(
-        runtime.connection_registry[crate::framework::capabilities::io::Token(connection_token)]
-            .state,
-        ConnectionState::Closing
+        runtime.ctx.replication().backlog.read_from(start),
+        Some(expected),
+        "pending DB1 evictions must precede DB2 import frames exactly once"
     );
+}
+
+#[test]
+fn empty_import_broadcasts_ownership_without_an_epoch_bump() {
+    use crate::engine::distributed::cluster::msg::{
+        bytes_to_slots, ClusterBusMessage, ClusterMsgType, ClusterProtocolError,
+    };
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let mut runtime = ServerWorkerState::new_with_slot_router(1, 14, |key| {
+        crate::engine::distributed::cluster::node::key_hash_slot(key) as usize
+    })
+    .unwrap();
+    let mut state = ClusterState::new("127.0.0.1", 6380, 16_380);
+    let source = NodeId::parse(b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+    let mut source_node = ClusterNode::new(
+        source.as_str().to_string(),
+        "127.0.0.1".into(),
+        6381,
+        16_381,
+        true,
+    );
+    source_node.flags &= !CLUSTER_NODE_MYSELF;
+    source_node.config_epoch = 13;
+    state.nodes.insert(source.as_str().to_string(), source_node);
+    state.set_slot_node(0, source.as_str()).unwrap();
+    state.myself.config_epoch = 14;
+    state.current_epoch = 14;
+    let id = MigrationJobId::parse(b"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee").unwrap();
+    let ranges = SlotRanges::new(vec![SlotRange::new(0, 0).unwrap()]).unwrap();
+    state
+        .migrations
+        .start(MigrationJob::new(
+            id.clone(),
+            source.clone(),
+            NodeId::parse(state.myself.name.as_bytes()).unwrap(),
+            ranges.clone(),
+            MigrationOperation::Import,
+            1,
+        ))
+        .unwrap();
+    for event in [
+        MigrationEvent::Ack,
+        MigrationEvent::SnapshotEof,
+        MigrationEvent::Paused,
+        MigrationEvent::FailoverGranted,
+    ] {
+        state.migrations.transition(&id, event, 1).unwrap();
+    }
+    state.take_topology_broadcast_request();
+    *runtime.ctx.cluster_state_mut() = Some(Box::new(state));
+    runtime.ctx.create_slot_import(id.clone(), &ranges);
+    let connection = runtime.transport.connect_tcp(address).unwrap();
+    let (mut peer, _) = listener.accept().unwrap();
+    peer.set_read_timeout(Some(std::time::Duration::from_secs(1)))
+        .unwrap();
+    runtime.cluster_bus.register_outgoing_for_node(
+        connection.token,
+        address,
+        false,
+        source.as_str().to_string(),
+    );
+    runtime
+        .cluster_bus
+        .connections
+        .get_mut(&connection.token.0)
+        .unwrap()
+        .handshake_sent = true;
+
+    runtime.drive_slot_migration_progress();
+
+    let state = runtime.ctx.cluster_state().as_deref().unwrap();
+    assert_eq!(state.myself.config_epoch, 14);
+    assert_eq!(state.get_node_by_slot(0).unwrap().name, state.myself.name);
+    let mut bytes = Vec::new();
+    let broadcast = loop {
+        let mut buffer = [0; 4096];
+        let count = peer.read(&mut buffer).expect(
+            "committing an empty import must broadcast its slots even when the epoch is already ahead",
+        );
+        assert_ne!(count, 0);
+        bytes.extend_from_slice(&buffer[..count]);
+        match ClusterBusMessage::decode(&bytes) {
+            Ok((message, _)) => break message,
+            Err(ClusterProtocolError::Incomplete { .. }) => {}
+            Err(error) => panic!("invalid topology broadcast: {error:?}"),
+        }
+    };
+    assert_eq!(broadcast.msg_type, ClusterMsgType::Pong);
+    assert_eq!(broadcast.config_epoch, 14);
+    assert!(bytes_to_slots(broadcast.topology_slots())[0]);
+    assert!(!runtime
+        .ctx
+        .cluster_state_mut()
+        .as_deref_mut()
+        .unwrap()
+        .take_topology_broadcast_request());
+}
+
+#[test]
+fn successful_import_finishes_without_replaying_already_replicated_data() {
+    use crate::engine::distributed::replication::protocol::encode_command;
+    use crate::foundation::io::persistence::load_aof_bytes;
+    use crate::foundation::io::protocol::parser::Parser;
+    use crate::foundation::io::store::Robj;
+    use crate::framework::aof_replay::AofReplayPlayer;
+    use crate::framework::context::ServerContext;
+    use bytes::Bytes;
+
+    let slot_of =
+        |key: &[u8]| crate::engine::distributed::cluster::node::key_hash_slot(key) as usize;
+    let mut runtime = ServerWorkerState::new_with_slot_router(2, 14, slot_of).unwrap();
+    crate::framework::commands::register_all(&mut runtime.registry);
+    runtime.ctx.replication_mut().backlog.activate();
+    let aof_path = std::env::temp_dir().join(format!(
+        "versal-import-finish-{}-{:?}.aof",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    runtime.ctx.config_mut().persistence.aof_enabled = true;
+    runtime.ctx.config_mut().persistence.aof_fsync =
+        crate::foundation::io::persistence::AofFsync::No;
+    runtime.ctx.aof_mut().journal = Some(
+        crate::foundation::io::persistence::journal::AofJournal::new(
+            crate::foundation::io::persistence::AofAppender::open_append_path(
+                &aof_path,
+                crate::foundation::io::persistence::AofFsync::No,
+            )
+            .unwrap(),
+        ),
+    );
+    let mut state = ClusterState::new("127.0.0.1", 6380, 16_380);
+    let id = MigrationJobId::parse(b"dddddddddddddddddddddddddddddddddddddddd").unwrap();
+    let source = NodeId::parse(b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+    let slot = slot_of(b"{atomic}key") as u16;
+    let ranges = SlotRanges::new(vec![SlotRange::new(slot, slot).unwrap()]).unwrap();
+    state
+        .migrations
+        .start(MigrationJob::new(
+            id.clone(),
+            source.clone(),
+            NodeId::parse(state.myself.name.as_bytes()).unwrap(),
+            ranges.clone(),
+            MigrationOperation::Import,
+            1,
+        ))
+        .unwrap();
+    *runtime.ctx.cluster_state_mut() = Some(Box::new(state));
+    runtime.ctx.create_slot_import(id.clone(), &ranges);
+    let mut connection = Connection::new_fake();
+    connection.set_token_for_test(Token(94));
+    connection.slot_migration_role = Some(SlotMigrationConnectionRole::Import(id.clone()));
+    let token = runtime.connection_registry.insert(connection);
+    let start = runtime.ctx.replication().backlog.next_stream_cursor();
+    let establish = encode_command(&[
+        b"CLUSTER",
+        b"SYNCSLOTS",
+        b"ESTABLISH",
+        b"SOURCE",
+        source.as_str().as_bytes(),
+        b"NAME",
+        id.as_str().as_bytes(),
+        b"SLOTSRANGE",
+        slot.to_string().as_bytes(),
+        slot.to_string().as_bytes(),
+    ]);
+    runtime.propagate_to_replicas(&establish);
+    runtime.feed_aof(&establish);
+    assert!(runtime.apply_slot_import_command(
+        token,
+        crate::framework::CommandArgs::from_parts(vec![
+            Bytes::from_static(b"SELECT"),
+            Bytes::from_static(b"1"),
+        ]),
+    ));
+    let value = Bytes::from(vec![b'v'; 4096]);
+    for index in 0..64 {
+        assert!(runtime.apply_slot_import_command(
+            token,
+            crate::framework::CommandArgs::from_parts(vec![
+                Bytes::from_static(b"SET"),
+                Bytes::from(format!("{{atomic}}key-{index}")),
+                value.clone(),
+            ]),
+        ));
+    }
+    let initial = runtime.ctx.replication().backlog.read_from(start).unwrap();
+    let mut replica = ServerContext::new_with_slot_router(2, 14, slot_of);
+    *replica.cluster_state_mut() = Some(Box::new(ClusterState::new("127.0.0.1", 6381, 16_381)));
+    replica
+        .db_mut(0)
+        .unwrap()
+        .set(b"{unrelated}key".to_vec(), Robj::string("retained"));
+    let mut replica_registry = crate::framework::CommandRegistry::new();
+    crate::framework::commands::register_all(&mut replica_registry);
+    let mut player = AofReplayPlayer::new(&replica_registry, &mut replica);
+    load_aof_bytes(&initial, &mut player).unwrap();
+    assert_eq!(player.ctx.slot_import_key_count(1, slot as usize), 64);
+    assert_eq!(player.ctx.db(1).unwrap().dbsize(), 0);
+
+    for event in [
+        MigrationEvent::Ack,
+        MigrationEvent::SnapshotEof,
+        MigrationEvent::Paused,
+        MigrationEvent::FailoverGranted,
+    ] {
+        runtime
+            .ctx
+            .cluster_state_mut()
+            .as_deref_mut()
+            .unwrap()
+            .migrations
+            .transition(&id, event, 1)
+            .unwrap();
+    }
+    let finish_start = runtime.ctx.replication().backlog.next_stream_cursor();
+    runtime.drive_slot_migration_progress();
+    assert_eq!(runtime.ctx.db(1).unwrap().dbsize(), 64);
+    let finish = runtime
+        .ctx
+        .replication()
+        .backlog
+        .read_from(finish_start)
+        .unwrap();
+    let mut parser = Parser::new();
+    parser.feed(&finish);
+    let first = parser.try_parse().unwrap().unwrap();
     assert_eq!(
-        runtime.connection_registry[crate::framework::capabilities::io::Token(connection_token)]
-            .slot_migration_role,
-        Some(SlotMigrationConnectionRole::Export(id))
+        first[0].as_ref(),
+        b"CLUSTER",
+        "the already replicated import must finish without another snapshot ahead of FINISH"
     );
+    assert_eq!(first[2].as_ref(), b"FINISH");
+    assert!(parser.try_parse().unwrap().is_none());
+    assert_eq!(runtime.ctx.repl_seldb(), 1);
+    assert_eq!(runtime.ctx.persistence().aof_selected_db(), 1);
+    assert_eq!(
+        std::fs::read(&aof_path).unwrap(),
+        [initial, finish.clone()].concat()
+    );
+    load_aof_bytes(&finish, &mut player).unwrap();
+    assert_eq!(player.ctx.db(1).unwrap().dbsize(), 64);
+    assert_eq!(player.ctx.db(0).unwrap().dbsize(), 1);
+    assert_eq!(player.ctx.slot_import_key_count(1, slot as usize), 0);
+    for index in 0..64 {
+        assert_eq!(
+            player
+                .ctx
+                .db(1)
+                .unwrap()
+                .get_no_expire(format!("{{atomic}}key-{index}").as_bytes())
+                .unwrap()
+                .as_bytes(),
+            value.as_ref()
+        );
+    }
+    drop(runtime);
+    std::fs::remove_file(aof_path).unwrap();
 }
 
 #[test]
@@ -1509,14 +1883,22 @@ fn target_oom_fails_live_import_before_applying_write() {
         bytes::Bytes::copy_from_slice(key),
         bytes::Bytes::from_static(b"value"),
     ]);
-
-    assert!(runtime.apply_slot_import_command(connection_token, args));
+    let mut effects = ReadBatchEffects::default();
 
     assert_eq!(
-        runtime.connection_registry[crate::framework::capabilities::io::Token(connection_token)]
-            .state,
-        ConnectionState::Closing
+        runtime.process_parsed_command(
+            Token(connection_token),
+            args,
+            "set".to_string(),
+            false,
+            &mut effects,
+        ),
+        crate::runtime::server::worker::flows::request::dispatch::LoopAction::Break
     );
+
+    assert!(!runtime
+        .connection_registry
+        .contains(crate::framework::capabilities::io::Token(connection_token)));
     let job = runtime
         .ctx
         .cluster_state()
@@ -1918,6 +2300,115 @@ fn forkless_capture_reblocks_live_import_write_after_generic_unpause_wakeup() {
         runtime.ctx.slot_import_key_count(0, slot as usize),
         before + 1
     );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn forkless_capture_keeps_import_write_blocked_after_serving_key_resolution() {
+    let mut runtime = ServerWorkerState::new_with_slot_router(1, 14, |key| {
+        crate::engine::distributed::cluster::node::key_hash_slot(key) as usize
+    })
+    .unwrap();
+    crate::framework::commands::register_all(&mut runtime.registry);
+    let id = MigrationJobId::parse(b"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee").unwrap();
+    let key = b"{forkless-import}priority-resolved";
+    let slot = crate::engine::distributed::cluster::node::key_hash_slot(key);
+    let ranges = SlotRanges::new(vec![SlotRange::new(slot, slot).unwrap()]).unwrap();
+    runtime.ctx.create_slot_import(id.clone(), &ranges);
+    runtime
+        .ctx
+        .apply_slot_import(
+            &id,
+            crate::engine::command::CommandArgs::from_parts(vec![
+                bytes::Bytes::from_static(b"SET"),
+                bytes::Bytes::from_static(b"{forkless-import}existing"),
+                bytes::Bytes::from_static(b"value"),
+            ]),
+            &runtime.registry,
+        )
+        .unwrap();
+    for index in 0..256 {
+        runtime.ctx.db_mut(0).unwrap().set(
+            format!("serving-seed-{index}").into_bytes(),
+            crate::foundation::io::store::Robj::string("value"),
+        );
+    }
+
+    let dir = std::env::temp_dir().join(format!(
+        "versal-forkless-slot-import-priority-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    runtime.ctx.config_mut().persistence.dir = dir.to_string_lossy().into_owned();
+    runtime.ctx.config_mut().persistence.dbfilename = "dump.rdb".to_string();
+    runtime.ctx.config_mut().persistence.bgsave_default_method =
+        crate::engine::extension::config::persistence::BgsaveMethod::Forkless;
+    runtime.ctx.config_mut().persistence.rdb_key_save_delay = 0;
+    crate::framework::commands::server::save::start_bgsave(&mut runtime.ctx).unwrap();
+    assert!(runtime.ctx.persistence().forkless_capture_in_progress());
+    assert!(runtime
+        .ctx
+        .prioritize_forkless_keys(0, std::iter::once(key.to_vec())));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !runtime.ctx.persistence().forkless_key_captured(0, key) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "priority key was not captured before the deadline"
+        );
+        runtime.ctx.drive_forkless_feed();
+        std::thread::yield_now();
+    }
+    assert!(runtime.ctx.persistence().forkless_capture_in_progress());
+
+    let token = Token(97);
+    let mut connection = Connection::new_fake();
+    connection.set_token_for_test(token);
+    connection.slot_migration_role = Some(SlotMigrationConnectionRole::Import(id));
+    runtime.connection_registry.insert(connection);
+    let before = runtime.ctx.slot_import_key_count(0, slot as usize);
+    let mut effects = ReadBatchEffects::default();
+    runtime.process_parsed_command(
+        token,
+        crate::engine::command::CommandArgs::from_parts(vec![
+            bytes::Bytes::from_static(b"SET"),
+            bytes::Bytes::copy_from_slice(key),
+            bytes::Bytes::from_static(b"value"),
+        ]),
+        "set".to_string(),
+        false,
+        &mut effects,
+    );
+    assert!(matches!(
+        runtime.connection_registry[token]
+            .blocked
+            .as_ref()
+            .map(|blocked| &blocked.cmd),
+        Some(BlockedCmd::Forkless)
+    ));
+
+    runtime.release_forkless_clients();
+
+    assert_eq!(runtime.ctx.slot_import_key_count(0, slot as usize), before);
+    assert!(runtime.ctx.db(0).unwrap().get_no_expire(key).is_none());
+    assert!(matches!(
+        runtime.connection_registry[token]
+            .blocked
+            .as_ref()
+            .map(|blocked| &blocked.cmd),
+        Some(BlockedCmd::Forkless)
+    ));
+
+    runtime
+        .ctx
+        .abort_forkless_save(crate::foundation::io::sys::time::mstime() / 1_000);
+    runtime.release_forkless_clients();
+    assert_eq!(
+        runtime.ctx.slot_import_key_count(0, slot as usize),
+        before + 1
+    );
+    assert!(runtime.ctx.db(0).unwrap().get_no_expire(key).is_none());
     let _ = std::fs::remove_dir_all(dir);
 }
 

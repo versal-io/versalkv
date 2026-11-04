@@ -16,4 +16,4 @@ pub(in crate::runtime::server) use state::{
 };
 
 #[cfg(test)]
-pub(in crate::runtime::server) use state::{SocketIoOwner, IO_BUF_SIZE};
+pub(in crate::runtime::server) use state::IO_BUF_SIZE;

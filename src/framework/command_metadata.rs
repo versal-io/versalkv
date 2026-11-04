@@ -1,8 +1,6 @@
-use bytes::Bytes;
+use crate::engine::command::{CmdFlags, CommandGetKeysFn, DispatchGroup};
 
-use crate::engine::command::{CmdFlags, DispatchGroup};
-
-pub type GetKeysFn = for<'a> fn(&'a [Bytes]) -> Vec<(&'a [u8], Vec<&'static str>)>;
+pub type GetKeysFn = CommandGetKeysFn;
 
 pub struct CommandMeta {
     pub name: &'static str,

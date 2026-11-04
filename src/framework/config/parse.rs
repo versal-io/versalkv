@@ -268,6 +268,21 @@ pub(crate) fn validate_config_file_directives(contents: &str) -> Result<(), Stri
             }
             continue;
         }
+        if key == "cluster-node-timeout" {
+            let value = decode_config_value(raw_value.unwrap_or_default().trim());
+            if !value.parse::<i64>().is_ok_and(|number| number >= 0) {
+                return Err(format!("invalid value for {key}"));
+            }
+            continue;
+        }
+        if key == "cluster-config-file" {
+            let arguments = parse_config_arguments(raw_value.unwrap_or_default().trim())
+                .map_err(|_| format!("invalid value for {key}"))?;
+            if arguments.len() != 1 || arguments[0].is_empty() {
+                return Err(format!("invalid value for {key}"));
+            }
+            continue;
+        }
         let Some(raw_value) = raw_value else {
             if matches!(
                 key.as_str(),
@@ -798,7 +813,7 @@ fn simple_config_escape(escaped: u8) -> Option<u8> {
 
 #[cfg(test)]
 mod quoted_value_tests {
-    use super::{decode_config_value, parse_config_arguments};
+    use super::{decode_config_value, parse_config_arguments, validate_config_file_directives};
 
     #[test]
     fn config_arguments_concatenate_quoted_and_unquoted_segments_like_sds() {
@@ -835,5 +850,32 @@ mod quoted_value_tests {
     #[test]
     fn double_quoted_config_values_decode_hex_bytes() {
         assert_eq!(decode_config_value("\"valkey\\x00AAAAA\""), "valkey\0AAAAA");
+    }
+
+    #[test]
+    fn cluster_node_timeout_rejects_values_above_signed_runtime_range() {
+        assert!(
+            validate_config_file_directives(&format!("cluster-node-timeout {}\n", i64::MAX))
+                .is_ok()
+        );
+        let error = validate_config_file_directives(&format!(
+            "cluster-node-timeout {}\n",
+            i64::MAX as u64 + 1
+        ))
+        .unwrap_err();
+        assert!(error.contains("cluster-node-timeout"));
+    }
+
+    #[test]
+    fn cluster_config_file_rejects_invalid_arguments() {
+        for contents in [
+            "cluster-config-file\n",
+            "cluster-config-file \"\"\n",
+            "cluster-config-file nodes.conf extra\n",
+            "cluster-config-file \"unterminated\n",
+        ] {
+            let error = validate_config_file_directives(contents).unwrap_err();
+            assert!(error.contains("cluster-config-file"));
+        }
     }
 }

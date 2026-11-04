@@ -749,7 +749,7 @@ fn main() {
     } else {
         ""
     };
-    for symbol in ["VM_CallArgv", "VM_ReplyRaw"] {
+    for symbol in ["VM_CallArgv", "moduleCallArgv", "VM_ReplyRaw"] {
         println!("cargo:rustc-link-arg-bin=versal-server=-Wl,-u,{symbol_prefix}{symbol}");
     }
 

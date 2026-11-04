@@ -183,7 +183,47 @@ impl ReplicationRuntime {
         if let Some(link) = self.primary_for_connection_mut(main_connection_id) {
             link.record_dual_channel_endoff_boundary(boundary);
         }
+        if self
+            .channel_records
+            .get(&rdb_connection_id)
+            .is_some_and(|record| record.rdb_snapshot_complete)
+        {
+            if let Some(link) = self.primary_for_connection_mut(main_connection_id) {
+                link.mark_dual_rdb_complete();
+            }
+        }
         Ok(())
+    }
+
+    pub(crate) fn mark_rdb_snapshot_complete(&mut self, rdb: ConnectionId) {
+        if !matches!(
+            self.role(rdb),
+            Some(
+                ReplicationConnection::RdbChannelCandidate
+                    | ReplicationConnection::RdbChannel { .. }
+            )
+        ) {
+            return;
+        }
+        if let Some(record) = self.channel_records.get_mut(&rdb) {
+            record.rdb_snapshot_complete = true;
+        }
+        if let Some(link) = self
+            .replica_id_for_connection(rdb)
+            .and_then(|id| self.primary_link_mut(id))
+        {
+            link.mark_dual_rdb_complete();
+        }
+    }
+
+    pub(crate) fn has_completed_unpaired_rdb_snapshot(&self, rdb: ConnectionId) -> bool {
+        self.channel_records.get(&rdb).is_some_and(|record| {
+            record.rdb_snapshot_complete
+                && matches!(
+                    record.role,
+                    Some(ReplicationConnection::RdbChannelCandidate)
+                )
+        })
     }
 
     /// After a successful pair, transition a waiting dual-channel main link
@@ -295,6 +335,7 @@ impl ReplicationRuntime {
         self.channel_pairs.remove(&rdb_connection_id);
         self.channel_pairs.remove(&main);
         self.channel_records.remove(&rdb_connection_id);
+        let had_wait = wait.is_some();
         let pin = wait.and_then(|wait| wait.pin_cursor);
         crate::server_log!(
             debug,
@@ -307,12 +348,14 @@ impl ReplicationRuntime {
         // succeeds. After that point the RDB socket may close while the
         // terminal ACK is still pending, but it must not remain in
         // `replicas_waiting_psync`.
-        if self.primary_for_connection(main).is_some_and(|link| {
-            matches!(
-                link.dual_state(),
-                PrimaryDualChannelState::WaitingForMainPsync
-            )
-        }) {
+        if had_wait
+            && self.primary_for_connection(main).is_some_and(|link| {
+                matches!(
+                    link.dual_state(),
+                    PrimaryDualChannelState::WaitingForMainPsync
+                )
+            })
+        {
             // The Rust socket is gone, so carry the C protected-client pin
             // under the paired main connection until grace expiry.
             self.grace_psync_pin_by_main.insert(

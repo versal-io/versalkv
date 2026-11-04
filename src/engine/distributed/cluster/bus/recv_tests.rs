@@ -478,6 +478,81 @@ fn pong_extensions_update_sender_metadata_after_full_decode() {
 }
 
 #[test]
+fn last_duplicate_string_extension_wins_after_full_decode() {
+    let mut manager = ClusterBusManager::new();
+    let mut state = ClusterState::new("127.0.0.1", 6379, 16379);
+    let token = Token(43);
+    let sender_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
+    let mut sender = ClusterNode::new(
+        sender_id.clone(),
+        "127.0.0.1".to_string(),
+        6380,
+        16380,
+        true,
+    );
+    sender.flags &= !CLUSTER_NODE_MYSELF;
+    state.nodes.insert(sender_id.clone(), sender.clone());
+    manager.register_incoming(token, "127.0.0.1:16380".parse().unwrap());
+    let mut message = msg::ClusterBusMessage::from_node(
+        ClusterMsgType::Pong,
+        &sender,
+        1,
+        msg::ClusterBusBody::Gossip(Vec::new()),
+    );
+    message.extensions = vec![
+        msg::ClusterExtension::Hostname("first.example.com".to_string()),
+        msg::ClusterExtension::Hostname("second.example.com".to_string()),
+    ];
+    let mut reader = PacketReader {
+        packet: Some(message.encode().unwrap()),
+    };
+
+    assert!(!manager.readable(&mut state, &mut reader, token.0, 100));
+    assert_eq!(
+        state.nodes[&sender_id].endpoints.hostname(),
+        Some("second.example.com")
+    );
+}
+
+#[test]
+fn last_invalid_duplicate_string_extension_clears_earlier_value() {
+    let mut manager = ClusterBusManager::new();
+    let mut state = ClusterState::new("127.0.0.1", 6379, 16379);
+    let token = Token(44);
+    let sender_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
+    let mut sender = ClusterNode::new(
+        sender_id.clone(),
+        "127.0.0.1".to_string(),
+        6380,
+        16380,
+        true,
+    );
+    sender.flags &= !CLUSTER_NODE_MYSELF;
+    sender.endpoints.set_hostname(b"old.example.com").unwrap();
+    state.nodes.insert(sender_id.clone(), sender.clone());
+    manager.register_incoming(token, "127.0.0.1:16380".parse().unwrap());
+    let mut message = msg::ClusterBusMessage::from_node(
+        ClusterMsgType::Pong,
+        &sender,
+        1,
+        msg::ClusterBusBody::Gossip(Vec::new()),
+    );
+    message.extensions = vec![
+        msg::ClusterExtension::Hostname("new.example.com".to_string()),
+        msg::ClusterExtension::Unknown {
+            kind: 0,
+            payload: b"bad,name\0".to_vec(),
+        },
+    ];
+    let mut reader = PacketReader {
+        packet: Some(message.encode().unwrap()),
+    };
+
+    assert!(!manager.readable(&mut state, &mut reader, token.0, 100));
+    assert_eq!(state.nodes[&sender_id].endpoints.hostname(), None);
+}
+
+#[test]
 fn replica_pong_does_not_assign_primary_slots_to_the_replica() {
     use crate::engine::distributed::cluster::node::{CLUSTER_NODE_PRIMARY, CLUSTER_NODE_REPLICA};
 
@@ -1104,7 +1179,7 @@ fn known_meet_removes_an_endpoint_matched_handshake_placeholder() {
 }
 
 #[test]
-fn unknown_meet_gossip_arms_one_asymmetric_repair() {
+fn known_meet_gossip_arms_one_asymmetric_repair() {
     let mut manager = ClusterBusManager::new();
     let mut state = ClusterState::new("127.0.0.1", 6379, 16379);
     let token = Token(11);
@@ -1116,6 +1191,9 @@ fn unknown_meet_gossip_arms_one_asymmetric_repair() {
         16380,
         true,
     );
+    let mut known_sender = sender.clone();
+    known_sender.flags &= !CLUSTER_NODE_MYSELF;
+    state.nodes.insert(sender.name.clone(), known_sender);
     let gossip_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string();
     let gossip = GossipEntry {
         node_id: gossip_id.clone(),
@@ -1132,21 +1210,67 @@ fn unknown_meet_gossip_arms_one_asymmetric_repair() {
         packet: Some(msg::encode_msg(ClusterMsgType::Meet, &sender, 1, &[gossip])),
     };
 
-    assert!(!manager.readable(&mut state, &mut reader, token.0, 100));
+    let before_ms = crate::foundation::io::sys::time::mstime();
+    assert!(!manager.readable(&mut state, &mut reader, token.0, before_ms));
+    let after_ms = crate::foundation::io::sys::time::mstime();
 
     assert_eq!(state.nodes.get(&gossip_id).unwrap().pong_received, 0);
-    assert_eq!(
-        state
-            .nodes
-            .get(&gossip_id)
-            .unwrap()
-            .asymmetric_meet_started_at,
-        100
-    );
+    let started_at = state.nodes[&gossip_id].asymmetric_meet_started_at;
+    assert!((before_ms..=after_ms).contains(&started_at));
     assert_eq!(
         state.pending_connects,
         vec![("127.0.0.1".to_string(), 16381, false)]
     );
+}
+
+#[test]
+fn unknown_meet_gossip_does_not_rewrite_known_node_identity() {
+    let mut manager = ClusterBusManager::new();
+    let mut state = ClusterState::new("127.0.0.1", 6379, 16379);
+    let token = Token(37);
+    manager.register_incoming(token, "127.0.0.1:16380".parse().unwrap());
+    let sender = ClusterNode::new(
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        "127.0.0.1".to_string(),
+        6380,
+        16380,
+        true,
+    );
+    let known_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string();
+    let unknown_id = "cccccccccccccccccccccccccccccccccccccccc".to_string();
+    let mut known = ClusterNode::new(known_id.clone(), "127.0.0.2".to_string(), 6381, 16381, true);
+    known.flags &= !CLUSTER_NODE_MYSELF;
+    known.flags |= CLUSTER_NODE_PFAIL;
+    known.config_epoch = 3;
+    state.nodes.insert(known_id.clone(), known);
+    let entries: Vec<_> = [&known_id, &unknown_id]
+        .into_iter()
+        .map(|id| GossipEntry {
+            node_id: id.clone(),
+            flags: CLUSTER_NODE_PRIMARY,
+            ping_sent: 0,
+            pong_received: 0,
+            ip: "127.0.0.3".to_string(),
+            port: 6382,
+            tls_port: 0,
+            bus_port: 16382,
+            config_epoch: 9,
+        })
+        .collect();
+    let mut reader = PacketReader {
+        packet: Some(msg::encode_msg(ClusterMsgType::Meet, &sender, 1, &entries)),
+    };
+
+    assert!(!manager.readable(&mut state, &mut reader, token.0, 100));
+
+    assert!(!state.nodes.contains_key(&unknown_id));
+    assert!(!state.nodes.contains_key(&sender.name));
+    assert_eq!(state.nodes[&known_id].ip(), "127.0.0.2");
+    assert_eq!(state.nodes[&known_id].port, 6381);
+    assert_eq!(state.nodes[&known_id].config_epoch, 3);
+    assert!(state.pending_connects.is_empty());
+    let handshake = &manager.connections[&token.0].handshake_node_name;
+    assert!(state.nodes[handshake].has_flag(CLUSTER_NODE_HANDSHAKE));
 }
 
 #[test]
@@ -1167,6 +1291,9 @@ fn gossip_learned_node_is_trusted_not_in_handshake() {
         16380,
         true,
     );
+    let mut known_sender = sender.clone();
+    known_sender.flags &= !CLUSTER_NODE_MYSELF;
+    state.nodes.insert(sender.name.clone(), known_sender);
     let gossip_id = "cccccccccccccccccccccccccccccccccccccccc".to_string();
     let gossip = GossipEntry {
         node_id: gossip_id.clone(),
@@ -2077,10 +2204,75 @@ fn replica_explicit_meet_learns_gossiped_node_as_trusted() {
 }
 
 #[test]
-fn pong_from_failed_primary_clears_local_fail_and_pfail_flags() {
+fn pong_clears_voting_primary_fail_only_after_undo_timeout() {
+    for (previous_pong, node_timeout_ms, should_clear_fail) in [
+        (190, 15_000, false),
+        (-30_001, 15_000, true),
+        (190, u64::MAX, false),
+    ] {
+        let mut manager = ClusterBusManager::new();
+        let mut state = ClusterState::new("127.0.0.1", 6379, 16379);
+        state.set_failure_report_node_timeout_ms(node_timeout_ms);
+        let token = Token(16);
+        let sender_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
+        let mut sender = ClusterNode::new(
+            sender_id.clone(),
+            "127.0.0.1".to_string(),
+            6380,
+            16380,
+            true,
+        );
+        sender.flags &= !crate::engine::distributed::cluster::node::CLUSTER_NODE_MYSELF;
+        sender.flags |= CLUSTER_NODE_FAIL | CLUSTER_NODE_PFAIL;
+        sender.ping_sent = 50;
+        sender.pong_received = previous_pong;
+        sender.fail_time = previous_pong;
+        sender.slots.fill(true);
+        sender.numslots = crate::engine::distributed::cluster::state::CLUSTER_SLOTS;
+        state.nodes.insert(sender_id.clone(), sender.clone());
+        state.recompute_state();
+        assert_ne!(
+            state.state,
+            crate::engine::distributed::cluster::state::CLUSTER_OK
+        );
+        manager.register_outgoing_for_node(
+            token,
+            "127.0.0.1:16380".parse().unwrap(),
+            false,
+            sender_id.clone(),
+        );
+        manager
+            .connections
+            .get_mut(&token.0)
+            .unwrap()
+            .handshake_sent = true;
+
+        let mut pong_sender = sender.clone();
+        pong_sender.flags &= !(CLUSTER_NODE_FAIL | CLUSTER_NODE_PFAIL);
+        let mut reader = PacketReader {
+            packet: Some(msg::encode_msg(ClusterMsgType::Pong, &pong_sender, 1, &[])),
+        };
+
+        assert!(!manager.readable(&mut state, &mut reader, token.0, 200));
+
+        let updated = state.nodes.get(&sender_id).unwrap();
+        assert_eq!(updated.pong_received, 200);
+        assert_eq!(updated.ping_sent, 0);
+        assert_eq!(!updated.has_flag(CLUSTER_NODE_FAIL), should_clear_fail);
+        assert!(!updated.has_flag(CLUSTER_NODE_PFAIL));
+        assert_eq!(
+            state.state == crate::engine::distributed::cluster::state::CLUSTER_OK,
+            should_clear_fail
+        );
+    }
+}
+
+#[test]
+fn fresh_fail_mark_uses_its_own_undo_deadline() {
     let mut manager = ClusterBusManager::new();
     let mut state = ClusterState::new("127.0.0.1", 6379, 16379);
-    let token = Token(16);
+    state.set_failure_report_node_timeout_ms(5_000);
+    let token = Token(41);
     let sender_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
     let mut sender = ClusterNode::new(
         sender_id.clone(),
@@ -2089,18 +2281,13 @@ fn pong_from_failed_primary_clears_local_fail_and_pfail_flags() {
         16380,
         true,
     );
-    sender.flags &= !crate::engine::distributed::cluster::node::CLUSTER_NODE_MYSELF;
-    sender.flags |= CLUSTER_NODE_FAIL | CLUSTER_NODE_PFAIL;
+    sender.flags &= !CLUSTER_NODE_MYSELF;
     sender.ping_sent = 50;
-    sender.pong_received = 25;
+    sender.pong_received = -30_001;
     sender.slots.fill(true);
     sender.numslots = crate::engine::distributed::cluster::state::CLUSTER_SLOTS;
     state.nodes.insert(sender_id.clone(), sender.clone());
-    state.recompute_state();
-    assert_ne!(
-        state.state,
-        crate::engine::distributed::cluster::state::CLUSTER_OK
-    );
+    assert!(state.mark_fail(&sender_id));
     manager.register_outgoing_for_node(
         token,
         "127.0.0.1:16380".parse().unwrap(),
@@ -2113,23 +2300,78 @@ fn pong_from_failed_primary_clears_local_fail_and_pfail_flags() {
         .unwrap()
         .handshake_sent = true;
 
-    let mut pong_sender = sender.clone();
+    let mut pong_sender = sender;
     pong_sender.flags &= !(CLUSTER_NODE_FAIL | CLUSTER_NODE_PFAIL);
     let mut reader = PacketReader {
         packet: Some(msg::encode_msg(ClusterMsgType::Pong, &pong_sender, 1, &[])),
     };
 
     assert!(!manager.readable(&mut state, &mut reader, token.0, 200));
+    assert!(state.nodes[&sender_id].has_flag(CLUSTER_NODE_FAIL));
+}
 
-    let updated = state.nodes.get(&sender_id).unwrap();
-    assert_eq!(updated.pong_received, 200);
-    assert_eq!(updated.ping_sent, 0);
-    assert!(!updated.has_flag(CLUSTER_NODE_FAIL));
-    assert!(!updated.has_flag(CLUSTER_NODE_PFAIL));
-    assert_eq!(
-        state.state,
-        crate::engine::distributed::cluster::state::CLUSTER_OK
+#[test]
+fn replica_heartbeat_does_not_restore_a_forgotten_primary_reference() {
+    use crate::engine::distributed::cluster::node::CLUSTER_NODE_REPLICA;
+
+    let mut manager = ClusterBusManager::new();
+    let mut state = ClusterState::new("127.0.0.1", 6379, 16379);
+    let token = Token(42);
+    let replica_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
+    let forgotten_primary = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string();
+    let mut known_replica = ClusterNode::new(
+        replica_id.clone(),
+        "127.0.0.1".to_string(),
+        6380,
+        16380,
+        false,
     );
+    known_replica.flags &= !(CLUSTER_NODE_MYSELF | CLUSTER_NODE_PRIMARY);
+    known_replica.flags |= CLUSTER_NODE_REPLICA;
+    state
+        .nodes
+        .insert(replica_id.clone(), known_replica.clone());
+    manager.register_incoming(token, "127.0.0.1:16380".parse().unwrap());
+
+    let mut sender = known_replica;
+    sender.replicaof = forgotten_primary;
+    let mut reader = PacketReader {
+        packet: Some(msg::encode_msg(ClusterMsgType::Pong, &sender, 1, &[])),
+    };
+
+    assert!(!manager.readable(&mut state, &mut reader, token.0, 200));
+    assert!(state.nodes[&replica_id].replicaof.is_empty());
+}
+
+#[test]
+fn newly_discovered_replica_does_not_retain_unknown_primary_reference() {
+    use crate::engine::distributed::cluster::node::{CLUSTER_NODE_PRIMARY, CLUSTER_NODE_REPLICA};
+
+    let mut state = ClusterState::new("127.0.0.1", 6379, 16379);
+    let replica_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
+    let unknown_primary = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string();
+    let mut replica = ClusterNode::new(
+        replica_id.clone(),
+        "127.0.0.1".to_string(),
+        6380,
+        16380,
+        false,
+    );
+    replica.flags &= !(CLUSTER_NODE_MYSELF | CLUSTER_NODE_PRIMARY);
+    replica.flags |= CLUSTER_NODE_REPLICA;
+    replica.replicaof = unknown_primary.clone();
+    let message = msg::ClusterBusMessage::from_node(
+        ClusterMsgType::Pong,
+        &replica,
+        1,
+        msg::ClusterBusBody::Gossip(Vec::new()),
+    );
+
+    ClusterBusManager::add_or_update_node(&mut state, &message, true);
+
+    assert!(state.nodes[&replica_id].is_replica());
+    assert!(state.nodes[&replica_id].replicaof.is_empty());
+    assert!(!state.nodes.contains_key(&unknown_primary));
 }
 
 #[test]

@@ -1,7 +1,12 @@
 pub use super::external::ExternalMemoryError;
 use super::external::MODULE_EXTERNAL_MEMORY;
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+thread_local! {
+    static THREAD_ALLOCATED: Cell<usize> = const { Cell::new(0) };
+}
 
 #[cfg(target_os = "macos")]
 extern "C" {
@@ -50,6 +55,7 @@ unsafe impl GlobalAlloc for LibcAllocator {
         let real = malloc_real_size(ptr, layout);
         if real > 0 {
             let prev = ALLOCATED.fetch_add(real, Ordering::Relaxed);
+            increase_thread_allocated(real);
             update_peak(prev + real);
         }
         ptr
@@ -70,6 +76,7 @@ unsafe impl GlobalAlloc for LibcAllocator {
         let real = malloc_real_size(ptr, layout);
         if real > 0 {
             let prev = ALLOCATED.fetch_add(real, Ordering::Relaxed);
+            increase_thread_allocated(real);
             update_peak(prev + real);
         }
         ptr
@@ -83,6 +90,7 @@ unsafe impl GlobalAlloc for LibcAllocator {
         let real = malloc_real_size(ptr, layout);
         if real > 0 {
             ALLOCATED.fetch_sub(real, Ordering::Relaxed);
+            decrease_thread_allocated(real);
         }
         // SAFETY: ptr was allocated by System with this exact layout and has not
         // been deallocated yet, as required by the GlobalAlloc caller contract.
@@ -96,6 +104,7 @@ unsafe impl GlobalAlloc for LibcAllocator {
             let old_real = malloc_real_size(ptr, layout);
             if old_real > 0 {
                 ALLOCATED.fetch_sub(old_real, Ordering::Relaxed);
+                decrease_thread_allocated(old_real);
             }
             // SAFETY: ptr was allocated by System with this exact layout and is
             // consumed here instead of being passed to realloc with size zero.
@@ -115,9 +124,11 @@ unsafe impl GlobalAlloc for LibcAllocator {
         let diff = (new_real as isize) - (old_real as isize);
         if diff > 0 {
             let prev = ALLOCATED.fetch_add(diff as usize, Ordering::Relaxed);
+            increase_thread_allocated(diff as usize);
             update_peak(prev + diff as usize);
         } else if diff < 0 {
             ALLOCATED.fetch_sub((-diff) as usize, Ordering::Relaxed);
+            decrease_thread_allocated((-diff) as usize);
         }
         new_ptr
     }
@@ -138,6 +149,20 @@ static ALLOCATED: AtomicUsize = AtomicUsize::new(0);
 static PEAK: AtomicUsize = AtomicUsize::new(0);
 
 #[inline]
+fn increase_thread_allocated(bytes: usize) {
+    THREAD_ALLOCATED.with(|allocated| {
+        allocated.set(allocated.get().saturating_add(bytes));
+    });
+}
+
+#[inline]
+fn decrease_thread_allocated(bytes: usize) {
+    THREAD_ALLOCATED.with(|allocated| {
+        allocated.set(allocated.get().saturating_sub(bytes));
+    });
+}
+
+#[inline]
 fn update_peak(candidate: usize) {
     PEAK.fetch_max(
         candidate.saturating_add(external_allocated()),
@@ -150,6 +175,11 @@ pub fn total_allocated() -> usize {
     ALLOCATED
         .load(Ordering::Relaxed)
         .saturating_add(external_allocated())
+}
+
+#[inline]
+pub fn current_thread_allocated() -> usize {
+    THREAD_ALLOCATED.with(Cell::get)
 }
 
 /// Return reported resident bytes not owned by the server allocator.
@@ -390,6 +420,29 @@ mod tests {
         assert!(total_allocated() > 0);
         std::hint::black_box(&v);
         drop(v);
+    }
+
+    #[test]
+    fn current_thread_allocated_excludes_other_threads() {
+        let (allocated_tx, allocated_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let before = current_thread_allocated();
+            let allocation = vec![0u8; 8 * 1024 * 1024];
+            let delta = current_thread_allocated().saturating_sub(before);
+            allocated_tx.send(delta).unwrap();
+            release_rx.recv().unwrap();
+            drop(allocation);
+        });
+        let before = current_thread_allocated();
+        let worker_delta = allocated_rx.recv().unwrap();
+        let local_delta = current_thread_allocated().saturating_sub(before);
+
+        assert!(worker_delta >= 8 * 1024 * 1024);
+        assert!(local_delta < worker_delta / 16);
+
+        release_tx.send(()).unwrap();
+        worker.join().unwrap();
     }
 
     #[test]

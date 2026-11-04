@@ -48,6 +48,10 @@ fn connect_peer(runtime: &mut ServerWorkerState) -> (usize, TcpStream) {
 
 impl ReplayFixture {
     fn new(aof_enabled: bool, scenario: &str) -> Self {
+        Self::with_main_reply(aof_enabled, scenario, true)
+    }
+
+    fn with_main_reply(aof_enabled: bool, scenario: &str, has_main_reply: bool) -> Self {
         let directory = TestDirectory(std::env::temp_dir().join(format!(
             "versal-replay-fifo-{}-{:?}-{scenario}-{aof_enabled}",
             std::process::id(),
@@ -92,8 +96,10 @@ impl ReplayFixture {
         .unwrap();
         link.on_rdb_bytes(format!("$EOF:{REPLID}\r\n").as_bytes())
             .unwrap();
-        link.on_bytes(b"+OK\r\n+CONTINUE\r\n", 6379).unwrap();
-        assert!(link.is_streaming());
+        if has_main_reply {
+            link.on_bytes(b"+OK\r\n+CONTINUE\r\n", 6379).unwrap();
+            assert!(link.is_streaming());
+        }
         runtime.replication_runtime.set_replica_link(link);
         runtime
             .replication_runtime
@@ -230,6 +236,154 @@ impl ReplayFixture {
             .set_replica_pending_buffer(session, pending)
             .is_none());
     }
+}
+
+#[test]
+fn incomplete_dual_disk_payload_never_schedules_main_readiness() {
+    let mut fixture = ReplayFixture::new(false, "incomplete-pending-rdb");
+    let mut payload = b"VALKEY080\x00".to_vec();
+    save_string(&mut payload, b"pending");
+    save_string(&mut payload, &[b'x'; 128]);
+    fixture._rdb_peer.write_all(&payload).unwrap();
+    fixture
+        .runtime
+        .transport
+        .wait_pending_bytes_for_test(Token(fixture.rdb), payload.len());
+    fixture
+        .runtime
+        .recv_rdb_channel_streaming_chunk(fixture.rdb, fixture.rdb);
+    assert!(fixture
+        .runtime
+        .replication_runtime
+        .replica_link()
+        .unwrap()
+        .has_pending_decompression());
+    for paused in [false, true] {
+        fixture
+            .runtime
+            .replication_runtime
+            .set_replica_main_read_paused(paused);
+        let events = fixture.runtime.collect_before_sleep_pending_events();
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.token == Token(fixture.main) && event.readable),
+            "RDB payload waiting for disk download completion belongs to the RDB socket"
+        );
+    }
+}
+
+#[test]
+fn paused_main_rejects_stale_reads_without_consuming_kernel_input() {
+    for direct in [false, true] {
+        let mut fixture = ReplayFixture::new(false, "stale-paused-main");
+        let frame = protocol::encode_command(&[b"PING"]);
+        fixture.main_peer.write_all(&frame).unwrap();
+        fixture
+            .runtime
+            .transport
+            .wait_pending_bytes_for_test(Token(fixture.main), frame.len());
+        fixture
+            .runtime
+            .replication_runtime
+            .set_replica_main_read_paused(true);
+        if direct {
+            fixture
+                .runtime
+                .recv_streaming_rdb_chunk(fixture.main, fixture.main);
+        } else {
+            fixture
+                .runtime
+                .handle_master_link_readable(fixture.main, fixture.main);
+        }
+        assert_eq!(
+            fixture
+                .runtime
+                .replication_runtime
+                .replica_link()
+                .unwrap()
+                .received_position(),
+            offset(SNAPSHOT_OFFSET)
+        );
+        assert!(fixture
+            .runtime
+            .replication_runtime
+            .replica_pending_buffer()
+            .is_none());
+        fixture
+            .runtime
+            .replication_runtime
+            .set_replica_main_read_paused(false);
+        fixture
+            .runtime
+            .handle_master_link_readable(fixture.main, fixture.main);
+        assert_eq!(
+            fixture
+                .runtime
+                .replication_runtime
+                .replica_link()
+                .unwrap()
+                .received_position(),
+            offset(SNAPSHOT_OFFSET + frame.len() as i64),
+            "the unread command remains available after an explicit resume"
+        );
+    }
+}
+
+#[test]
+fn dual_main_read_loop_stops_before_the_next_chunk_after_buffer_overrun() {
+    let mut fixture = ReplayFixture::new(false, "overrun-read-boundary");
+    // Keep both read batches pending without consuming data. The initial
+    // Linux receive window is smaller than this test's 256 KiB payload.
+    crate::foundation::io::sys::socket::set_buffer_size_raw(
+        fixture
+            .runtime
+            .transport
+            .raw_fd(Token(fixture.main))
+            .unwrap(),
+        crate::foundation::io::sys::socket::SocketBuffer::Receive,
+        512 * 1024,
+    )
+    .unwrap();
+    fixture
+        .runtime
+        .ctx
+        .config_mut()
+        .replication
+        .replica_output_buffer_hard_limit = 1024;
+    let frame = protocol::encode_command(&[b"PING"]);
+    let bytes: Vec<u8> = frame
+        .iter()
+        .copied()
+        .cycle()
+        .take(fixture.runtime.io_buf.len() * 2)
+        .collect();
+    fixture.main_peer.write_all(&bytes).unwrap();
+    fixture
+        .runtime
+        .transport
+        .wait_pending_bytes_for_test(Token(fixture.main), bytes.len());
+
+    fixture
+        .runtime
+        .recv_streaming_rdb_chunk(fixture.main, fixture.main);
+
+    assert!(fixture
+        .runtime
+        .replication_runtime
+        .replica_main_read_paused());
+    let received = fixture
+        .runtime
+        .replication_runtime
+        .replica_link()
+        .unwrap()
+        .received_position()
+        .get();
+    assert!(
+        received <= SNAPSHOT_OFFSET + fixture.runtime.io_buf.len() as i64,
+        "buffer overrun must prevent the next socket read, received offset {received}"
+    );
+    assert!(received > SNAPSHOT_OFFSET);
 }
 
 fn batch(commands: &[&[&[u8]]], position: &mut i64) -> (Vec<u8>, Vec<ReplicationOffset>) {
@@ -509,4 +663,72 @@ fn disk_backed_eof_pending_decode_completes_without_new_socket_bytes() {
         assert_eq!(fixture.runtime.ctx.aof().journal.is_some(), aof_enabled);
         assert!(!fixture.runtime.ctx.is_loading());
     }
+}
+
+#[test]
+fn disk_backed_eof_decode_is_scheduled_without_main_socket_readiness() {
+    use crate::runtime::server::worker::reactor::{BeforePollSlot, DispatchContext};
+
+    for aof_enabled in [false, true] {
+        for has_main_reply in [false, true] {
+            let mut fixture =
+                ReplayFixture::with_main_reply(aof_enabled, "eof-scheduled", has_main_reply);
+            fixture.load_first_turn();
+            fixture
+                .runtime
+                .replication_runtime
+                .set_replica_main_read_paused(true);
+            let wire_before = fixture.runtime.ctx.stats().total_net_repl_input_bytes;
+            assert!(fixture
+                .runtime
+                .processable_classic_replica_input_token()
+                .is_none());
+            for _ in 0..4 {
+                fixture.runtime.event_batch.begin_next_turn();
+                fixture
+                    .runtime
+                    .dispatch_before_poll_slot(BeforePollSlot::PreAof, DispatchContext::Normal)
+                    .unwrap();
+            }
+            let link = fixture.runtime.replication_runtime.replica_link().unwrap();
+            assert!(
+                !link.has_pending_rdb_receive(),
+                "framing EOF must schedule local decode without main-channel readiness"
+            );
+            assert_eq!(link.applied_position(), offset(SNAPSHOT_OFFSET));
+            assert_eq!(fixture.runtime.ctx.db(0).unwrap().dbsize(), 1536);
+            assert_eq!(fixture.runtime.ctx.aof().journal.is_some(), aof_enabled);
+            assert!(!fixture.runtime.ctx.is_loading());
+            assert_eq!(
+                fixture.runtime.ctx.stats().total_net_repl_input_bytes,
+                wire_before
+            );
+        }
+    }
+}
+
+#[test]
+fn disk_backed_decode_continuation_rejects_a_stale_session() {
+    let mut fixture = ReplayFixture::new(false, "eof-stale-session");
+    fixture.load_first_turn();
+    let was_loading = fixture.runtime.ctx.is_loading();
+    let (session_id, loaded) = {
+        let link = fixture
+            .runtime
+            .replication_runtime
+            .replica_link_mut()
+            .unwrap();
+        (link.session_id(), link.rdb_receive_mut().unwrap().loaded())
+    };
+    fixture
+        .runtime
+        .drive_pending_replica_rdb_decode(session_id.wrapping_sub(1));
+    let link = fixture
+        .runtime
+        .replication_runtime
+        .replica_link_mut()
+        .unwrap();
+    assert_eq!(link.session_id(), session_id);
+    assert_eq!(link.rdb_receive_mut().unwrap().loaded(), loaded);
+    assert_eq!(fixture.runtime.ctx.is_loading(), was_loading);
 }

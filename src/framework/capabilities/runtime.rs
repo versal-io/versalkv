@@ -92,7 +92,7 @@ fn module_acl_error(
     args: &CommandArgs,
     conn: &dyn CommandConn,
 ) -> Option<String> {
-    let keys = command.extract_keys(args).unwrap_or_default();
+    let key_accesses = command.extract_key_accesses(args).unwrap_or_default();
     let set_reads_old_value = command.name.as_str().eq_ignore_ascii_case("set")
         && args
             .args
@@ -107,8 +107,18 @@ fn module_acl_error(
     } else {
         crate::engine::extension::acl::ACL_READ_PERMISSION
     };
-    let key_requirements: Vec<(&[u8], u8)> =
-        keys.iter().map(|key| (key.as_ref(), required)).collect();
+    let key_requirements: Vec<(&[u8], u8)> = key_accesses
+        .iter()
+        .map(|(key, flags)| {
+            let key_required = crate::framework::spec::key_flags_to_acl_bits(flags);
+            let required = if key_required != 0 {
+                key_required
+            } else {
+                required
+            };
+            (key.as_ref(), required)
+        })
+        .collect();
     let acl_categories = crate::framework::spec::effective_acl_categories(
         command.name.as_str(),
         command.acl_categories,
@@ -117,7 +127,7 @@ fn module_acl_error(
     let should_restrict = crate::engine::extension::acl::should_restrict_cmd(
         command.name.as_str(),
         acl_categories,
-        !keys.is_empty(),
+        !key_accesses.is_empty(),
     );
     let db_req = crate::engine::extension::acl::compute_db_requirement(
         command.name.as_str(),
@@ -421,6 +431,59 @@ impl ScriptRuntime for ServerContext {
 }
 
 impl ModuleRuntime for ServerContext {
+    fn effective_command_flags(
+        &self,
+        command: &CommandDescriptor,
+        args: &CommandArgs,
+    ) -> crate::engine::command::CmdFlags {
+        crate::framework::spec::effective_command_flags_for_call(
+            command.name.as_str(),
+            command.flags,
+            args,
+            self,
+        )
+    }
+
+    fn command_would_block(
+        &self,
+        command: &CommandDescriptor,
+        args: &CommandArgs,
+        db_idx: u32,
+    ) -> bool {
+        let flags = self.effective_command_flags(command, args);
+        if !crate::engine::command::command_may_mutate_dataset(command.name.as_str(), flags) {
+            return false;
+        }
+        if command.name.as_str().eq_ignore_ascii_case("swapdb") {
+            return false;
+        }
+        let is_capture_control = matches!(
+            command.name.as_str(),
+            "bgsave" | "save" | "flushdb" | "flushall" | "shutdown"
+        );
+        let key_targets = crate::framework::spec::normalize_forkless_key_targets(
+            command.name.as_str(),
+            args,
+            db_idx,
+            command
+                .extract_keys(args)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|key| (db_idx, key.to_vec()))
+                .collect(),
+        );
+        if key_targets
+            .iter()
+            .any(|(target_db, _)| *target_db as usize >= self.num_dbs())
+        {
+            return false;
+        }
+        (!is_capture_control && self.persistence().forkless_capture_in_progress())
+            || key_targets
+                .iter()
+                .any(|(target_db, key)| self.persistence().forkless_key_blocked(*target_db, key))
+    }
+
     fn apply_module_call_effects(
         &mut self,
         mut effects: crate::engine::extension::module::api::call::pending::ModuleCallEffects,
@@ -469,18 +532,7 @@ impl ModuleRuntime for ServerContext {
         &mut self,
         call: crate::engine::extension::module::api::call::pending::PendingModuleCall,
     ) -> Option<usize> {
-        let blocked = call.conn.blocked()?;
-        let session = crate::engine::command::SessionId(call.conn.token().0 as u64);
-        if blocked.keys.is_empty() {
-            self.blocking_registry_mut()
-                .register_keyless_client(session);
-        } else {
-            self.blocking_registry_mut().register_client(
-                call.conn.selected_db(),
-                &blocked.keys,
-                session,
-            );
-        }
+        register_pending_module_call(self, &call.conn)?;
         Some(self.module_registry_mut().retain_pending_call(call))
     }
 
@@ -906,6 +958,21 @@ impl ModuleRuntime for ServerContext {
     }
 }
 
+pub(crate) fn register_pending_module_call(
+    ctx: &mut ServerContext,
+    conn: &dyn CommandConn,
+) -> Option<()> {
+    let blocked = conn.blocked()?;
+    let session = crate::engine::command::SessionId(conn.token().0 as u64);
+    if blocked.keys.is_empty() {
+        ctx.blocking_registry_mut().register_keyless_client(session);
+    } else {
+        ctx.blocking_registry_mut()
+            .register_client(conn.selected_db(), &blocked.keys, session);
+    }
+    Some(())
+}
+
 pub(crate) fn unregister_pending_module_call(ctx: &mut ServerContext, conn: &dyn CommandConn) {
     let Some(blocked) = conn.blocked() else {
         return;
@@ -937,10 +1004,14 @@ mod pause_tests;
 
 #[cfg(test)]
 mod tests {
+    use crate::engine::command::context::CommandConn;
     use crate::engine::command::CommandName;
+    use crate::engine::extension::acl::{acl_users, AclUser};
     use crate::engine::extension::module::capability::ModuleRuntime;
+    use crate::framework::capabilities::connection::Connection;
     use crate::framework::context::ServerContext;
-    use crate::framework::CommandRegistry;
+    use crate::framework::{CommandArgs, CommandRegistry};
+    use bytes::Bytes;
     use std::sync::Arc;
 
     fn unregister_script_command(
@@ -951,6 +1022,37 @@ mod tests {
         let name = std::str::from_utf8(&args.name).unwrap();
         assert!(ctx.script_mut().command_registry.unregister(name));
         crate::foundation::io::protocol::Value::ok()
+    }
+
+    #[test]
+    fn module_acl_dynamic_ro_keys_require_read_permission() {
+        const USERNAME: &str = "module-dynamic-ro-only";
+        let mut user = AclUser::new_disabled();
+        for rule in ["on", "nopass", "+@all", "alldbs", "%W~secret"] {
+            user.apply_rule(rule).unwrap();
+        }
+        acl_users()
+            .lock()
+            .unwrap()
+            .insert(USERNAME.to_string(), user);
+        let mut conn = Connection::new_fake();
+        conn.set_username(USERNAME.to_string());
+        let args = CommandArgs::from_parts(vec![
+            Bytes::from_static(b"MEMORY"),
+            Bytes::from_static(b"USAGE"),
+            Bytes::from_static(b"secret"),
+        ]);
+        let ctx = ServerContext::new(1);
+
+        let denial = super::module_acl_error(
+            &ctx,
+            crate::framework::commands::server::memory::MEMORY_SPEC.descriptor(),
+            &args,
+            &conn,
+        );
+
+        acl_users().lock().unwrap().remove(USERNAME);
+        assert!(denial.is_some());
     }
 
     #[test]

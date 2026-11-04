@@ -19,6 +19,7 @@ use crate::runtime::server::worker::reactor::blocked_events::BlockedOperation;
 
 use crate::runtime::server::worker::ServerWorkerState;
 
+mod debugger;
 mod module;
 
 #[derive(Clone, Copy, Default)]
@@ -87,6 +88,12 @@ impl ServerWorkerState {
                 }
             }
             crate::framework::host_tasks::PreparedHostTask::Lua(mut task) => {
+                if task.is_forked_debug() {
+                    return self.run_forked_lua_debugger(token, task);
+                }
+                if task.is_synchronous_debug() {
+                    return self.run_synchronous_lua_debugger(token, task);
+                }
                 self.ctx.enter_script(task.control());
                 let result = self
                     .with_host_dispatcher(HostTaskScope::client(token), |dispatcher| {
@@ -680,6 +687,1327 @@ mod tests {
         static DISCONNECT_ERROR: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
     }
 
+    #[test]
+    fn lua_debug_task_without_connected_client_clears_debug_state() {
+        use crate::framework::capabilities::io::Token;
+
+        let mut runtime = ServerWorkerState::new(1).unwrap();
+        let token = Token(42);
+        let mut connection = Connection::new_fake();
+        connection.set_token_for_test(token);
+        runtime.connection_registry.insert(connection);
+        let session = runtime.connection_registry[token].session_id();
+        let debug = CommandArgs::from_parts(vec![
+            Bytes::from_static(b"SCRIPT"),
+            Bytes::from_static(b"DEBUG"),
+            Bytes::from_static(b"YES"),
+        ]);
+        assert_eq!(
+            crate::framework::commands::scripting::script_cmd::script_cmd(
+                &mut runtime.connection_registry[token],
+                &debug,
+                &mut runtime.ctx,
+            ),
+            Value::ok()
+        );
+        assert!(runtime.ctx.script().debug_modes.contains_key(&session));
+        let eval = CommandArgs::from_parts(vec![
+            Bytes::from_static(b"EVAL"),
+            Bytes::from_static(b"return 'hello'"),
+            Bytes::from_static(b"0"),
+        ]);
+        let task = crate::framework::host_tasks::prepare_lua_task(
+            &mut runtime.connection_registry[token],
+            &eval,
+            &mut runtime.ctx,
+        )
+        .unwrap();
+        assert_eq!(runtime.ctx.script().debug_session, Some(session));
+
+        let result = runtime.run_prepared_host_task(token, task);
+
+        assert_eq!(
+            result,
+            Value::error("ERR debugger requires a connected client")
+        );
+        assert!(!runtime.ctx.script().debug_modes.contains_key(&session));
+        assert_eq!(runtime.ctx.script().debug_session, None);
+    }
+
+    #[test]
+    fn synchronous_lua_debugger_runs_against_live_dataset_and_returns_final_reply() {
+        use crate::framework::capabilities::connection::ConnectionState;
+        use std::io::Write;
+
+        let mut runtime = ServerWorkerState::new(1).unwrap();
+        crate::framework::commands::register_all(&mut runtime.registry);
+        runtime.ctx.set_command_registry_snapshot(&runtime.registry);
+        let (token, mut peer) = disconnect_owner(&mut runtime);
+        let debug = CommandArgs::from_parts(vec![
+            Bytes::from_static(b"SCRIPT"),
+            Bytes::from_static(b"DEBUG"),
+            Bytes::from_static(b"SYNC"),
+        ]);
+        assert_eq!(
+            crate::framework::commands::scripting::script_cmd::script_cmd(
+                &mut runtime.connection_registry[token],
+                &debug,
+                &mut runtime.ctx,
+            ),
+            Value::ok()
+        );
+        let eval = CommandArgs::from_parts(vec![
+            Bytes::from_static(b"EVAL"),
+            Bytes::from_static(b"redis.call('SET','sync-debug-key','value'); return 'hello'"),
+            Bytes::from_static(b"0"),
+        ]);
+        let task = crate::framework::host_tasks::prepare_lua_task(
+            &mut runtime.connection_registry[token],
+            &eval,
+            &mut runtime.ctx,
+        )
+        .unwrap();
+        peer.write_all(b"*1\r\n$8\r\ncontinue\r\n").unwrap();
+
+        let result = runtime.run_prepared_host_task(token, task);
+
+        assert_eq!(result, Value::bulk(Bytes::from_static(b"hello")));
+        assert_eq!(
+            runtime.connection_registry[token].state,
+            ConnectionState::CloseAfterReply
+        );
+        assert_eq!(
+            runtime
+                .ctx
+                .db(0)
+                .unwrap()
+                .get_no_expire(b"sync-debug-key")
+                .map(|value| value.as_bytes()),
+            Some(b"value".as_slice())
+        );
+        let output = read_debugger_output(&mut peer);
+        assert_eq!(
+            parse_debugger_frames(&output),
+            vec![
+                DebuggerFrame(vec![
+                    DebuggerFrameElement::SimpleString(b"* Stopped at 1, stop reason = step over"),
+                    DebuggerFrameElement::SimpleString(
+                        b"-> 1 redis.call('SET','sync-debug-key','value'); return 'hello'"
+                    ),
+                ]),
+                DebuggerFrame(vec![DebuggerFrameElement::SimpleString(b"<endsession>")]),
+            ]
+        );
+    }
+
+    fn prepare_synchronous_lua_debug_task(
+        runtime: &mut ServerWorkerState,
+        token: crate::framework::capabilities::io::Token,
+        source: &'static [u8],
+    ) -> crate::framework::host_tasks::PreparedHostTask {
+        prepare_synchronous_lua_debug_task_with_args(
+            runtime,
+            token,
+            Bytes::from_static(source),
+            &[],
+            &[],
+        )
+    }
+
+    fn prepare_synchronous_lua_debug_task_with_owned_source(
+        runtime: &mut ServerWorkerState,
+        token: crate::framework::capabilities::io::Token,
+        source: impl Into<Bytes>,
+    ) -> crate::framework::host_tasks::PreparedHostTask {
+        prepare_synchronous_lua_debug_task_with_args(runtime, token, source.into(), &[], &[])
+    }
+
+    fn prepare_synchronous_lua_debug_task_with_args(
+        runtime: &mut ServerWorkerState,
+        token: crate::framework::capabilities::io::Token,
+        source: Bytes,
+        keys: &[&'static [u8]],
+        args: &[&'static [u8]],
+    ) -> crate::framework::host_tasks::PreparedHostTask {
+        let debug = CommandArgs::from_parts(vec![
+            Bytes::from_static(b"SCRIPT"),
+            Bytes::from_static(b"DEBUG"),
+            Bytes::from_static(b"SYNC"),
+        ]);
+        assert_eq!(
+            crate::framework::commands::scripting::script_cmd::script_cmd(
+                &mut runtime.connection_registry[token],
+                &debug,
+                &mut runtime.ctx,
+            ),
+            Value::ok()
+        );
+        let mut eval_parts = vec![
+            Bytes::from_static(b"EVAL"),
+            source,
+            Bytes::from(keys.len().to_string()),
+        ];
+        eval_parts.extend(keys.iter().map(|key| Bytes::from_static(key)));
+        eval_parts.extend(args.iter().map(|arg| Bytes::from_static(arg)));
+        let eval = CommandArgs::from_parts(eval_parts);
+        crate::framework::host_tasks::prepare_lua_task(
+            &mut runtime.connection_registry[token],
+            &eval,
+            &mut runtime.ctx,
+        )
+        .unwrap()
+    }
+
+    fn read_debugger_output(peer: &mut std::net::TcpStream) -> Vec<u8> {
+        use std::io::Read;
+        use std::time::Duration;
+
+        peer.set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        let mut output = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        loop {
+            match peer.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(count) => output.extend_from_slice(&buffer[..count]),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    break;
+                }
+                Err(error) => panic!("failed to read debugger output: {error}"),
+            }
+        }
+        output
+    }
+
+    fn read_debugger_output_until_end_session(peer: &mut std::net::TcpStream) -> Vec<u8> {
+        use std::io::Read;
+        use std::time::Duration;
+
+        const END_SESSION_FRAME: &[u8] = b"*1\r\n+<endsession>\r\n";
+
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut output = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        loop {
+            match peer.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(count) => {
+                    output.extend_from_slice(&buffer[..count]);
+                    if output.ends_with(END_SESSION_FRAME) {
+                        return output;
+                    }
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    panic!("timed out before debugger end-session frame")
+                }
+                Err(error) => panic!("failed to read debugger output: {error}"),
+            }
+        }
+        panic!(
+            "debugger output ended before end-session frame after {} bytes",
+            output.len()
+        )
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct DebuggerFrame<'a>(Vec<DebuggerFrameElement<'a>>);
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum DebuggerFrameElement<'a> {
+        SimpleString(&'a [u8]),
+        Error(&'a [u8]),
+    }
+
+    fn parse_debugger_frames(mut input: &[u8]) -> Vec<DebuggerFrame<'_>> {
+        let mut frames = Vec::new();
+        while !input.is_empty() {
+            frames.push(parse_debugger_frame(&mut input));
+        }
+        frames
+    }
+
+    fn parse_debugger_frame<'a>(input: &mut &'a [u8]) -> DebuggerFrame<'a> {
+        let header = take_debugger_resp_line(input);
+        let length = header
+            .strip_prefix(b"*")
+            .expect("debugger output must contain only top-level RESP arrays");
+        assert!(
+            !length.is_empty() && length.iter().all(u8::is_ascii_digit),
+            "invalid debugger RESP array length"
+        );
+        let length = std::str::from_utf8(length)
+            .expect("debugger RESP array length must be ASCII")
+            .parse::<usize>()
+            .expect("debugger RESP array length must fit in usize");
+        let mut elements = Vec::with_capacity(length);
+        for _ in 0..length {
+            let element = take_debugger_resp_line(input);
+            let (kind, value) = element
+                .split_first()
+                .expect("debugger RESP array element must have a type prefix");
+            elements.push(match kind {
+                b'+' => DebuggerFrameElement::SimpleString(value),
+                b'-' => DebuggerFrameElement::Error(value),
+                _ => panic!("unsupported debugger RESP array element type"),
+            });
+        }
+        DebuggerFrame(elements)
+    }
+
+    fn take_debugger_resp_line<'a>(input: &mut &'a [u8]) -> &'a [u8] {
+        let line_end = input
+            .windows(2)
+            .position(|window| window == b"\r\n")
+            .expect("incomplete debugger RESP frame");
+        let (line, remaining) = input.split_at(line_end);
+        assert!(
+            !line.contains(&b'\r') && !line.contains(&b'\n'),
+            "debugger RESP line contains an invalid line break"
+        );
+        *input = &remaining[2..];
+        line
+    }
+
+    #[test]
+    fn synchronous_lua_debugger_eval_reports_fragment_result() {
+        use std::io::Write;
+
+        let mut runtime = ServerWorkerState::new(1).unwrap();
+        crate::framework::commands::register_all(&mut runtime.registry);
+        runtime.ctx.set_command_registry_snapshot(&runtime.registry);
+        let (token, mut peer) = disconnect_owner(&mut runtime);
+        let task =
+            prepare_synchronous_lua_debug_task(&mut runtime, token, b"return 'eval-complete'");
+        peer.write_all(
+            b"*4\r\n$4\r\neval\r\n$1\r\n1\r\n$1\r\n+\r\n$1\r\n2\r\n\
+              *1\r\n$8\r\ncontinue\r\n",
+        )
+        .unwrap();
+        peer.shutdown(std::net::Shutdown::Write).unwrap();
+
+        let result = runtime.run_prepared_host_task(token, task);
+
+        assert_eq!(result, Value::bulk(Bytes::from_static(b"eval-complete")));
+        let output = read_debugger_output(&mut peer);
+        assert_eq!(
+            parse_debugger_frames(&output),
+            vec![
+                DebuggerFrame(vec![
+                    DebuggerFrameElement::SimpleString(b"* Stopped at 1, stop reason = step over"),
+                    DebuggerFrameElement::SimpleString(b"-> 1 return 'eval-complete'"),
+                ]),
+                DebuggerFrame(vec![DebuggerFrameElement::SimpleString(b"<retval> 3")]),
+                DebuggerFrame(vec![DebuggerFrameElement::SimpleString(b"<endsession>")]),
+            ]
+        );
+    }
+
+    #[test]
+    fn synchronous_lua_debugger_sanitizes_line_breaks_in_logs() {
+        use std::io::Write;
+
+        let mut runtime = ServerWorkerState::new(1).unwrap();
+        crate::framework::commands::register_all(&mut runtime.registry);
+        runtime.ctx.set_command_registry_snapshot(&runtime.registry);
+        let (token, mut peer) = disconnect_owner(&mut runtime);
+        let task =
+            prepare_synchronous_lua_debug_task(&mut runtime, token, b"return 'log-complete'");
+        peer.write_all(
+            b"*2\r\n$4\r\neval\r\n$24\r\nstring.char(65,13,10,66)\r\n\
+              *1\r\n$8\r\ncontinue\r\n",
+        )
+        .unwrap();
+        peer.shutdown(std::net::Shutdown::Write).unwrap();
+
+        let result = runtime.run_prepared_host_task(token, task);
+
+        assert_eq!(result, Value::bulk(Bytes::from_static(b"log-complete")));
+        let output = read_debugger_output(&mut peer);
+        assert_eq!(
+            parse_debugger_frames(&output),
+            vec![
+                DebuggerFrame(vec![
+                    DebuggerFrameElement::SimpleString(b"* Stopped at 1, stop reason = step over"),
+                    DebuggerFrameElement::SimpleString(b"-> 1 return 'log-complete'"),
+                ]),
+                DebuggerFrame(vec![DebuggerFrameElement::SimpleString(b"<retval> A  B")]),
+                DebuggerFrame(vec![DebuggerFrameElement::SimpleString(b"<endsession>")]),
+            ]
+        );
+    }
+
+    #[test]
+    fn synchronous_lua_debugger_rejects_oversized_argument_and_ends_session() {
+        use std::io::Write;
+
+        const MAX_DEBUGGER_ARGUMENT_LEN: usize = 1024 * 1024;
+
+        let mut runtime = ServerWorkerState::new(1).unwrap();
+        crate::framework::commands::register_all(&mut runtime.registry);
+        runtime.ctx.set_command_registry_snapshot(&runtime.registry);
+        let (token, mut peer) = disconnect_owner(&mut runtime);
+        let task = prepare_synchronous_lua_debug_task(
+            &mut runtime,
+            token,
+            b"redis.call('SET','oversized-debugger-argument','executed'); return 'executed'",
+        );
+        let command = format!("*2\r\n$4\r\neval\r\n${}\r\n", MAX_DEBUGGER_ARGUMENT_LEN + 1);
+        peer.write_all(command.as_bytes()).unwrap();
+        peer.shutdown(std::net::Shutdown::Write).unwrap();
+
+        let result = runtime.run_prepared_host_task(token, task);
+
+        assert_eq!(result, Value::Null);
+        assert!(runtime
+            .ctx
+            .db(0)
+            .unwrap()
+            .get_no_expire(b"oversized-debugger-argument")
+            .is_none());
+        let output = read_debugger_output(&mut peer);
+        assert_eq!(
+            parse_debugger_frames(&output),
+            vec![
+                DebuggerFrame(vec![
+                    DebuggerFrameElement::SimpleString(b"* Stopped at 1, stop reason = step over"),
+                    DebuggerFrameElement::SimpleString(
+                        b"-> 1 redis.call('SET','oversized-debugger-argument','executed'); return 'executed'"
+                    ),
+                ]),
+                DebuggerFrame(vec![DebuggerFrameElement::SimpleString(
+                    b"<error> unauthenticated bulk length",
+                )]),
+                DebuggerFrame(vec![DebuggerFrameElement::SimpleString(b"<endsession>")]),
+            ]
+        );
+    }
+
+    #[test]
+    fn synchronous_lua_debugger_maxlen_controls_log_truncation() {
+        use std::io::Write;
+
+        let mut runtime = ServerWorkerState::new(1).unwrap();
+        crate::framework::commands::register_all(&mut runtime.registry);
+        runtime.ctx.set_command_registry_snapshot(&runtime.registry);
+        let (token, mut peer) = disconnect_owner(&mut runtime);
+        let task =
+            prepare_synchronous_lua_debug_task(&mut runtime, token, b"return 'maxlen-complete'");
+        peer.write_all(
+            b"*1\r\n$6\r\nmaxlen\r\n\
+              *2\r\n$4\r\neval\r\n$19\r\nstring.rep('x',300)\r\n\
+              *2\r\n$6\r\nmaxlen\r\n$2\r\n32\r\n\
+              *2\r\n$4\r\neval\r\n$19\r\nstring.rep('x',300)\r\n\
+              *2\r\n$6\r\nmaxlen\r\n$1\r\n0\r\n\
+              *2\r\n$4\r\neval\r\n$19\r\nstring.rep('x',300)\r\n\
+              *1\r\n$5\r\nabort\r\n",
+        )
+        .unwrap();
+        peer.shutdown(std::net::Shutdown::Write).unwrap();
+
+        let result = runtime.run_prepared_host_task(token, task);
+
+        assert_eq!(result, Value::error("ERR script aborted for user request"));
+        let output = read_debugger_output(&mut peer);
+        let full_log = format!("<retval> {}", "x".repeat(300));
+        let default_truncated = format!("{} ...", &full_log[..256]);
+        let minimum_truncated = format!("{} ...", &full_log[..60]);
+        assert_eq!(
+            parse_debugger_frames(&output),
+            vec![
+                DebuggerFrame(vec![
+                    DebuggerFrameElement::SimpleString(b"* Stopped at 1, stop reason = step over"),
+                    DebuggerFrameElement::SimpleString(b"-> 1 return 'maxlen-complete'"),
+                ]),
+                DebuggerFrame(vec![DebuggerFrameElement::SimpleString(
+                    b"Current maxlen is 256",
+                )]),
+                DebuggerFrame(vec![DebuggerFrameElement::SimpleString(
+                    default_truncated.as_bytes(),
+                )]),
+                DebuggerFrame(vec![DebuggerFrameElement::SimpleString(
+                    b"<hint> The above reply was trimmed. Use 'maxlen 0' to disable trimming.",
+                )]),
+                DebuggerFrame(vec![DebuggerFrameElement::SimpleString(
+                    b"<value> replies are truncated at 60 bytes.",
+                )]),
+                DebuggerFrame(vec![DebuggerFrameElement::SimpleString(
+                    minimum_truncated.as_bytes(),
+                )]),
+                DebuggerFrame(vec![DebuggerFrameElement::SimpleString(
+                    b"<value> configured reply truncation is disabled.",
+                )]),
+                DebuggerFrame(vec![DebuggerFrameElement::SimpleString(
+                    full_log.as_bytes(),
+                )]),
+                DebuggerFrame(vec![DebuggerFrameElement::SimpleString(b"<endsession>")]),
+            ]
+        );
+    }
+
+    #[test]
+    fn synchronous_lua_debugger_maxlen_zero_reports_hard_cap_truncation() {
+        use crate::engine::distributed::replication::protocol::encode_command;
+        use std::io::Write;
+
+        const DEBUGGER_HARD_LOG_LIMIT: usize = 1024 * 1024;
+        const HARD_LIMIT_SUFFIX: &[u8] = b" ...";
+        const HARD_LIMIT_HINT: &[u8] = b"<hint> Reply reached debugger hard safety limit.";
+
+        let mut runtime = ServerWorkerState::new(1).unwrap();
+        crate::framework::commands::register_all(&mut runtime.registry);
+        runtime.ctx.set_command_registry_snapshot(&runtime.registry);
+        let (token, mut peer) = disconnect_owner(&mut runtime);
+        let task =
+            prepare_synchronous_lua_debug_task(&mut runtime, token, b"return 'hard-cap-session'");
+        let mut commands = encode_command(&[b"maxlen", b"0"]);
+        commands.extend(encode_command(&[b"eval", b"string.rep('x', 1048576+1024)"]));
+        commands.extend(encode_command(&[b"eval", b"string.rep('y', 1048576+1024)"]));
+        commands.extend(encode_command(&[b"abort"]));
+        peer.write_all(&commands).unwrap();
+        peer.shutdown(std::net::Shutdown::Write).unwrap();
+        let reader = std::thread::spawn(move || read_debugger_output_until_end_session(&mut peer));
+
+        let result = runtime.run_prepared_host_task(token, task);
+
+        assert_eq!(result, Value::error("ERR script aborted for user request"));
+        let output = reader.join().expect("debugger output reader must finish");
+        let frames = parse_debugger_frames(&output);
+        assert_eq!(
+            frames.len(),
+            6,
+            "unexpected debugger frame count: {}",
+            frames.len()
+        );
+        assert_eq!(
+            frames[0],
+            DebuggerFrame(vec![
+                DebuggerFrameElement::SimpleString(b"* Stopped at 1, stop reason = step over"),
+                DebuggerFrameElement::SimpleString(b"-> 1 return 'hard-cap-session'"),
+            ])
+        );
+        assert_eq!(
+            frames[1],
+            DebuggerFrame(vec![DebuggerFrameElement::SimpleString(
+                b"<value> configured reply truncation is disabled.",
+            )])
+        );
+        let [DebuggerFrameElement::SimpleString(log)] = frames[2].0.as_slice() else {
+            panic!("expected one simple-string debugger hard-cap log frame");
+        };
+        assert_eq!(log.len(), DEBUGGER_HARD_LOG_LIMIT + HARD_LIMIT_SUFFIX.len());
+        assert!(log.starts_with(b"<retval> "));
+        assert_eq!(&log[DEBUGGER_HARD_LOG_LIMIT..], HARD_LIMIT_SUFFIX);
+        assert_eq!(
+            frames[3],
+            DebuggerFrame(vec![DebuggerFrameElement::SimpleString(HARD_LIMIT_HINT,)])
+        );
+        assert_eq!(
+            frames[5],
+            DebuggerFrame(vec![DebuggerFrameElement::SimpleString(b"<endsession>")])
+        );
+        let [DebuggerFrameElement::SimpleString(second_log)] = frames[4].0.as_slice() else {
+            panic!("expected a second simple-string debugger hard-cap log frame");
+        };
+        assert_eq!(
+            second_log.len(),
+            DEBUGGER_HARD_LOG_LIMIT + HARD_LIMIT_SUFFIX.len()
+        );
+        assert!(second_log.starts_with(b"<retval> "));
+        assert_eq!(&second_log[DEBUGGER_HARD_LOG_LIMIT..], HARD_LIMIT_SUFFIX);
+    }
+
+    #[test]
+    fn synchronous_lua_debugger_bounds_source_output() {
+        use crate::engine::distributed::replication::protocol::encode_command;
+        use std::io::Write;
+
+        const DEBUGGER_SOURCE_OUTPUT_LIMIT: usize = 1024 * 1024;
+        const SOURCE_TRIM_SUFFIX: &[u8] = b" ...";
+        const SOURCE_TRUNCATION_MARKER: &[u8] = b"<source output truncated>";
+
+        let mut runtime = ServerWorkerState::new(1).unwrap();
+        crate::framework::commands::register_all(&mut runtime.registry);
+        runtime.ctx.set_command_registry_snapshot(&runtime.registry);
+        let (token, mut peer) = disconnect_owner(&mut runtime);
+        let mut source = b"--".to_vec();
+        source.resize(DEBUGGER_SOURCE_OUTPUT_LIMIT + 128, b'x');
+        let source_line_len = source.len();
+        source.extend_from_slice(b"\nreturn 'done'");
+        let task =
+            prepare_synchronous_lua_debug_task_with_owned_source(&mut runtime, token, source);
+        let mut commands = encode_command(&[b"list"]);
+        commands.extend(encode_command(&[b"abort"]));
+        peer.write_all(&commands).unwrap();
+        peer.shutdown(std::net::Shutdown::Write).unwrap();
+        let reader = std::thread::spawn(move || read_debugger_output_until_end_session(&mut peer));
+
+        let result = runtime.run_prepared_host_task(token, task);
+
+        assert_eq!(result, Value::error("ERR script aborted for user request"));
+        let output = reader.join().expect("debugger output reader must finish");
+        let frames = parse_debugger_frames(&output);
+        assert_eq!(
+            frames.len(),
+            3,
+            "unexpected debugger frame count: {}",
+            frames.len()
+        );
+        let [DebuggerFrameElement::SimpleString(stopped), DebuggerFrameElement::SimpleString(initial_source)] =
+            frames[0].0.as_slice()
+        else {
+            panic!("expected the stopped frame and its bounded source line");
+        };
+        assert_eq!(
+            *stopped,
+            b"* Stopped at 1, stop reason = step over".as_slice()
+        );
+        let assert_bounded_source =
+            |line: &[u8], expected_prefix: &[u8], complete_line_len: usize| {
+                assert!(
+                    line.len() <= DEBUGGER_SOURCE_OUTPUT_LIMIT + SOURCE_TRIM_SUFFIX.len(),
+                    "bounded source element was {} bytes",
+                    line.len()
+                );
+                assert!(
+                    line.starts_with(expected_prefix),
+                    "bounded source element did not retain its prefix"
+                );
+                assert!(
+                    line.ends_with(SOURCE_TRIM_SUFFIX),
+                    "bounded source element did not retain its trim suffix"
+                );
+                assert!(
+                    line.len() < complete_line_len,
+                    "bounded source element retained the complete source line"
+                );
+            };
+        assert_bounded_source(initial_source, b"-> 1 --", b"-> 1 ".len() + source_line_len);
+        assert_eq!(
+            frames[1],
+            DebuggerFrame(vec![DebuggerFrameElement::SimpleString(
+                SOURCE_TRUNCATION_MARKER
+            )])
+        );
+        assert_eq!(
+            frames[2],
+            DebuggerFrame(vec![DebuggerFrameElement::SimpleString(b"<endsession>")])
+        );
+    }
+
+    #[test]
+    fn synchronous_lua_debugger_list_has_total_output_budget() {
+        use crate::engine::distributed::replication::protocol::encode_command;
+        use std::io::Write;
+
+        const DEBUGGER_SOURCE_OUTPUT_BUDGET: usize = 1024 * 1024;
+        const MAX_LISTED_SOURCE_LINES: usize = 4096;
+        const SOURCE_COMMENT_LINES: usize = 5000;
+        const SOURCE_COMMENT_PAYLOAD_LEN: usize = 240;
+        const SOURCE_TRUNCATION_MARKER: &[u8] = b"<source output truncated>";
+
+        let mut runtime = ServerWorkerState::new(1).unwrap();
+        crate::framework::commands::register_all(&mut runtime.registry);
+        runtime.ctx.set_command_registry_snapshot(&runtime.registry);
+        let (token, mut peer) = disconnect_owner(&mut runtime);
+        let comment_payload = vec![b'x'; SOURCE_COMMENT_PAYLOAD_LEN];
+        let mut source =
+            Vec::with_capacity(SOURCE_COMMENT_LINES * (SOURCE_COMMENT_PAYLOAD_LEN + 32));
+        for line_index in 0..SOURCE_COMMENT_LINES {
+            write!(&mut source, "-- source line {line_index:04} ").unwrap();
+            source.extend_from_slice(&comment_payload);
+            source.push(b'\n');
+        }
+        source.extend_from_slice(b"return 'done'");
+        assert!(source.len() > DEBUGGER_SOURCE_OUTPUT_BUDGET);
+        let complete_source_line_count = SOURCE_COMMENT_LINES + 1;
+        let task =
+            prepare_synchronous_lua_debug_task_with_owned_source(&mut runtime, token, source);
+        let mut commands = encode_command(&[b"list"]);
+        commands.extend(encode_command(&[b"abort"]));
+        peer.write_all(&commands).unwrap();
+        peer.shutdown(std::net::Shutdown::Write).unwrap();
+        let reader = std::thread::spawn(move || read_debugger_output_until_end_session(&mut peer));
+
+        let result = runtime.run_prepared_host_task(token, task);
+        let output = reader.join().expect("debugger output reader must finish");
+
+        assert_eq!(result, Value::error("ERR script aborted for user request"));
+        let frames = parse_debugger_frames(&output);
+        assert_eq!(
+            frames.len(),
+            3,
+            "unexpected debugger frame count: {}",
+            frames.len()
+        );
+        let [DebuggerFrameElement::SimpleString(stopped), DebuggerFrameElement::SimpleString(initial_source)] =
+            frames[0].0.as_slice()
+        else {
+            panic!("expected a bounded two-element stopped frame");
+        };
+        assert_eq!(
+            *stopped,
+            b"* Stopped at 1, stop reason = step over".as_slice()
+        );
+        assert!(initial_source.starts_with(b"-> 1 -- source line 0000 "));
+        assert!(
+            initial_source.len() <= DEBUGGER_SOURCE_OUTPUT_BUDGET + SOURCE_TRUNCATION_MARKER.len(),
+            "stopped source output was {} bytes",
+            initial_source.len()
+        );
+
+        let listed_source = &frames[1].0;
+        assert!(
+            listed_source.len() <= MAX_LISTED_SOURCE_LINES + 1,
+            "list frame contained {} elements",
+            listed_source.len()
+        );
+        assert!(
+            listed_source.len() < complete_source_line_count,
+            "list frame enumerated the complete source"
+        );
+        let listed_source_bytes = listed_source
+            .iter()
+            .map(|element| match element {
+                DebuggerFrameElement::SimpleString(line) => line.len(),
+                DebuggerFrameElement::Error(error) => {
+                    panic!(
+                        "list frame contained an error element: {}",
+                        String::from_utf8_lossy(error)
+                    )
+                }
+            })
+            .sum::<usize>();
+        assert!(
+            listed_source_bytes <= DEBUGGER_SOURCE_OUTPUT_BUDGET + SOURCE_TRUNCATION_MARKER.len(),
+            "list frame contained {listed_source_bytes} source bytes"
+        );
+        assert_eq!(
+            listed_source.last(),
+            Some(&DebuggerFrameElement::SimpleString(
+                SOURCE_TRUNCATION_MARKER
+            ))
+        );
+        assert_eq!(
+            frames[2],
+            DebuggerFrame(vec![DebuggerFrameElement::SimpleString(b"<endsession>")])
+        );
+    }
+
+    #[test]
+    fn synchronous_lua_debugger_maxlen_reports_upstream_argument_errors() {
+        use crate::engine::distributed::replication::protocol::encode_command;
+        use std::io::Write;
+
+        let mut runtime = ServerWorkerState::new(1).unwrap();
+        crate::framework::commands::register_all(&mut runtime.registry);
+        runtime.ctx.set_command_registry_snapshot(&runtime.registry);
+        let (token, mut peer) = disconnect_owner(&mut runtime);
+        let task =
+            prepare_synchronous_lua_debug_task(&mut runtime, token, b"return 'maxlen-errors'");
+        let mut commands = encode_command(&[b"max"]);
+        commands.extend(encode_command(&[b"maxlen", b"-1"]));
+        commands.extend(encode_command(&[b"maxlen", b"1", b"2"]));
+        commands.extend(encode_command(&[b"abort"]));
+        peer.write_all(&commands).unwrap();
+        peer.shutdown(std::net::Shutdown::Write).unwrap();
+
+        let result = runtime.run_prepared_host_task(token, task);
+
+        assert_eq!(result, Value::error("ERR script aborted for user request"));
+        let output = read_debugger_output(&mut peer);
+        assert_eq!(
+            parse_debugger_frames(&output),
+            vec![
+                DebuggerFrame(vec![
+                    DebuggerFrameElement::SimpleString(b"* Stopped at 1, stop reason = step over"),
+                    DebuggerFrameElement::SimpleString(b"-> 1 return 'maxlen-errors'"),
+                ]),
+                DebuggerFrame(vec![DebuggerFrameElement::SimpleString(
+                    b"Current maxlen is 256",
+                )]),
+                DebuggerFrame(vec![DebuggerFrameElement::SimpleString(
+                    b"<error> Invalid maxlen value.",
+                )]),
+                DebuggerFrame(vec![DebuggerFrameElement::SimpleString(
+                    b"<error> Wrong number of arguments for 'maxlen'.",
+                )]),
+                DebuggerFrame(vec![DebuggerFrameElement::SimpleString(b"<endsession>")]),
+            ]
+        );
+    }
+
+    #[test]
+    fn synchronous_lua_debugger_maxlen_truncates_binary_logs_by_bytes() {
+        use crate::engine::distributed::replication::protocol::encode_command;
+        use std::io::Write;
+
+        let mut runtime = ServerWorkerState::new(1).unwrap();
+        crate::framework::commands::register_all(&mut runtime.registry);
+        runtime.ctx.set_command_registry_snapshot(&runtime.registry);
+        let (token, mut peer) = disconnect_owner(&mut runtime);
+        let task =
+            prepare_synchronous_lua_debug_task(&mut runtime, token, b"return 'binary-maxlen'");
+        let mut commands = encode_command(&[b"maxlen", b"60"]);
+        commands.extend(encode_command(&[
+            b"eval",
+            b"string.rep(string.char(195,169),40)",
+        ]));
+        commands.extend(encode_command(&[b"abort"]));
+        peer.write_all(&commands).unwrap();
+        peer.shutdown(std::net::Shutdown::Write).unwrap();
+
+        let result = runtime.run_prepared_host_task(token, task);
+
+        assert_eq!(result, Value::error("ERR script aborted for user request"));
+        let output = read_debugger_output(&mut peer);
+        let mut truncated = b"<retval> ".to_vec();
+        truncated.extend([0xc3, 0xa9].into_iter().cycle().take(51));
+        truncated.extend_from_slice(b" ...");
+        assert_eq!(
+            parse_debugger_frames(&output),
+            vec![
+                DebuggerFrame(vec![
+                    DebuggerFrameElement::SimpleString(b"* Stopped at 1, stop reason = step over"),
+                    DebuggerFrameElement::SimpleString(b"-> 1 return 'binary-maxlen'"),
+                ]),
+                DebuggerFrame(vec![DebuggerFrameElement::SimpleString(
+                    b"<value> replies are truncated at 60 bytes.",
+                )]),
+                DebuggerFrame(vec![DebuggerFrameElement::SimpleString(&truncated)]),
+                DebuggerFrame(vec![DebuggerFrameElement::SimpleString(b"<endsession>")]),
+            ]
+        );
+    }
+
+    #[test]
+    fn synchronous_lua_debugger_preserves_modified_key_globals_on_continue() {
+        use std::io::Write;
+
+        let mut runtime = ServerWorkerState::new(1).unwrap();
+        crate::framework::commands::register_all(&mut runtime.registry);
+        runtime.ctx.set_command_registry_snapshot(&runtime.registry);
+        let (token, mut peer) = disconnect_owner(&mut runtime);
+        let task = prepare_synchronous_lua_debug_task_with_args(
+            &mut runtime,
+            token,
+            Bytes::from_static(b"return KEYS[1]"),
+            &[b"original"],
+            &[],
+        );
+        peer.write_all(
+            b"*2\r\n$4\r\neval\r\n$19\r\nKEYS[1] = 'changed'\r\n\
+              *1\r\n$8\r\ncontinue\r\n",
+        )
+        .unwrap();
+        peer.shutdown(std::net::Shutdown::Write).unwrap();
+
+        let result = runtime.run_prepared_host_task(token, task);
+
+        assert_eq!(result, Value::bulk(Bytes::from_static(b"changed")));
+        let output = read_debugger_output(&mut peer);
+        assert_eq!(
+            parse_debugger_frames(&output),
+            vec![
+                DebuggerFrame(vec![
+                    DebuggerFrameElement::SimpleString(b"* Stopped at 1, stop reason = step over"),
+                    DebuggerFrameElement::SimpleString(b"-> 1 return KEYS[1]"),
+                ]),
+                DebuggerFrame(vec![DebuggerFrameElement::SimpleString(b"<retval> nil")]),
+                DebuggerFrame(vec![DebuggerFrameElement::SimpleString(b"<endsession>")]),
+            ]
+        );
+    }
+
+    #[test]
+    fn synchronous_lua_debugger_rejects_extra_fixed_command_arguments() {
+        use crate::engine::distributed::replication::protocol::encode_command;
+        use std::io::Write;
+
+        let mut runtime = ServerWorkerState::new(1).unwrap();
+        crate::framework::commands::register_all(&mut runtime.registry);
+        runtime.ctx.set_command_registry_snapshot(&runtime.registry);
+        let (token, mut peer) = disconnect_owner(&mut runtime);
+        let task = prepare_synchronous_lua_debug_task(
+            &mut runtime,
+            token,
+            b"redis.call('SET','continue-extra-key','executed'); return 'executed'",
+        );
+        let mut commands = encode_command(&[b"continue", b"extra"]);
+        commands.extend(encode_command(&[b"abort", b"extra"]));
+        commands.extend(encode_command(&[b"help", b"extra"]));
+        commands.extend(encode_command(&[b"list", b"extra"]));
+        commands.extend(encode_command(&[b"print", b"KEYS", b"extra"]));
+        commands.extend(encode_command(&[b"abort"]));
+        peer.write_all(&commands).unwrap();
+        peer.shutdown(std::net::Shutdown::Write).unwrap();
+
+        let result = runtime.run_prepared_host_task(token, task);
+
+        assert_eq!(result, Value::error("ERR script aborted for user request"));
+        assert!(runtime
+            .ctx
+            .db(0)
+            .unwrap()
+            .get_no_expire(b"continue-extra-key")
+            .is_none());
+        let output = read_debugger_output(&mut peer);
+        assert_eq!(
+            parse_debugger_frames(&output),
+            vec![
+                DebuggerFrame(vec![
+                    DebuggerFrameElement::SimpleString(b"* Stopped at 1, stop reason = step over"),
+                    DebuggerFrameElement::SimpleString(
+                        b"-> 1 redis.call('SET','continue-extra-key','executed'); return 'executed'"
+                    ),
+                ]),
+                DebuggerFrame(vec![DebuggerFrameElement::SimpleString(
+                    b"<error> Wrong number of arguments for 'continue'.",
+                )]),
+                DebuggerFrame(vec![DebuggerFrameElement::SimpleString(
+                    b"<error> Wrong number of arguments for 'abort'.",
+                )]),
+                DebuggerFrame(vec![DebuggerFrameElement::SimpleString(
+                    b"<error> Wrong number of arguments for 'help'.",
+                )]),
+                DebuggerFrame(vec![DebuggerFrameElement::SimpleString(
+                    b"<error> Wrong number of arguments for 'list'.",
+                )]),
+                DebuggerFrame(vec![DebuggerFrameElement::SimpleString(
+                    b"<error> Wrong number of arguments for 'print'.",
+                )]),
+                DebuggerFrame(vec![DebuggerFrameElement::SimpleString(b"<endsession>")]),
+            ]
+        );
+    }
+
+    #[test]
+    fn synchronous_lua_debugger_rejects_extra_restart_arguments() {
+        use crate::engine::distributed::replication::protocol::encode_command;
+        use std::io::Write;
+
+        let mut runtime = ServerWorkerState::new(1).unwrap();
+        crate::framework::commands::register_all(&mut runtime.registry);
+        runtime.ctx.set_command_registry_snapshot(&runtime.registry);
+        let (token, mut peer) = disconnect_owner(&mut runtime);
+        let task =
+            prepare_synchronous_lua_debug_task(&mut runtime, token, b"return 'restart-arity'");
+        let mut commands = encode_command(&[b"SCRIPT", b"DEBUG", b"SYNC", b"unknown"]);
+        commands.extend(encode_command(&[
+            b"SCRIPT", b"DEBUG", b"SYNC", b"lua", b"extra",
+        ]));
+        commands.extend(encode_command(&[b"abort"]));
+        peer.write_all(&commands).unwrap();
+        peer.shutdown(std::net::Shutdown::Write).unwrap();
+
+        let result = runtime.run_prepared_host_task(token, task);
+
+        assert_eq!(result, Value::error("ERR script aborted for user request"));
+        let output = read_debugger_output_until_end_session(&mut peer);
+        assert!(
+            !output
+                .windows(b"+OK\r\n".len())
+                .any(|window| window == b"+OK\r\n"),
+            "unexpected bare OK debugger reply in {} bytes",
+            output.len()
+        );
+        assert_eq!(
+            parse_debugger_frames(&output),
+            vec![
+                DebuggerFrame(vec![
+                    DebuggerFrameElement::SimpleString(b"* Stopped at 1, stop reason = step over"),
+                    DebuggerFrameElement::SimpleString(b"-> 1 return 'restart-arity'"),
+                ]),
+                DebuggerFrame(vec![DebuggerFrameElement::SimpleString(
+                    b"<error> No scripting engine found with name 'unknown' to enable debug",
+                )]),
+                DebuggerFrame(vec![DebuggerFrameElement::SimpleString(
+                    b"<error> Wrong number of arguments for 'script debug sync'.",
+                )]),
+                DebuggerFrame(vec![DebuggerFrameElement::SimpleString(b"<endsession>")]),
+            ]
+        );
+    }
+
+    #[test]
+    fn synchronous_lua_debugger_parse_error_ends_session() {
+        use std::io::Write;
+
+        let mut runtime = ServerWorkerState::new(1).unwrap();
+        crate::framework::commands::register_all(&mut runtime.registry);
+        runtime.ctx.set_command_registry_snapshot(&runtime.registry);
+        let (token, mut peer) = disconnect_owner(&mut runtime);
+        let task = prepare_synchronous_lua_debug_task(&mut runtime, token, b"return 'unreachable'");
+        peer.write_all(b"*1\r\n+invalid\r\n").unwrap();
+        peer.shutdown(std::net::Shutdown::Write).unwrap();
+
+        let result = runtime.run_prepared_host_task(token, task);
+
+        assert_eq!(result, Value::Null);
+        let output = read_debugger_output(&mut peer);
+        let frames = parse_debugger_frames(&output);
+        assert_eq!(frames.len(), 3);
+        assert_eq!(
+            frames[0],
+            DebuggerFrame(vec![
+                DebuggerFrameElement::SimpleString(b"* Stopped at 1, stop reason = step over"),
+                DebuggerFrameElement::SimpleString(b"-> 1 return 'unreachable'"),
+            ])
+        );
+        assert_eq!(
+            frames[1],
+            DebuggerFrame(vec![DebuggerFrameElement::SimpleString(
+                b"<error> Protocol error: expected '$', got '+'",
+            )])
+        );
+        assert_eq!(
+            frames[2],
+            DebuggerFrame(vec![DebuggerFrameElement::SimpleString(b"<endsession>")])
+        );
+    }
+
+    #[test]
+    fn synchronous_lua_debugger_initialization_failure_ends_without_stopping() {
+        use crate::engine::extension::lua::{reset_lua_runtime, with_lua_runtime};
+        use crate::engine::extension::script::ScriptError;
+
+        reset_lua_runtime();
+        let mut runtime = ServerWorkerState::new(1).unwrap();
+        crate::framework::commands::register_all(&mut runtime.registry);
+        runtime.ctx.set_command_registry_snapshot(&runtime.registry);
+        let (token, mut peer) = disconnect_owner(&mut runtime);
+        let task = prepare_synchronous_lua_debug_task(&mut runtime, token, b"return 'unreachable'");
+        with_lua_runtime(false, |lua| {
+            lua.set_memory_limit(lua.used_memory().saturating_add(1))
+                .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+            Ok(())
+        })
+        .unwrap();
+        peer.shutdown(std::net::Shutdown::Write).unwrap();
+
+        let result = runtime.run_prepared_host_task(token, task);
+
+        with_lua_runtime(false, |lua| {
+            lua.set_memory_limit(0)
+                .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+            Ok(())
+        })
+        .unwrap();
+        reset_lua_runtime();
+        assert!(matches!(result, Value::Error(_)));
+        let output = read_debugger_output(&mut peer);
+        let frames = parse_debugger_frames(&output);
+        assert_eq!(frames.len(), 2);
+        assert!(
+            matches!(
+                &frames[0].0[..],
+                [DebuggerFrameElement::SimpleString(message)]
+                    if message.starts_with(b"<error> ")
+            ),
+            "{frames:?}"
+        );
+        assert_eq!(
+            frames[1],
+            DebuggerFrame(vec![DebuggerFrameElement::SimpleString(b"<endsession>")])
+        );
+    }
+
+    #[test]
+    fn synchronous_lua_debugger_failed_restart_keeps_old_task() {
+        use crate::engine::distributed::replication::protocol::encode_command;
+        use std::io::Write;
+
+        let mut runtime = ServerWorkerState::new(1).unwrap();
+        crate::framework::commands::register_all(&mut runtime.registry);
+        runtime.ctx.set_command_registry_snapshot(&runtime.registry);
+        let (token, mut peer) = disconnect_owner(&mut runtime);
+        let source = b"return 'old-task-complete'";
+        let task = prepare_synchronous_lua_debug_task(&mut runtime, token, source);
+        let mut commands = encode_command(&[b"SCRIPT", b"DEBUG", b"SYNC"]);
+        commands.extend(encode_command(&[b"EVAL", b"local =", b"0"]));
+        commands.extend(encode_command(&[b"continue"]));
+        peer.write_all(&commands).unwrap();
+        peer.shutdown(std::net::Shutdown::Write).unwrap();
+
+        let result = runtime.run_prepared_host_task(token, task);
+
+        assert_eq!(
+            result,
+            Value::bulk(Bytes::from_static(b"old-task-complete"))
+        );
+        let output = read_debugger_output(&mut peer);
+        assert_eq!(
+            output
+                .windows(b"* Stopped at 1, stop reason = step over".len())
+                .filter(|part| *part == b"* Stopped at 1, stop reason = step over")
+                .count(),
+            1,
+            "unexpected stop-frame count in {} bytes",
+            output.len()
+        );
+        assert!(
+            output.windows(b"-ERR ".len()).any(|part| part == b"-ERR "),
+            "missing debugger error frame in {} bytes",
+            output.len()
+        );
+        assert!(
+            output.ends_with(b"*1\r\n+<endsession>\r\n"),
+            "missing end-session frame in {} bytes",
+            output.len()
+        );
+    }
+
+    #[test]
+    fn synchronous_lua_debugger_redis_executes_command_against_live_dataset() {
+        use std::io::Write;
+
+        let mut runtime = ServerWorkerState::new(1).unwrap();
+        crate::framework::commands::register_all(&mut runtime.registry);
+        runtime.ctx.set_command_registry_snapshot(&runtime.registry);
+        let (token, mut peer) = disconnect_owner(&mut runtime);
+        let task =
+            prepare_synchronous_lua_debug_task(&mut runtime, token, b"return 'redis-complete'");
+        peer.write_all(
+            b"*4\r\n$5\r\nredis\r\n$3\r\nSET\r\n$20\r\ndebugger-command-key\r\n\
+              $5\r\nvalue\r\n*1\r\n$8\r\ncontinue\r\n",
+        )
+        .unwrap();
+        peer.shutdown(std::net::Shutdown::Write).unwrap();
+
+        let result = runtime.run_prepared_host_task(token, task);
+
+        assert_eq!(result, Value::bulk(Bytes::from_static(b"redis-complete")));
+        assert_eq!(
+            runtime
+                .ctx
+                .db(0)
+                .unwrap()
+                .get_no_expire(b"debugger-command-key")
+                .map(|value| value.as_bytes()),
+            Some(b"value".as_slice())
+        );
+        let output = read_debugger_output(&mut peer);
+        assert_eq!(
+            parse_debugger_frames(&output),
+            vec![
+                DebuggerFrame(vec![
+                    DebuggerFrameElement::SimpleString(b"* Stopped at 1, stop reason = step over"),
+                    DebuggerFrameElement::SimpleString(b"-> 1 return 'redis-complete'"),
+                ]),
+                DebuggerFrame(vec![
+                    DebuggerFrameElement::SimpleString(b"<command> SET debugger-command-key value"),
+                    DebuggerFrameElement::SimpleString(b"<reply> OK"),
+                ]),
+                DebuggerFrame(vec![DebuggerFrameElement::SimpleString(b"<endsession>")]),
+            ]
+        );
+    }
+
+    #[test]
+    fn synchronous_lua_debugger_eval_falls_back_to_statement() {
+        use std::io::Write;
+
+        let mut runtime = ServerWorkerState::new(1).unwrap();
+        crate::framework::commands::register_all(&mut runtime.registry);
+        runtime.ctx.set_command_registry_snapshot(&runtime.registry);
+        let (token, mut peer) = disconnect_owner(&mut runtime);
+        let task =
+            prepare_synchronous_lua_debug_task(&mut runtime, token, b"return 'statement-complete'");
+        peer.write_all(
+            b"*2\r\n$4\r\neval\r\n$25\r\nlocal statement_value = 1\r\n\
+              *1\r\n$8\r\ncontinue\r\n",
+        )
+        .unwrap();
+        peer.shutdown(std::net::Shutdown::Write).unwrap();
+
+        let result = runtime.run_prepared_host_task(token, task);
+
+        assert_eq!(
+            result,
+            Value::bulk(Bytes::from_static(b"statement-complete"))
+        );
+        let output = read_debugger_output(&mut peer);
+        assert_eq!(
+            parse_debugger_frames(&output),
+            vec![
+                DebuggerFrame(vec![
+                    DebuggerFrameElement::SimpleString(b"* Stopped at 1, stop reason = step over"),
+                    DebuggerFrameElement::SimpleString(b"-> 1 return 'statement-complete'"),
+                ]),
+                DebuggerFrame(vec![DebuggerFrameElement::SimpleString(b"<retval> nil")]),
+                DebuggerFrame(vec![DebuggerFrameElement::SimpleString(b"<endsession>")]),
+            ]
+        );
+    }
+
+    #[test]
+    fn synchronous_lua_debugger_command_aliases_use_real_dispatch() {
+        use std::io::Write;
+
+        let mut runtime = ServerWorkerState::new(1).unwrap();
+        crate::framework::commands::register_all(&mut runtime.registry);
+        runtime.ctx.set_command_registry_snapshot(&runtime.registry);
+        let (token, mut peer) = disconnect_owner(&mut runtime);
+        let task =
+            prepare_synchronous_lua_debug_task(&mut runtime, token, b"return 'alias-complete'");
+        peer.write_all(
+            b"*2\r\n$6\r\nserver\r\n$4\r\nPING\r\n\
+              *3\r\n$6\r\nvalkey\r\n$4\r\nECHO\r\n$11\r\nalias-value\r\n\
+              *1\r\n$8\r\ncontinue\r\n",
+        )
+        .unwrap();
+        peer.shutdown(std::net::Shutdown::Write).unwrap();
+
+        let result = runtime.run_prepared_host_task(token, task);
+
+        assert_eq!(result, Value::bulk(Bytes::from_static(b"alias-complete")));
+        let output = read_debugger_output(&mut peer);
+        assert_eq!(
+            parse_debugger_frames(&output),
+            vec![
+                DebuggerFrame(vec![
+                    DebuggerFrameElement::SimpleString(b"* Stopped at 1, stop reason = step over"),
+                    DebuggerFrameElement::SimpleString(b"-> 1 return 'alias-complete'"),
+                ]),
+                DebuggerFrame(vec![
+                    DebuggerFrameElement::SimpleString(b"<command> PING"),
+                    DebuggerFrameElement::SimpleString(b"<reply> PONG"),
+                ]),
+                DebuggerFrame(vec![
+                    DebuggerFrameElement::SimpleString(b"<command> ECHO alias-value"),
+                    DebuggerFrameElement::SimpleString(b"<reply> alias-value"),
+                ]),
+                DebuggerFrame(vec![DebuggerFrameElement::SimpleString(b"<endsession>")]),
+            ]
+        );
+    }
+
+    #[test]
+    fn synchronous_lua_debugger_abort_preserves_command_effects() {
+        use crate::engine::distributed::replication::protocol::encode_command;
+        use crate::engine::extension::script::PropagationOp;
+        use std::io::Write;
+
+        let mut runtime = ServerWorkerState::new(1).unwrap();
+        crate::framework::commands::register_all(&mut runtime.registry);
+        runtime.ctx.set_command_registry_snapshot(&runtime.registry);
+        let (token, mut peer) = disconnect_owner(&mut runtime);
+        let task = prepare_synchronous_lua_debug_task(&mut runtime, token, b"return 'unreachable'");
+        peer.write_all(
+            b"*4\r\n$5\r\nredis\r\n$3\r\nSET\r\n$18\r\ndebugger-abort-key\r\n\
+              $5\r\nvalue\r\n*1\r\n$5\r\nabort\r\n",
+        )
+        .unwrap();
+        peer.shutdown(std::net::Shutdown::Write).unwrap();
+
+        let result = runtime.run_prepared_host_task(token, task);
+
+        assert_eq!(result, Value::error("ERR script aborted for user request"));
+        assert_eq!(
+            runtime
+                .ctx
+                .db(0)
+                .unwrap()
+                .get_no_expire(b"debugger-abort-key")
+                .map(|value| value.as_bytes()),
+            Some(b"value".as_slice())
+        );
+        assert_eq!(
+            runtime.connection_registry[token].script_propagation(),
+            &[PropagationOp::both(
+                0,
+                encode_command(&[b"SET", b"debugger-abort-key", b"value"]),
+            )]
+        );
+        let output = read_debugger_output(&mut peer);
+        assert_eq!(
+            parse_debugger_frames(&output),
+            vec![
+                DebuggerFrame(vec![
+                    DebuggerFrameElement::SimpleString(b"* Stopped at 1, stop reason = step over"),
+                    DebuggerFrameElement::SimpleString(b"-> 1 return 'unreachable'"),
+                ]),
+                DebuggerFrame(vec![
+                    DebuggerFrameElement::SimpleString(b"<command> SET debugger-abort-key value"),
+                    DebuggerFrameElement::SimpleString(b"<reply> OK"),
+                ]),
+                DebuggerFrame(vec![DebuggerFrameElement::SimpleString(b"<endsession>")]),
+            ]
+        );
+    }
+
+    #[test]
+    fn lua_debugger_synchronous_restart_preserves_command_effects() {
+        use crate::engine::distributed::replication::protocol::encode_command;
+        use crate::engine::extension::script::PropagationOp;
+        use std::io::Write;
+
+        let mut runtime = ServerWorkerState::new(1).unwrap();
+        crate::framework::commands::register_all(&mut runtime.registry);
+        runtime.ctx.set_command_registry_snapshot(&runtime.registry);
+        let (token, mut peer) = disconnect_owner(&mut runtime);
+        let task = prepare_synchronous_lua_debug_task(&mut runtime, token, b"return 'replaced'");
+        peer.write_all(
+            b"*4\r\n$5\r\nredis\r\n$3\r\nSET\r\n$20\r\ndebugger-restart-key\r\n\
+              $5\r\nvalue\r\n\
+              *3\r\n$6\r\nSCRIPT\r\n$5\r\nDEBUG\r\n$4\r\nSYNC\r\n\
+              *3\r\n$4\r\nEVAL\r\n$25\r\nreturn 'restart-complete'\r\n$1\r\n0\r\n\
+              *1\r\n$8\r\ncontinue\r\n",
+        )
+        .unwrap();
+        peer.shutdown(std::net::Shutdown::Write).unwrap();
+
+        let result = runtime.run_prepared_host_task(token, task);
+
+        assert_eq!(result, Value::bulk(Bytes::from_static(b"restart-complete")));
+        assert_eq!(
+            runtime.connection_registry[token].script_propagation(),
+            &[PropagationOp::both(
+                0,
+                encode_command(&[b"SET", b"debugger-restart-key", b"value"]),
+            )]
+        );
+    }
+
+    #[test]
+    fn lua_debugger_synchronous_disconnect_preserves_command_effects() {
+        use crate::engine::distributed::replication::protocol::encode_command;
+        use crate::engine::extension::script::PropagationOp;
+        use std::io::Write;
+
+        let mut runtime = ServerWorkerState::new(1).unwrap();
+        crate::framework::commands::register_all(&mut runtime.registry);
+        runtime.ctx.set_command_registry_snapshot(&runtime.registry);
+        let (token, mut peer) = disconnect_owner(&mut runtime);
+        let task = prepare_synchronous_lua_debug_task(&mut runtime, token, b"return 'unreachable'");
+        peer.write_all(
+            b"*4\r\n$5\r\nredis\r\n$3\r\nSET\r\n$23\r\ndebugger-disconnect-key\r\n\
+              $5\r\nvalue\r\n",
+        )
+        .unwrap();
+        peer.shutdown(std::net::Shutdown::Write).unwrap();
+
+        let result = runtime.run_prepared_host_task(token, task);
+
+        assert_eq!(result, Value::Null);
+        assert_eq!(
+            runtime.connection_registry[token].script_propagation(),
+            &[PropagationOp::both(
+                0,
+                encode_command(&[b"SET", b"debugger-disconnect-key", b"value"]),
+            )]
+        );
+    }
+
     extern "C" fn yield_disconnect_command(
         _ctx: *mut crate::engine::extension::module::ValkeyModuleCtx,
         _argv: *mut *mut crate::engine::extension::module::ValkeyModuleString,
@@ -748,6 +2076,17 @@ mod tests {
         runtime: &mut ServerWorkerState,
         token: crate::framework::capabilities::io::Token,
     ) -> crate::framework::host_tasks::PreparedHostTask {
+        register_disconnect_module(runtime);
+        let args = CommandArgs::from_parts(vec![Bytes::from_static(b"disconnect-test.run")]);
+        crate::framework::host_tasks::prepare_module_task(
+            &mut runtime.connection_registry[token],
+            &args,
+            &mut runtime.ctx,
+        )
+        .unwrap()
+    }
+
+    fn register_disconnect_module(runtime: &mut ServerWorkerState) {
         use crate::engine::extension::module::registry::ModuleRef;
         runtime
             .ctx
@@ -768,13 +2107,30 @@ mod tests {
                 Some(yield_disconnect_command),
             )
             .unwrap();
-        let args = CommandArgs::from_parts(vec![Bytes::from_static(b"disconnect-test.run")]);
-        crate::framework::host_tasks::prepare_module_task(
-            &mut runtime.connection_registry[token],
-            &args,
-            &mut runtime.ctx,
-        )
-        .unwrap()
+    }
+
+    fn register_disconnect_runtime_command(runtime: &mut ServerWorkerState) {
+        register_disconnect_module(runtime);
+        runtime.registry.register(CommandSpec {
+            name: crate::engine::command::CommandName::Shared(std::sync::Arc::from(
+                "disconnect-test.run",
+            )),
+            arity: 1,
+            flags: crate::engine::command::CMD_MODULE,
+            dispatch_group: DispatchGroup::Default,
+            first_key: 0,
+            last_key: 0,
+            key_step: 0,
+            container: None,
+            key_flags: &[],
+            acl_categories: &[],
+            executor: CommandExecutor::Hosted {
+                fallback: crate::framework::capabilities::module::module_cmd_dispatcher,
+                prepare: crate::framework::host_tasks::prepare_module_task,
+            },
+            get_keys: None,
+        });
+        runtime.ctx.set_command_registry_snapshot(&runtime.registry);
     }
 
     fn disconnect_owner(
@@ -793,6 +2149,69 @@ mod tests {
             peer_addr: addr,
         });
         (peer.token, stream)
+    }
+
+    #[test]
+    fn synchronous_lua_debugger_protects_owner_during_nested_module_disconnect() {
+        use crate::engine::extension::lua::runtime::reset_lua_runtime;
+        use crate::framework::capabilities::connection::ConnectionState;
+        use std::io::Write;
+
+        reset_lua_runtime();
+        DISCONNECT_SOCKET.with(|slot| {
+            drop(slot.borrow_mut().take());
+        });
+        DISCONNECT_ERROR.with(|slot| slot.set(None));
+
+        let mut runtime = ServerWorkerState::new(1).unwrap();
+        crate::framework::commands::register_all(&mut runtime.registry);
+        register_disconnect_runtime_command(&mut runtime);
+        let (token, mut peer) = disconnect_owner(&mut runtime);
+        let session = runtime.connection_registry[token].session_id();
+        let task = prepare_synchronous_lua_debug_task(&mut runtime, token, b"return 'unreachable'");
+        peer.write_all(b"*2\r\n$5\r\nredis\r\n$19\r\ndisconnect-test.run\r\n")
+            .unwrap();
+        let stream = runtime.transport.duplicate_stream(token).unwrap();
+        DISCONNECT_SOCKET.with(|slot| *slot.borrow_mut() = Some((peer, stream)));
+        runtime
+            .transport
+            .queue_test_transport_event_batch(&[(token, false, false, false, true)]);
+
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.run_prepared_host_task(token, task)
+        }));
+
+        let disconnect_error = DISCONNECT_ERROR.with(|slot| slot.replace(None));
+        DISCONNECT_SOCKET.with(|slot| {
+            drop(slot.borrow_mut().take());
+        });
+        let debug_mode_was_cleared = !runtime.ctx.script().debug_modes.contains_key(&session);
+        let debug_session_was_cleared = runtime.ctx.script().debug_session.is_none();
+        runtime.ctx.script_mut().debug_modes.remove(&session);
+        runtime.ctx.script_mut().debug_session = None;
+        reset_lua_runtime();
+
+        assert_eq!(disconnect_error, Some(libc::ECONNRESET));
+        assert!(
+            outcome.is_ok(),
+            "nested disconnect must not panic after removing or deferring the debugger owner"
+        );
+        let connection = runtime
+            .connection_registry
+            .get(token)
+            .expect("synchronous debugger must not remove its owner during nested disconnect");
+        assert_eq!(connection.session_id(), session);
+        assert!(!connection.protected);
+        assert!(connection.is_async_close_pending);
+        assert!(
+            matches!(
+                connection.state,
+                ConnectionState::Closing | ConnectionState::CloseAfterReply
+            ),
+            "deferred debugger owner must be closing"
+        );
+        assert!(debug_mode_was_cleared);
+        assert!(debug_session_was_cleared);
     }
 
     #[test]

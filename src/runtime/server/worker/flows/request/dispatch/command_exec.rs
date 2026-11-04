@@ -18,23 +18,44 @@ use bytes::Bytes;
 #[path = "dirty_delta_tests.rs"]
 mod dirty_delta_tests;
 
+const MAX_CLIENT_COMMAND_NAME_BYTES: usize = 128;
+
+fn push_bounded_command_component(output: &mut String, input: &[u8]) {
+    let input_limit = MAX_CLIENT_COMMAND_NAME_BYTES.saturating_sub(output.len());
+    let input = &input[..input.len().min(input_limit)];
+    for character in String::from_utf8_lossy(input).chars() {
+        let character = if matches!(character, '\r' | '\n') {
+            ' '
+        } else {
+            character.to_ascii_lowercase()
+        };
+        if output.len() + character.len_utf8() > MAX_CLIENT_COMMAND_NAME_BYTES {
+            break;
+        }
+        output.push(character);
+    }
+}
+
+pub(super) fn bounded_command_name(name_lower: &str, subcommand: Option<&[u8]>) -> String {
+    let mut output = String::with_capacity(MAX_CLIENT_COMMAND_NAME_BYTES);
+    push_bounded_command_component(&mut output, name_lower.as_bytes());
+    if let Some(subcommand) = subcommand {
+        if output.len() < MAX_CLIENT_COMMAND_NAME_BYTES {
+            output.push('|');
+            push_bounded_command_component(&mut output, subcommand);
+        }
+    }
+    output
+}
+
 pub(super) fn client_last_command_name(name_lower: &str, args: &CommandArgs) -> String {
-    args.args
-        .first()
-        .filter(|_| {
-            matches!(
-                name_lower,
-                "cluster" | "client" | "config" | "xinfo" | "slowlog"
-            )
-        })
-        .map(|subcommand| {
-            format!(
-                "{}|{}",
-                name_lower,
-                String::from_utf8_lossy(subcommand).to_ascii_lowercase()
-            )
-        })
-        .unwrap_or_else(|| name_lower.to_string())
+    let subcommand = args.args.first().filter(|_| {
+        matches!(
+            name_lower,
+            "cluster" | "client" | "config" | "xinfo" | "slowlog"
+        )
+    });
+    bounded_command_name(name_lower, subcommand.map(bytes::Bytes::as_ref))
 }
 
 struct CommandPropagationPlan<'a> {
@@ -126,6 +147,15 @@ impl ServerWorkerState {
         if required == 0 {
             return None;
         }
+        let cannot_block = self.ctx.is_script_busy()
+            || self
+                .connection_registry
+                .get(token)
+                .is_some_and(|connection| connection.in_transaction() || connection.deny_blocking);
+        if cannot_block {
+            self.record_nonblocking_cluster_setslot_propagation(token, args);
+            return None;
+        }
         // The frame is appended before the target offset is read, matching C's
         // `server.primary_repl_offset + 1` target captured at block time.
         self.propagate_to_replicas_with_ack(&encode_command_args(args), true);
@@ -144,6 +174,30 @@ impl ServerWorkerState {
             args,
             connection.request_bytes_current_command(),
         ))
+    }
+
+    pub(crate) fn record_nonblocking_cluster_setslot_propagation(
+        &mut self,
+        token: crate::framework::capabilities::io::Token,
+        args: &CommandArgs,
+    ) {
+        if !is_setslot_wait_candidate(self.connection_registry.get(token), args)
+            || self.eligible_setslot_replica_count() == 0
+            || crate::framework::commands::cluster::slots::prepare_cluster_setslot(
+                &args.args[1..],
+                false,
+                &self.ctx,
+            )
+            .is_err()
+        {
+            return;
+        }
+        let db_id = self.connection_registry[token].selected_db;
+        self.connection_registry[token].record_script_propagation(PropagationOp::new(
+            db_id,
+            PropagationTargets::Replication,
+            encode_command_args(args),
+        ));
     }
 
     fn eligible_setslot_replica_count(&self) -> usize {

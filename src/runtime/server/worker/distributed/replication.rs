@@ -13,12 +13,10 @@ use crate::framework::distributed::replication::{
     ReplicationConnection, ReplicationTickFacts,
 };
 use crate::runtime::server::worker::distributed::replication::disk_sync_batch::DiskSyncBatch;
-use crate::runtime::server::worker::distributed::replication::diskless_child::{
-    DirectDualRdbChild, DisklessRelay,
-};
+use crate::runtime::server::worker::distributed::replication::diskless_child::DisklessRelay;
 use crate::runtime::server::worker::reactor::blocked_events::BlockedOperation;
 use crate::runtime::server::worker::reactor::sources::SourceOwner;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::net::{SocketAddr, ToSocketAddrs};
 
@@ -33,14 +31,124 @@ mod replica_apply;
 
 mod timeout;
 
+const REPLICATION_LOG_MESSAGE_MAX_BYTES: usize = 4096;
+
+struct BoundedReplicationLog {
+    output: String,
+}
+
+impl BoundedReplicationLog {
+    fn new() -> Self {
+        Self {
+            output: String::with_capacity(REPLICATION_LOG_MESSAGE_MAX_BYTES),
+        }
+    }
+
+    fn push_ascii(&mut self, value: &str) {
+        let remaining = REPLICATION_LOG_MESSAGE_MAX_BYTES.saturating_sub(self.output.len());
+        self.output.push_str(&value[..value.len().min(remaining)]);
+    }
+
+    fn push_sanitized(&mut self, mut value: &[u8]) {
+        while !value.is_empty() && self.output.len() < REPLICATION_LOG_MESSAGE_MAX_BYTES {
+            let (character, consumed) = next_lossy_character(value);
+            let character = if matches!(character, '\r' | '\n') {
+                ' '
+            } else {
+                character
+            };
+            if self.output.len() + character.len_utf8() > REPLICATION_LOG_MESSAGE_MAX_BYTES {
+                break;
+            }
+            self.output.push(character);
+            value = &value[consumed..];
+        }
+    }
+
+    fn push_arguments(&mut self, args: &crate::engine::command::CommandArgs) {
+        if args.args.is_empty() {
+            return;
+        }
+        self.push_ascii(", with args beginning with: ");
+        for (index, argument) in args.args.iter().take(8).enumerate() {
+            if self.output.len() == REPLICATION_LOG_MESSAGE_MAX_BYTES {
+                break;
+            }
+            if index != 0 {
+                self.push_ascii(" ");
+            }
+            self.push_ascii("'");
+            self.push_sanitized(argument);
+            self.push_ascii("'");
+        }
+    }
+
+    fn finish(self) -> String {
+        self.output
+    }
+}
+
+fn next_lossy_character(value: &[u8]) -> (char, usize) {
+    if value[0].is_ascii() {
+        return (char::from(value[0]), 1);
+    }
+    let probe = &value[..value.len().min(4)];
+    match std::str::from_utf8(probe) {
+        Ok(valid) => valid
+            .chars()
+            .next()
+            .map(|character| (character, character.len_utf8()))
+            .unwrap_or(('\u{fffd}', 1)),
+        Err(error) if error.valid_up_to() > 0 => {
+            let valid = std::str::from_utf8(&probe[..error.valid_up_to()]).ok();
+            valid
+                .and_then(|valid| valid.chars().next())
+                .map(|character| (character, character.len_utf8()))
+                .unwrap_or(('\u{fffd}', 1))
+        }
+        Err(error) => ('\u{fffd}', error.error_len().unwrap_or(probe.len()).max(1)),
+    }
+}
+
+pub(crate) fn render_replication_error_for_log(
+    error: &[u8],
+    args: &crate::engine::command::CommandArgs,
+    hide_user_data: bool,
+) -> String {
+    if hide_user_data {
+        return "*redacted*".to_string();
+    }
+    let mut renderer = BoundedReplicationLog::new();
+    renderer.push_sanitized(error);
+    renderer.push_arguments(args);
+    renderer.finish()
+}
+
+pub(crate) fn render_unknown_replication_command_for_log(
+    args: &crate::engine::command::CommandArgs,
+    hide_user_data: bool,
+) -> String {
+    if hide_user_data {
+        return "*redacted*".to_string();
+    }
+    let mut renderer = BoundedReplicationLog::new();
+    renderer.push_ascii("ERR unknown command '");
+    renderer.push_sanitized(&args.name);
+    renderer.push_ascii("'");
+    renderer.push_arguments(args);
+    renderer.finish()
+}
+
 #[derive(Default)]
 pub(crate) struct FullSyncCoordinator {
     pub(crate) next_transfer_id: u64,
     pub(crate) pending_dual_rdb_snapshots: HashMap<Token, (i64, Vec<u8>)>,
+    /// Main-channel replies held while the pipe relay services a paused primary.
+    pub(crate) paused_dual_main_replies: HashMap<Token, Vec<Vec<u8>>>,
+    /// Ordinary clients held until the paused dual-channel transfer resumes.
+    pub(crate) paused_dual_clients: HashSet<Token>,
     /// One fork pipe streaming an RDB to a cohort of EOF-capable replicas.
     pub(crate) diskless_relay: Option<DisklessRelay>,
-    /// A direct dual-channel child whose RDB sockets are owned by the child.
-    pub(crate) direct_dual_rdb_child: Option<DirectDualRdbChild>,
     /// A shared disk snapshot served to independent replica cursors.
     pub(crate) disk_sync_batch: Option<DiskSyncBatch>,
     pub(crate) disk_snapshot_options:
@@ -236,7 +344,7 @@ impl ServerWorkerState {
         // C backfills RDB clients that entered the wait-PSYNC set with an
         // empty replication buffer as soon as the first block is created.
         let delayed_snapshot_without_child = !self.full_sync.pending_dual_rdb_snapshots.is_empty()
-            && self.full_sync.direct_dual_rdb_child.is_none();
+            && self.full_sync.diskless_relay.is_none();
         let mut protected = if delayed_snapshot_without_child {
             self.replication_runtime
                 .min_protected_backlog_cursor_without_psync_wait()
@@ -569,6 +677,11 @@ impl ServerWorkerState {
         token_value: usize,
         connection_token: usize,
     ) {
+        // Readiness may already be queued when the pending buffer reaches its
+        // limit. C removes the read handler; stale events cannot consume more.
+        if self.replica_main_read_is_paused(Token(token_value)) {
+            return;
+        }
         if matches!(
             self.blocked_events.current(),
             Some(BlockedOperation::DualRdb { main, .. }) if main.0 == token_value
@@ -1211,8 +1324,16 @@ impl ServerWorkerState {
         if !self.ctx.replication().is_replica() {
             self.replication_runtime.clear_replica_resume();
         }
+        if self.ctx.replication().is_replica()
+            && (self.ctx.replication().throttle.is_active()
+                || !self.ctx.throttled_clients().is_empty())
+        {
+            self.ctx.replication_mut().force_full_sync_on_next_reconnect = true;
+        }
         self.schedule_master_reconnect(MasterReconnectCause::ExplicitTargetChange);
-        if self.ctx.replication().cache_primary_on_next_reconnect {
+        if self.ctx.replication().cache_primary_on_next_reconnect
+            && !self.ctx.replication().force_full_sync_on_next_reconnect
+        {
             let master = crate::framework::distributed::replication::MasterInfo {
                 host: self
                     .ctx
@@ -1318,9 +1439,7 @@ impl ServerWorkerState {
     }
 
     pub(crate) fn drive_pending_dual_rdb_snapshots(&mut self) {
-        if self.ctx.persistence().has_active_child()
-            || self.full_sync.direct_dual_rdb_child.is_some()
-        {
+        if self.ctx.persistence().has_active_child() || self.full_sync.diskless_relay.is_some() {
             return;
         }
         let now = crate::foundation::io::sys::time::mstime();
@@ -1560,13 +1679,94 @@ impl ServerWorkerState {
                 .map(|library| library.code.as_bytes().to_vec())
                 .collect()
         };
-        if self.try_begin_direct_dual_fork(&function_codes, &fork_targets) {
+        let Some(snapshot) = snapshot else {
+            for rdb_connection_id in fork_targets {
+                self.remove_connection(rdb_connection_id.0);
+            }
+            return;
+        };
+        if filter_mode != RdbFilterMode::All {
+            let slot_imports = self.ctx.slot_import_dbs();
+            let functions = if filter_mode == RdbFilterMode::Empty {
+                Vec::new()
+            } else {
+                self.ctx
+                    .script()
+                    .function_registry
+                    .list_libraries()
+                    .into_iter()
+                    .map(|library| library.code.as_bytes().to_vec())
+                    .collect()
+            };
+            let replication = self.ctx.rdb_full_sync_replication_info();
+            let rdb =
+                crate::foundation::io::persistence::rdb::serialize::serialize_replication_snapshot(
+                    self.ctx.dbs(),
+                    self.ctx.config().persistence.rdb_key_save_delay,
+                    &functions,
+                    false,
+                    Some(&replication),
+                    &slot_imports,
+                    snapshot,
+                );
+            let marker = crate::engine::distributed::replication::protocol::generate_replid();
+            let mut payload = format!("$EOF:{}\r\n", marker).into_bytes();
+            payload.extend_from_slice(&rdb);
+            payload.extend_from_slice(marker.as_bytes());
+            for rdb_connection_id in fork_targets {
+                let token = rdb_connection_id.0;
+                if let Some(connection) = self.connection_registry.get_mut(Token(token)) {
+                    connection.queue_reply(payload.clone());
+                }
+                if !matches!(self.flush_connection_output(token), WriteOutcome::Complete) {
+                    self.remove_connection(token);
+                    continue;
+                }
+                self.replication_runtime
+                    .mark_rdb_snapshot_complete(rdb_connection_id);
+            }
+            self.refresh_replication_view();
             return;
         }
-
-        for rdb_connection_id in fork_targets {
-            self.remove_connection(rdb_connection_id.0);
+        let Some((read_end, marker, release)) = self.try_begin_diskless_fork_with_options(
+            &function_codes,
+            snapshot,
+            "dual-channel",
+            false,
+        ) else {
+            for rdb_connection_id in fork_targets {
+                self.remove_connection(rdb_connection_id.0);
+            }
+            return;
+        };
+        let mut header = b"$EOF:".to_vec();
+        header.extend_from_slice(&marker);
+        header.extend_from_slice(b"\r\n");
+        for rdb_connection_id in &fork_targets {
+            if let Some(connection) = self.connection_registry.get_mut(Token(rdb_connection_id.0)) {
+                connection.queue_reply(header.clone());
+            }
         }
+        for rdb_connection_id in &fork_targets {
+            if !matches!(
+                self.flush_connection_output(rdb_connection_id.0),
+                WriteOutcome::Complete
+            ) {
+                self.remove_connection(rdb_connection_id.0);
+            }
+        }
+        let targets = fork_targets
+            .into_iter()
+            .filter_map(|connection_id| {
+                self.connection_registry
+                    .get(Token(connection_id.0))
+                    .map(|connection| diskless_child::DisklessTarget::Rdb {
+                        connection_id,
+                        client_id: connection.client_id(),
+                    })
+            })
+            .collect();
+        self.store_diskless_transport_relay(read_end, release, marker, targets, false, 0);
     }
 
     pub(crate) fn is_replica_connection(&self, token_value: usize) -> bool {
@@ -1581,6 +1781,10 @@ impl ServerWorkerState {
             self.replication_runtime.role(ConnectionId(token_value)),
             Some(ReplicationConnection::Replica)
         )
+    }
+
+    pub(crate) fn replica_main_read_is_paused(&self, token: Token) -> bool {
+        self.replication_runtime.replica_main_read_paused() && self.is_master_link(token.0)
     }
 
     pub(crate) fn handle_master_link_connected(&mut self, connection_token: usize) {
@@ -1626,6 +1830,9 @@ impl ServerWorkerState {
                 ReplicaAction::SendDualPsync(frame) => {
                     self.pause_before_replica_psync();
                     if self.consume_debug_pause_after_fork() {
+                        if let Some(link) = self.replication_runtime.replica_link_mut() {
+                            link.mark_dual_main_psync_paused();
+                        }
                         crate::server_log!(
                             debug,
                             "dual-rdb replica main PSYNC pause: token={} phase=before-sigstop bytes={}",
@@ -1648,6 +1855,12 @@ impl ServerWorkerState {
                     self.connection_registry
                         [crate::framework::capabilities::io::Token(connection_token)]
                     .queue_reply(frame);
+                    // Submit the resumed PSYNC before another ready RDB read
+                    // can observe EOF and tear down the paired main socket.
+                    self.handle_writable(token);
+                    if !self.connection_registry.contains(token) {
+                        return;
+                    }
                     main_has_output = true;
                 }
                 ReplicaAction::OpenRdbChannel { initial_frames } => {
@@ -1672,9 +1885,12 @@ impl ServerWorkerState {
             && self.connection_registry[crate::framework::capabilities::io::Token(connection_token)]
                 .has_pending_output()
         {
-            self.transport
-                .set_interest(token, Interest::ReadWritable)
-                .ok();
+            let interest = if self.replica_main_read_is_paused(token) {
+                Interest::Writable
+            } else {
+                Interest::ReadWritable
+            };
+            self.transport.set_interest(token, interest).ok();
         }
     }
 
@@ -1718,9 +1934,9 @@ impl ServerWorkerState {
         &mut self,
         mut ids: Vec<crate::framework::distributed::replication::ReplicaId>,
     ) {
-        if self.ctx.persistence().has_active_child() {
+        if self.ctx.persistence().has_active_child() || self.full_sync.diskless_relay.is_some() {
             // Apply to cron and max-replicas alike: only keyless cohorts can
-            // progress while the All child is running or waiting for ACK.
+            // progress while the All producer runs or its relay waits for ACK.
             ids.retain(|id| {
                 self.replication_runtime
                     .primary_link(*id)
@@ -1862,7 +2078,7 @@ impl ServerWorkerState {
                 })
         });
         let fork = if batch_is_diskless && has_all_target {
-            self.try_begin_diskless_fork_with_options(&libs, snapshot)
+            self.try_begin_diskless_fork_with_options(&libs, snapshot, "normal sync", true)
         } else {
             None
         };

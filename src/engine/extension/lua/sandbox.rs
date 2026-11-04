@@ -17,14 +17,18 @@ pub fn enter_compile_mode(lua: &Lua) -> Result<(), ScriptError> {
         .raw_set(super::VKY_SAVED_KEY, lib_api)
         .map_err(|e| ScriptError::Runtime(format!("Failed to enter compile mode: {}", e)))?;
     // Set compile mode flag
-    let _ = globals.raw_set(super::COMPILE_MODE_FLAG, true);
+    globals
+        .raw_set(super::COMPILE_MODE_FLAG, true)
+        .map_err(|e| ScriptError::Runtime(format!("Failed to set compile mode flag: {}", e)))?;
     Ok(())
 }
 
 pub fn exit_compile_mode(lua: &Lua) -> Result<(), ScriptError> {
     let globals = lua.globals();
     // Clear compile mode flag
-    let _ = globals.raw_set(super::COMPILE_MODE_FLAG, LuaValue::Nil);
+    globals
+        .raw_set(super::COMPILE_MODE_FLAG, LuaValue::Nil)
+        .map_err(|e| ScriptError::Runtime(format!("Failed to clear compile mode flag: {}", e)))?;
     let saved = globals
         .raw_get::<LuaTable>("__vky_saved_runtime")
         .map_err(|e| ScriptError::Runtime(format!("Failed to get runtime saved: {}", e)))?;
@@ -49,44 +53,26 @@ pub(super) fn setup_redis_table(lua: &Lua) -> Result<(), ScriptError> {
 
     let log_fn = lua
         .create_function(|lua, args: LuaMultiValue| {
-            let mut iter = real_args!(args);
-            let level: u8 = match iter.next() {
-                Some(LuaValue::Integer(n)) => *n as u8,
-                Some(LuaValue::Number(n)) => *n as u8,
-                None => {
-                    return super::make_raise_err(
-                        lua,
-                        "server.log() requires two arguments or more.",
-                    )
-                }
-                _ => {
-                    return super::make_raise_err(
-                        lua,
-                        "First argument must be a number (log level).",
-                    )
-                }
-            };
-            let msg: String = match iter.next() {
-                Some(LuaValue::String(s)) => s.to_str().map(|s| s.to_string()).unwrap_or_default(),
-                _ => {
-                    return super::make_raise_err(
-                        lua,
-                        "server.log() requires two arguments or more.",
-                    )
-                }
-            };
-            match level {
-                0..=3 => {}
-                _ => return super::make_raise_err(lua, "Invalid log level."),
+            let arguments = real_args!(args).cloned().collect::<Vec<_>>();
+            if arguments.len() < 2 {
+                return super::make_raise_err(lua, "server.log() requires two arguments or more.");
             }
-            let level_str = match level {
-                0 => "debug",
-                1 => "verbose",
-                2 => "notice",
-                _ => "warning",
+            let Some(level) = lua.coerce_number(arguments[0].clone())? else {
+                return super::make_raise_err(lua, "First argument must be a number (log level).");
             };
-            eprintln!("[LUA {}] {}", level_str, msg);
-            Ok(LuaValue::Boolean(true))
+            let level = level.trunc();
+            if !(0.0..=3.0).contains(&level) {
+                return super::make_raise_err(lua, "Invalid log level.");
+            }
+            let level = level as u8;
+            let msg = render_lua_log_message(lua, arguments.into_iter().skip(1))?;
+            match level {
+                0 => crate::server_log!(debug, "<lua> {}", msg),
+                1 => crate::server_log!(verbose, "<lua> {}", msg),
+                2 => crate::server_log!(notice, "<lua> {}", msg),
+                _ => crate::server_log!(warning, "<lua> {}", msg),
+            }
+            Ok(LuaValue::Nil)
         })
         .map_err(|e| ScriptError::Runtime(e.to_string()))?;
 
@@ -388,10 +374,49 @@ pub(super) fn setup_redis_table(lua: &Lua) -> Result<(), ScriptError> {
     Ok(())
 }
 
+fn render_lua_log_message(
+    lua: &Lua,
+    values: impl IntoIterator<Item = LuaValue>,
+) -> LuaResult<String> {
+    let mut message = String::new();
+    for value in values {
+        let Some(value) = lua.coerce_string(value)? else {
+            continue;
+        };
+        if !message.is_empty() {
+            message.push(' ');
+        }
+        message.push_str(&String::from_utf8_lossy(value.as_bytes().as_ref()));
+    }
+    Ok(message.replace(['\r', '\n'], " "))
+}
+
 fn dispatch_scoped_host(lua: &Lua, operation: i64, mut args: LuaMultiValue) -> LuaResult<LuaValue> {
     let callback: LuaFunction = lua
         .named_registry_value(super::runtime::HOST_CALLBACK_REGISTRY_KEY)
         .map_err(|_| mlua::Error::external("Script host dispatcher is not active"))?;
     args.push_front(LuaValue::Integer(operation));
     callback.call(args)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_lua_log_message;
+    use mlua::prelude::*;
+
+    #[test]
+    fn lua_log_message_joins_strings_and_numbers_and_sanitizes_lines() {
+        let lua = Lua::new();
+        let values = vec![
+            LuaValue::String(lua.create_string("before\r\nafter").unwrap()),
+            LuaValue::Integer(42),
+            LuaValue::Boolean(true),
+            LuaValue::String(lua.create_string("tail").unwrap()),
+        ];
+
+        assert_eq!(
+            render_lua_log_message(&lua, values).unwrap(),
+            "before  after 42 tail"
+        );
+    }
 }

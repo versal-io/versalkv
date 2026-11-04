@@ -132,7 +132,7 @@ impl ServerWorkerState {
     pub(crate) fn refresh_replication_buffer_accounting(&mut self) {
         self.replication_buffer_accounting_dirty = false;
         let protected = if !self.full_sync.pending_dual_rdb_snapshots.is_empty()
-            && self.full_sync.direct_dual_rdb_child.is_none()
+            && self.full_sync.diskless_relay.is_none()
         {
             self.replication_runtime
                 .min_protected_backlog_cursor_without_psync_wait()
@@ -161,17 +161,15 @@ impl ServerWorkerState {
     pub(super) fn active_replication_transfer_floor(&self) -> Option<BacklogCursor> {
         let mut targets = Vec::new();
         if let Some(relay) = &self.full_sync.diskless_relay {
-            targets.extend(relay.targets.iter().copied());
+            targets.extend(
+                relay
+                    .targets
+                    .iter()
+                    .filter_map(|target| self.diskless_target_replica_id(*target)),
+            );
         }
         if let Some(batch) = &self.full_sync.disk_sync_batch {
             targets.extend(batch.target_ids());
-        }
-        if let Some(child) = &self.full_sync.direct_dual_rdb_child {
-            if !child.phases.contains(
-                &crate::framework::commands::server::save::DirectDualRdbChildPhase::MarkerSent,
-            ) {
-                targets.extend(child.targets.iter().copied());
-            }
         }
         targets
             .into_iter()
@@ -209,13 +207,11 @@ impl ServerWorkerState {
                 .replication_runtime
                 .primary_links()
                 .values()
-                .filter(|link| !self.is_direct_dual_snapshot_target(link.connection_id()))
                 .filter_map(|link| self.connection_registry.get(Token(link.connection_id().0)))
                 .map(|conn| conn.replication_output_bytes())
                 .max()
                 .unwrap_or(0);
-            let shared = self.direct_dual_logical_replication_buffer_bytes(backlog_bytes);
-            shared.max(queued)
+            backlog_bytes.max(queued)
         };
         let allocation = if self.ctx.replication().is_replica() {
             self.replication_runtime
@@ -245,22 +241,6 @@ impl ServerWorkerState {
         replication.replica_output_buffer_allocation_bytes = allocation.saturating_add(codecs);
         replication.replica_output_buffer_peak =
             replication.replica_output_buffer_peak.max(live_total);
-    }
-
-    fn is_direct_dual_snapshot_target(&self, connection_id: ConnectionId) -> bool {
-        self.replication_runtime
-            .replica_id_for_connection(connection_id)
-            .is_some_and(|id| {
-                self.full_sync
-                    .direct_dual_rdb_child
-                    .as_ref()
-                    .is_some_and(|child| {
-                        child.targets.contains(&id)
-                            && !child.phases.contains(
-                                &crate::framework::commands::server::save::DirectDualRdbChildPhase::MarkerSent,
-                            )
-                    })
-            })
     }
 
     fn collect_main_output_buffer_entries(
@@ -413,29 +393,17 @@ impl ServerWorkerState {
     }
 
     fn replica_snapshot_transfer_active(&self, connection_id: ConnectionId) -> bool {
-        self.replication_runtime
-            .replica_id_for_connection(connection_id)
-            .is_some_and(|id| {
-                self.full_sync
-                    .diskless_relay
-                    .as_ref()
-                    .is_some_and(|relay| relay.targets.contains(&id))
-                    || self
-                        .full_sync
+        self.diskless_relay_target_for_connection(connection_id)
+            .is_some()
+            || self
+                .replication_runtime
+                .replica_id_for_connection(connection_id)
+                .is_some_and(|id| {
+                    self.full_sync
                         .disk_sync_batch
                         .as_ref()
                         .is_some_and(|batch| batch.contains_target(id))
-                    || self
-                        .full_sync
-                        .direct_dual_rdb_child
-                        .as_ref()
-                        .is_some_and(|child| {
-                            child.targets.contains(&id)
-                                && !child.phases.contains(
-                                    &crate::framework::commands::server::save::DirectDualRdbChildPhase::MarkerSent,
-                                )
-                        })
-            })
+                })
     }
 
     fn evaluate_main_output_buffer_entries(
@@ -493,6 +461,7 @@ impl ServerWorkerState {
         violations: Vec<MainOutputBufferViolation>,
     ) {
         for violation in violations {
+            let failed_rdb = self.shared_output_limit_rdb(violation);
             if violation.cursor_error {
                 crate::server_log!(
                     warning,
@@ -505,13 +474,24 @@ impl ServerWorkerState {
                     warning,
                     "Client token={} scheduled to be closed ASAP for overcoming of output buffer limits. endpoint_token={} queued_bytes={} limit_type={}",
                     violation.owner_connection_id.0,
-                    violation.diagnostic_connection_id.0,
+                    failed_rdb.unwrap_or(violation.diagnostic_connection_id).0,
                     violation.bytes,
                     if violation.hard_exceeded { "hard" } else { "soft" }
                 );
                 self.ctx
                     .stats_mut()
                     .client_output_buffer_limit_disconnections += 1;
+            }
+            if let Some(rdb) = failed_rdb {
+                // Before main PSYNC, the protected RDB client owns the shared
+                // backlog. Release that failed snapshot while leaving the main
+                // socket alive to receive the normal lack-of-backlog rejection.
+                self.replication_runtime
+                    .detach_rdb_channel_preserving_main(rdb);
+                self.replication_runtime
+                    .abort_psync_wait_for_main(violation.owner_connection_id);
+                self.remove_connection(rdb.0);
+                continue;
             }
             if !violation.cursor_error {
                 // A configured hard or soft close is a definitive failure.
@@ -522,6 +502,37 @@ impl ServerWorkerState {
             }
             self.remove_connection(violation.owner_connection_id.0);
         }
+    }
+
+    fn shared_output_limit_rdb(
+        &self,
+        violation: MainOutputBufferViolation,
+    ) -> Option<ConnectionId> {
+        let main = violation.owner_connection_id;
+        if violation.cursor_error
+            || violation.diagnostic_connection_id != main
+            || self
+                .replication_runtime
+                .psync_wait_pin_for_main(main)
+                .is_none()
+        {
+            return None;
+        }
+        let link = self.replication_runtime.primary_for_connection(main)?;
+        if link.dual_state() != PrimaryDualChannelState::WaitingForMainPsync {
+            return None;
+        }
+        let rdb = self.replication_runtime.rdb_channel_for_main(main)?;
+        let main_bytes = self
+            .connection_registry
+            .get(Token(main.0))?
+            .output_buffer_bytes()
+            .saturating_add(link.compression_memory_bytes());
+        let rdb_bytes = self
+            .connection_registry
+            .get(Token(rdb.0))?
+            .output_buffer_bytes();
+        (main_bytes < violation.bytes && rdb_bytes < violation.bytes).then_some(rdb)
     }
 
     fn enforce_retained_output_buffer_limits(

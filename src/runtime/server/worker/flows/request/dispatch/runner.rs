@@ -104,12 +104,29 @@ impl ServerWorkerState {
         };
         let decision = self.pre_dispatch_exec(connection_token, preconditions, invocation.args);
         match decision.action {
-            DispatchAction::Execute => self.execute_admitted_invocation(
-                invocation,
-                connection_token,
-                executor,
-                decision.call_flags,
-            ),
+            DispatchAction::Execute => {
+                let is_script_debug = invocation.args.name.eq_ignore_ascii_case(b"script")
+                    && invocation
+                        .args
+                        .args
+                        .first()
+                        .is_some_and(|subcommand| subcommand.eq_ignore_ascii_case(b"debug"));
+                let has_pending_replies = !invocation.pending_replies.is_empty()
+                    || self.connection_registry[invocation.target.token()].has_pending_output()
+                    || self.io_threads.is_write_inflight(invocation.target.token());
+                if is_script_debug && has_pending_replies {
+                    Ok(CommandExecution::rejected(Value::error(
+                        "ERR SCRIPT DEBUG must be called outside a pipeline",
+                    )))
+                } else {
+                    self.execute_admitted_invocation(
+                        invocation,
+                        connection_token,
+                        executor,
+                        decision.call_flags,
+                    )
+                }
+            }
             DispatchAction::Rejected => Ok(CommandExecution::rejected(
                 decision.reject_reply.unwrap_or(Value::null()),
             )),
@@ -327,7 +344,7 @@ fn unknown_command_reply(
     session: crate::engine::command::SessionId,
     ctx: &crate::framework::context::ServerContext,
 ) -> Value {
-    if crate::framework::commands::scripting::script_cmd::script_debug_enabled() {
+    if ctx.script().debug_modes.contains_key(&session) {
         if (args.name.eq_ignore_ascii_case(b"print") || args.name.eq_ignore_ascii_case(b"p"))
             && args.args.len() == 1
         {

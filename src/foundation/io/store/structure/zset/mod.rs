@@ -10,7 +10,9 @@ pub mod skiplist_tests;
 pub mod tests;
 
 mod core;
+mod lex_range;
 mod zset_lp;
 
 pub use core::{check_zset_encoding_upgrade, infer_zset_encoding, ZSetSl};
+pub(crate) use lex_range::{LexBound, LexRange};
 pub use zset_lp::ZSetLp;

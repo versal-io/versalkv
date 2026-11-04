@@ -7,10 +7,12 @@ use crate::framework::{CommandArgs, CommandError};
 use crate::foundation::io::store::kv_engine::now_ms;
 use crate::foundation::io::protocol::Value;
 use command_macros::command;
+use std::sync::atomic::{AtomicI32, Ordering};
+
+static CLUSTER_CONFIG_LOCK_FD: AtomicI32 = AtomicI32::new(-1);
 
 mod fullsync_fork;
 pub use fullsync_fork::{
-    fork_direct_diskless_rdb_child,
     fork_disk_rdb_file_child_with_options, fork_diskless_rdb_child_with_options,
     pause_parent_after_replication_fork, DiskSyncChildExit,
 };
@@ -18,9 +20,6 @@ pub use fullsync_fork::{
 pub use fullsync_fork::{fork_diskless_rdb_child, fork_disk_rdb_file_child};
 #[cfg(test)]
 pub use fullsync_fork::reap_disk_sync_file_child;
-pub(crate) use fullsync_fork::{
-    drain_direct_dual_rdb_phase_pipe, DirectDualRdbChildPhase,
-};
 
 #[cfg(test)]
 static DISKLESS_FORK_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -318,8 +317,27 @@ pub fn close_listener_fds(fds: &[i32]) -> usize {
     closed
 }
 
+pub(crate) fn register_cluster_config_lock_fd(fd: i32) {
+    CLUSTER_CONFIG_LOCK_FD.store(fd, Ordering::Release);
+}
+
+pub(crate) fn unregister_cluster_config_lock_fd(fd: i32) {
+    let _ = CLUSTER_CONFIG_LOCK_FD.compare_exchange(
+        fd,
+        -1,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    );
+}
+
+fn close_cluster_config_lock_in_child() -> bool {
+    let fd = CLUSTER_CONFIG_LOCK_FD.swap(-1, Ordering::AcqRel);
+    fd >= 0 && crate::framework::capabilities::process::close_fd(fd)
+}
+
 pub fn child_after_fork(rcfg: &RuntimeConfig, listener_fds: &[i32]) {
     close_listener_fds(listener_fds);
+    close_cluster_config_lock_in_child();
     crate::foundation::io::sys::process::monitor_persistence_child_parent();
     crate::foundation::io::persistence::serialize::reset_key_save_delay_interrupt();
     install_child_signal_handlers();

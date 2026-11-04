@@ -85,18 +85,43 @@ impl ReplicationRuntime {
                                 link.applied_position().get(),
                                 link.rdb_channel_state()
                             );
-                            self.replica_resume = Some((
+                            // A committed session replaces any prior forced-full-sync request.
+                            self.set_replica_resume(
                                 link.master().clone(),
                                 replid.to_string(),
                                 link.applied_position(),
                                 link.selected_db(),
-                            ));
+                            );
+                        }
+                    } else if link.dual_main_psync_was_paused() && self.replica_resume.is_none() {
+                        if let Some((replid, offset, selected_db)) =
+                            link.provisional_resume_position()
+                        {
+                            crate::server_log!(
+                                debug,
+                                "dual-rdb preserving handshake resume after main close: main={} replid={} offset={} rdb_state={:?}",
+                                connection_id.0,
+                                replid,
+                                offset.get(),
+                                link.rdb_channel_state()
+                            );
+                            self.set_replica_resume(
+                                link.master().clone(),
+                                replid.to_string(),
+                                offset,
+                                selected_db,
+                            );
                         }
                     }
                 }
                 self.channel_pairs.remove(&connection_id);
             }
             if is_replica_side_rdb {
+                if is_active_replica_side_rdb {
+                    if let Some(link) = self.replica_link_mut() {
+                        link.mark_rdb_transfer_failed();
+                    }
+                }
                 self.replica_rdb_link = None;
                 self.channel_pairs.remove(&connection_id);
             }
@@ -115,12 +140,12 @@ impl ReplicationRuntime {
                     if let Some(link) = self.replica_link.take() {
                         if link.can_resume_after_disconnect() {
                             if let Some(replid) = link.master_replid() {
-                                self.replica_resume = Some((
+                                self.set_replica_resume(
                                     link.master().clone(),
                                     replid.to_string(),
                                     link.applied_position(),
                                     link.selected_db(),
-                                ));
+                                );
                             }
                         }
                     }

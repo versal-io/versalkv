@@ -6,7 +6,7 @@ use super::serialize::{
 };
 use crate::foundation::io::persistence::snapshot::background::{FeedError, RdbSaveFeeder};
 use crate::foundation::io::store::kv_engine::{DbSet, SnapshotValue};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 pub struct FrozenRdb {
     header: Vec<u8>,
@@ -175,6 +175,7 @@ impl FrozenRdb {
                 .into_iter()
                 .map(|database| ForklessDatabaseFeed {
                     id: database.id,
+                    current_id: database.id,
                     dataset_id: database.dataset_id,
                     total_entries: database.total_entries,
                     expires: database.expires,
@@ -189,8 +190,13 @@ impl FrozenRdb {
             pending: None,
             capture_ms,
             should_preserve_expired,
-            shared_keys: Vec::new(),
+            queued_keys: Vec::new(),
             captured_keys: Vec::new(),
+            resolved_keys: Vec::new(),
+            priority_keys: HashMap::new(),
+            priority_requested: HashSet::new(),
+            scheduled_keys: HashSet::new(),
+            ordinary_turn_pending: false,
             is_finished: false,
         }
     }
@@ -215,13 +221,19 @@ pub(crate) struct ForklessFeed {
     pending: Option<FrozenWorkItem>,
     capture_ms: u64,
     should_preserve_expired: bool,
-    shared_keys: Vec<ForklessItemId>,
+    queued_keys: Vec<ForklessItemId>,
     captured_keys: Vec<ForklessItemId>,
+    resolved_keys: Vec<ForklessItemId>,
+    priority_keys: HashMap<(Option<Vec<u8>>, u32), VecDeque<ForklessItemId>>,
+    priority_requested: HashSet<ForklessItemId>,
+    scheduled_keys: HashSet<ForklessItemId>,
+    ordinary_turn_pending: bool,
     is_finished: bool,
 }
 
 struct ForklessDatabaseFeed {
     id: u32,
+    current_id: u32,
     dataset_id: Option<Vec<u8>>,
     total_entries: usize,
     expires: usize,
@@ -263,6 +275,41 @@ impl ForklessFeed {
                 }
                 continue;
             }
+            if !self.ordinary_turn_pending {
+                if let Some((completion, current_db_id)) = self.pop_current_priority() {
+                    remaining -= 1;
+                    self.ordinary_turn_pending = true;
+                    self.priority_requested.remove(&completion);
+                    if self.scheduled_keys.remove(&completion) {
+                        continue;
+                    }
+                    let Some(entry) = capture_forkless_entry(
+                        primary,
+                        additional_datasets,
+                        &completion,
+                        current_db_id,
+                        self.capture_ms,
+                        self.should_preserve_expired,
+                    ) else {
+                        self.scheduled_keys.insert(completion.clone());
+                        self.captured_keys.push(completion.clone());
+                        self.resolved_keys.push(completion);
+                        continue;
+                    };
+                    self.scheduled_keys.insert(completion.clone());
+                    self.captured_keys.push(completion.clone());
+                    self.track_entry_handoff(completion, &entry.value);
+                    match self.feeder.try_send(FrozenWorkItem::Entry(entry)) {
+                        Ok(()) => {}
+                        Err(FeedError::Full(item)) => {
+                            self.pending = Some(*item);
+                            return false;
+                        }
+                        Err(FeedError::Closed) => return false,
+                    }
+                    continue;
+                }
+            }
             let Some(database) = self.databases.get_mut(self.database_index) else {
                 self.feeder.finish();
                 self.is_finished = true;
@@ -290,7 +337,7 @@ impl ForklessFeed {
                 }
                 let (cursor, keys) =
                     find_dataset(primary, additional_datasets, database.dataset_id.as_deref())
-                        .and_then(|dataset| dataset.get(database.id))
+                        .and_then(|dataset| dataset.get(database.current_id))
                         .map_or((0, Vec::new()), |db| {
                             db.snapshot_scan_bucket(database.cursor)
                         });
@@ -299,15 +346,31 @@ impl ForklessFeed {
                 database.keys = keys;
                 database.key_index = 0;
                 database.is_done = cursor == 0;
+                if self.ordinary_turn_pending {
+                    self.ordinary_turn_pending = false;
+                    remaining -= 1;
+                    continue;
+                }
             }
             if let Some(key) = database.keys.get(database.key_index).cloned() {
                 database.key_index += 1;
+                self.ordinary_turn_pending = false;
+                remaining -= 1;
+                let completion = ForklessItemId {
+                    dataset_id: database.dataset_id.clone(),
+                    db_id: database.id,
+                    key: key.clone(),
+                };
+                let was_priority = self.priority_requested.remove(&completion);
+                if self.scheduled_keys.remove(&completion) {
+                    continue;
+                }
                 let Some(dataset) =
                     find_dataset_mut(primary, additional_datasets, database.dataset_id.as_deref())
                 else {
                     continue;
                 };
-                let Some(db) = dataset.get_mut(database.id) else {
+                let Some(db) = dataset.get_mut(database.current_id) else {
                     continue;
                 };
                 let expire_ms = db.get_expire(&key);
@@ -321,32 +384,22 @@ impl ForklessFeed {
                 else {
                     continue;
                 };
-                let is_shared = value.is_shared();
-                let item = FrozenWorkItem::Entry(FrozenEntry {
+                let entry = FrozenEntry {
                     key: key.clone(),
                     value,
                     expire_ms,
                     hash_field_expires: db.hash_field_expires_for(&key).cloned(),
-                    completion: is_shared.then(|| ForklessItemId {
-                        dataset_id: database.dataset_id.clone(),
-                        db_id: database.id,
-                        key: key.clone(),
-                    }),
-                });
-                self.captured_keys.push(ForklessItemId {
-                    dataset_id: database.dataset_id.clone(),
-                    db_id: database.id,
-                    key: key.clone(),
-                });
-                if is_shared {
-                    self.shared_keys.push(ForklessItemId {
-                        dataset_id: database.dataset_id.clone(),
-                        db_id: database.id,
-                        key,
-                    });
+                    completion: Some(completion.clone()),
+                };
+                self.captured_keys.push(completion.clone());
+                if was_priority {
+                    self.scheduled_keys.insert(completion.clone());
                 }
-                match self.feeder.try_send(item) {
-                    Ok(()) => remaining -= 1,
+                // Ordinary iteration keeps the C-compatible in-use marker.
+                // Only independent early copies may release waiting writers.
+                self.queued_keys.push(completion);
+                match self.feeder.try_send(FrozenWorkItem::Entry(entry)) {
+                    Ok(()) => {}
                     Err(FeedError::Full(item)) => {
                         self.pending = Some(*item);
                         return false;
@@ -362,17 +415,116 @@ impl ForklessFeed {
         false
     }
 
-    pub(crate) fn take_shared_keys(&mut self) -> Vec<ForklessItemId> {
-        std::mem::take(&mut self.shared_keys)
+    fn track_entry_handoff(&mut self, item: ForklessItemId, value: &SnapshotValue) {
+        // Shared values still require the serializer to release live storage.
+        // Independent copies can release writers as soon as they are captured.
+        match value {
+            SnapshotValue::Shared(_) => self.queued_keys.push(item),
+            SnapshotValue::Owned(_) => self.resolved_keys.push(item),
+        }
+    }
+
+    pub(crate) fn take_queued_keys(&mut self) -> Vec<ForklessItemId> {
+        std::mem::take(&mut self.queued_keys)
     }
 
     pub(crate) fn take_captured_keys(&mut self) -> Vec<ForklessItemId> {
         std::mem::take(&mut self.captured_keys)
     }
 
+    pub(crate) fn take_resolved_keys(&mut self) -> Vec<ForklessItemId> {
+        std::mem::take(&mut self.resolved_keys)
+    }
+
+    fn pop_current_priority(&mut self) -> Option<(ForklessItemId, u32)> {
+        let database = self.databases.get(self.database_index)?;
+        if !database.is_header_sent {
+            return None;
+        }
+        let id = (database.dataset_id.clone(), database.id);
+        let current_db_id = database.current_id;
+        let completion = self.priority_keys.get_mut(&id)?.pop_front();
+        if self.priority_keys.get(&id).is_some_and(VecDeque::is_empty) {
+            self.priority_keys.remove(&id);
+        }
+        completion.map(|item| (item, current_db_id))
+    }
+
+    pub(crate) fn prioritize_keys(
+        &mut self,
+        db_id: u32,
+        keys: impl IntoIterator<Item = Vec<u8>>,
+    ) -> bool {
+        let can_capture_now = self
+            .databases
+            .get(self.database_index)
+            .is_some_and(|database| database.dataset_id.is_none() && database.id == db_id);
+        let mut has_keys = false;
+        for key in keys {
+            has_keys = true;
+            let item = ForklessItemId {
+                dataset_id: None,
+                db_id,
+                key,
+            };
+            if !self.scheduled_keys.contains(&item) && self.priority_requested.insert(item.clone())
+            {
+                self.priority_keys
+                    .entry((None, db_id))
+                    .or_default()
+                    .push_back(item);
+            }
+        }
+        has_keys && can_capture_now
+    }
+
+    pub(crate) fn swap_databases(&mut self, first: u32, second: u32) {
+        if first == second {
+            return;
+        }
+        for database in &mut self.databases {
+            if database.dataset_id.is_some() {
+                continue;
+            }
+            if database.current_id == first {
+                database.current_id = second;
+            } else if database.current_id == second {
+                database.current_id = first;
+            }
+        }
+    }
+
     pub(crate) fn is_finished(&self) -> bool {
         self.is_finished
     }
+}
+
+fn capture_forkless_entry(
+    primary: &mut DbSet,
+    additional_datasets: &mut [(Vec<u8>, &mut DbSet)],
+    completion: &ForklessItemId,
+    current_db_id: u32,
+    capture_ms: u64,
+    should_preserve_expired: bool,
+) -> Option<FrozenEntry> {
+    let dataset = find_dataset_mut(
+        primary,
+        additional_datasets,
+        completion.dataset_id.as_deref(),
+    )?;
+    let db = dataset.get_mut(current_db_id)?;
+    let expire_ms = db.get_expire(&completion.key);
+    if !should_preserve_expired && expire_ms.is_some_and(|expire| expire <= capture_ms) {
+        return None;
+    }
+    let value = db.snapshot_value_for_background(&completion.key, LARGE_VALUE_HANDOFF_THRESHOLD)?;
+    Some(FrozenEntry {
+        key: completion.key.clone(),
+        value,
+        expire_ms,
+        hash_field_expires: db.hash_field_expires_for(&completion.key).cloned(),
+        completion: Some(completion.clone()),
+    })
 }
 
 impl FrozenRdb {
@@ -725,7 +877,7 @@ mod tests {
             dir.clone(),
             "dump.rdb".to_string(),
             1,
-            10_000_000,
+            0,
             false,
             RdbSnapshotOptions {
                 compression: RdbCompression::No,
@@ -742,6 +894,455 @@ mod tests {
             "one drive must not scan the complete dictionary"
         );
 
+        task.control().cancel();
+        let _ = task.finish();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn ordinary_scan_does_not_retain_scheduled_key_copies() {
+        let mut dbs = DbSet::new(1);
+        dbs.get_mut(0).unwrap().set(
+            b"ordinary".to_vec(),
+            Robj::string_raw(Bytes::from_static(b"value")),
+        );
+        let frozen =
+            FrozenRdb::capture_header(&dbs, &[], &[], None, RdbSerializeOptions::default());
+        let dir = std::env::temp_dir().join(format!(
+            "versal-forkless-ordinary-scheduled-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut task, feeder) = BackgroundRdbSave::start_incremental(
+            frozen.total_keys(),
+            dir.clone(),
+            "dump.rdb".to_string(),
+            1,
+            0,
+            false,
+            RdbSnapshotOptions {
+                compression: RdbCompression::No,
+                checksum: true,
+            },
+        )
+        .unwrap();
+        let mut feed = frozen.into_incremental_feed(feeder, 0, true);
+
+        assert!(!feed.drive(&mut dbs, &mut [], 1));
+        assert!(feed.scheduled_keys.is_empty());
+
+        drop(feed);
+        task.control().cancel();
+        let _ = task.finish();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn priority_keys_only_bypass_scanning_for_the_current_database() {
+        let mut dbs = DbSet::new(2);
+        dbs.get_mut(0).unwrap().set(
+            b"current".to_vec(),
+            Robj::string_raw(Bytes::from_static(b"value")),
+        );
+        dbs.get_mut(1).unwrap().set(
+            b"later".to_vec(),
+            Robj::string_raw(Bytes::from_static(b"value")),
+        );
+        let frozen =
+            FrozenRdb::capture_header(&dbs, &[], &[], None, RdbSerializeOptions::default());
+        let dir = std::env::temp_dir().join(format!(
+            "versal-forkless-priority-db-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut task, feeder) = BackgroundRdbSave::start_incremental(
+            frozen.total_keys(),
+            dir.clone(),
+            "dump.rdb".to_string(),
+            1,
+            0,
+            false,
+            RdbSnapshotOptions {
+                compression: RdbCompression::No,
+                checksum: true,
+            },
+        )
+        .unwrap();
+        let mut feed = frozen.into_incremental_feed(feeder, 0, true);
+
+        assert!(feed.prioritize_keys(0, [b"current".to_vec()]));
+        assert!(!feed.prioritize_keys(1, [b"later".to_vec()]));
+        assert!(!feed.prioritize_keys(0, std::iter::empty()));
+
+        drop(feed);
+        task.control().cancel();
+        let _ = task.finish();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn priority_queue_resolves_current_database_behind_future_database_request() {
+        let mut dbs = DbSet::new(2);
+        dbs.get_mut(0).unwrap().set(
+            b"current-filler".to_vec(),
+            Robj::string_raw(Bytes::from_static(b"value")),
+        );
+        dbs.get_mut(1).unwrap().set(
+            b"future-filler".to_vec(),
+            Robj::string_raw(Bytes::from_static(b"value")),
+        );
+        let frozen =
+            FrozenRdb::capture_header(&dbs, &[], &[], None, RdbSerializeOptions::default());
+        let dir = std::env::temp_dir().join(format!(
+            "versal-forkless-priority-order-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut task, feeder) = BackgroundRdbSave::start_incremental(
+            frozen.total_keys(),
+            dir.clone(),
+            "dump.rdb".to_string(),
+            1,
+            0,
+            false,
+            RdbSnapshotOptions {
+                compression: RdbCompression::No,
+                checksum: true,
+            },
+        )
+        .unwrap();
+        let mut feed = frozen.into_incremental_feed(feeder, 0, true);
+
+        assert!(!feed.drive(&mut dbs, &mut [], 1));
+        let future = ForklessItemId {
+            dataset_id: None,
+            db_id: 1,
+            key: b"future-missing".to_vec(),
+        };
+        let current = ForklessItemId {
+            dataset_id: None,
+            db_id: 0,
+            key: b"current-missing".to_vec(),
+        };
+        assert!(!feed.prioritize_keys(1, [future.key.clone()]));
+        assert!(feed.prioritize_keys(0, [current.key.clone()]));
+
+        assert!(!feed.drive(&mut dbs, &mut [], 1));
+        assert!(
+            feed.take_resolved_keys().contains(&current),
+            "a future-database request must not block a current-database priority key"
+        );
+
+        drop(feed);
+        task.control().cancel();
+        let _ = task.finish();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn priority_keys_resolve_entries_absent_from_the_snapshot() {
+        let mut dbs = DbSet::new(1);
+        dbs.get_mut(0).unwrap().set(
+            b"existing".to_vec(),
+            Robj::string_raw(Bytes::from_static(b"value")),
+        );
+        let frozen =
+            FrozenRdb::capture_header(&dbs, &[], &[], None, RdbSerializeOptions::default());
+        let dir = std::env::temp_dir().join(format!(
+            "versal-forkless-priority-missing-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut task, feeder) = BackgroundRdbSave::start_incremental(
+            frozen.total_keys(),
+            dir.clone(),
+            "dump.rdb".to_string(),
+            1,
+            0,
+            false,
+            RdbSnapshotOptions {
+                compression: RdbCompression::No,
+                checksum: true,
+            },
+        )
+        .unwrap();
+        let mut feed = frozen.into_incremental_feed(feeder, 0, true);
+        let missing = ForklessItemId {
+            dataset_id: None,
+            db_id: 0,
+            key: b"missing".to_vec(),
+        };
+
+        assert!(feed.prioritize_keys(0, [missing.key.clone()]));
+        assert!(!feed.drive(&mut dbs, &mut [], 1));
+        assert_eq!(feed.take_resolved_keys(), vec![missing.clone()]);
+        assert!(feed.scheduled_keys.contains(&missing));
+
+        drop(feed);
+        task.control().cancel();
+        let _ = task.finish();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn priority_shared_key_waits_for_background_serialization() {
+        let mut dbs = DbSet::new(1);
+        dbs.get_mut(0).unwrap().set(
+            b"owned".to_vec(),
+            Robj::ListQuicklist(ListValue::from_vecdeque(
+                (0..8_192).map(|_| Bytes::from_static(b"value")).collect(),
+            )),
+        );
+        let frozen =
+            FrozenRdb::capture_header(&dbs, &[], &[], None, RdbSerializeOptions::default());
+        let dir = std::env::temp_dir().join(format!(
+            "versal-forkless-priority-owned-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut task, feeder) = BackgroundRdbSave::start_incremental(
+            frozen.total_keys(),
+            dir.clone(),
+            "dump.rdb".to_string(),
+            1,
+            10_000_000,
+            false,
+            RdbSnapshotOptions {
+                compression: RdbCompression::No,
+                checksum: true,
+            },
+        )
+        .unwrap();
+        let mut feed = frozen.into_incremental_feed(feeder, 0, true);
+        let owned = ForklessItemId {
+            dataset_id: None,
+            db_id: 0,
+            key: b"owned".to_vec(),
+        };
+
+        assert!(feed.prioritize_keys(0, [owned.key.clone()]));
+        assert!(!feed.drive(&mut dbs, &mut [], 1));
+        assert!(feed.take_resolved_keys().is_empty());
+        assert_eq!(feed.take_queued_keys(), vec![owned]);
+
+        drop(feed);
+        task.control().cancel();
+        let _ = task.finish();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn priority_owned_key_releases_writer_before_background_serialization() {
+        let mut dbs = DbSet::new(1);
+        dbs.get_mut(0).unwrap().set(
+            b"owned".to_vec(),
+            Robj::string_raw(Bytes::from_static(b"value")),
+        );
+        let frozen =
+            FrozenRdb::capture_header(&dbs, &[], &[], None, RdbSerializeOptions::default());
+        let dir = std::env::temp_dir().join(format!(
+            "versal-forkless-priority-owned-release-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut task, feeder) = BackgroundRdbSave::start_incremental(
+            frozen.total_keys(),
+            dir.clone(),
+            "dump.rdb".to_string(),
+            1,
+            10_000_000,
+            false,
+            RdbSnapshotOptions {
+                compression: RdbCompression::No,
+                checksum: true,
+            },
+        )
+        .unwrap();
+        let mut feed = frozen.into_incremental_feed(feeder, 0, true);
+        let owned = ForklessItemId {
+            dataset_id: None,
+            db_id: 0,
+            key: b"owned".to_vec(),
+        };
+
+        assert!(feed.prioritize_keys(0, [owned.key.clone()]));
+        assert!(!feed.drive(&mut dbs, &mut [], 1));
+        let resolved = feed.take_resolved_keys();
+        let queued = feed.take_queued_keys();
+        let processed = task.control().progress().processed;
+        drop(feed);
+        task.control().cancel();
+        let _ = task.finish();
+        let _ = std::fs::remove_dir_all(dir);
+
+        assert_eq!(resolved, vec![owned]);
+        assert!(queued.is_empty());
+        assert_eq!(processed, 0);
+    }
+
+    #[test]
+    fn missing_priority_work_consumes_the_priority_budget() {
+        let mut dbs = DbSet::new(1);
+        dbs.get_mut(0).unwrap().set(
+            b"ordinary".to_vec(),
+            Robj::string_raw(Bytes::from_static(b"value")),
+        );
+        let frozen =
+            FrozenRdb::capture_header(&dbs, &[], &[], None, RdbSerializeOptions::default());
+        let dir = std::env::temp_dir().join(format!(
+            "versal-forkless-priority-budget-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut task, feeder) = BackgroundRdbSave::start_incremental(
+            frozen.total_keys(),
+            dir.clone(),
+            "dump.rdb".to_string(),
+            1,
+            0,
+            false,
+            RdbSnapshotOptions {
+                compression: RdbCompression::No,
+                checksum: true,
+            },
+        )
+        .unwrap();
+        let mut feed = frozen.into_incremental_feed(feeder, 0, true);
+        let missing_keys = (0..3).map(|index| format!("missing-{index}").into_bytes());
+
+        assert!(feed.prioritize_keys(0, missing_keys));
+        assert!(!feed.drive(&mut dbs, &mut [], 1));
+
+        assert_eq!(feed.take_resolved_keys().len(), 1);
+        assert_eq!(
+            feed.priority_keys.get(&(None, 0)).map_or(0, VecDeque::len),
+            2
+        );
+
+        drop(feed);
+        task.control().cancel();
+        let _ = task.finish();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn full_priority_budget_still_advances_the_ordinary_scan() {
+        let mut dbs = DbSet::new(1);
+        let keys: Vec<Vec<u8>> = (0..4)
+            .map(|index| format!("key-{index}").into_bytes())
+            .collect();
+        for key in &keys {
+            dbs.get_mut(0)
+                .unwrap()
+                .set(key.clone(), Robj::string_raw(Bytes::from_static(b"value")));
+        }
+        let frozen =
+            FrozenRdb::capture_header(&dbs, &[], &[], None, RdbSerializeOptions::default());
+        let dir = std::env::temp_dir().join(format!(
+            "versal-forkless-priority-fairness-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut task, feeder) = BackgroundRdbSave::start_incremental(
+            frozen.total_keys(),
+            dir.clone(),
+            "dump.rdb".to_string(),
+            1,
+            0,
+            false,
+            RdbSnapshotOptions {
+                compression: RdbCompression::No,
+                checksum: true,
+            },
+        )
+        .unwrap();
+        let mut feed = frozen.into_incremental_feed(feeder, 0, true);
+
+        assert!(feed.prioritize_keys(0, keys));
+        assert!(!feed.drive(&mut dbs, &mut [], 1));
+        assert!(!feed.drive(&mut dbs, &mut [], 1));
+
+        let database = &feed.databases[0];
+        assert!(
+            database.cursor != 0
+                || !database.keys.is_empty()
+                || database.key_index != 0
+                || database.is_done,
+            "priority capture must preserve ordinary scan progress"
+        );
+
+        drop(feed);
+        task.control().cancel();
+        let _ = task.finish();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn ordinary_scan_does_not_recapture_a_queued_priority_key() {
+        let mut dbs = DbSet::new(1);
+        for index in 0..4 {
+            dbs.get_mut(0).unwrap().set(
+                format!("key-{index}").into_bytes(),
+                Robj::string_raw(Bytes::from_static(b"value")),
+            );
+        }
+        let frozen =
+            FrozenRdb::capture_header(&dbs, &[], &[], None, RdbSerializeOptions::default());
+        let dir = std::env::temp_dir().join(format!(
+            "versal-forkless-priority-stale-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut task, feeder) = BackgroundRdbSave::start_incremental(
+            frozen.total_keys(),
+            dir.clone(),
+            "dump.rdb".to_string(),
+            1,
+            0,
+            false,
+            RdbSnapshotOptions {
+                compression: RdbCompression::No,
+                checksum: true,
+            },
+        )
+        .unwrap();
+        let mut feed = frozen.into_incremental_feed(feeder, 0, true);
+
+        assert!(!feed.drive(&mut dbs, &mut [], 1));
+        let database = &feed.databases[0];
+        let ordinary_key = database.keys[database.key_index].clone();
+        let first_priority = database.keys[database.key_index + 1].clone();
+        assert!(feed.prioritize_keys(0, [first_priority.clone(), ordinary_key.clone()]));
+
+        assert!(!feed.drive(&mut dbs, &mut [], 1));
+        assert!(!feed.drive(&mut dbs, &mut [], 1));
+        assert!(!feed.drive(&mut dbs, &mut [], 1));
+
+        let captured = feed
+            .take_captured_keys()
+            .into_iter()
+            .filter(|item| item.key == ordinary_key)
+            .count();
+        assert_eq!(captured, 1);
+
+        drop(feed);
         task.control().cancel();
         let _ = task.finish();
         let _ = std::fs::remove_dir_all(dir);

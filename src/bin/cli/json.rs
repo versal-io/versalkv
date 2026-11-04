@@ -6,12 +6,44 @@ pub fn format_resp(val: &RespValue, opts: &CliOptions) -> String {
         format_json(val, false)
     } else if opts.quoted_json {
         format_json(val, true)
+    } else if opts.csv {
+        format_csv(val)
     } else {
         let mut output = val.to_string_raw();
         if opts.raw {
             output.push_str(opts.delimiter.as_deref().unwrap_or("\n"));
         }
         output
+    }
+}
+
+fn format_csv(value: &RespValue) -> String {
+    match value {
+        RespValue::SimpleString(text) => {
+            format!(
+                "\"{}\"",
+                super::resp::escape_bulk_tty_bytes(text.as_bytes())
+            )
+        }
+        RespValue::Error(text) => format!(
+            "ERROR,\"{}\"",
+            super::resp::escape_bulk_tty_bytes(text.as_bytes())
+        ),
+        RespValue::Bulk(bytes) | RespValue::Verbatim { data: bytes } => {
+            format!("\"{}\"", super::resp::escape_bulk_tty_bytes(bytes))
+        }
+        RespValue::Null | RespValue::NullArray => "NULL".to_string(),
+        RespValue::Array(items) | RespValue::Set(items) | RespValue::Push(items) => {
+            items.iter().map(format_csv).collect::<Vec<_>>().join(",")
+        }
+        RespValue::Map(items) => items
+            .iter()
+            .flat_map(|(key, value)| [format_csv(key), format_csv(value)])
+            .collect::<Vec<_>>()
+            .join(","),
+        RespValue::Boolean(value) => value.to_string(),
+        RespValue::Integer(value) => value.to_string(),
+        RespValue::Double(value) | RespValue::BigNumber(value) => value.clone(),
     }
 }
 

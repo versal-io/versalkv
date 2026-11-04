@@ -412,6 +412,23 @@ impl ServerWorkerState {
         keys
     }
 
+    pub(crate) fn forkless_key_targets(
+        meta: &CmdPreconditions,
+        args: &CommandArgs,
+        selected_db: u32,
+    ) -> Vec<(u32, Vec<u8>)> {
+        let targets = Self::cluster_redirect_keys(meta, args)
+            .into_iter()
+            .map(|key| (selected_db, key))
+            .collect::<Vec<_>>();
+        crate::framework::spec::normalize_forkless_key_targets(
+            meta.name.as_str(),
+            args,
+            selected_db,
+            targets,
+        )
+    }
+
     pub(super) fn stage_client_pause(
         &self,
         facts: &CommandClientFacts,
@@ -449,7 +466,7 @@ impl ServerWorkerState {
     }
 
     pub(super) fn stage_forkless_key_barrier(
-        &self,
+        &mut self,
         facts: &CommandClientFacts,
         meta: &CmdPreconditions,
         args: &CommandArgs,
@@ -474,28 +491,88 @@ impl ServerWorkerState {
         if !call_flags.is_write {
             return None;
         }
-        let keys = super::ServerWorkerState::cluster_redirect_keys(meta, args);
-        let is_capture_control = args.name.eq_ignore_ascii_case(b"bgsave")
-            || args.name.eq_ignore_ascii_case(b"save")
-            || args.name.eq_ignore_ascii_case(b"flushdb")
-            || args.name.eq_ignore_ascii_case(b"flushall")
-            || args.name.eq_ignore_ascii_case(b"shutdown");
-        if !is_capture_control && self.ctx.persistence().forkless_capture_in_progress() {
+        let is_slot_import = matches!(
+            self.connection_registry[facts.token].slot_migration_role,
+            Some(
+                crate::engine::distributed::cluster::migration::SlotMigrationConnectionRole::Import(
+                    _
+                )
+            )
+        );
+        if is_slot_import && self.ctx.persistence().forkless_save_in_progress() {
             return Some(DispatchOutcome {
                 action: DispatchAction::Postpone(PostponeReason::ForklessKey),
                 call_flags,
                 reject_reply: None,
             });
         }
+        let key_targets = Self::forkless_key_targets(meta, args, facts.selected_db);
+        if key_targets
+            .iter()
+            .any(|(db_id, _)| *db_id as usize >= self.ctx.num_dbs())
+        {
+            return None;
+        }
+        let is_capture_control = args.name.eq_ignore_ascii_case(b"bgsave")
+            || args.name.eq_ignore_ascii_case(b"save")
+            || args.name.eq_ignore_ascii_case(b"flushdb")
+            || args.name.eq_ignore_ascii_case(b"flushall")
+            || args.name.eq_ignore_ascii_case(b"shutdown");
+        if !is_capture_control && self.ctx.persistence().forkless_capture_in_progress() {
+            if !facts.transaction && args.name.eq_ignore_ascii_case(b"swapdb") {
+                return None;
+            }
+            let has_indirect_writes = facts.transaction
+                || [
+                    b"eval".as_slice(),
+                    b"evalsha".as_slice(),
+                    b"fcall".as_slice(),
+                ]
+                .iter()
+                .any(|name| args.name.eq_ignore_ascii_case(name))
+                || key_targets.iter().any(|(db_id, key)| {
+                    !self
+                        .ctx
+                        .blocking_registry()
+                        .waiters_for_key(*db_id, key)
+                        .is_empty()
+                });
+            if has_indirect_writes || key_targets.is_empty() {
+                self.ctx.persistence().set_forkless_key_delay(0);
+                return Some(DispatchOutcome {
+                    action: DispatchAction::Postpone(PostponeReason::ForklessKey),
+                    call_flags,
+                    reject_reply: None,
+                });
+            }
+            let uncaptured_keys = key_targets
+                .iter()
+                .filter(|(db_id, key)| !self.ctx.persistence().forkless_key_captured(*db_id, key))
+                .cloned()
+                .collect::<Vec<_>>();
+            if !uncaptured_keys.is_empty() {
+                let mut can_capture_all_now = true;
+                for (db_id, key) in uncaptured_keys {
+                    can_capture_all_now &= self
+                        .ctx
+                        .prioritize_forkless_keys(db_id, std::iter::once(key));
+                }
+                if !can_capture_all_now {
+                    self.ctx.persistence().set_forkless_key_delay(0);
+                }
+                return Some(DispatchOutcome {
+                    action: DispatchAction::Postpone(PostponeReason::ForklessKey),
+                    call_flags,
+                    reject_reply: None,
+                });
+            }
+        }
         if facts.transaction {
             return None;
         }
-        keys.into_iter()
-            .any(|key| {
-                self.ctx
-                    .persistence()
-                    .forkless_key_blocked(facts.selected_db, &key)
-            })
+        key_targets
+            .into_iter()
+            .any(|(db_id, key)| self.ctx.persistence().forkless_key_blocked(db_id, &key))
             .then_some(DispatchOutcome {
                 action: DispatchAction::Postpone(PostponeReason::ForklessKey),
                 call_flags,

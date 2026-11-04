@@ -35,7 +35,11 @@ pub fn config_rewrite(ctx: &mut ServerContext) -> Value {
         r.replication.master_host.as_deref(),
         r.replication.master_port,
     ) {
-        lines.push(format!("replicaof {} {}", host, port));
+        lines.push(format!(
+            "replicaof {} {}",
+            crate::framework::config::encode_config_argument(host),
+            port
+        ));
     }
     if let Some(ref cfg_path) = r.server.config_file {
         if config_file_contains_key(cfg_path, "unixsocket") {
@@ -382,7 +386,7 @@ pub fn config_rewrite(ctx: &mut ServerContext) -> Value {
         if spec.is_hidden() {
             continue;
         }
-        if matches!(spec.name, "bind" | "bind-source-addr") {
+        if matches!(spec.name, "bind" | "bind-source-addr" | "replicaof") {
             continue;
         }
         if emitted.contains(spec.name) {

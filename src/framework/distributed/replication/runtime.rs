@@ -732,7 +732,6 @@ mod tests {
         assert!(runtime
             .take_endoff_for_rdb_candidate_if_unambiguous(rdb, true, &mut backlog)
             .is_some());
-        runtime.activate_waiting_psync_pins_for_rdb_connections(&[rdb], &mut backlog);
         assert_eq!(
             runtime
                 .primary_link(replica_id)
@@ -1131,7 +1130,6 @@ mod tests {
             1
         );
 
-        runtime.activate_waiting_psync_pins_for_rdb_connections(&[rdb], &mut backlog);
         assert!(runtime.has_psync_wait_owners());
         assert_eq!(runtime.psync_wait_owner_count(), 1);
         assert_eq!(runtime.rdb_psync_waits[&rdb].pin_cursor, None);
@@ -1186,7 +1184,6 @@ mod tests {
         );
         assert_eq!(runtime.min_protected_backlog_cursor(), None);
 
-        runtime.activate_waiting_psync_pins_for_rdb_connections(&rdbs, &mut backlog);
         assert!(runtime.has_psync_wait_owners());
         assert_eq!(runtime.min_protected_backlog_cursor(), None);
         assert_eq!(runtime.backfill_waiting_psync_pins(cursor(42)), rdbs);
@@ -1495,7 +1492,7 @@ mod tests {
         assert_eq!(
             runtime.min_protected_backlog_cursor(),
             Some(cursor(42)),
-            "direct child completion must not release the main backlog pin before terminal ACK"
+            "RDB completion must not release the main backlog pin before terminal ACK"
         );
         {
             let link = runtime.primary_link_mut(id).unwrap();
@@ -2211,6 +2208,30 @@ mod tests {
             std::any::type_name_of_val(&resume.1),
             std::any::type_name::<crate::engine::distributed::replication::ReplicationOffset>()
         );
+    }
+
+    #[test]
+    fn synced_upstream_at_zero_offset_clears_a_previous_full_sync_request() {
+        let mut runtime = ReplicationRuntime::new();
+        let master = MasterInfo {
+            host: "127.0.0.1".to_string(),
+            port: 6379,
+        };
+        runtime.clear_replica_resume();
+        runtime.set_replica_link(ReplicaLink::streaming(
+            ConnectionId(9),
+            master.clone(),
+            "replid".to_string(),
+            offset(0),
+        ));
+
+        runtime.remove_connection(ConnectionId(9));
+
+        assert_eq!(
+            runtime.replica_resume_for(&master),
+            Some(("replid", offset(0), 0))
+        );
+        assert!(!runtime.force_full_sync_pending());
     }
 
     #[test]

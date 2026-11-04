@@ -95,8 +95,13 @@ pub(crate) fn register_cluster_configs(reg: &mut ConfigRegistry) {
         flags: &["immutable"],
         alias: None,
         get: |rcfg| ConfigValue::String(rcfg.server.cluster_config_file.clone()),
-        set: |_rcfg, _val| {
-            Err("ERR CONFIG SET failed (immutable config 'cluster-config-file')".to_string())
+        set: |rcfg, val| {
+            let value = val.as_str();
+            if value.is_empty() {
+                return Err("cluster-config-file must not be empty".to_string());
+            }
+            rcfg.server.cluster_config_file = value.to_string();
+            Ok(())
         },
     });
     super::cluster_metadata::register_cluster_metadata_configs(reg);

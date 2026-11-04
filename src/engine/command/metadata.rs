@@ -1,4 +1,7 @@
+use bytes::Bytes;
+
 pub type CmdFlags = u64;
+pub type CommandGetKeysFn = for<'a> fn(&'a [Bytes]) -> Vec<(&'a [u8], Vec<&'static str>)>;
 
 pub const CMD_WRITE: CmdFlags = 1 << 0;
 pub const CMD_DENYOOM: CmdFlags = 1 << 1;

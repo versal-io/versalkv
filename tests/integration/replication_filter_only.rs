@@ -665,3 +665,131 @@ fn pending_dual_cohorts_do_not_mix_filter_modes() {
         "0"
     );
 }
+
+#[test]
+fn paused_primary_finishes_rdb_before_processing_main_and_ordinary_commands() {
+    struct ResumeOnDrop(u32);
+    impl Drop for ResumeOnDrop {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("kill")
+                .args(["-CONT", &self.0.to_string()])
+                .status();
+        }
+    }
+
+    let server = start_server("yes", "0");
+    let resume = ResumeOnDrop(server.pid());
+    let version = seed(&server);
+    assert_eq!(
+        server
+            .connect()
+            .command(&[b"CONFIG", b"SET", b"rdb-key-save-delay", b"200000"]),
+        b"+OK\r\n"
+    );
+    assert_eq!(
+        server
+            .connect()
+            .command(&[b"DEBUG", b"pause-after-fork", b"1"]),
+        b"+OK\r\n"
+    );
+    let (mut main, mut rdb, public_id) = negotiate_dual(&server, Filter::All, &version);
+    rdb.send(&[b"SYNC"]);
+    let boundary = rdb.nonempty_line(Instant::now() + TIMEOUT);
+    let fields: Vec<_> = boundary
+        .strip_prefix(b"$ENDOFF:")
+        .unwrap()
+        .split(|byte| *byte == b' ')
+        .collect();
+    main.send(&[
+        b"REPLCONF",
+        b"set-rdb-client-id",
+        public_id.to_string().as_bytes(),
+    ]);
+    let mut ordinary = RawClient::connect(&server);
+    ordinary.send(&[b"SET", b"after-pause", b"value"]);
+    assert_snapshot(&rdb.read_rdb(true), Filter::All);
+    main.stream
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    let early_reply = main.stream.peek(&mut [0u8; 1]);
+    ordinary
+        .stream
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    let early_ordinary_reply = ordinary.stream.peek(&mut [0u8; 1]);
+    let resume_result = std::process::Command::new("kill")
+        .args(["-CONT", &server.pid().to_string()])
+        .status()
+        .unwrap();
+    assert!(resume_result.success());
+    assert!(
+        matches!(early_reply, Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)),
+        "main association must wait while the primary is paused after RDB transfer"
+    );
+    assert!(
+        matches!(early_ordinary_reply, Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)),
+        "ordinary commands must wait while the primary services the paused RDB relay"
+    );
+    assert_eq!(main.nonempty_line(Instant::now() + TIMEOUT), b"+OK");
+    assert_eq!(ordinary.nonempty_line(Instant::now() + TIMEOUT), b"+OK");
+    main.send(&[
+        b"PSYNC",
+        fields[1],
+        (std::str::from_utf8(fields[0])
+            .unwrap()
+            .parse::<i64>()
+            .unwrap()
+            + 1)
+        .to_string()
+        .as_bytes(),
+    ]);
+    assert!(main
+        .nonempty_line(Instant::now() + TIMEOUT)
+        .starts_with(b"+CONTINUE"));
+    assert_eq!(
+        info_field(&server, b"replication", "replicas_waiting_psync"),
+        "0"
+    );
+    drop(resume);
+}
+
+#[test]
+fn rdb_disconnect_releases_paused_main_association_reply() {
+    let server = start_server("yes", "0");
+    let version = seed(&server);
+    let mut admin = server.connect();
+    assert_eq!(
+        admin.command(&[b"CONFIG", b"SET", b"rdb-key-save-delay", b"1000000"]),
+        b"+OK\r\n"
+    );
+    assert_eq!(
+        admin.command(&[b"DEBUG", b"pause-after-fork", b"1"]),
+        b"+OK\r\n"
+    );
+    let (mut main, mut rdb, public_id) = negotiate_dual(&server, Filter::All, &version);
+    rdb.send(&[b"SYNC"]);
+    assert!(rdb
+        .nonempty_line(Instant::now() + TIMEOUT)
+        .starts_with(b"$ENDOFF:"));
+    main.send(&[
+        b"REPLCONF",
+        b"set-rdb-client-id",
+        public_id.to_string().as_bytes(),
+    ]);
+    main.stream
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    assert!(matches!(
+        main.stream.peek(&mut [0u8; 1]),
+        Err(error) if matches!(
+            error.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        )
+    ));
+    drop(rdb);
+    assert_eq!(admin.command(&[b"PING"]), b"+PONG\r\n");
+    assert_eq!(
+        main.nonempty_line(Instant::now() + Duration::from_secs(2)),
+        b"+OK"
+    );
+}

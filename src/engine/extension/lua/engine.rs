@@ -16,6 +16,30 @@ pub struct LuaEngine;
 
 pub static LUA_ENGINE: LuaEngine = LuaEngine;
 
+const FUNCTION_RESTORE_BACKUP_REGISTRY_KEY: &str = "__valkey_function_restore_backup_v1";
+
+fn collect_function_garbage(lua: &Lua) {
+    // mlua can require a second cycle when deletion occurs during an active GC cycle.
+    for _ in 0..2 {
+        if let Err(error) = lua.gc_collect() {
+            log::warn!("Failed to collect Lua function garbage: {error}");
+        }
+    }
+}
+
+fn combine_compile_mode_result<T>(
+    operation_result: Result<T, ScriptError>,
+    exit_result: Result<(), ScriptError>,
+) -> Result<T, ScriptError> {
+    match (operation_result, exit_result) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+        (Err(operation_error), Err(exit_error)) => Err(ScriptError::Runtime(format!(
+            "{operation_error}; failed to exit compile mode: {exit_error}"
+        ))),
+    }
+}
+
 impl LuaEngine {
     pub(crate) fn prepare_cached_eval(
         &self,
@@ -75,6 +99,19 @@ impl LuaEngine {
         }
         let digest = ctx.func_name.clone();
         self.eval_with_identity(Some(&digest), code, ctx, Some((keys, args)), dispatcher)
+    }
+
+    pub(crate) fn eval_cached_with_bound_globals(
+        &self,
+        code: &str,
+        ctx: &mut ScriptRunCtx,
+        dispatcher: &mut crate::engine::host::HostDispatcher<'_>,
+    ) -> Result<Value, ScriptError> {
+        if ctx.func_name.is_empty() {
+            return self.eval(code, ctx, dispatcher);
+        }
+        let digest = ctx.func_name.clone();
+        self.eval_with_identity(Some(&digest), code, ctx, None, dispatcher)
     }
 
     fn eval_with_identity(
@@ -191,9 +228,12 @@ impl LuaEngine {
                 .map_err(|e| ScriptError::Runtime(format!("Failed to get pcall: {}", e)))?;
 
             let globals = lua.globals();
-            let reg_table = match globals.raw_get::<LuaTable>(super::REGISTERED_FUNCS_TABLE) {
-                Ok(table) => table,
-                Err(_) => {
+            let mut reg_table = match globals
+                .raw_get::<Option<LuaTable>>(super::REGISTERED_FUNCS_TABLE)
+                .map_err(|error| ScriptError::Runtime(error.to_string()))?
+            {
+                Some(table) => table,
+                None => {
                     let table = lua
                         .create_table()
                         .map_err(|e| ScriptError::Runtime(e.to_string()))?;
@@ -209,40 +249,7 @@ impl LuaEngine {
                 .is_ok()
                 || reg_table.get::<LuaFunction>(func.name.as_str()).is_ok();
 
-            if !has_callback {
-                let load_wrapped = format!("return function(...)\n{}\nend", body);
-                let load_chunk: LuaFunction = lua
-                    .load(&load_wrapped)
-                    .set_name("@user_script")
-                    .eval()
-                    .map_err(|error| {
-                        ScriptError::Runtime(format!("Failed to load function body: {error}"))
-                    })?;
-                let _ = crate::engine::extension::lua::sandbox::enter_compile_mode(lua);
-                let load_result: LuaMultiValue =
-                    super::runtime::with_lua_host(lua, ctx, dispatcher, || {
-                        pcall_fn.call(load_chunk)
-                    })
-                    .map_err(|error| {
-                        if ctx.is_killed() {
-                            ScriptError::KillError(ctx.kill_message())
-                        } else {
-                            ScriptError::Runtime(format!(
-                                "Failed to execute function body: {error}"
-                            ))
-                        }
-                    })?;
-                let _ = crate::engine::extension::lua::sandbox::exit_compile_mode(lua);
-                let mut load_iter = load_result.iter();
-                if !matches!(load_iter.next(), Some(LuaValue::Boolean(true))) {
-                    let err_obj = load_iter.next().cloned().unwrap_or(LuaValue::Nil);
-                    return Err(ScriptError::Runtime(super::lua_value_to_err_string(
-                        &err_obj,
-                    )));
-                }
-            }
-
-            let lua_func: LuaFunction =
+            let lua_func: LuaFunction = if has_callback {
                 if let Ok(entry) = reg_table.get::<LuaTable>(func.name.as_str()) {
                     entry.get::<LuaFunction>("callback").map_err(|error| {
                         ScriptError::Runtime(format!(
@@ -259,7 +266,131 @@ impl LuaEngine {
                                 func.name
                             ))
                         })?
+                }
+            } else {
+                let load_wrapped = format!("return function(...)\n{}\nend", body);
+                let load_chunk: LuaFunction = lua
+                    .load(&load_wrapped)
+                    .set_name("@user_script")
+                    .eval()
+                    .map_err(|error| {
+                        ScriptError::Runtime(format!("Failed to load function body: {error}"))
+                    })?;
+                let temporary = lua
+                    .create_table()
+                    .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+                if let Err(switch_error) =
+                    globals.raw_set(super::REGISTERED_FUNCS_TABLE, temporary.clone())
+                {
+                    return match globals.raw_set(super::REGISTERED_FUNCS_TABLE, reg_table.clone()) {
+                        Ok(()) => Err(ScriptError::Runtime(format!(
+                            "Failed to activate the temporary function table: {switch_error}"
+                        ))),
+                        Err(restore_error) => Err(ScriptError::Runtime(format!(
+                            "Failed to activate the temporary function table: {switch_error}; \
+                             failed to restore the active function table: {restore_error}"
+                        ))),
+                    };
+                }
+
+                let load_result =
+                    match crate::engine::extension::lua::sandbox::enter_compile_mode(lua) {
+                        Ok(()) => {
+                            let run_result =
+                                super::runtime::with_lua_host(lua, ctx, dispatcher, || {
+                                    pcall_fn.call(load_chunk)
+                                })
+                                .map_err(|error| {
+                                    if ctx.is_killed() {
+                                        ScriptError::KillError(ctx.kill_message())
+                                    } else {
+                                        ScriptError::Runtime(format!(
+                                            "Failed to execute function body: {error}"
+                                        ))
+                                    }
+                                });
+                            let exit_result =
+                                crate::engine::extension::lua::sandbox::exit_compile_mode(lua);
+                            combine_compile_mode_result(run_result, exit_result)
+                        }
+                        Err(error) => Err(error),
+                    };
+                let restore_result =
+                    globals.raw_set(super::REGISTERED_FUNCS_TABLE, reg_table.clone());
+                let load_result: LuaMultiValue = match (load_result, restore_result) {
+                    (Ok(result), Ok(())) => result,
+                    (Err(error), Ok(())) => return Err(error),
+                    (Ok(_), Err(restore_error)) => {
+                        return Err(ScriptError::Runtime(format!(
+                            "Failed to restore the active function table: {restore_error}"
+                        )));
+                    }
+                    (Err(error), Err(restore_error)) => {
+                        return Err(ScriptError::Runtime(format!(
+                            "{error}; failed to restore the active function table: {restore_error}"
+                        )));
+                    }
                 };
+                let mut load_iter = load_result.iter();
+                if !matches!(load_iter.next(), Some(LuaValue::Boolean(true))) {
+                    let err_obj = load_iter.next().cloned().unwrap_or(LuaValue::Nil);
+                    return Err(ScriptError::Runtime(super::lua_value_to_err_string(
+                        &err_obj,
+                    )));
+                }
+
+                let working = lua
+                    .create_table()
+                    .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+                for pair in reg_table.clone().pairs::<LuaValue, LuaValue>() {
+                    let (key, value) =
+                        pair.map_err(|error| ScriptError::Runtime(error.to_string()))?;
+                    working
+                        .raw_set(key, value)
+                        .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+                }
+                for pair in temporary.pairs::<LuaString, LuaTable>() {
+                    let (name, entry) =
+                        pair.map_err(|error| ScriptError::Runtime(error.to_string()))?;
+                    let name = name
+                        .to_str()
+                        .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+                    working
+                        .raw_set(name.as_ref(), entry)
+                        .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+                }
+                let active = reg_table;
+                reg_table = working;
+                let callback = if let Ok(entry) = reg_table.get::<LuaTable>(func.name.as_str()) {
+                    entry.get::<LuaFunction>("callback").map_err(|error| {
+                        ScriptError::Runtime(format!(
+                            "function '{}' entry missing callback: {error}",
+                            func.name
+                        ))
+                    })?
+                } else {
+                    reg_table
+                        .get::<LuaFunction>(func.name.as_str())
+                        .map_err(|error| {
+                            ScriptError::Runtime(format!(
+                                "function '{}' not registered: {error}",
+                                func.name
+                            ))
+                        })?
+                };
+                if let Err(publish_error) =
+                    globals.raw_set(super::REGISTERED_FUNCS_TABLE, reg_table.clone())
+                {
+                    return match globals.raw_set(super::REGISTERED_FUNCS_TABLE, active) {
+                        Ok(()) => Err(ScriptError::Runtime(publish_error.to_string())),
+                        Err(restore_error) => Err(ScriptError::Runtime(format!(
+                            "Failed to publish self-healed functions: {publish_error}; \
+                             failed to restore the active function table: {restore_error}"
+                        ))),
+                    };
+                }
+                callback
+            };
 
             let keys_table = lua
                 .create_table()
@@ -400,190 +531,357 @@ impl ScriptEngine for LuaEngine {
         flags: ScriptFlags,
     ) -> Result<Vec<CompiledFunction>, ScriptError> {
         let (body, func_flags, _) = parse_shebang(code, flags)?;
-        let result = with_lua_runtime(false, |runtime| {
+        with_lua_runtime(false, |runtime| {
             let lua = &runtime.lua;
-            let pcall_fn: LuaFunction = lua
-                .globals()
+            let globals = lua.globals();
+            globals
+                .raw_set(super::REGISTERED_FUNCS_PENDING_TABLE, LuaValue::Nil)
+                .map_err(|error| ScriptError::Compile(error.to_string()))?;
+            let pcall_fn: LuaFunction = globals
                 .get("pcall")
                 .map_err(|e| ScriptError::Runtime(format!("Failed to get pcall: {}", e)))?;
 
             let wrapped = format!("return function(...)\n{}\nend", body);
 
-            let old_table = lua
-                .globals()
-                .raw_get::<LuaTable>(super::REGISTERED_FUNCS_TABLE)
-                .ok();
-            let new_table = lua.create_table().ok();
-            if let Some(ref nt) = new_table {
-                let _ = lua
-                    .globals()
-                    .raw_set(super::REGISTERED_FUNCS_TABLE, nt.clone());
+            let old_table = globals
+                .raw_get::<Option<LuaTable>>(super::REGISTERED_FUNCS_TABLE)
+                .map_err(|error| ScriptError::Compile(error.to_string()))?;
+            let old_table = match old_table {
+                Some(old_table) => old_table,
+                None => {
+                    let old_table = lua
+                        .create_table()
+                        .map_err(|error| ScriptError::Compile(error.to_string()))?;
+                    globals
+                        .raw_set(super::REGISTERED_FUNCS_TABLE, old_table.clone())
+                        .map_err(|error| ScriptError::Compile(error.to_string()))?;
+                    old_table
+                }
+            };
+            let new_table = lua
+                .create_table()
+                .map_err(|error| ScriptError::Compile(error.to_string()))?;
+            if let Err(switch_error) =
+                globals.raw_set(super::REGISTERED_FUNCS_TABLE, new_table.clone())
+            {
+                let restore_result = globals.raw_set(super::REGISTERED_FUNCS_TABLE, old_table);
+                return match restore_result {
+                    Ok(()) => Err(ScriptError::Compile(switch_error.to_string())),
+                    Err(restore_error) => Err(ScriptError::Runtime(format!(
+                        "Failed to activate the temporary function table: {switch_error}; \
+                         failed to restore the active function table: {restore_error}"
+                    ))),
+                };
             }
 
-            crate::engine::extension::lua::sandbox::enter_compile_mode(lua)?;
+            let compile_result =
+                match crate::engine::extension::lua::sandbox::enter_compile_mode(lua) {
+                    Ok(()) => {
+                        let now = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map(|d| d.as_millis() as i64)
+                            .unwrap_or(0);
+                        crate::engine::extension::lua::timeout::COMPILE_START_MS
+                            .with(|c| c.set(now));
+                        crate::engine::extension::lua::timeout::COMPILE_TIMEOUT_MS
+                            .with(|c| c.set(500));
 
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_millis() as i64)
-                .unwrap_or(0);
-            crate::engine::extension::lua::timeout::COMPILE_START_MS.with(|c| c.set(now));
-            crate::engine::extension::lua::timeout::COMPILE_TIMEOUT_MS.with(|c| c.set(500));
-
-            let compile_result = (|| -> Result<Vec<CompiledFunction>, ScriptError> {
-                if !runtime.compiled_scripts.contains_key(&wrapped) {
-                    let chunk_fn: LuaFunction =
-                        match lua.load(&wrapped).set_name("@user_script").eval() {
-                            Ok(f) => f,
-                            Err(e) => {
-                                return Err(ScriptError::Compile(e.to_string()));
+                        let result = (|| -> Result<
+                            (Vec<CompiledFunction>, Vec<(String, LuaTable)>),
+                            ScriptError,
+                        > {
+                            let chunk_fn: LuaFunction = lua
+                                .load(&wrapped)
+                                .set_name("@user_script")
+                                .eval()
+                                .map_err(|error| ScriptError::Compile(error.to_string()))?;
+                            let pcall_result: LuaMultiValue = pcall_fn
+                                .call(chunk_fn)
+                                .map_err(|error| ScriptError::Compile(error.to_string()))?;
+                            let mut iter = pcall_result.iter();
+                            let success =
+                                matches!(iter.next(), Some(LuaValue::Boolean(true)));
+                            if !success {
+                                let error = iter.next().cloned().unwrap_or(LuaValue::Nil);
+                                return Err(ScriptError::Compile(
+                                    super::lua_value_to_err_string(&error),
+                                ));
                             }
-                        };
-                    let key = lua
-                        .create_registry_value(chunk_fn)
-                        .map_err(|e| ScriptError::Compile(e.to_string()))?;
-                    runtime.compiled_scripts.insert(wrapped.clone(), key);
-                }
-                let key = runtime.compiled_scripts.get(&wrapped).unwrap();
-                let chunk_fn: LuaFunction = lua
-                    .registry_value(key)
-                    .map_err(|e| ScriptError::Compile(e.to_string()))?;
-                let pcall_result: LuaMultiValue = pcall_fn
-                    .call(chunk_fn)
-                    .map_err(|e| ScriptError::Compile(e.to_string()))?;
-                let mut iter = pcall_result.iter();
-                let success: bool = match iter.next() {
-                    Some(LuaValue::Boolean(b)) => *b,
-                    _ => false,
-                };
-                if !success {
-                    let err_obj = iter.next().cloned().unwrap_or(LuaValue::Nil);
-                    let err_msg = super::lua_value_to_err_string(&err_obj);
-                    return Err(ScriptError::Compile(err_msg));
-                }
 
-                let globals = lua.globals();
-                let funcs = globals.raw_get::<LuaTable>(super::REGISTERED_FUNCS_TABLE);
-                if let Ok(table) = funcs {
-                    let mut result = Vec::new();
-                    for pair in table.pairs::<LuaString, LuaTable>() {
-                        let (name_val, entry) =
-                            pair.map_err(|e| ScriptError::Compile(e.to_string()))?;
-                        let func_name = name_val
-                            .to_str()
-                            .map_err(|e| ScriptError::Compile(e.to_string()))?
-                            .to_string();
-                        let _callback: LuaFunction = entry.get("callback").map_err(|e| {
-                            ScriptError::Compile(format!(
-                                "missing callback for '{}': {}",
-                                func_name, e
+                            let mut result = Vec::new();
+                            let mut entries = Vec::new();
+                            for pair in new_table.clone().pairs::<LuaString, LuaTable>() {
+                                let (name_val, entry) =
+                                    pair.map_err(|e| ScriptError::Compile(e.to_string()))?;
+                                let func_name = name_val
+                                    .to_str()
+                                    .map_err(|e| ScriptError::Compile(e.to_string()))?
+                                    .to_string();
+                                let _callback: LuaFunction =
+                                    entry.get("callback").map_err(|e| {
+                                        ScriptError::Compile(format!(
+                                            "missing callback for '{}': {}",
+                                            func_name, e
+                                        ))
+                                    })?;
+                                let per_func_flags_str = entry
+                                    .get::<Option<String>>("flags")
+                                    .map_err(|error| ScriptError::Compile(error.to_string()))?
+                                    .unwrap_or_default();
+                                let desc_str = entry
+                                    .get::<Option<String>>("description")
+                                    .map_err(|error| ScriptError::Compile(error.to_string()))?
+                                    .unwrap_or_default();
+                                let mut per_func_flags: ScriptFlags = 0;
+                                for flag in per_func_flags_str.split(',') {
+                                    let flag = flag.trim();
+                                    if flag == "no-writes" {
+                                        per_func_flags |= SCRIPT_NO_WRITES;
+                                    } else if flag == "allow-oom" {
+                                        per_func_flags |= SCRIPT_ALLOW_OOM;
+                                    } else if flag == "allow-stale" {
+                                        per_func_flags |= SCRIPT_ALLOW_STALE;
+                                    } else if flag == "allow-cross-slot-keys" {
+                                        per_func_flags |= SCRIPT_ALLOW_CROSS_SLOT;
+                                    } else if flag == "no-cluster" {
+                                        per_func_flags |= SCRIPT_NO_CLUSTER;
+                                    }
+                                }
+                                let combined_flags = func_flags | per_func_flags;
+                                result.push(CompiledFunction {
+                                    engine: self.name(),
+                                    name: func_name.clone(),
+                                    code: code.to_string(),
+                                    description: desc_str,
+                                    flags: combined_flags,
+                                });
+                                entries.push((func_name, entry));
+                            }
+                            if !result.is_empty() {
+                                return Ok((result, entries));
+                            }
+
+                            Err(ScriptError::Compile(
+                                "No functions registered".to_string(),
                             ))
-                        })?;
-                        let per_func_flags_str: String = entry.get("flags").unwrap_or_default();
-                        let desc_str: String = entry.get("description").unwrap_or_default();
-                        let mut per_func_flags: ScriptFlags = 0;
-                        for flag in per_func_flags_str.split(',') {
-                            let flag = flag.trim();
-                            if flag == "no-writes" {
-                                per_func_flags |= SCRIPT_NO_WRITES;
-                            } else if flag == "allow-oom" {
-                                per_func_flags |= SCRIPT_ALLOW_OOM;
-                            } else if flag == "allow-stale" {
-                                per_func_flags |= SCRIPT_ALLOW_STALE;
-                            } else if flag == "allow-cross-slot-keys" {
-                                per_func_flags |= SCRIPT_ALLOW_CROSS_SLOT;
-                            } else if flag == "no-cluster" {
-                                per_func_flags |= SCRIPT_NO_CLUSTER;
-                            }
-                        }
-                        let combined_flags = func_flags | per_func_flags;
-                        result.push(CompiledFunction {
-                            engine: self.name(),
-                            name: func_name,
-                            code: code.to_string(),
-                            description: desc_str,
-                            flags: combined_flags,
-                        });
+                        })();
+                        let exit_result =
+                            crate::engine::extension::lua::sandbox::exit_compile_mode(lua);
+                        combine_compile_mode_result(result, exit_result)
                     }
-                    if !result.is_empty() {
-                        return Ok(result);
-                    }
-                }
-
-                Err(ScriptError::Compile("No functions registered".to_string()))
-            })();
-
-            let _ = crate::engine::extension::lua::sandbox::exit_compile_mode(lua);
+                    Err(error) => Err(error),
+                };
             crate::engine::extension::lua::timeout::COMPILE_TIMEOUT_MS.with(|c| c.set(0));
 
-            let new_entries: Vec<(String, LuaTable)> = new_table
-                .as_ref()
-                .map(|nt| {
-                    nt.pairs::<LuaString, LuaTable>()
-                        .filter_map(|r| r.ok())
-                        .map(|(k, v)| (k.to_str().map(|s| s.to_string()).unwrap_or_default(), v))
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            if let Some(ref old) = old_table {
-                let _ = lua
-                    .globals()
-                    .raw_set(super::REGISTERED_FUNCS_TABLE, old.clone());
-            }
-
-            if let Ok(compiled) = &compile_result {
-                if !compiled.is_empty() {
-                    if lua
-                        .globals()
-                        .raw_get::<LuaTable>(super::REGISTERED_FUNCS_PENDING_TABLE)
-                        .is_ok()
-                    {
-                        let _ = lua
-                            .globals()
-                            .raw_set(super::REGISTERED_FUNCS_PENDING_TABLE, LuaValue::Nil);
-                    }
-                    if let Ok(new_pending) = lua.create_table() {
-                        for (name, entry) in &new_entries {
-                            let _ = new_pending.raw_set(name.as_str(), entry.clone());
-                        }
-                        let _ = lua
-                            .globals()
-                            .raw_set(super::REGISTERED_FUNCS_PENDING_TABLE, new_pending);
-                    }
+            let staged = compile_result.and_then(|(compiled, entries)| {
+                let pending = lua
+                    .create_table()
+                    .map_err(|error| ScriptError::Compile(error.to_string()))?;
+                for (name, entry) in entries {
+                    pending
+                        .raw_set(name, entry)
+                        .map_err(|error| ScriptError::Compile(error.to_string()))?;
                 }
+                Ok((compiled, pending))
+            });
+
+            let restore_result = globals.raw_set(super::REGISTERED_FUNCS_TABLE, old_table);
+            if let Err(restore_error) = restore_result {
+                return match staged {
+                    Ok(_) => Err(ScriptError::Runtime(format!(
+                        "Failed to restore the active function table: {restore_error}"
+                    ))),
+                    Err(error) => Err(ScriptError::Runtime(format!(
+                        "{error}; failed to restore the active function table: {restore_error}"
+                    ))),
+                };
             }
 
-            compile_result
-        });
-        result
+            let (compiled, pending) = staged?;
+            if let Err(publish_error) =
+                globals.raw_set(super::REGISTERED_FUNCS_PENDING_TABLE, pending)
+            {
+                return match globals.raw_set(super::REGISTERED_FUNCS_PENDING_TABLE, LuaValue::Nil) {
+                    Ok(()) => Err(ScriptError::Compile(publish_error.to_string())),
+                    Err(cleanup_error) => Err(ScriptError::Runtime(format!(
+                        "Failed to publish pending functions: {publish_error}; \
+                         failed to clear pending functions: {cleanup_error}"
+                    ))),
+                };
+            }
+
+            Ok(compiled)
+        })
     }
 
     fn commit_compile(&self, _code: &str, _flags: ScriptFlags) -> Result<(), ScriptError> {
         with_lua_runtime(false, |runtime| {
             let lua = &runtime.lua;
-            let pending: Option<LuaTable> = lua
-                .globals()
-                .raw_get(super::REGISTERED_FUNCS_PENDING_TABLE)
-                .ok();
-            if let Some(pending) = pending {
-                if let Ok(table) = lua
-                    .globals()
-                    .raw_get::<LuaTable>(super::REGISTERED_FUNCS_TABLE)
-                {
-                    for (name, entry) in pending.pairs::<LuaString, LuaTable>().flatten() {
-                        let _ = table.raw_set(name, entry);
-                    }
-                }
-                let _ = lua
-                    .globals()
-                    .raw_set(super::REGISTERED_FUNCS_PENDING_TABLE, LuaValue::Nil);
+            let globals = lua.globals();
+            let pending = globals
+                .raw_get::<Option<LuaTable>>(super::REGISTERED_FUNCS_PENDING_TABLE)
+                .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+            let Some(pending) = pending else {
+                return Ok(());
+            };
+            let active = globals
+                .raw_get::<LuaTable>(super::REGISTERED_FUNCS_TABLE)
+                .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+            let working = lua
+                .create_table()
+                .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+            for pair in active.clone().pairs::<LuaValue, LuaValue>() {
+                let (name, entry) =
+                    pair.map_err(|error| ScriptError::Runtime(error.to_string()))?;
+                working
+                    .raw_set(name, entry)
+                    .map_err(|error| ScriptError::Runtime(error.to_string()))?;
             }
+            for pair in pending.clone().pairs::<LuaString, LuaTable>() {
+                let (name, entry) =
+                    pair.map_err(|error| ScriptError::Runtime(error.to_string()))?;
+                working
+                    .raw_set(name, entry)
+                    .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+            }
+            globals
+                .raw_set(super::REGISTERED_FUNCS_TABLE, working)
+                .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+            if let Err(clear_error) =
+                globals.raw_set(super::REGISTERED_FUNCS_PENDING_TABLE, LuaValue::Nil)
+            {
+                return match globals.raw_set(super::REGISTERED_FUNCS_TABLE, active) {
+                    Ok(()) => Err(ScriptError::Runtime(clear_error.to_string())),
+                    Err(restore_error) => Err(ScriptError::Runtime(format!(
+                        "Failed to clear pending functions: {clear_error}; \
+                         failed to restore active functions: {restore_error}"
+                    ))),
+                };
+            }
+            Ok(())
+        })
+    }
+
+    fn begin_function_restore_transaction(&self) -> Result<(), ScriptError> {
+        with_lua_runtime(false, |runtime| {
+            let lua = &runtime.lua;
+            let transaction_state = lua
+                .named_registry_value::<LuaValue>(FUNCTION_RESTORE_BACKUP_REGISTRY_KEY)
+                .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+            if !matches!(transaction_state, LuaValue::Nil) {
+                return Err(ScriptError::Runtime(
+                    "Function restore transaction is already active".to_string(),
+                ));
+            }
+
+            let globals = lua.globals();
+            let active = globals
+                .raw_get::<Option<LuaTable>>(super::REGISTERED_FUNCS_TABLE)
+                .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+            let active = match active {
+                Some(active) => active,
+                None => {
+                    let active = lua
+                        .create_table()
+                        .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+                    globals
+                        .raw_set(super::REGISTERED_FUNCS_TABLE, active.clone())
+                        .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+                    active
+                }
+            };
+            let working = lua
+                .create_table()
+                .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+            for pair in active.clone().pairs::<LuaValue, LuaValue>() {
+                let (key, value) = pair.map_err(|error| ScriptError::Runtime(error.to_string()))?;
+                working
+                    .raw_set(key, value)
+                    .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+            }
+
+            lua.set_named_registry_value(FUNCTION_RESTORE_BACKUP_REGISTRY_KEY, active.clone())
+                .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+            if let Err(activate_error) = globals.raw_set(super::REGISTERED_FUNCS_TABLE, working) {
+                return match lua.unset_named_registry_value(FUNCTION_RESTORE_BACKUP_REGISTRY_KEY) {
+                    Ok(()) => Err(ScriptError::Runtime(activate_error.to_string())),
+                    Err(cleanup_error) => Err(ScriptError::Runtime(format!(
+                        "Failed to activate the function restore working table: {activate_error}; \
+                         failed to clear the function restore backup: {cleanup_error}"
+                    ))),
+                };
+            }
+            Ok(())
+        })
+    }
+
+    fn commit_function_restore_transaction(&self) -> Result<(), ScriptError> {
+        with_lua_runtime(false, |runtime| {
+            let lua = &runtime.lua;
+            lua.globals()
+                .raw_set(super::REGISTERED_FUNCS_PENDING_TABLE, LuaValue::Nil)
+                .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+            lua.unset_named_registry_value(FUNCTION_RESTORE_BACKUP_REGISTRY_KEY)
+                .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+            collect_function_garbage(lua);
+            Ok(())
+        })
+    }
+
+    fn rollback_function_restore_transaction(&self) -> Result<(), ScriptError> {
+        with_lua_runtime(false, |runtime| {
+            let lua = &runtime.lua;
+            let backup = lua
+                .named_registry_value::<Option<LuaTable>>(FUNCTION_RESTORE_BACKUP_REGISTRY_KEY)
+                .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+            let Some(backup) = backup else {
+                return Ok(());
+            };
+            let globals = lua.globals();
+            globals
+                .raw_set(super::REGISTERED_FUNCS_PENDING_TABLE, LuaValue::Nil)
+                .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+            lua.unset_named_registry_value(FUNCTION_RESTORE_BACKUP_REGISTRY_KEY)
+                .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+            if let Err(restore_error) =
+                globals.raw_set(super::REGISTERED_FUNCS_TABLE, backup.clone())
+            {
+                return match lua
+                    .set_named_registry_value(FUNCTION_RESTORE_BACKUP_REGISTRY_KEY, backup)
+                {
+                    Ok(()) => Err(ScriptError::Runtime(format!(
+                        "Failed to restore the function callback table: {restore_error}"
+                    ))),
+                    Err(recovery_error) => Err(ScriptError::Runtime(format!(
+                        "Failed to restore the function callback table: {restore_error}; \
+                         failed to preserve the function restore backup: {recovery_error}"
+                    ))),
+                };
+            }
+            collect_function_garbage(lua);
             Ok(())
         })
     }
 
     fn clear_functions(&self) {
         super::runtime::clear_function_tables();
+    }
+
+    fn remove_functions(&self, functions: &[CompiledFunction]) -> Result<(), ScriptError> {
+        with_lua_runtime(false, |runtime| {
+            let lua = &runtime.lua;
+            let table = lua
+                .globals()
+                .raw_get::<LuaTable>(super::REGISTERED_FUNCS_TABLE)
+                .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+            for function in functions {
+                table
+                    .raw_set(function.name.as_str(), LuaValue::Nil)
+                    .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+            }
+            collect_function_garbage(lua);
+            Ok(())
+        })
     }
 
     fn call(

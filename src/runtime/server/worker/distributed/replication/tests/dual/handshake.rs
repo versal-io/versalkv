@@ -1,5 +1,44 @@
 use super::*;
+use crate::framework::distributed::replication::ReplicaAction;
 use std::io::Read;
+
+#[test]
+fn dual_main_psync_is_sent_before_another_rdb_read() {
+    let mut backend = ServerWorkerState::new(1).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let primary_addr = listener.local_addr().unwrap();
+    let main = backend.transport.connect_tcp(primary_addr).unwrap();
+    let (mut primary_stream, _) = listener.accept().unwrap();
+    let connection_token =
+        backend
+            .connection_registry
+            .insert(Connection::new(main.token, primary_addr, false));
+    let link = ReplicaLink::streaming(
+        ConnectionId(main.token.0),
+        MasterInfo {
+            host: primary_addr.ip().to_string(),
+            port: primary_addr.port(),
+        },
+        "aaaabbbbccccddddeeeeffff0000111122223333".to_string(),
+        offset(0),
+    );
+    backend.replication_runtime.set_replica_link(link);
+    let frame = protocol::build_psync("aaaabbbbccccddddeeeeffff0000111122223333", 1);
+    primary_stream
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+
+    backend.queue_replica_actions(
+        connection_token,
+        vec![ReplicaAction::SendDualPsync(frame.clone())],
+    );
+
+    let mut received = vec![0; frame.len()];
+    primary_stream
+        .read_exact(&mut received)
+        .expect("PSYNC must reach the main peer before an RDB EOF can tear it down");
+    assert_eq!(received, frame);
+}
 
 #[test]
 fn replica_dual_link_coexist_and_classify_tokens() {

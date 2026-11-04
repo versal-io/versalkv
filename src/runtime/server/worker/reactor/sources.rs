@@ -29,9 +29,7 @@ impl SourceRoute {
                 EventDependencies::safe_producer()
             }
             SourceOwner::InternalPipe(
-                InternalPipeOwner::DisklessRdb { .. }
-                | InternalPipeOwner::SlotSnapshot { .. }
-                | InternalPipeOwner::DirectDualPhase { .. },
+                InternalPipeOwner::DisklessRdb { .. } | InternalPipeOwner::SlotSnapshot { .. },
             ) => EventDependencies::safe_producer(),
             SourceOwner::Listener => EventDependencies::safe_producer(),
             SourceOwner::Connection | SourceOwner::ClusterBus | SourceOwner::Sentinel => {
@@ -106,7 +104,6 @@ pub(crate) enum ChildSignalOwner {
 pub(crate) enum InternalPipeOwner {
     DisklessRdb { transfer_id: TransferId },
     SlotSnapshot { job_id: MigrationJobId },
-    DirectDualPhase { child: ChildHandle },
 }
 
 // Tasks 9-11 assign transfer identifiers when the current internal pipe pumps
@@ -132,7 +129,7 @@ pub(crate) enum ChildOwner {
     DisklessReplication,
     DiskSyncReplication,
     SlotSnapshot(MigrationJobId),
-    DirectDualRdb,
+    ScriptDebugger,
 }
 
 #[derive(Debug)]
@@ -350,9 +347,20 @@ impl ChildRegistry {
             .and_then(|entry| entry.completion.clone())
     }
 
-    pub(crate) fn defer_completion(&mut self, child: ChildHandle) {
+    pub(crate) fn defer_completion(&mut self, child: ChildHandle) -> bool {
+        let Some(entry) = self.entries.get_mut(&child) else {
+            return false;
+        };
+        if entry.deferred {
+            return false;
+        }
+        entry.deferred = true;
+        true
+    }
+
+    pub(crate) fn resume_completion(&mut self, child: ChildHandle) {
         if let Some(entry) = self.entries.get_mut(&child) {
-            entry.deferred = true;
+            entry.deferred = false;
         }
     }
 
@@ -371,7 +379,10 @@ impl ChildRegistry {
         let remove: Vec<ChildHandle> = self
             .entries
             .iter()
-            .filter_map(|(handle, entry)| (Some(entry.pid) != active_pid).then_some(*handle))
+            .filter_map(|(handle, entry)| {
+                (entry.owner != ChildOwner::ScriptDebugger && Some(entry.pid) != active_pid)
+                    .then_some(*handle)
+            })
             .collect();
         let mut removed_sources = Vec::new();
         for handle in remove {

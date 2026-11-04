@@ -97,6 +97,7 @@ impl ServerContext {
     }
     pub fn swap_dbs(&mut self, a: u32, b: u32) {
         self.db.dbs.swap(a, b);
+        self.persistence.swap_forkless_databases(a, b);
     }
     pub fn sync_eviction_policy(&mut self) {
         let use_lfu = crate::foundation::io::store::kv_engine::EvictionPolicy::from_name(

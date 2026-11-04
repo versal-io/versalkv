@@ -124,7 +124,10 @@ impl RdbSaveFeeder {
             return Err(FeedError::Closed);
         };
         match sender.try_send(item) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.control.notify_feed_changed();
+                Ok(())
+            }
             Err(std::sync::mpsc::TrySendError::Full(item)) => {
                 if is_entry {
                     self.control.unqueued_item();
@@ -142,6 +145,13 @@ impl RdbSaveFeeder {
 
     pub(crate) fn finish(&mut self) {
         self.sender.take();
+        self.control.notify_feed_changed();
+    }
+}
+
+impl Drop for RdbSaveFeeder {
+    fn drop(&mut self) {
+        self.finish();
     }
 }
 
@@ -224,6 +234,35 @@ impl RdbSaveControl {
             Err(io::Error::new(io::ErrorKind::Interrupted, SaveCancelled))
         } else {
             Ok(())
+        }
+    }
+
+    fn notify_feed_changed(&self) {
+        // Pair notification with the receiver's state lock so an enqueue or
+        // disconnect between try_recv and wait cannot lose its wakeup.
+        let _state = self.lock();
+        self.changed.notify_all();
+    }
+
+    fn receive_work_item(
+        &self,
+        receiver: &Receiver<FrozenWorkItem>,
+    ) -> io::Result<Option<FrozenWorkItem>> {
+        let mut state = self.lock();
+        loop {
+            if state.is_cancelled {
+                return Err(io::Error::new(io::ErrorKind::Interrupted, SaveCancelled));
+            }
+            match receiver.try_recv() {
+                Ok(item) => return Ok(Some(item)),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => return Ok(None),
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    state = self
+                        .changed
+                        .wait(state)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                }
+            }
         }
     }
 
@@ -310,7 +349,10 @@ fn feed_work_items(
         if sender.send(item).is_err() {
             break;
         }
+        control.notify_feed_changed();
     }
+    drop(sender);
+    control.notify_feed_changed();
 }
 
 fn serialize_work_items<F>(
@@ -329,7 +371,7 @@ where
         crc = crc64(crc, bytes);
         emit(bytes)
     };
-    while let Ok(item) = receiver.recv() {
+    while let Some(item) = control.receive_work_item(&receiver)? {
         match item {
             FrozenWorkItem::Header(header) => write(&header)?,
             FrozenWorkItem::Database {
@@ -628,6 +670,42 @@ impl Drop for BackgroundRdbSave {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn incremental_save_drop_cancels_an_idle_receiver_with_a_live_feeder() {
+        let dir = std::env::temp_dir().join(format!(
+            "versal-rdb-idle-cancel-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (task, feeder) = BackgroundRdbSave::start_incremental(
+            1,
+            dir.clone(),
+            "dump.rdb".to_string(),
+            1,
+            0,
+            false,
+            RdbSnapshotOptions {
+                compression: RdbCompression::No,
+                checksum: true,
+            },
+        )
+        .unwrap();
+        let (sender, receiver) = channel();
+        let dropping = std::thread::spawn(move || {
+            drop(task);
+            sender.send(()).unwrap();
+        });
+        let cancelled = receiver.recv_timeout(Duration::from_secs(1)).is_ok();
+        // Always close the feed and join, including the pre-fix failure case.
+        drop(feeder);
+        dropping.join().unwrap();
+        assert!(!dir.join("dump.rdb").exists());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(cancelled, "cancellation must wake an idle work receiver");
+    }
 
     #[test]
     fn incremental_feeder_reports_full_without_consuming_item() {

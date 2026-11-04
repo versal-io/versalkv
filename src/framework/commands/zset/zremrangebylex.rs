@@ -15,7 +15,7 @@ pub fn zremrangebylex(
     }
     let min_raw = &args.args[1];
     let max_raw = &args.args[2];
-    let (min_val, min_inc) = match parse_lex_bound(min_raw) {
+    let min = match parse_lex_bound(min_raw) {
         Some(v) => v,
         None => {
             return CommandOutcome::reply(Value::error(
@@ -23,7 +23,7 @@ pub fn zremrangebylex(
             ))
         }
     };
-    let (max_val, max_inc) = match parse_lex_bound(max_raw) {
+    let max = match parse_lex_bound(max_raw) {
         Some(v) => v,
         None => {
             return CommandOutcome::reply(Value::error(
@@ -42,7 +42,7 @@ pub fn zremrangebylex(
         Ok(None) => return CommandOutcome::reply(Value::integer(0)),
         Err(_) => return CommandOutcome::reply(CommandError::wrong_type()),
     };
-    let removed = zset.zset_remove_range_by_lex(&min_val, min_inc, &max_val, max_inc) as i64;
+    let removed = zset.zset_remove_range_by_lex_bounds(min, max) as i64;
     let is_empty = zset.zset_is_empty();
     if is_empty {
         db.del(key);

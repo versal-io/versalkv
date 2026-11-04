@@ -115,33 +115,47 @@ impl ServerWorkerState {
     }
 
     fn validate_function_replacement(&self, function_codes: &[Vec<u8>]) -> Result<(), ()> {
-        let registry = &self.ctx.script().function_registry;
-        let mut library_names = HashSet::new();
-        let mut function_names = HashSet::new();
-        for code in function_codes {
-            let code = String::from_utf8_lossy(code);
-            let library_name = crate::engine::extension::lua::shebang::extract_shebang_name(&code)
-                .map_err(|_| ())?;
-            if !library_names.insert(library_name) {
-                return Err(());
-            }
-            let engine_name = crate::engine::extension::function::parse_engine_name(&code);
-            let engine = registry.engine_mgr().get(&engine_name).ok_or(())?;
-            let compiled = engine.compile(&code, 0).map_err(|_| ())?;
-            if compiled
-                .iter()
-                .any(|function| !function_names.insert(function.name.to_ascii_lowercase()))
-            {
-                return Err(());
-            }
+        if function_codes.is_empty() {
+            return Ok(());
         }
-        Ok(())
+        let registry = &self.ctx.script().function_registry;
+        registry.begin_restore_transaction().map_err(|_| ())?;
+        let validation = (|| {
+            let mut library_names = HashSet::new();
+            let mut function_names = HashSet::new();
+            for code in function_codes {
+                let code = std::str::from_utf8(code).map_err(|_| ())?;
+                let library_name =
+                    crate::engine::extension::lua::shebang::extract_shebang_name(code)
+                        .map_err(|_| ())?;
+                if !library_names.insert(library_name) {
+                    return Err(());
+                }
+                let engine_name = crate::engine::extension::function::parse_engine_name(code);
+                let engine = registry.engine_mgr().get(&engine_name).ok_or(())?;
+                let compiled = engine.compile(code, 0).map_err(|_| ())?;
+                if compiled
+                    .iter()
+                    .any(|function| !function_names.insert(function.name.to_ascii_lowercase()))
+                {
+                    return Err(());
+                }
+            }
+            Ok(())
+        })();
+        let rollback = registry.rollback_restore_transaction().map_err(|_| ());
+        match (validation, rollback) {
+            (Ok(()), Ok(())) => Ok(()),
+            _ => Err(()),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::replication_buffer_limit_message;
+    use super::{replication_buffer_limit_message, ServerWorkerState};
+    use crate::engine::extension::lua::{registered_function_count, reset_lua_runtime, LuaEngine};
+    use crate::engine::extension::script::ScriptEngine;
 
     #[test]
     fn replication_buffer_limit_log_matches_valkey_wording() {
@@ -149,5 +163,21 @@ mod tests {
             replication_buffer_limit_message(16_383),
             "Replication buffer limit reached (16383 bytes), stopping buffering. Further accumulation will occur on primary side."
         );
+    }
+
+    #[test]
+    fn function_replacement_validation_clears_compiled_callbacks() {
+        reset_lua_runtime();
+        let backend = ServerWorkerState::new(1).unwrap();
+        let code =
+            b"#!lua name=validated\nserver.register_function('validated', function() return 1 end)";
+
+        backend
+            .validate_function_replacement(&[code.to_vec()])
+            .unwrap();
+        LuaEngine.commit_compile("", 0).unwrap();
+
+        assert_eq!(registered_function_count(), 0);
+        reset_lua_runtime();
     }
 }

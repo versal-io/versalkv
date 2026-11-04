@@ -197,7 +197,7 @@ fn forkless_capture_postpones_potentially_writing_scripts_but_allows_read_only_s
     let connection_token = add_fake_connection(&mut backend);
     let dir = start_test_forkless_capture(&mut backend, "forkless-script-barrier");
 
-    let script_actions: Vec<_> = [
+    let script_args = [
         make_args(&[
             b"EVAL",
             b"return redis.call('SET', KEYS[1], ARGV[1])",
@@ -205,16 +205,35 @@ fn forkless_capture_postpones_potentially_writing_scripts_but_allows_read_only_s
             b"key",
             b"value",
         ]),
+        make_args(&[
+            b"EVALSHA",
+            b"0123456789012345678901234567890123456789",
+            b"1",
+            b"key",
+        ]),
         make_args(&[b"FCALL", b"writer", b"1", b"key"]),
-    ]
-    .into_iter()
-    .map(|args| {
-        let spec = backend.registry.lookup(&args.name).unwrap();
-        backend
-            .pre_dispatch_exec(connection_token, meta_from_spec(spec), &args)
-            .action
-    })
-    .collect();
+    ];
+    let script_actions: Vec<_> = script_args
+        .iter()
+        .map(|args| {
+            let spec = backend.registry.lookup(&args.name).unwrap();
+            backend
+                .pre_dispatch_exec(connection_token, meta_from_spec(spec), args)
+                .action
+        })
+        .collect();
+    let module_call_barriers: Vec<_> = script_args
+        .iter()
+        .map(|args| {
+            let spec = backend.registry.lookup(&args.name).unwrap();
+            crate::engine::extension::module::capability::ModuleRuntime::command_would_block(
+                &backend.ctx,
+                &spec.descriptor(),
+                args,
+                0,
+            )
+        })
+        .collect();
 
     let args = make_args(&[
         b"EVAL_RO",
@@ -223,6 +242,13 @@ fn forkless_capture_postpones_potentially_writing_scripts_but_allows_read_only_s
         b"key",
     ]);
     let spec = backend.registry.lookup(&args.name).unwrap();
+    let module_read_only_barrier =
+        crate::engine::extension::module::capability::ModuleRuntime::command_would_block(
+            &backend.ctx,
+            &spec.descriptor(),
+            &args,
+            0,
+        );
     let mut meta = meta_from_spec(spec);
     meta.flags = super::subcmd_flags::effective_command_flags_for_call(
         spec.name.as_str(),
@@ -241,9 +267,225 @@ fn forkless_capture_postpones_potentially_writing_scripts_but_allows_read_only_s
         vec![
             DispatchAction::Postpone(PostponeReason::ForklessKey),
             DispatchAction::Postpone(PostponeReason::ForklessKey),
+            DispatchAction::Postpone(PostponeReason::ForklessKey),
         ]
     );
+    assert_eq!(module_call_barriers, vec![true, true, true]);
+    assert!(!module_read_only_barrier);
     assert_eq!(read_only_action, DispatchAction::Execute);
+}
+
+#[test]
+fn module_forkless_barrier_uses_dynamic_flags_and_keys() {
+    let mut backend = ServerWorkerState::new(1).unwrap();
+    crate::framework::commands::register_all(&mut backend.registry);
+    let dir = start_test_forkless_capture(&mut backend, "module-dynamic-forkless-barrier");
+    let cases = [
+        (
+            make_args(&[b"XGROUP", b"CREATE", b"capture-0", b"group", b"0"]),
+            true,
+        ),
+        (
+            make_args(&[b"EVAL", b"#!lua flags=no-writes\nreturn 1", b"0"]),
+            false,
+        ),
+        (make_args(&[b"SWAPDB", b"0", b"0"]), false),
+        (
+            make_args(&[b"COPY", b"capture-0", b"target", b"DB", b"999"]),
+            false,
+        ),
+    ];
+
+    let outcomes = cases
+        .iter()
+        .map(|(args, _)| {
+            let spec = backend.registry.lookup(&args.name).unwrap();
+            crate::engine::extension::module::capability::ModuleRuntime::command_would_block(
+                &backend.ctx,
+                &spec.descriptor(),
+                args,
+                0,
+            )
+        })
+        .collect::<Vec<_>>();
+
+    stop_test_forkless_capture(&mut backend, dir);
+
+    assert_eq!(
+        outcomes,
+        cases
+            .iter()
+            .map(|(_, expected)| *expected)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn forkless_capture_postpones_keys_until_their_snapshot_state_is_resolved() {
+    let mut backend = ServerWorkerState::new(1).unwrap();
+    crate::framework::commands::register_all(&mut backend.registry);
+    let connection_token = add_fake_connection(&mut backend);
+    let dir = start_test_forkless_capture(&mut backend, "forkless-new-key");
+
+    let existing = make_args(&[b"SET", b"capture-0", b"updated"]);
+    let spec = backend.registry.lookup(&existing.name).unwrap();
+    let existing_action = backend
+        .pre_dispatch_exec(connection_token, meta_from_spec(spec), &existing)
+        .action;
+
+    let new_key = make_args(&[b"SET", b"created-during-save", b"value"]);
+    let spec = backend.registry.lookup(&new_key.name).unwrap();
+    let new_key_action = backend
+        .pre_dispatch_exec(connection_token, meta_from_spec(spec), &new_key)
+        .action;
+
+    stop_test_forkless_capture(&mut backend, dir);
+
+    assert_eq!(
+        existing_action,
+        DispatchAction::Postpone(PostponeReason::ForklessKey)
+    );
+    assert_eq!(
+        new_key_action,
+        DispatchAction::Postpone(PostponeReason::ForklessKey)
+    );
+}
+
+#[test]
+fn forkless_capture_allows_top_level_swapdb() {
+    let mut backend = ServerWorkerState::new(2).unwrap();
+    crate::framework::commands::register_all(&mut backend.registry);
+    let connection_token = add_fake_connection(&mut backend);
+    let dir = start_test_forkless_capture(&mut backend, "forkless-swapdb");
+    let args = make_args(&[b"SWAPDB", b"0", b"1"]);
+    let spec = backend.registry.lookup(&args.name).unwrap();
+
+    let action = backend
+        .pre_dispatch_exec(connection_token, meta_from_spec(spec), &args)
+        .action;
+
+    stop_test_forkless_capture(&mut backend, dir);
+
+    assert_eq!(action, DispatchAction::Execute);
+}
+
+#[test]
+fn cross_database_copy_does_not_treat_destination_as_a_source_db_key() {
+    let mut backend = ServerWorkerState::new(2).unwrap();
+    crate::framework::commands::register_all(&mut backend.registry);
+    let args = make_args(&[b"COPY", b"source", b"destination", b"DB", b"1", b"REPLACE"]);
+    let spec = backend.registry.lookup(&args.name).unwrap();
+
+    let targets = ServerWorkerState::forkless_key_targets(&meta_from_spec(spec), &args, 0);
+
+    assert_eq!(
+        targets,
+        vec![(0, b"source".to_vec()), (1, b"destination".to_vec()),]
+    );
+}
+
+#[test]
+fn forkless_capture_postpones_cross_database_move_and_copy_targets() {
+    let mut backend = ServerWorkerState::new(2).unwrap();
+    crate::framework::commands::register_all(&mut backend.registry);
+    let connection_token = add_fake_connection(&mut backend);
+    // Startup captures up to 128 items before priority keys can be requested.
+    // Keep DB 0 larger than startup plus the next bounded capture turn.
+    for index in 256..512 {
+        backend.ctx.db_mut(0).unwrap().set(
+            format!("capture-{index}").into_bytes(),
+            crate::foundation::io::store::Robj::string("value"),
+        );
+    }
+    for key in [b"capture-0".as_slice(), b"capture-1".as_slice()] {
+        backend.ctx.db_mut(1).unwrap().set(
+            key.to_vec(),
+            crate::foundation::io::store::Robj::string("target"),
+        );
+    }
+    let dir = start_test_forkless_capture(&mut backend, "forkless-cross-db");
+    assert!(backend
+        .ctx
+        .prioritize_forkless_keys(0, [b"capture-0".to_vec(), b"capture-1".to_vec()]));
+    // A full serializer queue may postpone priority work across calls.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while (!backend
+        .ctx
+        .persistence()
+        .forkless_key_captured(0, b"capture-0")
+        || !backend
+            .ctx
+            .persistence()
+            .forkless_key_captured(0, b"capture-1"))
+        && std::time::Instant::now() < deadline
+    {
+        backend.ctx.drive_forkless_feed();
+        std::thread::yield_now();
+    }
+    assert!(backend
+        .ctx
+        .persistence()
+        .forkless_key_captured(0, b"capture-0"));
+    assert!(backend
+        .ctx
+        .persistence()
+        .forkless_key_captured(0, b"capture-1"));
+    assert!(!backend
+        .ctx
+        .persistence()
+        .forkless_key_captured(1, b"capture-0"));
+    assert!(!backend
+        .ctx
+        .persistence()
+        .forkless_key_captured(1, b"capture-1"));
+
+    let actions = [
+        make_args(&[b"MOVE", b"capture-0", b"1"]),
+        make_args(&[b"COPY", b"capture-0", b"capture-1", b"DB", b"1", b"REPLACE"]),
+    ]
+    .into_iter()
+    .map(|args| {
+        let spec = backend.registry.lookup(&args.name).unwrap();
+        backend
+            .pre_dispatch_exec(connection_token, meta_from_spec(spec), &args)
+            .action
+    })
+    .collect::<Vec<_>>();
+
+    stop_test_forkless_capture(&mut backend, dir);
+
+    assert_eq!(
+        actions,
+        vec![
+            DispatchAction::Postpone(PostponeReason::ForklessKey),
+            DispatchAction::Postpone(PostponeReason::ForklessKey),
+        ]
+    );
+}
+
+#[test]
+fn forkless_capture_does_not_postpone_invalid_cross_database_targets() {
+    let mut backend = ServerWorkerState::new(2).unwrap();
+    crate::framework::commands::register_all(&mut backend.registry);
+    let connection_token = add_fake_connection(&mut backend);
+    let dir = start_test_forkless_capture(&mut backend, "forkless-invalid-cross-db");
+
+    let actions = [
+        make_args(&[b"MOVE", b"capture-0", b"999"]),
+        make_args(&[b"COPY", b"capture-0", b"target", b"DB", b"999"]),
+    ]
+    .into_iter()
+    .map(|args| {
+        let spec = backend.registry.lookup(&args.name).unwrap();
+        backend
+            .pre_dispatch_exec(connection_token, meta_from_spec(spec), &args)
+            .action
+    })
+    .collect::<Vec<_>>();
+
+    stop_test_forkless_capture(&mut backend, dir);
+
+    assert_eq!(actions, vec![DispatchAction::Execute; 2]);
 }
 
 #[test]
@@ -1123,6 +1365,34 @@ fn replica_reply_diagnostics_include_xinfo_and_slowlog_subcommands() {
 }
 
 #[test]
+fn client_last_command_bounds_untrusted_container_subcommand() {
+    let subcommand = vec![b'x'; 1024 * 1024];
+    let args = make_args(&[b"CLIENT", &subcommand]);
+    let command = super::command_exec::client_last_command_name("client", &args);
+
+    assert!(command.starts_with("client|"));
+    assert!(command.len() <= 128);
+}
+
+#[test]
+fn client_last_command_sanitizes_container_subcommand_newlines() {
+    let args = make_args(&[b"CLIENT", b"LIST\r\nforged-log-line"]);
+    let command = super::command_exec::client_last_command_name("client", &args);
+
+    assert_eq!(command, "client|list  forged-log-line");
+    assert!(!command.contains(['\r', '\n']));
+    assert!(command.len() <= 128);
+}
+
+#[test]
+fn replica_command_log_omits_subcommand_when_user_data_is_hidden() {
+    let args = make_args(&[b"CLIENT", b"secret-subcommand"]);
+    let command = super::completion::replica_command_name_for_log("client", &args, true);
+
+    assert_eq!(command, "client");
+}
+
+#[test]
 fn multi_queue_honors_asking_for_an_importing_slot() {
     use crate::engine::distributed::cluster::node::{ClusterNode, CLUSTER_NODE_MYSELF};
 
@@ -1777,7 +2047,10 @@ fn command_time_eviction_queues_unlink_from_independent_sink_cursors() {
 
     backend._queue_eviction_unlink(10, b"victim", &mut effects);
 
-    assert_eq!(effects.replication_only, vec![unlink.clone()]);
+    assert_eq!(
+        effects.replication_only,
+        vec![select.clone(), unlink.clone()]
+    );
     assert_eq!(effects.aof_only, vec![select, unlink]);
     assert_eq!(backend.ctx.repl_seldb(), 10);
     assert_eq!(backend.ctx.persistence().aof_selected_db(), 10);

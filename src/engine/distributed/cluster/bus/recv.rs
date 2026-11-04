@@ -5,7 +5,7 @@ use crate::engine::distributed::cluster::action::ClusterAction;
 use crate::engine::distributed::cluster::msg::{
     self, bytes_to_slots, ClusterBusBody, ClusterMessageFlags, ClusterMsg, ClusterMsgType,
 };
-use crate::engine::distributed::cluster::node::{ClusterNode, CLUSTER_NODE_HANDSHAKE};
+use crate::engine::distributed::cluster::node::CLUSTER_NODE_HANDSHAKE;
 use crate::engine::distributed::cluster::state::ClusterState;
 
 use super::types::ClusterBusManager;
@@ -155,6 +155,21 @@ impl ClusterBusManager {
                     }
                 }
                 Err(error) if error.is_incomplete() => break,
+                Err(msg::ClusterProtocolError::UnsupportedVersion(version)) => {
+                    state.record_bus_message_received_from_header(remaining);
+                    crate::server_log!(
+                        debug,
+                        "Dropping cluster packet with unsupported protocol version {}",
+                        version
+                    );
+                    let frame_len = u32::from_be_bytes([
+                        remaining[4],
+                        remaining[5],
+                        remaining[6],
+                        remaining[7],
+                    ]) as usize;
+                    processed += frame_len;
+                }
                 Err(e) => {
                     state.record_bus_message_received_from_header(remaining);
                     crate::server_log!(debug, "Cluster msg parse error: {}", e);
@@ -602,7 +617,16 @@ impl ClusterBusManager {
                 let dead_voters = std::iter::once(&state.myself)
                     .chain(state.nodes.values())
                     .filter(|node| {
-                        ClusterState::is_voting_primary(node) && node.has_flag(CLUSTER_NODE_FAIL)
+                        if !ClusterState::is_voting_primary(node)
+                            || !node.has_flag(CLUSTER_NODE_FAIL)
+                        {
+                            return false;
+                        }
+                        crate::engine::distributed::cluster::NodeId::parse(node.name.as_bytes())
+                            .is_ok_and(|failed_id| {
+                                failed_id != voter_id
+                                    && !state.automatic_failover.has_voter_response(&failed_id)
+                            })
                     })
                     .count();
                 let Some(cannot_win) = state.automatic_failover.on_vote_nack(
@@ -626,10 +650,11 @@ impl ClusterBusManager {
                     quorum,
                 );
                 if cannot_win {
+                    let ack_count = state.automatic_failover.voter_count();
                     crate::server_log!(
                         notice,
-                        "Failover election for epoch {} cannot reach quorum {} (NACKs {}, dead voters {}). Resetting the election since we cannot win an election without quorum.",
-                        election_epoch, quorum, nack_count, dead_voters,
+                        "Failover election for epoch {} cannot reach quorum {} (ACKs {}, NACKs {}, dead voters {}). Resetting the election since we cannot win an election without quorum.",
+                        election_epoch, quorum, ack_count, nack_count, dead_voters,
                     );
                 }
             }
@@ -1178,13 +1203,29 @@ impl ClusterBusManager {
                 && (node.has_flag(CLUSTER_NODE_PFAIL) || node.has_flag(CLUSTER_NODE_FAIL))
             {
                 let was_fail = node.has_flag(CLUSTER_NODE_FAIL);
-                node.flags &= !(CLUSTER_NODE_FAIL | CLUSTER_NODE_PFAIL);
-                crate::server_log!(
-                    notice,
-                    "Cluster cleared {} for {} after fresh PONG",
-                    if was_fail { "FAIL/PFAIL" } else { "PFAIL" },
-                    msg.sender_id
-                );
+                let was_pfail = node.has_flag(CLUSTER_NODE_PFAIL);
+                node.flags &= !CLUSTER_NODE_PFAIL;
+                let undo_timeout_ms = state
+                    .failure_report_node_timeout_ms()
+                    .saturating_mul(2)
+                    .min(i64::MAX as u64) as i64;
+                let fail_is_old_enough = now.saturating_sub(node.fail_time) > undo_timeout_ms;
+                if !ClusterState::is_voting_primary(&node) || fail_is_old_enough {
+                    node.flags &= !CLUSTER_NODE_FAIL;
+                    node.fail_time = 0;
+                }
+                if was_pfail || (was_fail && !node.has_flag(CLUSTER_NODE_FAIL)) {
+                    crate::server_log!(
+                        notice,
+                        "Cluster cleared {} for {} after fresh PONG",
+                        if was_fail && !node.has_flag(CLUSTER_NODE_FAIL) {
+                            "FAIL/PFAIL"
+                        } else {
+                            "PFAIL"
+                        },
+                        msg.sender_id
+                    );
+                }
             }
             if !node.is_primary() && !node.is_replica() {
                 node.flags |= crate::engine::distributed::cluster::node::CLUSTER_NODE_PRIMARY;
@@ -1204,42 +1245,11 @@ impl ClusterBusManager {
     }
 
     fn process_gossip_entries(state: &mut ClusterState, msg: &ClusterMsg, now: i64) {
-        let mut topology_changed = false;
-        for entry in msg.gossip() {
-            if entry.node_id.is_empty() || entry.node_id == state.myself.name {
-                continue;
-            }
-            if state.observe_gossip_handshake(&entry.node_id, now) {
-                continue;
-            }
-            let mut node = ClusterNode::new(
-                entry.node_id.clone(),
-                entry.ip.clone(),
-                entry.port,
-                entry.bus_port,
-                (entry.flags & crate::engine::distributed::cluster::node::CLUSTER_NODE_PRIMARY)
-                    != 0,
-            );
-            node.flags &= !(crate::engine::distributed::cluster::node::CLUSTER_NODE_MYSELF
-                | crate::engine::distributed::cluster::node::CLUSTER_NODE_PRIMARY
-                | crate::engine::distributed::cluster::node::CLUSTER_NODE_REPLICA);
-            node.flags |= entry.flags
-                & (crate::engine::distributed::cluster::node::CLUSTER_NODE_PRIMARY
-                    | crate::engine::distributed::cluster::node::CLUSTER_NODE_REPLICA);
-            // Match C clusterProcessGossipSection: the gossip sender's
-            // liveness timestamps are not evidence of a direct exchange by
-            // this node. Leave both clocks at zero so the new connection owns
-            // and starts its first probe immediately.
-            node.ping_sent = 0;
-            node.pong_received = 0;
-            node.asymmetric_meet_started_at = now;
-            state.insert_node(node);
-            topology_changed = true;
-            let connect = (entry.ip.clone(), entry.bus_port, false);
-            state.queue_connect_once(connect);
-        }
-        if topology_changed {
+        // Only a confirmed sender may mutate known peers, introduce nodes, or
+        // contribute failure reports.
+        if Self::apply_gossip_observations(state, msg, now) {
             state.mark_topology_changed();
+            state.request_config_save();
         }
     }
 }

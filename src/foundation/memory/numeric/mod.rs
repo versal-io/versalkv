@@ -4,7 +4,7 @@ mod format;
 mod parse;
 
 pub use format::format_long_double_human;
-pub use parse::{parse_long_double, NumericParseError};
+pub use parse::{parse_double, parse_long_double, NumericParseError};
 
 use rustc_apfloat::{Float, Round, StatusAnd};
 

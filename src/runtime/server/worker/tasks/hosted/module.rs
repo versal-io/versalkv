@@ -8,10 +8,13 @@ use bytes::Bytes;
 impl ServerWorkerState {
     pub(crate) fn apply_pending_module_effects(&mut self) {
         let pending = std::mem::take(&mut self.ctx.module_registry_mut().pending_effects);
+        let monitor_events = std::mem::take(&mut self.ctx.script_mut().pending_internal_monitor);
         if pending.is_empty() {
+            self.deliver_monitor(monitor_events);
             return;
         }
         let dirty_keys = self.commit_pending_module_effects(pending, None, None, None);
+        self.deliver_monitor(monitor_events);
         if !dirty_keys.is_empty() {
             self.wakeup_blocked_on_keys(&dirty_keys, None, None);
         }

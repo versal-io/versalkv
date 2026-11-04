@@ -100,18 +100,8 @@ pub(super) fn decode_extensions(
 
 fn decode_extension(kind: u16, payload: &[u8]) -> Result<ClusterExtension, ClusterProtocolError> {
     Ok(match kind {
-        0 => {
-            let value = decode_c_string(payload)?;
-            ClusterEndpoints::validate_hostname(value.as_bytes())
-                .map_err(|error| ClusterProtocolError::InvalidExtension(error.to_string()))?;
-            ClusterExtension::Hostname(value)
-        }
-        1 => {
-            let value = decode_c_string(payload)?;
-            ClusterEndpoints::validate_aux_value(value.as_bytes())
-                .map_err(|error| ClusterProtocolError::InvalidExtension(error.to_string()))?;
-            ClusterExtension::HumanNodeName(value)
-        }
+        0 => decode_loadable_string(kind, payload, ClusterEndpoints::validate_hostname)?,
+        1 => decode_loadable_string(kind, payload, ClusterEndpoints::validate_aux_value)?,
         2 => {
             require_payload(payload, 48, "forgotten-node")?;
             let node_id = NodeId::parse(&payload[..40])
@@ -128,18 +118,8 @@ fn decode_extension(kind: u16, payload: &[u8]) -> Result<ClusterExtension, Clust
                     .map_err(|error| ClusterProtocolError::InvalidNodeId(error.to_string()))?,
             )
         }
-        4 => {
-            let value = decode_c_string(payload)?;
-            ClusterEndpoints::validate_ipv4(value.as_bytes())
-                .map_err(|error| ClusterProtocolError::InvalidExtension(error.to_string()))?;
-            ClusterExtension::ClientIpv4(value)
-        }
-        5 => {
-            let value = decode_c_string(payload)?;
-            ClusterEndpoints::validate_ipv6(value.as_bytes())
-                .map_err(|error| ClusterProtocolError::InvalidExtension(error.to_string()))?;
-            ClusterExtension::ClientIpv6(value)
-        }
+        4 => decode_loadable_string(kind, payload, ClusterEndpoints::validate_ipv4)?,
+        5 => decode_loadable_string(kind, payload, ClusterEndpoints::validate_ipv6)?,
         6 => {
             require_payload(payload, 8, "client-port")?;
             ClusterExtension::ClientPort(read_u16(payload, 0)?)
@@ -148,11 +128,50 @@ fn decode_extension(kind: u16, payload: &[u8]) -> Result<ClusterExtension, Clust
             require_payload(payload, 8, "client-tls-port")?;
             ClusterExtension::ClientTlsPort(read_u16(payload, 0)?)
         }
-        8 => ClusterExtension::AvailabilityZone(decode_c_string(payload)?),
+        8 => decode_loadable_string(kind, payload, ClusterEndpoints::validate_aux_value)?,
         9 => {
             require_payload(payload, 8, "replica-priority")?;
             ClusterExtension::ReplicaPriority(read_u32(payload, 0)?)
         }
+        _ => ClusterExtension::Unknown {
+            kind,
+            payload: payload.to_vec(),
+        },
+    })
+}
+
+fn decode_loadable_string(
+    kind: u16,
+    payload: &[u8],
+    validate: impl Fn(
+        &[u8],
+    ) -> Result<
+        Option<String>,
+        crate::engine::distributed::cluster::endpoint::EndpointError,
+    >,
+) -> Result<ClusterExtension, ClusterProtocolError> {
+    let value = match decode_c_string(payload) {
+        Ok(value) => value,
+        Err(ClusterProtocolError::InvalidUtf8) => {
+            return Ok(ClusterExtension::Unknown {
+                kind,
+                payload: payload.to_vec(),
+            });
+        }
+        Err(error) => return Err(error),
+    };
+    if validate(value.as_bytes()).is_err() {
+        return Ok(ClusterExtension::Unknown {
+            kind,
+            payload: payload.to_vec(),
+        });
+    }
+    Ok(match kind {
+        0 => ClusterExtension::Hostname(value),
+        1 => ClusterExtension::HumanNodeName(value),
+        4 => ClusterExtension::ClientIpv4(value),
+        5 => ClusterExtension::ClientIpv6(value),
+        8 => ClusterExtension::AvailabilityZone(value),
         _ => ClusterExtension::Unknown {
             kind,
             payload: payload.to_vec(),

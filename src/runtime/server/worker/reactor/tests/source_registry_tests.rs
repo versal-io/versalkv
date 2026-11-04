@@ -10,7 +10,9 @@ use crate::runtime::server::worker::reactor::sources::{
 use crate::runtime::server::worker::reactor::transport::{
     FakeTransportRuntime, RuntimeSentinelIo, RuntimeTransport,
 };
-use crate::runtime::server::worker::reactor::{DispatchContext, EventPayload, ReadyEvent};
+use crate::runtime::server::worker::reactor::{
+    DispatchContext, DispatchOutcome, EventPayload, ReadyEvent,
+};
 use crate::runtime::server::worker::PendingRemovalOwner;
 use crate::runtime::server::worker::ServerWorkerState;
 use std::fs::File;
@@ -228,6 +230,43 @@ fn child_completion_event_finalizes_only_in_normal_context() {
 }
 
 #[test]
+fn deferred_script_debugger_completion_replays_in_normal_context() {
+    let mut runtime = ServerWorkerState::new(1).expect("runtime");
+    let child = runtime.install_test_child(ChildOwner::ScriptDebugger, 2469);
+    runtime
+        .child_registry
+        .record_exit_for_test(child, ChildExitOutcome::Exited(0));
+    runtime.collect_child_completion_events();
+    let events = runtime.event_batch.drain_ready_for_test();
+    let EventPayload::ChildCompletion(completion) = &events[0].payload else {
+        panic!("expected child completion event");
+    };
+
+    let outcome = runtime.dispatch_child_completion_for_test(
+        completion.clone(),
+        DispatchContext::CommandBlocked {
+            protected_client: Token(1),
+        },
+    );
+
+    assert_eq!(outcome, DispatchOutcome::Requeued);
+    assert!(runtime.child_registry.contains(child));
+    assert_eq!(
+        runtime
+            .event_batch
+            .next_turn_queued_sequence_count_for_test(),
+        1
+    );
+
+    runtime.event_batch.begin_next_turn();
+    runtime
+        .dispatch_ready_phase(DispatchContext::Normal)
+        .expect("dispatch deferred child completion");
+
+    assert!(!runtime.child_registry.contains(child));
+}
+
+#[test]
 fn child_registry_tracks_every_planned_owner_kind() {
     let mut registry = ChildRegistry::default();
     let slot_job = crate::engine::distributed::cluster::migration::MigrationJobId::generate();
@@ -237,7 +276,6 @@ fn child_registry_tracks_every_planned_owner_kind() {
         (ChildOwner::DisklessReplication, 2003),
         (ChildOwner::DiskSyncReplication, 2004),
         (ChildOwner::SlotSnapshot(slot_job), 2005),
-        (ChildOwner::DirectDualRdb, 2006),
     ];
 
     for (owner, pid) in cases {

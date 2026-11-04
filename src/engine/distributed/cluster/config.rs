@@ -309,6 +309,9 @@ fn parse_node(fields: &[&str]) -> Result<ParsedNode, String> {
     let is_primary = flags & CLUSTER_NODE_REPLICA == 0;
     let mut node = ClusterNode::new(node_id.to_string(), ip, port, bus_port, is_primary);
     node.flags = flags;
+    if flags & (CLUSTER_NODE_FAIL | CLUSTER_NODE_NOADDR) != 0 {
+        node.fail_time = crate::foundation::io::sys::time::mstime();
+    }
     if let Some(hostname) = hostname {
         node.endpoints
             .set_hostname(hostname.as_bytes())

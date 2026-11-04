@@ -3,6 +3,27 @@ use crate::engine::extension::config::spec_registry::ConfigRegistry;
 
 pub(crate) fn register_replication_configs(reg: &mut ConfigRegistry) {
     reg.register(&ConfigSpec {
+        name: "replicaof",
+        type_: ConfigType::Special,
+        enum_values: &[],
+        numeric_min: 0,
+        numeric_max: 0,
+        flags: &["immutable"],
+        alias: Some("slaveof"),
+        get: |config| {
+            ConfigValue::String(
+                config
+                    .replication
+                    .master_host
+                    .as_ref()
+                    .map_or_else(String::new, |host| {
+                        format!("{} {}", host, config.replication.master_port)
+                    }),
+            )
+        },
+        set: |_config, _value| Ok(()),
+    });
+    reg.register(&ConfigSpec {
         name: "repl-compression",
         type_: ConfigType::Enum,
         enum_values: &["no", "yes", "lz4", "zstd"],

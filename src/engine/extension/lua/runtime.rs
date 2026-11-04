@@ -189,15 +189,30 @@ pub(super) fn bind_eval_arguments(
     keys: &[bytes::Bytes],
     args: &[bytes::Bytes],
 ) -> LuaResult<()> {
+    let keys_table = create_argument_table(lua, keys)?;
+    let args_table = create_argument_table(lua, args)?;
     let globals = lua.globals();
-    for (name, values) in [("KEYS", keys), ("ARGV", args)] {
-        let table = lua.create_table_with_capacity(values.len(), 0)?;
-        for (index, value) in values.iter().enumerate() {
-            table.raw_set(index + 1, lua.create_string(value.as_ref())?)?;
-        }
-        globals.raw_set(name, table)?;
+    let old_keys = globals.raw_get::<LuaValue>("KEYS")?;
+    let _old_args = globals.raw_get::<LuaValue>("ARGV")?;
+
+    globals.raw_set("KEYS", keys_table)?;
+    if let Err(publish_error) = globals.raw_set("ARGV", args_table) {
+        return match globals.raw_set("KEYS", old_keys) {
+            Ok(()) => Err(publish_error),
+            Err(restore_error) => Err(LuaError::RuntimeError(format!(
+                "failed to publish ARGV: {publish_error}; failed to restore KEYS: {restore_error}"
+            ))),
+        };
     }
     Ok(())
+}
+
+fn create_argument_table(lua: &Lua, values: &[bytes::Bytes]) -> LuaResult<LuaTable> {
+    let table = lua.create_table_with_capacity(values.len(), 0)?;
+    for (index, value) in values.iter().enumerate() {
+        table.raw_set(index + 1, lua.create_string(value.as_ref())?)?;
+    }
+    Ok(table)
 }
 
 thread_local! {
@@ -220,6 +235,19 @@ impl LuaRuntime {
         super::libs::setup_cmsgpack_table(&lua)?;
         super::libs::setup_bit_table(&lua)?;
         sandbox::finalize_sandbox(&lua)?;
+        let globals = lua.globals();
+        let keys = lua
+            .create_table()
+            .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+        let args = lua
+            .create_table()
+            .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+        globals
+            .raw_set("KEYS", keys)
+            .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+        globals
+            .raw_set("ARGV", args)
+            .map_err(|error| ScriptError::Runtime(error.to_string()))?;
         Ok(Self {
             lua,
             compiled_scripts: HashMap::new(),
@@ -331,6 +359,11 @@ pub(crate) fn compiled_eval_count() -> usize {
 }
 
 #[cfg(test)]
+pub(crate) fn compiled_script_count() -> usize {
+    with_lua_runtime(false, |runtime| Ok(runtime.compiled_scripts.len())).unwrap()
+}
+
+#[cfg(test)]
 pub(crate) fn eval_argument_tables() -> Result<(LuaTable, LuaTable), ScriptError> {
     with_lua_runtime(false, |runtime| {
         let globals = runtime.lua.globals();
@@ -345,10 +378,159 @@ pub(crate) fn eval_argument_tables() -> Result<(LuaTable, LuaTable), ScriptError
 mod tests {
     use super::*;
     use crate::engine::extension::lua::LuaEngine;
+    use bytes::Bytes;
 
     fn compiled_eval_function(runtime: &LuaRuntime, digest: &str) -> LuaFunction {
         let key = &runtime.compiled_eval_scripts[digest];
         runtime.lua.registry_value(key).unwrap()
+    }
+
+    #[test]
+    fn bind_eval_arguments_publishes_globals_atomically_on_allocation_failure() {
+        const OLD_KEYS: &str = "old-keys-sentinel";
+        const OLD_ARGS: &str = "old-args-sentinel";
+
+        reset_lua_runtime();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let keys = (0..32)
+                .map(|index| Bytes::from(format!("key-{index:03}-{}", "k".repeat(256))))
+                .collect::<Vec<_>>();
+            let args = (0..256)
+                .map(|index| Bytes::from(format!("arg-{index:03}-{}", "a".repeat(512))))
+                .collect::<Vec<_>>();
+            let mut observed_error = false;
+
+            for headroom in [
+                64usize,
+                512,
+                2 * 1024,
+                8 * 1024,
+                16 * 1024,
+                32 * 1024,
+                64 * 1024,
+                128 * 1024,
+                256 * 1024,
+            ] {
+                reset_lua_runtime();
+                with_lua_runtime(false, |runtime| {
+                    let old_keys = runtime
+                        .lua
+                        .create_table()
+                        .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+                    old_keys
+                        .raw_set(1, OLD_KEYS)
+                        .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+                    let old_args = runtime
+                        .lua
+                        .create_table()
+                        .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+                    old_args
+                        .raw_set(1, OLD_ARGS)
+                        .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+                    let globals = runtime.lua.globals();
+                    globals
+                        .raw_set("KEYS", old_keys)
+                        .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+                    globals
+                        .raw_set("ARGV", old_args)
+                        .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+                    runtime
+                        .lua
+                        .set_memory_limit(runtime.lua.used_memory().saturating_add(headroom))
+                        .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+                    Ok(())
+                })
+                .unwrap();
+
+                let bind_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    with_lua_runtime(false, |runtime| {
+                        bind_eval_arguments(&runtime.lua, &keys, &args)
+                            .map_err(|error| ScriptError::Runtime(error.to_string()))
+                    })
+                }));
+                let limit_cleanup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    with_lua_runtime(false, |runtime| {
+                        runtime
+                            .lua
+                            .set_memory_limit(0)
+                            .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+                        Ok(())
+                    })
+                }));
+                let bind_result = match bind_outcome {
+                    Ok(result) => {
+                        match limit_cleanup {
+                            Ok(result) => result.unwrap(),
+                            Err(payload) => std::panic::resume_unwind(payload),
+                        }
+                        result
+                    }
+                    Err(payload) => {
+                        let _ = limit_cleanup;
+                        std::panic::resume_unwind(payload);
+                    }
+                };
+
+                if bind_result.is_err() {
+                    observed_error = true;
+                    with_lua_runtime(false, |runtime| {
+                        let globals = runtime.lua.globals();
+                        let current_keys = globals
+                            .raw_get::<LuaTable>("KEYS")
+                            .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+                        let current_args = globals
+                            .raw_get::<LuaTable>("ARGV")
+                            .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+                        assert_eq!(
+                            current_keys
+                                .raw_get::<String>(1)
+                                .map_err(|error| ScriptError::Runtime(error.to_string()))?,
+                            OLD_KEYS
+                        );
+                        assert_eq!(
+                            current_args
+                                .raw_get::<String>(1)
+                                .map_err(|error| ScriptError::Runtime(error.to_string()))?,
+                            OLD_ARGS
+                        );
+                        Ok(())
+                    })
+                    .unwrap();
+                }
+                reset_lua_runtime();
+            }
+
+            assert!(
+                observed_error,
+                "at least one constrained-memory argument bind must fail"
+            );
+        }));
+
+        let limit_cleanup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            LUA_RUNTIME.with(|runtime| {
+                if let Some(runtime) = runtime.borrow().as_ref() {
+                    runtime.lua.set_memory_limit(0).unwrap();
+                }
+            });
+        }));
+        let reset_cleanup =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(reset_lua_runtime));
+
+        match outcome {
+            Ok(()) => {
+                if let Err(payload) = limit_cleanup {
+                    std::panic::resume_unwind(payload);
+                }
+                if let Err(payload) = reset_cleanup {
+                    std::panic::resume_unwind(payload);
+                }
+            }
+            Err(payload) => {
+                let _ = limit_cleanup;
+                let _ = reset_cleanup;
+                std::panic::resume_unwind(payload);
+            }
+        }
     }
 
     #[test]

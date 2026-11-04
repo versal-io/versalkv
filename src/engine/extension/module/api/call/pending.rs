@@ -176,8 +176,9 @@ mod tests {
             first_key: 1,
             last_key: -2,
             key_step: 1,
-            container: None,
+            key_flags: &[],
             acl_categories: &[],
+            get_keys: None,
         };
         let before = lifecycle_test_support::snapshot();
         // SAFETY: all argv pointers are owned, live module strings; no handlers are installed.

@@ -376,6 +376,17 @@ fn diskless_rdb_read_hup_only_dispatches_eof_instead_of_source_failure() {
             crate::runtime::server::worker::distributed::replication::diskless_child::DisklessCompletionState::default(),
     });
 
+    runtime
+        .full_sync
+        .diskless_relay
+        .as_mut()
+        .unwrap()
+        .completion_state
+        .apply_fact(
+            crate::runtime::server::worker::distributed::replication::diskless_child::DisklessFact::ChildExited(
+                crate::runtime::server::worker::reactor::sources::ChildExitOutcome::Exited(0),
+            ),
+        );
     runtime.dispatch_transport_event(
         ReadyEvent {
             token: source.token,

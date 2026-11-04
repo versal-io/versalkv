@@ -126,13 +126,6 @@ impl ServerWorkerState {
         {
             return Ok(LoopControl::Stop);
         }
-        if self
-            .dispatch_before_poll_slot(BeforePollSlot::OrdinaryWrites, DispatchContext::Normal)?
-            == LoopControl::Stop
-        {
-            return Ok(LoopControl::Stop);
-        }
-        self.drain_acl_kills();
         self.schedule_pending_replica_writes_before_sleep();
         if self
             .dispatch_before_poll_slot(BeforePollSlot::DistributedWrites, DispatchContext::Normal)?
@@ -140,6 +133,13 @@ impl ServerWorkerState {
         {
             return Ok(LoopControl::Stop);
         }
+        if self
+            .dispatch_before_poll_slot(BeforePollSlot::OrdinaryWrites, DispatchContext::Normal)?
+            == LoopControl::Stop
+        {
+            return Ok(LoopControl::Stop);
+        }
+        self.drain_acl_kills();
         self.io_threads_before_sleep();
         if self
             .dispatch_before_poll_slot(BeforePollSlot::PollPreparation, DispatchContext::Normal)?
@@ -223,11 +223,11 @@ impl ServerWorkerState {
         self.flush_aof_if_needed();
         self.schedule_pending_replica_writes_before_sleep();
         self.event_batch.activate_next_turn_before_poll_slots(&[
-            BeforePollSlot::OrdinaryWrites,
             BeforePollSlot::DistributedWrites,
+            BeforePollSlot::OrdinaryWrites,
         ]);
-        self.drive_pending_ordinary_writes();
         self.drive_pending_slot_export_writes();
+        self.drive_pending_ordinary_writes();
     }
 
     pub(crate) fn start_event_loop_cycle(

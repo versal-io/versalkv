@@ -34,6 +34,8 @@ pub struct ReplicaLink {
     state: ReplicaLinkState,
     #[allow(dead_code)] // Wired into dual-channel negotiation in a later slice.
     rdb_channel_state: ReplicaRdbChannelState,
+    rdb_transfer_failed: bool,
+    dual_main_psync_paused: bool,
     input: Vec<u8>,
     compression_mode: String,
     compression_decoder: Option<StreamDecoder>,
@@ -91,6 +93,8 @@ impl ReplicaLink {
             master,
             state: ReplicaLinkState::Connecting,
             rdb_channel_state: ReplicaRdbChannelState::None,
+            rdb_transfer_failed: false,
+            dual_main_psync_paused: false,
             input: Vec::new(),
             compression_mode: "no".to_string(),
             compression_decoder: None,
@@ -153,6 +157,12 @@ impl ReplicaLink {
     #[allow(dead_code)]
     pub fn provisional_primary(&self) -> Option<&ProvisionalPrimary> {
         self.provisional_primary.as_ref()
+    }
+
+    pub fn provisional_resume_position(&self) -> Option<(&str, ReplicationOffset, u32)> {
+        self.provisional_primary
+            .as_ref()
+            .map(|primary| (primary.replid.as_str(), primary.end_offset, primary.db_id))
     }
 
     pub fn clear_provisional_primary(&mut self) {
@@ -236,13 +246,19 @@ impl ReplicaLink {
     }
 
     pub fn has_pending_decompression(&self) -> bool {
-        self.compression_decoder
-            .as_ref()
-            .is_some_and(StreamDecoder::has_pending_decode)
+        self.has_pending_main_decompression()
             || self
                 .rdb_receive
                 .as_ref()
                 .is_some_and(RdbReceive::has_pending_decompression)
+    }
+
+    /// Pending command-stream decoding belongs to the main connection.
+    /// The independent dual-channel RDB receiver cannot make it readable.
+    pub fn has_pending_main_decompression(&self) -> bool {
+        self.compression_decoder
+            .as_ref()
+            .is_some_and(StreamDecoder::has_pending_decode)
     }
 
     pub fn compression_memory_bytes(&self) -> usize {
@@ -503,6 +519,13 @@ impl ReplicaLink {
                         // discarded and we restart on DB 0 (§5.6).
                         self.selected_db = 0;
                     } else if let Some(new_replid) = protocol::parse_continue(&line) {
+                        if self.master_replid.is_none() || self.requested_offset.is_none() {
+                            crate::server_log!(
+                                warning,
+                                "Primary replied +CONTINUE to a full resynchronization request, will try later."
+                            );
+                            return Err(LinkError::TryLater);
+                        }
                         self.mark_failover_accepted();
                         self.partial_resync_accepted = true;
                         if let Some(rid) = new_replid {
@@ -1165,11 +1188,18 @@ impl ReplicaLink {
     pub fn can_resume_after_disconnect(&self) -> bool {
         self.is_streaming()
             && self.ack_enabled_after_rdb_commit
+            && !self.rdb_transfer_failed
             && !self.has_pending_rdb_receive()
             && matches!(
                 self.rdb_channel_state,
                 ReplicaRdbChannelState::None | ReplicaRdbChannelState::RdbLoaded
             )
+    }
+
+    pub fn mark_rdb_transfer_failed(&mut self) {
+        if self.rdb_channel_state != ReplicaRdbChannelState::RdbLoaded {
+            self.rdb_transfer_failed = true;
+        }
     }
 
     pub fn is_in_handshake(&self) -> bool {
@@ -1180,6 +1210,14 @@ impl ReplicaLink {
                 | ReplicaLinkState::ReceivingRdb { .. }
                 | ReplicaLinkState::ReceivingRdbEof { .. }
         )
+    }
+
+    pub fn mark_dual_main_psync_paused(&mut self) {
+        self.dual_main_psync_paused = true;
+    }
+
+    pub fn dual_main_psync_was_paused(&self) -> bool {
+        self.dual_main_psync_paused
     }
 
     pub fn is_receiving_rdb(&self) -> bool {

@@ -190,8 +190,9 @@ impl Server {
                     "Valkey port number too high. Cluster communication port is 10,000 port numbers higher than your Valkey port. Your Valkey port number must be 55535 or less.",
                 )
             })?;
-            let cluster_config_path =
-                std::path::Path::new(&self.config.dir).join(&self.config.cluster_config_file);
+            let cluster_config_path = std::path::Path::new(&self.config.dir)
+                .join(&backend.ctx.config().server.cluster_config_file);
+            backend.lock_cluster_config(cluster_config_path.clone())?;
             let cluster_default_ip = self.config.default_advertised_ip();
             let loaded_config = std::fs::read_to_string(&cluster_config_path).ok();
             let mut cluster_state = match loaded_config.as_deref() {
@@ -234,7 +235,6 @@ impl Server {
             *backend.ctx.cluster_state_mut() = Some(cluster_state);
             apply_cluster_config_snapshot(&mut backend.ctx)
                 .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-            backend.set_cluster_config_path(cluster_config_path);
             backend.save_cluster_config_now()?;
             crate::server_log!(notice, "Cluster mode enabled (node_id={})", node_id);
 

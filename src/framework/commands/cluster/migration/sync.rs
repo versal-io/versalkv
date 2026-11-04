@@ -190,7 +190,7 @@ fn establish(args: &[Bytes], conn: &mut dyn CommandConn, ctx: &mut ServerContext
     if !tracking_only && !state.myself.is_primary() {
         return Value::error("ERR Slot migration can only be used on primary nodes.");
     }
-    if state.has_importing_slots() {
+    if !tracking_only && state.has_importing_slots() {
         return Value::error("ERR Slots are being manually imported");
     }
     if state.has_migrating_slots() {
@@ -607,6 +607,41 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[test]
+    fn tracking_establish_allows_topology_importing_slot_marker() {
+        let mut ctx = context();
+        ctx.cluster_state_mut()
+            .as_deref_mut()
+            .unwrap()
+            .set_slot_importing(100, SOURCE)
+            .unwrap();
+        let mut conn = Connection::new_fake();
+        conn.import_source = true;
+
+        assert_eq!(
+            cluster_syncslots(
+                &args(&[
+                    "ESTABLISH",
+                    "SOURCE",
+                    SOURCE,
+                    "NAME",
+                    JOB,
+                    "SLOTSRANGE",
+                    "100",
+                    "100",
+                ]),
+                &mut conn,
+                &mut ctx,
+            ),
+            Value::ok()
+        );
+
+        assert_eq!(conn.slot_migration_role, None);
+        assert!(ctx.has_slot_import(
+            &MigrationJobId::parse(JOB.as_bytes()).expect("test job id is valid")
+        ));
     }
 
     #[test]

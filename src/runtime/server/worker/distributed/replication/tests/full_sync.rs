@@ -316,6 +316,155 @@ fn aof_base_prepare_failure_keeps_full_sync_state_unpublished() {
 }
 
 #[test]
+fn function_install_failure_keeps_full_sync_state_unpublished() {
+    use crate::engine::extension::lua::reset_lua_runtime;
+
+    let dir = std::env::temp_dir().join(format!(
+        "valkey-replica-function-install-failure-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    reset_lua_runtime();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let app_dir = dir.join("appendonlydir");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(dir.join("dump.rdb"), b"old-rdb").unwrap();
+        let old_manifest = "file appendonly.aof.1.base.rdb seq 1 type b\n\
+                            file appendonly.aof.1.incr.aof seq 1 type i\n";
+        let old_base = app_dir.join("appendonly.aof.1.base.rdb");
+        let old_incr = app_dir.join("appendonly.aof.1.incr.aof");
+        std::fs::write(&old_base, b"old-base").unwrap();
+        std::fs::write(&old_incr, b"old-tail").unwrap();
+        std::fs::write(app_dir.join("appendonly.aof.manifest"), old_manifest).unwrap();
+        let mut fixture = atomic_full_sync_fixture(&dir, &old_incr);
+        fixture
+            .backend
+            .ctx
+            .config_mut()
+            .persistence
+            .aof_appenddirname = "appendonlydir".to_string();
+        let old_library =
+            "#!lua name=oldlib\nserver.register_function('oldfn', function() return 'old' end)";
+        fixture
+            .backend
+            .ctx
+            .script_mut()
+            .function_registry
+            .load_library("oldlib", old_library)
+            .unwrap();
+
+        let mut function_code = b"#!lua name=newlib\n-- invalid UTF-8 follows: ".to_vec();
+        function_code.push(0xff);
+        function_code
+            .extend_from_slice(b"\nserver.register_function('newfn', function() return 'new' end)");
+        assert!(std::str::from_utf8(&function_code).is_err());
+        let lossy_code = String::from_utf8_lossy(&function_code);
+        assert!(lossy_code.contains(char::REPLACEMENT_CHARACTER));
+        assert_eq!(
+            crate::engine::extension::lua::shebang::extract_shebang_name(&lossy_code).unwrap(),
+            "newlib"
+        );
+        let registry = &fixture.backend.ctx.script().function_registry;
+        let engine = registry
+            .engine_mgr()
+            .get("LUA")
+            .expect("LUA engine must be registered");
+        registry
+            .begin_restore_transaction()
+            .expect("lossy compile validation must start a restore transaction");
+        let compile_result = engine.compile(&lossy_code, 0);
+        registry
+            .rollback_restore_transaction()
+            .expect("lossy compile validation must roll back its restore transaction");
+        assert!(compile_result.is_ok(), "lossy function source must compile");
+        let commit = fixture.commit.as_mut().unwrap();
+        commit.function_codes = vec![function_code];
+        commit.raw = Some(b"new-rdb".to_vec());
+
+        assert!(fixture
+            .backend
+            .commit_streamed_rdb(
+                fixture.connection_token,
+                &mut fixture.link,
+                fixture.commit.take().unwrap(),
+            )
+            .is_err());
+
+        let mut root_entries = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        root_entries.sort();
+        assert_eq!(
+            root_entries,
+            vec![
+                std::ffi::OsString::from("appendonlydir"),
+                std::ffi::OsString::from("dump.rdb"),
+            ]
+        );
+        let mut aof_entries = std::fs::read_dir(&app_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        aof_entries.sort();
+        assert_eq!(
+            aof_entries,
+            vec![
+                std::ffi::OsString::from("appendonly.aof.1.base.rdb"),
+                std::ffi::OsString::from("appendonly.aof.1.incr.aof"),
+                std::ffi::OsString::from("appendonly.aof.manifest"),
+            ]
+        );
+        assert_atomic_full_sync_state_unchanged(&fixture);
+        assert!(fixture
+            .backend
+            .ctx
+            .script()
+            .function_registry
+            .get_library("oldlib")
+            .is_some());
+        assert!(fixture
+            .backend
+            .ctx
+            .script()
+            .function_registry
+            .get_library("newlib")
+            .is_none());
+        assert_eq!(std::fs::read(dir.join("dump.rdb")).unwrap(), b"old-rdb");
+        assert_eq!(
+            std::fs::read_to_string(app_dir.join("appendonly.aof.manifest")).unwrap(),
+            old_manifest
+        );
+        assert_eq!(std::fs::read(&old_base).unwrap(), b"old-base");
+        assert_eq!(std::fs::read(&old_incr).unwrap(), b"old-tail");
+        if let Some(mut journal) = fixture.backend.ctx.aof_mut().journal.take() {
+            journal.appender.shutdown().unwrap();
+        }
+    }));
+
+    let cleanup = std::fs::remove_dir_all(&dir);
+    reset_lua_runtime();
+    match outcome {
+        Ok(()) => cleanup.unwrap_or_else(|error| {
+            panic!(
+                "failed to remove full-sync test directory {}: {error}",
+                dir.display()
+            )
+        }),
+        Err(payload) => {
+            if let Err(error) = cleanup {
+                eprintln!(
+                    "failed to remove full-sync test directory after panic ({}): {error}",
+                    dir.display()
+                );
+            }
+            std::panic::resume_unwind(payload);
+        }
+    }
+}
+
+#[test]
 fn disk_rdb_commit_failure_rolls_back_prepared_aof_manifest() {
     let dir = std::env::temp_dir().join(format!(
         "valkey-replica-aof-rollback-{}-{:?}",

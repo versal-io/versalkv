@@ -5,6 +5,34 @@ use crate::framework::{CommandArgs, CommandError};
 use bytes::Bytes;
 use command_macros::command;
 
+pub(crate) fn target_db_and_key(
+    args: &CommandArgs,
+    selected_db: u32,
+) -> Option<(u32, &[u8])> {
+    let target_key = args.args.get(1)?;
+    let mut db_idx = selected_db;
+    let mut index = 2;
+    while index < args.args.len() {
+        match String::from_utf8_lossy(&args.args[index])
+            .to_ascii_uppercase()
+            .as_str()
+        {
+            "REPLACE" => {}
+            "DB" => {
+                index += 1;
+                db_idx = std::str::from_utf8(args.args.get(index)?)
+                    .ok()?
+                    .trim()
+                    .parse::<u32>()
+                    .ok()?;
+            }
+            _ => return None,
+        }
+        index += 1;
+    }
+    Some((db_idx, target_key))
+}
+
 fn copy_get_keys(args: &[Bytes]) -> Vec<(&[u8], Vec<&'static str>)> {
     let mut result = Vec::new();
     if !args.is_empty() {

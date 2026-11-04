@@ -26,9 +26,7 @@ pub use stream::{
 #[cfg(test)]
 pub use encoder::save_binary_double;
 
-use crate::foundation::io::persistence::codec::types::{
-    RDB_FOREIGN_VERSION_MAX, RDB_FOREIGN_VERSION_MIN, RDB_VERSION,
-};
+use crate::foundation::io::persistence::codec::types::is_rdb_version_accepted;
 
 #[derive(Debug)]
 pub enum LoadError {
@@ -261,28 +259,7 @@ pub(crate) fn is_version_accepted(
     is_redis: bool,
     strict: bool,
 ) -> bool {
-    if rdbver < 1 {
-        return false;
-    }
-    if is_valkey && rdbver <= RDB_FOREIGN_VERSION_MAX as i32 {
-        return false;
-    }
-    if is_redis && rdbver > RDB_FOREIGN_VERSION_MAX as i32 {
-        return false;
-    }
-    if strict {
-        if rdbver > RDB_VERSION as i32 {
-            return false;
-        }
-        if is_foreign_version(rdbver) {
-            return false;
-        }
-    }
-    true
-}
-
-fn is_foreign_version(rdbver: i32) -> bool {
-    (RDB_FOREIGN_VERSION_MIN as i32..=RDB_FOREIGN_VERSION_MAX as i32).contains(&rdbver)
+    is_rdb_version_accepted(rdbver, is_valkey, is_redis, strict)
 }
 
 pub fn is_rdb_magic(bytes: &[u8]) -> bool {
