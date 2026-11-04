@@ -200,15 +200,41 @@ fn diskless_relay_yields_before_draining_a_large_ready_source() {
     );
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    while backend.full_sync.diskless_relay.is_some() && std::time::Instant::now() < deadline {
+    while backend
+        .full_sync
+        .diskless_relay
+        .as_ref()
+        .is_some_and(|relay| !relay.eof_reached)
+        && std::time::Instant::now() < deadline
+    {
         backend.on_diskless_pipe_readable(transfer_id);
         std::thread::yield_now();
     }
     assert!(
-        backend.full_sync.diskless_relay.is_none(),
+        backend
+            .full_sync
+            .diskless_relay
+            .as_ref()
+            .is_some_and(|relay| relay.eof_reached && relay.completion_announced),
         "bounded relay turns must still make forward progress to EOF"
     );
     crate::foundation::io::sys::fd::join_background_pipe_writer(writer);
+    // This fixture uses a writer thread in place of a registered child.
+    // Publish its actual successful exit separately from pipe EOF.
+    backend
+        .full_sync
+        .diskless_relay
+        .as_mut()
+        .unwrap()
+        .completion_state
+        .apply_fact(crate::runtime::server::worker::distributed::replication::diskless_child::DisklessFact::ChildExited(
+            crate::runtime::server::worker::reactor::sources::ChildExitOutcome::Exited(0),
+        ));
+    backend.finish_diskless_relay_if_ready();
+    assert!(
+        backend.full_sync.diskless_relay.is_none(),
+        "the completed writer and drained relay must release transfer ownership"
+    );
 }
 
 #[test]
@@ -284,7 +310,7 @@ fn preexisting_diskless_backpressure_disables_pipe_source_until_target_drains() 
         transfer_id,
         source: Some(source),
         child_release_write_end: None,
-        targets: vec![replica_id],
+        targets: vec![replica_id.into()],
         marker: Vec::new(),
         complete_full_resync: true,
         not_before_ms: 0,
@@ -386,12 +412,12 @@ fn drained_split_diskless_marker_is_marked_sent_on_target_writable() {
         transfer_id: crate::runtime::server::worker::reactor::sources::TransferId(0),
         source: None,
         child_release_write_end: None,
-        targets: vec![replica_id],
+        targets: vec![replica_id.into()],
         marker: Vec::new(),
         complete_full_resync: true,
         not_before_ms: 0,
         eof_reached: true,
-        marker_queued_targets: [replica_id].into_iter().collect(),
+        marker_queued_targets: [replica_id.into()].into_iter().collect(),
         marker_sent_targets: std::collections::HashSet::new(),
         completion_announced: false,
         completion_state:
@@ -406,10 +432,10 @@ fn drained_split_diskless_marker_is_marked_sent_on_target_writable() {
         .as_ref()
         .expect("terminal ACK still pending");
     assert!(
-        relay.marker_sent_targets.contains(&replica_id),
+        relay.marker_sent_targets.contains(&replica_id.into()),
         "fully drained queued marker must be promoted to sent"
     );
-    assert!(!relay.marker_queued_targets.contains(&replica_id));
+    assert!(!relay.marker_queued_targets.contains(&replica_id.into()));
     assert_eq!(
         backend
             .replication_runtime
@@ -455,7 +481,7 @@ fn dropping_backpressured_diskless_target_reenables_pipe_for_survivors() {
         transfer_id,
         source: Some(source),
         child_release_write_end: None,
-        targets: vec![slow, survivor],
+        targets: vec![slow.into(), survivor.into()],
         marker: Vec::new(),
         complete_full_resync: true,
         not_before_ms: 0,
@@ -480,7 +506,7 @@ fn dropping_backpressured_diskless_target_reenables_pipe_for_survivors() {
             .as_ref()
             .expect("survivor keeps relay alive")
             .targets,
-        vec![survivor]
+        vec![survivor.into()]
     );
     assert!(
         backend
@@ -514,7 +540,7 @@ fn diskless_pipe_error_readiness_clears_relay_and_closes_targets() {
         transfer_id,
         source: Some(source),
         child_release_write_end: None,
-        targets: vec![replica_id],
+        targets: vec![replica_id.into()],
         marker: Vec::new(),
         complete_full_resync: true,
         not_before_ms: 0,
@@ -599,7 +625,7 @@ fn classic_diskless_marker_publishes_online_before_terminal_ack() {
         transfer_id,
         source: Some(source),
         child_release_write_end: None,
-        targets: vec![replica_id],
+        targets: vec![replica_id.into()],
         marker: b"0123456789012345678901234567890123456789".to_vec(),
         complete_full_resync: true,
         not_before_ms: 0,
@@ -675,7 +701,7 @@ fn diskless_pipe_eof_explicitly_releases_child_with_inherited_writer() {
             .full_sync
             .diskless_relay
             .as_ref()
-            .is_some_and(|relay| relay.child_release_write_end.is_none())
+            .is_none_or(|relay| relay.child_release_write_end.is_none())
         {
             break;
         }
@@ -686,23 +712,22 @@ fn diskless_pipe_eof_explicitly_releases_child_with_inherited_writer() {
         sleep(Duration::from_millis(1));
     }
 
-    assert!(
-        backend.full_sync.diskless_relay.is_some(),
-        "pipe EOF must retain the relay until child status is known"
-    );
+    // A fast child may already have exited and been reaped in the EOF
+    // callback. The inherited writer stays open throughout this test, so
+    // either outcome still requires the parent's explicit release byte.
     assert!(
         backend
             .full_sync
             .diskless_relay
             .as_ref()
-            .is_some_and(|relay| relay.child_release_write_end.is_none()),
+            .is_none_or(|relay| relay.child_release_write_end.is_none()),
         "pipe EOF and marker flush must release the child"
     );
-    assert_eq!(
-        backend.ctx.persistence().diskless_child_pid(),
-        Some(pid),
-        "pipe EOF must not synchronously publish child reap"
-    );
+    assert!(backend
+        .ctx
+        .persistence()
+        .diskless_child_pid()
+        .is_none_or(|current| current == pid));
     let reap_deadline = Instant::now() + Duration::from_secs(5);
     loop {
         backend.collect_idle_diskless_child_exit();
@@ -800,13 +825,13 @@ fn successful_diskless_child_reap_preserves_acknowledged_replica() {
         transfer_id: crate::runtime::server::worker::reactor::sources::TransferId(0),
         source: None,
         child_release_write_end: None,
-        targets: vec![replica_id],
+        targets: vec![replica_id.into()],
         marker: Vec::new(),
         complete_full_resync: true,
         not_before_ms: 0,
         eof_reached: true,
         marker_queued_targets: std::collections::HashSet::new(),
-        marker_sent_targets: [replica_id].into_iter().collect(),
+        marker_sent_targets: [replica_id.into()].into_iter().collect(),
         completion_announced: false,
         completion_state: crate::runtime::server::worker::distributed::replication::diskless_child::DisklessCompletionState::default(),
     });
@@ -897,13 +922,13 @@ fn diskless_completion_waits_for_each_classic_target_outcome() {
         transfer_id: crate::runtime::server::worker::reactor::sources::TransferId(0),
         source: None,
         child_release_write_end: Some(File::open("/dev/null").unwrap()),
-        targets: vec![fast, slow],
+        targets: vec![fast.into(), slow.into()],
         marker: Vec::new(),
         complete_full_resync: true,
         not_before_ms: 0,
         eof_reached: true,
         marker_queued_targets: std::collections::HashSet::new(),
-        marker_sent_targets: [fast, slow].into_iter().collect(),
+        marker_sent_targets: [fast.into(), slow.into()].into_iter().collect(),
         completion_announced: false,
         completion_state: crate::runtime::server::worker::distributed::replication::diskless_child::DisklessCompletionState::default(),
     });
@@ -914,8 +939,18 @@ fn diskless_completion_waits_for_each_classic_target_outcome() {
         .diskless_relay
         .as_ref()
         .expect("unresolved target must keep the relay active");
-    assert!(!relay.completion_announced);
-    assert!(relay.child_release_write_end.is_some());
+    assert!(
+        relay.completion_announced,
+        "physical transport completion is announced independently of target ACK outcomes"
+    );
+    assert!(
+        !relay.completion_state.published(),
+        "transport notification must not publish the unresolved command stream"
+    );
+    assert!(
+        relay.child_release_write_end.is_none(),
+        "the completed producer is released while replica ACK outcomes remain pending"
+    );
 
     backend.disconnect_timedout_replicas_at(now_ms, now_sec);
 
@@ -926,7 +961,7 @@ fn diskless_completion_waits_for_each_classic_target_outcome() {
         .diskless_relay
         .as_ref()
         .expect("surviving target must keep the relay until child reap");
-    assert_eq!(relay.targets, vec![fast]);
+    assert_eq!(relay.targets, vec![fast.into()]);
     assert!(relay.completion_announced);
     assert!(relay.child_release_write_end.is_none());
     backend.finish_diskless_relay_if_ready();
@@ -938,6 +973,162 @@ fn diskless_completion_waits_for_each_classic_target_outcome() {
             .expect("idempotent completion must retain the relay")
             .completion_announced
     );
+}
+
+#[test]
+fn deferred_dual_reply_overrun_can_retire_the_completed_relay() {
+    use crate::runtime::server::worker::distributed::replication::diskless_child::DisklessRelay;
+
+    let mut backend = ServerWorkerState::new(1).unwrap();
+    let (main_token, _peer) = add_runtime_connection(&mut backend);
+    let replica_id = backend.replication_runtime.register_primary(
+        ConnectionId(main_token),
+        ReplicaConnectionInfo {
+            ip: "127.0.0.1".to_string(),
+            port: 6381,
+            capability: vec!["eof".to_string(), "dual-channel".to_string()],
+            rdb_filter_mode: crate::framework::distributed::replication::RdbFilterMode::All,
+        },
+    );
+    backend
+        .ctx
+        .config_mut()
+        .replication
+        .normal_output_buffer_hard_limit = 1;
+    backend
+        .full_sync
+        .paused_dual_main_replies
+        .insert(Token(main_token), vec![b"+OK\r\n".to_vec(); 4096]);
+    backend.full_sync.diskless_relay = Some(DisklessRelay {
+        transfer_id: crate::runtime::server::worker::reactor::sources::TransferId(0),
+        source: None,
+        child_release_write_end: None,
+        targets: vec![replica_id.into()],
+        marker: Vec::new(),
+        complete_full_resync: false,
+        not_before_ms: 0,
+        eof_reached: true,
+        marker_queued_targets: [replica_id.into()].into_iter().collect(),
+        marker_sent_targets: [replica_id.into()].into_iter().collect(),
+        completion_announced: false,
+        completion_state: crate::runtime::server::worker::distributed::replication::diskless_child::DisklessCompletionState::default(),
+    });
+
+    backend.finish_diskless_relay_if_ready();
+
+    assert!(!backend.connection_registry.contains(Token(main_token)));
+    assert!(backend.full_sync.diskless_relay.is_none());
+    assert!(backend.full_sync.paused_dual_main_replies.is_empty());
+    assert_eq!(
+        backend
+            .ctx
+            .stats()
+            .client_output_buffer_limit_disconnections,
+        1
+    );
+}
+
+#[test]
+fn paused_replica_ack_preserves_read_backpressure_after_writable_drain() {
+    use crate::foundation::io::transport::Interest;
+    use crate::framework::distributed::replication::ReplicaAction;
+
+    for uses_replica_action in [false, true] {
+        let (mut backend, main, _peer) = classic_blocked_rdb_receiver();
+        backend
+            .replication_runtime
+            .set_replica_main_read_paused(true);
+        backend
+            .transport
+            .set_interest(main, Interest::None)
+            .unwrap();
+        backend.transport.clear_interest_requests_for_test();
+        let frame = protocol::encode_command(&[b"REPLCONF", b"ACK", b"0"]);
+        if uses_replica_action {
+            backend.queue_replica_actions(main.0, vec![ReplicaAction::Send(frame)]);
+        } else {
+            assert!(backend.queue_client_reply(main, frame));
+        }
+        assert_eq!(
+            backend.transport.last_set_interest_calls_for_test().last(),
+            Some(&(main, Interest::Writable)),
+            "ACK output must not resume a primary stream paused by the pending buffer"
+        );
+
+        backend.handle_writable(main);
+
+        assert!(!backend.connection_registry[main].has_pending_output());
+        assert!(backend.replication_runtime.replica_main_read_paused());
+        assert_eq!(
+            backend.transport.last_set_interest_calls_for_test().last(),
+            Some(&(main, Interest::None)),
+            "a drained paused stream must not keep polling a writable socket"
+        );
+    }
+}
+
+#[test]
+fn paused_dual_relay_disables_ordinary_socket_events_until_abort() {
+    use crate::foundation::io::transport::{Interest, ReadOutcome};
+    use crate::runtime::server::worker::distributed::replication::diskless_child::DisklessRelay;
+    use crate::runtime::server::worker::sessions::read::ClientReadMode;
+
+    for has_eof in [false, true] {
+        let mut backend = ServerWorkerState::new(1).unwrap();
+        let (ordinary, _peer) = add_runtime_connection(&mut backend);
+        backend.ctx.config_mut().server.debug_pause_after_fork = true;
+        backend.full_sync.diskless_relay = Some(DisklessRelay {
+            transfer_id: crate::runtime::server::worker::reactor::sources::TransferId(0),
+            source: None,
+            child_release_write_end: None,
+            targets: Vec::new(),
+            marker: Vec::new(),
+            complete_full_resync: false,
+            not_before_ms: 0,
+            eof_reached: false,
+            marker_queued_targets: std::collections::HashSet::new(),
+            marker_sent_targets: std::collections::HashSet::new(),
+            completion_announced: false,
+            completion_state: crate::runtime::server::worker::distributed::replication::diskless_child::DisklessCompletionState::default(),
+        });
+        backend.transport.clear_interest_requests_for_test();
+
+        backend.process_client_read_outcome(
+            Token(ordinary),
+            ClientReadMode::Fair,
+            protocol::encode_command(&[b"PING"]),
+            if has_eof {
+                ReadOutcome::PeerClosed
+            } else {
+                ReadOutcome::Quiescent
+            },
+        );
+
+        assert!(backend.connection_registry.contains(Token(ordinary)));
+        assert!(backend
+            .full_sync
+            .paused_dual_clients
+            .contains(&Token(ordinary)));
+        assert!(backend.connection_registry[Token(ordinary)]
+            .parser
+            .has_pending_data());
+        assert_eq!(
+            backend.transport.last_set_interest_calls_for_test().last(),
+            Some(&(Token(ordinary), Interest::None))
+        );
+
+        backend
+            .drop_diskless_relay_target(crate::framework::distributed::replication::ReplicaId(1));
+
+        assert!(backend.full_sync.paused_dual_clients.is_empty());
+        assert_eq!(
+            backend.transport.last_set_interest_calls_for_test().last(),
+            Some(&(Token(ordinary), Interest::Readable))
+        );
+        assert!(backend.event_batch.contains_runnable(
+            crate::runtime::server::worker::reactor::RunnableKey::ClientRead(Token(ordinary))
+        ));
+    }
 }
 
 #[test]
@@ -967,13 +1158,13 @@ fn classic_diskless_ack_wait_does_not_poll_or_reread_completed_pipe() {
         transfer_id: crate::runtime::server::worker::reactor::sources::TransferId(0),
         source: None,
         child_release_write_end: Some(File::open("/dev/null").unwrap()),
-        targets: vec![replica_id],
+        targets: vec![replica_id.into()],
         marker: Vec::new(),
         complete_full_resync: true,
         not_before_ms: 0,
         eof_reached: true,
         marker_queued_targets: std::collections::HashSet::new(),
-        marker_sent_targets: [replica_id].into_iter().collect(),
+        marker_sent_targets: [replica_id.into()].into_iter().collect(),
         completion_announced: false,
         completion_state: crate::runtime::server::worker::distributed::replication::diskless_child::DisklessCompletionState::default(),
     });
@@ -1059,7 +1250,7 @@ fn early_diskless_child_success_waits_for_pipe_and_target_facts() {
         transfer_id: crate::runtime::server::worker::reactor::sources::TransferId(0),
         source: None,
         child_release_write_end: None,
-        targets: vec![replica_id],
+        targets: vec![replica_id.into()],
         marker: Vec::new(),
         complete_full_resync: true,
         not_before_ms: 0,
@@ -2593,7 +2784,7 @@ fn replica_output_hard_limit_ignores_active_snapshot_queue() {
         transfer_id: crate::runtime::server::worker::reactor::sources::TransferId(0),
         source: None,
         child_release_write_end: None,
-        targets: vec![replica_id],
+        targets: vec![replica_id.into()],
         marker: Vec::new(),
         complete_full_resync: true,
         not_before_ms: 0,
@@ -2655,7 +2846,7 @@ fn active_diskless_relay_reaps_abnormally_exited_child() {
         transfer_id: crate::runtime::server::worker::reactor::sources::TransferId(0),
         source: None,
         child_release_write_end: None,
-        targets: vec![replica_id],
+        targets: vec![replica_id.into()],
         marker: Vec::new(),
         complete_full_resync: true,
         not_before_ms: 0,

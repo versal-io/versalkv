@@ -253,6 +253,10 @@ impl ServerWorkerState {
                     self.remove_connection(token.0);
                     return;
                 }
+                if self.pause_dual_relay_client_if_needed(token) {
+                    self.release_io_worker_write_socket_lease(id);
+                    return;
+                }
                 if self.connection_registry[Token(connection_token)].has_pending_output() {
                     if matches!(outcome, WriteOutcome::BudgetExhausted) {
                         self.schedule_runtime_runnable_next_turn(
@@ -404,6 +408,9 @@ impl ServerWorkerState {
     /// (replication.c:1902-1908).
     pub(crate) fn flush_connection_output(&mut self, connection_token: usize) -> WriteOutcome {
         let token_value = self.connection_registry[Token(connection_token)].token().0;
+        if self.pause_dual_relay_client_if_needed(Token(token_value)) {
+            return WriteOutcome::Backpressured;
+        }
         let is_master_link = self.is_master_link(token_value);
         let is_slot_export =
             is_slot_export_connection(&self.connection_registry[Token(connection_token)]);
@@ -485,6 +492,9 @@ impl ServerWorkerState {
         token: Token,
         should_wait_for_replication: bool,
     ) {
+        if self.pause_dual_relay_client_if_needed(token) {
+            return;
+        }
         if !self.socket_write_owned_by_main_thread(token) {
             return;
         }
@@ -542,8 +552,8 @@ impl ServerWorkerState {
             self.finish_partial_writable(&context, &flush.result);
         }
         if matches!(&flush.result, WriteOutcome::Complete) {
+            self.on_diskless_connection_writable(context.token);
             if let Some(id) = replica_target {
-                let _ = self.on_diskless_target_writable(id);
                 let _ = self.on_disk_sync_batch_target_writable(id);
             }
             if context.is_slot_export() {
@@ -841,11 +851,7 @@ impl ServerWorkerState {
 
     fn rearm_drained_writable(&mut self, token: Token, keep_master_paused: bool) -> bool {
         let interest = if keep_master_paused {
-            if self.ctx.persistence().forkless_capture_in_progress() {
-                Interest::None
-            } else {
-                Interest::Writable
-            }
+            Interest::None
         } else {
             Interest::Readable
         };

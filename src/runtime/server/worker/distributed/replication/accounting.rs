@@ -161,7 +161,12 @@ impl ServerWorkerState {
     pub(super) fn active_replication_transfer_floor(&self) -> Option<BacklogCursor> {
         let mut targets = Vec::new();
         if let Some(relay) = &self.full_sync.diskless_relay {
-            targets.extend(relay.targets.iter().copied());
+            targets.extend(
+                relay
+                    .targets
+                    .iter()
+                    .filter_map(|target| self.diskless_target_replica_id(*target)),
+            );
         }
         if let Some(batch) = &self.full_sync.disk_sync_batch {
             targets.extend(batch.target_ids());
@@ -388,19 +393,17 @@ impl ServerWorkerState {
     }
 
     fn replica_snapshot_transfer_active(&self, connection_id: ConnectionId) -> bool {
-        self.replication_runtime
-            .replica_id_for_connection(connection_id)
-            .is_some_and(|id| {
-                self.full_sync
-                    .diskless_relay
-                    .as_ref()
-                    .is_some_and(|relay| relay.targets.contains(&id))
-                    || self
-                        .full_sync
+        self.diskless_relay_target_for_connection(connection_id)
+            .is_some()
+            || self
+                .replication_runtime
+                .replica_id_for_connection(connection_id)
+                .is_some_and(|id| {
+                    self.full_sync
                         .disk_sync_batch
                         .as_ref()
                         .is_some_and(|batch| batch.contains_target(id))
-            })
+                })
     }
 
     fn evaluate_main_output_buffer_entries(

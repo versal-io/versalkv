@@ -7,6 +7,43 @@ use crate::foundation::io::transport::{Interest, WriteOutcome};
 use crate::framework::capabilities::io::Token;
 
 impl ServerWorkerState {
+    pub(crate) fn dual_relay_parent_pause_pending(&self) -> bool {
+        self.ctx.config().server.debug_pause_after_fork
+            && self
+                .full_sync
+                .diskless_relay
+                .as_ref()
+                .is_some_and(|relay| !relay.complete_full_resync && !relay.completion_announced)
+    }
+
+    pub(crate) fn pause_dual_relay_client_if_needed(&mut self, token: Token) -> bool {
+        let has_reply_barrier = self.full_sync.paused_dual_main_replies.contains_key(&token);
+        let is_ordinary = self
+            .replication_runtime
+            .role(crate::framework::distributed::replication::ConnectionId(
+                token.0,
+            ))
+            .is_none();
+        if !self.connection_registry.contains(token)
+            || (!has_reply_barrier && !(is_ordinary && self.dual_relay_parent_pause_pending()))
+        {
+            return false;
+        }
+        // A stopped C parent cannot parse commands or deliver asynchronous
+        // replies. Only the RDB transport must progress in our parent relay.
+        self.full_sync.paused_dual_clients.insert(token);
+        self.cancel_runtime_runnable(
+            crate::runtime::server::worker::reactor::RunnableKey::ClientRead(token),
+        );
+        self.cancel_runtime_runnable(
+            crate::runtime::server::worker::reactor::RunnableKey::ClientWrite(token),
+        );
+        if self.transport.set_interest(token, Interest::None).is_err() {
+            self.remove_connection(token.0);
+        }
+        true
+    }
+
     pub(crate) fn prepare_slot_import_output(&mut self, connection_token: usize) -> bool {
         let became_slot_import = self.connection_registry.get(crate::framework::capabilities::io::Token(connection_token)).is_some_and(|connection| {
             matches!(
@@ -27,6 +64,21 @@ impl ServerWorkerState {
         replies: &mut Vec<Vec<u8>>,
     ) -> bool {
         let trace_rdb_ok = self.should_trace_rdb_ok(connection_token, token_value, replies);
+        if self
+            .full_sync
+            .paused_dual_main_replies
+            .contains_key(&Token(token_value))
+        {
+            // C's dual-channel child can transmit RDB while the parent is stopped.
+            // The parent-owned pipe relay must finish that transport work first.
+            // Its main-channel association reply stays pending until resume.
+            self.full_sync
+                .paused_dual_main_replies
+                .entry(Token(token_value))
+                .or_default()
+                .append(replies);
+            return false;
+        }
         let mut needs_flush = false;
         if self
             .connection_registry
@@ -187,6 +239,9 @@ impl ServerWorkerState {
             .connection_registry
             .contains(crate::framework::capabilities::io::Token(connection_token))
         {
+            return;
+        }
+        if self.pause_dual_relay_client_if_needed(Token(token_value)) {
             return;
         }
         use crate::engine::command::context::ConnectionState;

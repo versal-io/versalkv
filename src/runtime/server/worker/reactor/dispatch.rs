@@ -285,7 +285,8 @@ impl ServerWorkerState {
         match key {
             RunnableKey::ClientRead(_)
             | RunnableKey::DeferredReadiness(_)
-            | RunnableKey::ReplicationAction(_) => BeforePollSlot::PreAof,
+            | RunnableKey::ReplicationAction(_)
+            | RunnableKey::ReplicaRdbDecode(_) => BeforePollSlot::PreAof,
             RunnableKey::ClientWrite(token) => {
                 let connection_id =
                     crate::framework::distributed::replication::ConnectionId(token.0);
@@ -747,7 +748,8 @@ impl ServerWorkerState {
                 }
                 super::RunnableKey::DeferredReadiness(_) => EventDependencies::safe_producer(),
                 super::RunnableKey::ClusterBeforeSleep
-                | super::RunnableKey::ReplicationAction(_) => EventDependencies::safe_producer(),
+                | super::RunnableKey::ReplicationAction(_)
+                | super::RunnableKey::ReplicaRdbDecode(_) => EventDependencies::safe_producer(),
                 #[cfg(test)]
                 super::RunnableKey::Test(_) => EventDependencies::none(),
             },
@@ -811,6 +813,9 @@ impl ServerWorkerState {
             RunnableKey::ClusterBeforeSleep => self.recompute_cluster_state_before_sleep(),
             RunnableKey::ReplicationAction(action) => {
                 self.drive_pending_replication_action(action);
+            }
+            RunnableKey::ReplicaRdbDecode(session_id) => {
+                self.drive_pending_replica_rdb_decode(session_id);
             }
             #[cfg(test)]
             RunnableKey::Test(_) => {}

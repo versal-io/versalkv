@@ -757,6 +757,11 @@ impl ServerWorkerState {
         connection_token: usize,
         link: &mut ReplicaLink,
     ) -> Result<(), ()> {
+        // Finish the already buffered local stream before admitting newer
+        // socket bytes, as C's dualChannelSyncSuccess does before rearming.
+        if self.replica_main_read_is_paused(Token(connection_token)) {
+            return Ok(());
+        }
         let Some(conn) = self
             .connection_registry
             .get(crate::framework::capabilities::io::Token(connection_token))

@@ -1235,7 +1235,7 @@ mod tests {
             .diskless_relay
             .as_ref()
             .expect("the released child slot must start the pipe relay");
-        assert!(relay.targets.is_empty());
+        assert_eq!(relay.targets.len(), 1);
         rdb_target
             .set_read_timeout(Some(Duration::from_secs(1)))
             .unwrap();
@@ -1273,7 +1273,7 @@ mod tests {
                 .as_ref()
                 .map(|relay| relay.targets.len()),
             Some(1),
-            "the pipe relay must attach the associated primary target"
+            "association must preserve the existing RDB transport target"
         );
         let relay_child_pid = backend.ctx.persistence().diskless_child_pid();
 

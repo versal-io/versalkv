@@ -1,17 +1,34 @@
 use super::super::super::ServerWorkerState;
 use crate::foundation::io::transport::{Interest, OwnedPollSource, WriteOutcome};
 use crate::framework::capabilities::io::Token;
-use crate::framework::distributed::replication::{ConnectionId, ReplicaId};
+use crate::framework::distributed::replication::{ConnectionId, PrimaryLinkState, ReplicaId};
 use crate::runtime::server::worker::reactor::sources::{RuntimeSourceHandle, TransferId};
 use crate::runtime::server::worker::reactor::transport::PendingRemovalOwner;
 use std::collections::HashSet;
 use std::io::Write;
 use std::os::unix::io::AsRawFd;
 
+/// Classic transport follows a stable replica identity. Dual transport owns
+/// the dedicated RDB session from the start of the snapshot, before pairing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum DisklessTarget {
+    Replica(ReplicaId),
+    Rdb {
+        connection_id: ConnectionId,
+        client_id: u64,
+    },
+}
+
+impl From<ReplicaId> for DisklessTarget {
+    fn from(id: ReplicaId) -> Self {
+        Self::Replica(id)
+    }
+}
+
 /// In-flight diskless fork relay: bytes stream from the child's pipe to every
 /// replica in this batch until EOF, then the trailing `$EOF` marker is sent.
-/// Classic targets must acknowledge that boundary (or be removed) before the
-/// child is released and reaped.
+/// The producer is released once every marker drains. Classic targets must
+/// acknowledge that boundary (or be removed) before final relay publication.
 pub(crate) struct DisklessRelay {
     pub(crate) transfer_id: TransferId,
     pub(crate) source: Option<RuntimeSourceHandle>,
@@ -19,13 +36,9 @@ pub(crate) struct DisklessRelay {
     /// byte after every EOF marker drains explicitly releases the child; EOF
     /// remains a fallback when the parent exits.
     pub(crate) child_release_write_end: Option<std::fs::File>,
-    /// `ReplicaId` for every replica receiving this snapshot. The connection_token is
-    /// NOT cached: a connection can close between ticks and its slab slot be
-    /// reused by another client, so a stale connection_token would misdeliver the RDB
-    /// stream (ABA). Instead each tick re-resolves the connection_token from the link's
-    /// live `connection_id`, exactly as `pump_full_resync_transfers` and
-    /// `propagate_to_replicas` do.
-    pub(crate) targets: Vec<ReplicaId>,
+    /// Fixed snapshot cohort. Dedicated RDB tokens are validated against the
+    /// public client identity on every access to reject reused transport slots.
+    pub(crate) targets: Vec<DisklessTarget>,
     /// Trailing marker to append after the RDB body ($EOF framing).
     pub(crate) marker: Vec<u8>,
     pub(crate) complete_full_resync: bool,
@@ -33,8 +46,8 @@ pub(crate) struct DisklessRelay {
     pub(crate) eof_reached: bool,
     /// Targets whose EOF marker has been queued but is not fully flushed yet.
     /// The marker must be queued once across Partial/WouldBlock retries.
-    pub(crate) marker_queued_targets: HashSet<ReplicaId>,
-    pub(crate) marker_sent_targets: HashSet<ReplicaId>,
+    pub(crate) marker_queued_targets: HashSet<DisklessTarget>,
+    pub(crate) marker_sent_targets: HashSet<DisklessTarget>,
     pub(crate) completion_announced: bool,
     pub(crate) completion_state: DisklessCompletionState,
 }
@@ -156,16 +169,17 @@ impl ServerWorkerState {
         crate::runtime::server::worker::reactor::DispatchOutcome::Handled
     }
 
+    #[cfg(test)]
     pub(crate) fn on_diskless_target_writable(
         &mut self,
         id: ReplicaId,
     ) -> crate::runtime::server::worker::reactor::DispatchOutcome {
-        if self
-            .full_sync
-            .diskless_relay
-            .as_ref()
-            .is_none_or(|relay| !relay.targets.contains(&id))
-        {
+        if self.full_sync.diskless_relay.as_ref().is_none_or(|relay| {
+            !relay
+                .targets
+                .iter()
+                .any(|target| self.diskless_target_replica_id(*target) == Some(id))
+        }) {
             return crate::runtime::server::worker::reactor::DispatchOutcome::Stale;
         }
         self.flush_diskless_relay_targets();
@@ -173,27 +187,16 @@ impl ServerWorkerState {
         crate::runtime::server::worker::reactor::DispatchOutcome::Handled
     }
 
-    pub(crate) fn on_diskless_target_closed(
-        &mut self,
-        id: ReplicaId,
-    ) -> crate::runtime::server::worker::reactor::DispatchOutcome {
-        if self.full_sync.diskless_relay.is_none() {
-            return crate::runtime::server::worker::reactor::DispatchOutcome::Stale;
-        }
-        self.drop_diskless_relay_target(id);
-        crate::runtime::server::worker::reactor::DispatchOutcome::Handled
-    }
-
     pub(crate) fn on_diskless_terminal_ack(
         &mut self,
         id: ReplicaId,
     ) -> crate::runtime::server::worker::reactor::DispatchOutcome {
-        if self
-            .full_sync
-            .diskless_relay
-            .as_ref()
-            .is_none_or(|relay| !relay.targets.contains(&id))
-        {
+        if self.full_sync.diskless_relay.as_ref().is_none_or(|relay| {
+            !relay
+                .targets
+                .iter()
+                .any(|target| self.diskless_target_replica_id(*target) == Some(id))
+        }) {
             return crate::runtime::server::worker::reactor::DispatchOutcome::Stale;
         }
         self.finish_diskless_relay_if_ready();
@@ -244,8 +247,18 @@ impl ServerWorkerState {
         sync_target_label: &'static str,
         pause_after_fork: bool,
     ) -> Option<(std::fs::File, Vec<u8>, std::fs::File)> {
-        if self.ctx.persistence().has_active_child() {
+        if self.ctx.persistence().has_active_child() || self.full_sync.diskless_relay.is_some() {
             return None;
+        }
+        if !pause_after_fork && self.ctx.config().server.debug_pause_after_fork {
+            if let Err(error) = self.quiesce_ordinary_threaded_writes() {
+                crate::server_log!(
+                    warning,
+                    "Failed to reclaim ordinary writes before the dual-channel pause: {}",
+                    error
+                );
+                return None;
+            }
         }
         let child = crate::framework::commands::server::save::fork_diskless_rdb_child_with_options(
             &mut self.ctx,
@@ -285,17 +298,6 @@ impl ServerWorkerState {
                 "diskless replication fork pause: pid={} phase=after-sigcont",
                 child.pid
             );
-        } else if !pause_after_fork
-            && self.ctx.config().server.debug_pause_after_fork
-            && self.ctx.config().server.debug_delay_rdb_client_free_seconds >= 60
-            && crate::framework::capabilities::process::stop_current_process_temporarily(500)
-                .is_ok()
-        {
-            crate::server_log!(
-                debug,
-                "dual-channel diskless fork pause: pid={} phase=after-auto-sigcont",
-                child.pid
-            );
         }
         let _ = crate::foundation::io::sys::fd::set_nonblocking(
             std::os::fd::AsFd::as_fd(&child.data_read_end),
@@ -314,6 +316,25 @@ impl ServerWorkerState {
         child_release_write_end: std::fs::File,
         marker: Vec<u8>,
         targets: Vec<ReplicaId>,
+        complete_full_resync: bool,
+        not_before_ms: i64,
+    ) {
+        self.store_diskless_transport_relay(
+            read_end,
+            child_release_write_end,
+            marker,
+            targets.into_iter().map(DisklessTarget::Replica).collect(),
+            complete_full_resync,
+            not_before_ms,
+        );
+    }
+
+    pub(crate) fn store_diskless_transport_relay(
+        &mut self,
+        read_end: std::fs::File,
+        child_release_write_end: std::fs::File,
+        marker: Vec<u8>,
+        targets: Vec<DisklessTarget>,
         complete_full_resync: bool,
         not_before_ms: i64,
     ) {
@@ -362,29 +383,35 @@ impl ServerWorkerState {
             completion_state: DisklessCompletionState::default(),
         });
         if !has_targets {
-            let _ = self.transport.set_source_enabled(source.token, false);
+            self.abort_empty_diskless_relay();
         }
     }
 
-    pub(crate) fn associate_diskless_relay_target(
-        &mut self,
-        _rdb: ConnectionId,
-        main: ConnectionId,
-    ) {
-        let Some(id) = self.replication_runtime.primary_id(main) else {
-            return;
-        };
-        let source = {
-            let Some(relay) = self.full_sync.diskless_relay.as_mut() else {
-                return;
-            };
-            if !relay.targets.contains(&id) {
-                relay.targets.push(id);
-            }
-            relay.source
-        };
-        if let Some(source) = source {
-            let _ = self.transport.set_source_enabled(source.token, true);
+    pub(crate) fn diskless_relay_target_for_connection(
+        &self,
+        connection_id: ConnectionId,
+    ) -> Option<DisklessTarget> {
+        self.full_sync
+            .diskless_relay
+            .as_ref()?
+            .targets
+            .iter()
+            .copied()
+            .find(|target| {
+                self.diskless_target_token(*target) == Some(Token(connection_id.0))
+                    || self.diskless_target_replica_id(*target)
+                        == self.replication_runtime.primary_id(connection_id)
+                        && self.replication_runtime.primary_id(connection_id).is_some()
+            })
+    }
+
+    pub(crate) fn on_diskless_connection_writable(&mut self, token: Token) {
+        if self
+            .diskless_relay_target_for_connection(ConnectionId(token.0))
+            .is_some()
+        {
+            self.flush_diskless_relay_targets();
+            self.finish_diskless_relay_if_ready();
         }
     }
 
@@ -395,12 +422,40 @@ impl ServerWorkerState {
     /// between adjacent full-sync attempts, or a deferred second sync can wait
     /// indefinitely behind a killed child. Call this from `remove_connection`
     /// with the `ReplicaId` resolved before the `PrimaryLink` is erased.
+    #[cfg(test)]
     pub(crate) fn drop_diskless_relay_target(&mut self, id: ReplicaId) {
+        if self
+            .full_sync
+            .diskless_relay
+            .as_ref()
+            .is_some_and(|relay| relay.targets.is_empty())
+        {
+            self.abort_empty_diskless_relay();
+            return;
+        }
+        let target = self.full_sync.diskless_relay.as_ref().and_then(|relay| {
+            relay
+                .targets
+                .iter()
+                .copied()
+                .find(|target| self.diskless_target_replica_id(*target) == Some(id))
+        });
+        if let Some(target) = target {
+            self.drop_diskless_transport_target(target);
+        }
+    }
+
+    pub(crate) fn drop_diskless_transport_target(&mut self, target: DisklessTarget) {
         let has_survivors = {
             let Some(relay) = self.full_sync.diskless_relay.as_mut() else {
                 return;
             };
-            relay.targets.retain(|&t| t != id);
+            if !relay.targets.contains(&target) {
+                return;
+            }
+            relay.targets.retain(|&t| t != target);
+            relay.marker_queued_targets.remove(&target);
+            relay.marker_sent_targets.remove(&target);
             !relay.targets.is_empty()
         };
         if has_survivors {
@@ -408,6 +463,10 @@ impl ServerWorkerState {
             self.enable_diskless_source_if_unblocked();
             return;
         }
+        self.abort_empty_diskless_relay();
+    }
+
+    fn abort_empty_diskless_relay(&mut self) {
         if let Some(pid) = self.ctx.persistence().diskless_child_pid() {
             crate::server_log!(
                 notice,
@@ -429,79 +488,132 @@ impl ServerWorkerState {
             self.ctx.persistence_mut().complete_diskless_child();
             self.register_active_persistence_child();
         }
+        // The relay no longer has transport work that could require a pause.
+        // Surviving main channels may retain a PSYNC grace wait after their
+        // RDB channel closes, so their association reply must not be stranded.
+        self.release_paused_dual_main_replies();
     }
 
     pub(crate) fn finish_diskless_relay_if_ready(&mut self) {
-        let ready = self.full_sync.diskless_relay.as_ref().is_some_and(|relay| {
-            !relay.completion_announced
-                && relay.eof_reached
+        let is_drained = self.full_sync.diskless_relay.as_ref().is_some_and(|relay| {
+            relay.eof_reached
                 && relay
                     .targets
                     .iter()
                     .all(|id| relay.marker_sent_targets.contains(id))
-                && (!relay.complete_full_resync
-                    || relay.targets.iter().all(|id| {
-                        self.replication_runtime
-                            .primary_link(*id)
-                            .is_some_and(|link| {
-                                link.state()
-                                    == crate::framework::distributed::replication::PrimaryLinkState::Streaming
-                            })
-                    }))
         });
-        if !ready {
+        if !is_drained {
             return;
         }
         let relay = self
             .full_sync
             .diskless_relay
             .as_mut()
-            .expect("ready diskless relay must remain installed");
+            .expect("drained diskless relay must remain installed");
         relay.completion_state.apply_fact(DisklessFact::PipeEof);
         relay
             .completion_state
             .apply_fact(DisklessFact::MarkersFlushed);
-        relay
-            .completion_state
-            .apply_fact(DisklessFact::TerminalAckSatisfied);
-        // Keep the upstream message text for compatibility, but emit it only
-        // after Rust has reconciled terminal ACKs and removals rather than at
-        // the physical pipe-EOF instant used by C Valkey.
-        crate::server_log!(
-            notice,
-            "Diskless rdb transfer, done reading from pipe, {} replicas still up.",
-            relay.targets.len()
-        );
-        let should_pause_after_dual_relay =
-            !relay.complete_full_resync && self.ctx.config().server.debug_pause_after_fork;
-        relay.completion_announced = true;
-        if should_pause_after_dual_relay
-            && crate::framework::commands::server::save::pause_parent_after_replication_fork(
-                &self.ctx,
-            )
-        {
-            crate::server_log!(
-                debug,
-                "dual-channel diskless relay pause: phase=after-sigcont"
-            );
-        }
-        let relay = self
-            .full_sync
-            .diskless_relay
-            .as_mut()
-            .expect("ready diskless relay must remain installed");
+        // C announces physical transport completion and releases the child
+        // before the terminal ACK admits the replication command stream.
         relay.release_child();
+        if !relay.completion_announced {
+            crate::server_log!(
+                notice,
+                "Diskless rdb transfer, done reading from pipe, {} replicas still up.",
+                relay.targets.len()
+            );
+            let should_pause_after_dual_relay =
+                !relay.complete_full_resync && self.ctx.config().server.debug_pause_after_fork;
+            relay.completion_announced = true;
+            if should_pause_after_dual_relay
+                && crate::framework::commands::server::save::pause_parent_after_replication_fork(
+                    &self.ctx,
+                )
+            {
+                crate::server_log!(
+                    debug,
+                    "dual-channel diskless relay pause: phase=after-sigcont"
+                );
+            }
+            self.release_paused_dual_main_replies();
+        }
+        // Reply enqueueing may synchronously close the last target after an
+        // output-buffer overrun and retire the relay along with its child.
+        let Some(relay) = self.full_sync.diskless_relay.as_mut() else {
+            return;
+        };
+        if !relay.complete_full_resync
+            || relay.targets.iter().all(|id| {
+                self.replication_runtime
+                    .primary_link(match id {
+                        DisklessTarget::Replica(id) => *id,
+                        DisklessTarget::Rdb { .. } => return false,
+                    })
+                    .is_some_and(|link| link.state() == PrimaryLinkState::Streaming)
+            })
+        {
+            relay
+                .completion_state
+                .apply_fact(DisklessFact::TerminalAckSatisfied);
+        }
         let _ = self.reap_diskless_relay_child_if_done();
     }
 
-    /// Resolve a live `connection_token` for a replica id, preferring the associated
-    /// RDB channel when the primary link is in `WaitingForMainPsync` and the
-    /// RDB channel token is still valid in the connection registry. Falls
-    /// back to the main connection's token when the dual-state guard doesn't
-    /// match, no RDB channel is associated, or the RDB channel token is stale
-    /// — double defense so a stale or missing RDB channel never drops bytes.
-    /// Re-resolving each tick avoids retaining registry-internal storage.
-    fn diskless_target_token(&self, id: ReplicaId) -> Option<Token> {
+    fn release_paused_dual_main_replies(&mut self) {
+        // Remove all barriers before rescheduling or enqueueing output.
+        let deferred_replies = std::mem::take(&mut self.full_sync.paused_dual_main_replies);
+        let paused_clients = std::mem::take(&mut self.full_sync.paused_dual_clients);
+        for token in paused_clients {
+            let Some(connection) = self.connection_registry.get(token) else {
+                continue;
+            };
+            let interest = if connection.has_pending_output() {
+                Interest::ReadWritable
+            } else {
+                Interest::Readable
+            };
+            if self.transport.set_interest(token, interest).is_err() {
+                self.remove_connection(token.0);
+                continue;
+            }
+            self.queue_client_for_reprocessing(token);
+            self.schedule_ordinary_write(token.0);
+        }
+        for (token, replies) in deferred_replies {
+            for reply in replies {
+                self.queue_client_reply(token, reply);
+            }
+        }
+    }
+
+    /// Pairing changes the command-stream owner, never the RDB transport cohort.
+    pub(super) fn diskless_target_replica_id(&self, target: DisklessTarget) -> Option<ReplicaId> {
+        match target {
+            DisklessTarget::Replica(id) => Some(id),
+            DisklessTarget::Rdb { connection_id, .. } => {
+                self.diskless_target_token(target)?;
+                self.replication_runtime
+                    .replica_id_for_connection(connection_id)
+            }
+        }
+    }
+
+    fn diskless_target_token(&self, target: DisklessTarget) -> Option<Token> {
+        let id = match target {
+            DisklessTarget::Replica(id) => id,
+            DisklessTarget::Rdb {
+                connection_id,
+                client_id,
+            } => {
+                let token = Token(connection_id.0);
+                return self
+                    .connection_registry
+                    .get(token)
+                    .filter(|connection| connection.client_id() == client_id)
+                    .map(|_| token);
+            }
+        };
         let link = self.replication_runtime.primary_link(id)?;
         let main_connection_id = link.connection_id();
         let target_connection_id = self
@@ -523,21 +635,17 @@ impl ServerWorkerState {
     /// primary link's own connection, never the RDB channel. Used for the
     /// backlog tail flush after EOF, which belongs to the main link's owner
     /// socket even in dual-channel mode.
-    fn diskless_main_target_token(&self, id: ReplicaId) -> Option<Token> {
+    fn diskless_main_target_token(&self, target: DisklessTarget) -> Option<Token> {
+        let id = self.diskless_target_replica_id(target)?;
         let main_connection_id = self.replication_runtime.primary_link(id)?.connection_id();
         let token = Token(main_connection_id.0);
         self.connection_registry.contains(token).then_some(token)
     }
 
-    /// Cron fallback that retires a lingering diskless child once its relay has
-    /// finished. The EOF / error / orphan paths reap with a single
-    /// `waitpid(WNOHANG)`, which races the child's `close(write_fd)` → `_exit`
-    /// window: the parent can observe pipe EOF and reap *before* the child has
-    /// actually exited, so `WNOHANG` returns 0 and the single-child slot would
-    /// leak forever. Retrying each tick — but only when no relay is in flight —
-    /// drains that zombie. Gating on `diskless_relay.is_none()` is essential: an
-    /// active relay legitimately holds the child slot, and reaping it early would
-    /// let a second fork clobber the still-draining relay's pipe.
+    /// Collect the producer's exit independently of terminal ACK. Its process
+    /// slot and metrics end when it exits; the relay retains the completion
+    /// fact until all replica outcomes allow publication. New diskless forks
+    /// remain excluded while that relay still owns the transport cohort.
     pub(crate) fn collect_idle_diskless_child_exit(&mut self) {
         if self.full_sync.diskless_relay.is_some() {
             let _ = self.reap_diskless_relay_child_if_done();
@@ -601,22 +709,26 @@ impl ServerWorkerState {
             .unwrap_or_default();
         self.ctx.persistence_mut().abort_child();
         self.register_active_persistence_child();
-        let connections: Vec<Token> = targets
-            .iter()
-            .filter_map(|id| {
-                self.replication_runtime
-                    .primary_link(*id)
-                    .map(|link| Token(link.connection_id().0))
-            })
-            .collect();
-        for token in connections {
-            self.remove_connection(token.0);
-        }
-        self.refresh_replication_view();
+        self.close_diskless_relay_targets(&targets);
+        self.release_paused_dual_main_replies();
     }
 
     fn reap_diskless_relay_child_if_done(&mut self) -> bool {
         let Some(pid) = self.ctx.persistence().diskless_child_pid() else {
+            if self
+                .full_sync
+                .diskless_relay
+                .as_ref()
+                .is_some_and(|relay| relay.completion_state.published)
+            {
+                let relay = self
+                    .full_sync
+                    .diskless_relay
+                    .take()
+                    .expect("published diskless relay was verified above");
+                self.publish_diskless_relay_targets(relay);
+                return true;
+            }
             return false;
         };
         let Some((handle, child_succeeded)) = self.take_child_exit_success(
@@ -641,12 +753,14 @@ impl ServerWorkerState {
                 .apply_fact(DisklessFact::ChildExited(child_fact));
             relay.completion_state.published
         });
-        if child_succeeded && !ready_to_publish {
-            return false;
-        }
-        let relay = self.full_sync.diskless_relay.take();
+        // Reaping ends ownership of the PID and its permanently readable
+        // pidfd even when the relay is still waiting for a replica's ACK.
         self.ctx.persistence_mut().complete_diskless_child();
         self.finalize_child_registry_entry(handle);
+        if child_succeeded && !ready_to_publish {
+            return true;
+        }
+        let relay = self.full_sync.diskless_relay.take();
         if child_succeeded {
             if let Some(relay) = relay {
                 self.publish_diskless_relay_targets(relay);
@@ -661,17 +775,17 @@ impl ServerWorkerState {
                 })
                 .unwrap_or_default();
             self.close_diskless_relay_targets(&targets);
+            self.release_paused_dual_main_replies();
         }
         true
     }
 
-    fn close_diskless_relay_targets(&mut self, targets: &[ReplicaId]) {
+    fn close_diskless_relay_targets(&mut self, targets: &[DisklessTarget]) {
         let connections: Vec<Token> = targets
             .iter()
-            .filter_map(|id| {
-                self.replication_runtime
-                    .primary_link(*id)
-                    .map(|link| Token(link.connection_id().0))
+            .filter_map(|target| {
+                self.diskless_main_target_token(*target)
+                    .or_else(|| self.diskless_target_token(*target))
             })
             .collect();
         for token in connections {
@@ -691,6 +805,7 @@ impl ServerWorkerState {
             })
             .unwrap_or_default();
         self.close_diskless_relay_targets(&targets);
+        self.release_paused_dual_main_replies();
     }
 
     fn clear_diskless_relay_source(&mut self) {
@@ -716,7 +831,10 @@ impl ServerWorkerState {
                 .and_then(|connection_token| self.connection_registry.get(connection_token))
                 .map(|connection| connection.token());
             if !relay.complete_full_resync {
-                if let Some(link) = self.replication_runtime.primary_link_mut(id) {
+                if let Some(link) = self
+                    .diskless_target_replica_id(id)
+                    .and_then(|replica_id| self.replication_runtime.primary_link_mut(replica_id))
+                {
                     link.mark_dual_rdb_complete();
                 }
             }
@@ -778,6 +896,7 @@ impl ServerWorkerState {
             .unwrap_or_default();
         for id in targets {
             let Some(connection_token) = self.diskless_target_token(id) else {
+                self.drop_diskless_transport_target(id);
                 continue;
             };
             if !self
@@ -818,7 +937,7 @@ impl ServerWorkerState {
         }
     }
 
-    fn mark_diskless_marker_sent_if_drained(&mut self, id: ReplicaId) {
+    fn mark_diskless_marker_sent_if_drained(&mut self, id: DisklessTarget) {
         let should_mark = self.full_sync.diskless_relay.as_ref().is_some_and(|relay| {
             relay.eof_reached
                 && relay.marker_queued_targets.contains(&id)
@@ -840,7 +959,19 @@ impl ServerWorkerState {
             .diskless_relay
             .as_ref()
             .is_some_and(|relay| relay.complete_full_resync);
-        if let Some(link) = self.replication_runtime.primary_link_mut(id) {
+        self.complete_diskless_target(id, complete_full_resync);
+    }
+
+    fn complete_diskless_target(&mut self, target: DisklessTarget, complete_full_resync: bool) {
+        if let DisklessTarget::Rdb { connection_id, .. } = target {
+            if self.diskless_target_token(target).is_some() {
+                self.replication_runtime
+                    .mark_rdb_snapshot_complete(connection_id);
+            }
+        } else if let Some(link) = self
+            .diskless_target_replica_id(target)
+            .and_then(|id| self.replication_runtime.primary_link_mut(id))
+        {
             if complete_full_resync {
                 link.finish_full_resync();
             } else {
@@ -851,8 +982,8 @@ impl ServerWorkerState {
 
     /// Pump a diskless child's pipe into replica output queues. On EOF, append
     /// each `$EOF` marker and move classic targets into their terminal-ACK
-    /// wait. Once every survivor ACKs or is removed, release the child; a later
-    /// successful reap performs final relay publication and cleanup.
+    /// wait. Release the child after its markers drain; final publication also
+    /// requires every survivor to ACK or be removed and a successful child exit.
     fn service_diskless_relay_source(&mut self) {
         if self.full_sync.diskless_relay.is_none() {
             return;
@@ -953,9 +1084,9 @@ impl ServerWorkerState {
                         continue;
                     }
                     // Send the $EOF trailing marker over the RDB channel (or
-                    // main channel when dual-channel is inactive). The final
-                    // survivor notice is deferred until target outcomes are
-                    // known.
+                    // main channel when dual-channel is inactive). Transport
+                    // completion is announced after every surviving marker
+                    // drains, independently of later terminal ACKs.
                     let Some(rdb_connection_token) = self.diskless_target_token(id) else {
                         continue;
                     };
@@ -1000,14 +1131,8 @@ impl ServerWorkerState {
                         .diskless_relay
                         .as_ref()
                         .is_some_and(|relay| relay.complete_full_resync);
-                    if let Some(link) = self.replication_runtime.primary_link_mut(id) {
-                        if complete_full_resync {
-                            link.finish_full_resync();
-                            published_classic_online = true;
-                        } else {
-                            link.mark_dual_rdb_complete();
-                        }
-                    }
+                    self.complete_diskless_target(id, complete_full_resync);
+                    published_classic_online |= complete_full_resync;
                 }
                 if published_classic_online {
                     // C's replicaPutOnline() publishes ONLINE as soon as the
@@ -1017,22 +1142,11 @@ impl ServerWorkerState {
                     self.refresh_replication_view();
                 }
                 self.finish_diskless_relay_if_ready();
-                let finish_without_child = self.ctx.persistence().diskless_child_pid().is_none()
-                    && self
-                        .full_sync
-                        .diskless_relay
-                        .as_ref()
-                        .is_some_and(|relay| relay.completion_announced);
-                if finish_without_child {
-                    if let Some(relay) = self.full_sync.diskless_relay.take() {
-                        self.publish_diskless_relay_targets(relay);
-                    }
-                }
             }
             Ok(n) => {
                 let chunk = buf[..n].to_vec();
                 if let Some(relay) = self.full_sync.diskless_relay.as_ref() {
-                    let ids: Vec<ReplicaId> = relay.targets.clone();
+                    let ids = relay.targets.clone();
                     for id in ids {
                         // Re-resolve the socket each tick (ABA-safe); see the EOF
                         // branch and `diskless_target_token`.

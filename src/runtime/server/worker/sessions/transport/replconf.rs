@@ -497,11 +497,18 @@ impl ServerWorkerState {
         self.replication_runtime
             .associate_rdb_channel(connection_id, rdb_connection_id)
             .map_err(|_| format!("ERR Unrecognized RDB client id {public_client_id}"))?;
-        self.associate_diskless_relay_target(rdb_connection_id, connection_id);
         self.finalize_replconf_rdb_association(connection_id, rdb_connection_id);
         self.release_full_dual_snapshot_batch();
         self.log_replconf_rdb_association(connection_id, rdb_connection_id);
         self.drive_zero_delay_dual_snapshot(rdb_connection_id);
+        if self.dual_relay_parent_pause_pending() {
+            // Install the barrier at association, before another command in
+            // the same batch can change PSYNC state or produce a later reply.
+            self.full_sync
+                .paused_dual_main_replies
+                .entry(crate::framework::capabilities::io::Token(connection_id.0))
+                .or_default();
+        }
         Ok(())
     }
 

@@ -246,13 +246,19 @@ impl ReplicaLink {
     }
 
     pub fn has_pending_decompression(&self) -> bool {
-        self.compression_decoder
-            .as_ref()
-            .is_some_and(StreamDecoder::has_pending_decode)
+        self.has_pending_main_decompression()
             || self
                 .rdb_receive
                 .as_ref()
                 .is_some_and(RdbReceive::has_pending_decompression)
+    }
+
+    /// Pending command-stream decoding belongs to the main connection.
+    /// The independent dual-channel RDB receiver cannot make it readable.
+    pub fn has_pending_main_decompression(&self) -> bool {
+        self.compression_decoder
+            .as_ref()
+            .is_some_and(StreamDecoder::has_pending_decode)
     }
 
     pub fn compression_memory_bytes(&self) -> usize {

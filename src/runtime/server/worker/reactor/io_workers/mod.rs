@@ -155,16 +155,43 @@ impl WorkerCompletionQueue {
         self.sender.clone()
     }
 
-    pub(crate) fn drain(&mut self) -> Vec<WorkerCompletionEvent> {
+    pub(crate) fn stage_pending(&mut self) {
         self.sender.pending.store(false, Ordering::Release);
-        let mut events = Vec::new();
-        while let Some(event) = self.completed.pop_front() {
-            events.push(event);
-        }
         while let Ok(event) = self.receiver.try_recv() {
-            events.push(event);
+            self.completed.push_back(event);
         }
-        events
+    }
+
+    pub(crate) fn pop_staged(&mut self) -> Option<WorkerCompletionEvent> {
+        self.completed.pop_front()
+    }
+
+    pub(crate) fn drain(&mut self) -> Vec<WorkerCompletionEvent> {
+        self.stage_pending();
+        self.completed.drain(..).collect()
+    }
+
+    pub(crate) fn recv_write_completion(
+        &mut self,
+        id: IoOperationId,
+    ) -> Result<WriteCompletion, mpsc::RecvError> {
+        if let Some(index) = self.completed.iter().position(
+            |event| matches!(event, WorkerCompletionEvent::SocketWrite(completion) if completion.id == id),
+        ) {
+            if let Some(WorkerCompletionEvent::SocketWrite(completion)) = self.completed.remove(index)
+            {
+                return Ok(completion);
+            }
+        }
+        loop {
+            let event = self.receiver.recv()?;
+            match event {
+                WorkerCompletionEvent::SocketWrite(completion) if completion.id == id => {
+                    return Ok(completion);
+                }
+                event => self.completed.push_back(event),
+            }
+        }
     }
 
     #[cfg(test)]

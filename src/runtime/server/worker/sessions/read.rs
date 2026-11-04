@@ -104,6 +104,9 @@ impl ServerWorkerState {
             self.handle_master_link_readable(token_value, connection_token);
             return;
         }
+        if self.pause_dual_relay_client_if_needed(Token(token_value)) {
+            return;
+        }
         let is_replica_side_rdb = self
             .replication_runtime
             .replica_rdb_link()
@@ -273,6 +276,9 @@ impl ServerWorkerState {
             {
                 return false;
             }
+            if self.pause_dual_relay_client_if_needed(token) {
+                return false;
+            }
             match self.parse_next_client_command(token) {
                 ClientParseResult::Command(args, name, resp3) => {
                     parsed_commands += 1;
@@ -369,6 +375,9 @@ impl ServerWorkerState {
     }
 
     fn schedule_client_read_continuation(&mut self, token: Token, yielded: bool) {
+        if self.full_sync.paused_dual_clients.contains(&token) {
+            return;
+        }
         if yielded && self.connection_registry.contains(token) {
             let session = self.connection_registry[token].session_id();
             let is_forked_debugger = self.ctx.script().debug_modes.get(&session)
@@ -720,12 +729,25 @@ impl ServerWorkerState {
         {
             return;
         }
+        if !read_failed
+            && self
+                .full_sync
+                .paused_dual_clients
+                .contains(&Token(token_value))
+        {
+            // The paused parent has not admitted these buffered commands yet.
+            // Resume their EOF drain with the rest of the client pipeline.
+            return;
+        }
         let connection_token = token_value;
         let is_blocked = self.connection_registry
             [crate::framework::capabilities::io::Token(connection_token)]
         .blocked
         .is_some();
-        if read_failed && is_blocked {
+        if read_failed {
+            // A fatal read is terminal even when a bounded pipeline turn left
+            // a continuation. C marks this client for asynchronous closure;
+            // unlike EOF, it must not wait for another input or unblock turn.
             self.cancel_runtime_runnable(RunnableKey::ClientRead(Token(token_value)));
             self.client_hup_drains.remove(&Token(token_value));
             self.remove_connection(token_value);
@@ -1053,7 +1075,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_read_drains_admitted_command_before_teardown() {
+    fn failed_read_does_not_retain_the_client_to_flush_unsent_replies() {
         let mut runtime = ServerWorkerState::new(1).expect("create runtime");
         crate::framework::commands::register_all(&mut runtime.registry);
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind peer listener");
@@ -1079,12 +1101,55 @@ mod tests {
         );
 
         let mut response = [0_u8; 7];
-        target
-            .read_exact(&mut response)
-            .expect("read reply for command admitted before failure");
-        assert_eq!(&response, b"+PONG\r\n");
+        // C handleReadResult closes a failed transport without flushing queued
+        // replies. The orderly EOF test above still requires its PONG reply.
+        assert_eq!(
+            target
+                .read(&mut response)
+                .expect("observe closure after the terminal read failure"),
+            0
+        );
         assert!(!runtime.connection_registry.contains(peer.token));
         assert!(!runtime.transport.is_registered(peer.token));
+    }
+
+    #[test]
+    fn failed_read_drops_a_pipeline_continuation_at_the_terminal_boundary() {
+        for mode in [ClientReadMode::Fair, ClientReadMode::DrainAfterHup] {
+            let mut runtime = ServerWorkerState::new(1).unwrap();
+            crate::framework::commands::register_all(&mut runtime.registry);
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let peer = runtime.transport.connect_tcp(address).unwrap();
+            let (_target, _) = listener.accept().unwrap();
+            runtime.add_connection(RuntimeConnectedPeer {
+                token: peer.token,
+                peer_addr: address,
+            });
+            let commands = crate::runtime::server::worker::HUP_CLIENT_COMMAND_BUDGET + 1;
+            let mut input = b"*1\r\n$4\r\nPING\r\n".repeat(commands);
+            input.extend_from_slice(b"*1\r\n$4\r\nPI");
+
+            runtime.process_client_read_outcome(
+                peer.token,
+                mode,
+                input,
+                ReadOutcome::Failed(Error::new(
+                    ErrorKind::ConnectionReset,
+                    "peer reset a pipelined write load",
+                )),
+            );
+
+            assert!(
+                !runtime.connection_registry.contains(peer.token),
+                "a fatal read must not retain the client for another pipeline turn"
+            );
+            assert!(!runtime.transport.is_registered(peer.token));
+            assert!(!runtime.client_hup_drains.contains(&peer.token));
+            assert!(!runtime
+                .event_batch
+                .contains_runnable(RunnableKey::ClientRead(peer.token)));
+        }
     }
 
     #[test]

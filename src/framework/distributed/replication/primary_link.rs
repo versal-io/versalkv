@@ -741,10 +741,6 @@ impl PrimaryLink {
         self.dual_rdb_complete
     }
 
-    pub fn dual_terminal_ack_received(&self) -> bool {
-        self.dual_post_psync_ack_received
-    }
-
     #[cfg(test)]
     pub fn full_resync_is_none(&self) -> bool {
         self.full_resync.is_none()

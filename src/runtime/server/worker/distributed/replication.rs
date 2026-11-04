@@ -16,7 +16,7 @@ use crate::runtime::server::worker::distributed::replication::disk_sync_batch::D
 use crate::runtime::server::worker::distributed::replication::diskless_child::DisklessRelay;
 use crate::runtime::server::worker::reactor::blocked_events::BlockedOperation;
 use crate::runtime::server::worker::reactor::sources::SourceOwner;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::net::{SocketAddr, ToSocketAddrs};
 
@@ -143,6 +143,10 @@ pub(crate) fn render_unknown_replication_command_for_log(
 pub(crate) struct FullSyncCoordinator {
     pub(crate) next_transfer_id: u64,
     pub(crate) pending_dual_rdb_snapshots: HashMap<Token, (i64, Vec<u8>)>,
+    /// Main-channel replies held while the pipe relay services a paused primary.
+    pub(crate) paused_dual_main_replies: HashMap<Token, Vec<Vec<u8>>>,
+    /// Ordinary clients held until the paused dual-channel transfer resumes.
+    pub(crate) paused_dual_clients: HashSet<Token>,
     /// One fork pipe streaming an RDB to a cohort of EOF-capable replicas.
     pub(crate) diskless_relay: Option<DisklessRelay>,
     /// A shared disk snapshot served to independent replica cursors.
@@ -673,6 +677,11 @@ impl ServerWorkerState {
         token_value: usize,
         connection_token: usize,
     ) {
+        // Readiness may already be queued when the pending buffer reaches its
+        // limit. C removes the read handler; stale events cannot consume more.
+        if self.replica_main_read_is_paused(Token(token_value)) {
+            return;
+        }
         if matches!(
             self.blocked_events.current(),
             Some(BlockedOperation::DualRdb { main, .. }) if main.0 == token_value
@@ -1713,14 +1722,8 @@ impl ServerWorkerState {
                     self.remove_connection(token);
                     continue;
                 }
-                if let Some(replica_id) = self
-                    .replication_runtime
-                    .replica_id_for_connection(rdb_connection_id)
-                {
-                    if let Some(link) = self.replication_runtime.primary_link_mut(replica_id) {
-                        link.mark_dual_rdb_complete();
-                    }
-                }
+                self.replication_runtime
+                    .mark_rdb_snapshot_complete(rdb_connection_id);
             }
             self.refresh_replication_view();
             return;
@@ -1752,7 +1755,18 @@ impl ServerWorkerState {
                 self.remove_connection(rdb_connection_id.0);
             }
         }
-        self.store_diskless_relay(read_end, release, marker, Vec::new(), false, 0);
+        let targets = fork_targets
+            .into_iter()
+            .filter_map(|connection_id| {
+                self.connection_registry
+                    .get(Token(connection_id.0))
+                    .map(|connection| diskless_child::DisklessTarget::Rdb {
+                        connection_id,
+                        client_id: connection.client_id(),
+                    })
+            })
+            .collect();
+        self.store_diskless_transport_relay(read_end, release, marker, targets, false, 0);
     }
 
     pub(crate) fn is_replica_connection(&self, token_value: usize) -> bool {
@@ -1767,6 +1781,10 @@ impl ServerWorkerState {
             self.replication_runtime.role(ConnectionId(token_value)),
             Some(ReplicationConnection::Replica)
         )
+    }
+
+    pub(crate) fn replica_main_read_is_paused(&self, token: Token) -> bool {
+        self.replication_runtime.replica_main_read_paused() && self.is_master_link(token.0)
     }
 
     pub(crate) fn handle_master_link_connected(&mut self, connection_token: usize) {
@@ -1867,9 +1885,12 @@ impl ServerWorkerState {
             && self.connection_registry[crate::framework::capabilities::io::Token(connection_token)]
                 .has_pending_output()
         {
-            self.transport
-                .set_interest(token, Interest::ReadWritable)
-                .ok();
+            let interest = if self.replica_main_read_is_paused(token) {
+                Interest::Writable
+            } else {
+                Interest::ReadWritable
+            };
+            self.transport.set_interest(token, interest).ok();
         }
     }
 
@@ -1913,9 +1934,9 @@ impl ServerWorkerState {
         &mut self,
         mut ids: Vec<crate::framework::distributed::replication::ReplicaId>,
     ) {
-        if self.ctx.persistence().has_active_child() {
+        if self.ctx.persistence().has_active_child() || self.full_sync.diskless_relay.is_some() {
             // Apply to cron and max-replicas alike: only keyless cohorts can
-            // progress while the All child is running or waiting for ACK.
+            // progress while the All producer runs or its relay waits for ACK.
             ids.retain(|id| {
                 self.replication_runtime
                     .primary_link(*id)

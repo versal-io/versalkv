@@ -1,10 +1,8 @@
 //! Owned process capabilities used by persistence and replication orchestration.
 
+use crate::foundation::io::sys::process::{exit_immediately, send_signal, ProcessSignal};
 #[cfg(test)]
-use crate::foundation::io::sys::process::wait_nonblocking;
-use crate::foundation::io::sys::process::{
-    exit_immediately, send_signal, wait_blocking, ProcessSignal, WaitOutcome,
-};
+use crate::foundation::io::sys::process::{wait_blocking, wait_nonblocking, WaitOutcome};
 use std::fs::File;
 use std::io;
 use std::os::fd::RawFd;
@@ -41,6 +39,7 @@ impl ForkChild {
         wait_nonblocking(self.pid)
     }
 
+    #[cfg(test)]
     pub(crate) fn wait(&mut self) -> io::Result<WaitOutcome> {
         wait_blocking(self.pid)
     }
@@ -166,27 +165,6 @@ pub(crate) fn wait_for_pipe_eof(read_end: File) {
 
 pub(crate) fn stop_current_process() -> io::Result<()> {
     send_signal(std::process::id() as i32, ProcessSignal::Stop)
-}
-
-pub(crate) fn stop_current_process_temporarily(resume_after_ms: u64) -> io::Result<()> {
-    let parent_pid = std::process::id() as i32;
-    let mut child = match fork_process()? {
-        ForkBranch::Parent(child) => child,
-        ForkBranch::Child => {
-            let micros = resume_after_ms.saturating_mul(1_000);
-            // SAFETY: usleep takes a scalar duration and affects only this short-lived helper.
-            unsafe { libc::usleep(micros.min(libc::useconds_t::MAX as u64) as libc::useconds_t) };
-            let status = if send_signal(parent_pid, ProcessSignal::Continue).is_ok() {
-                0
-            } else {
-                1
-            };
-            exit_immediately(status);
-        }
-    };
-    stop_current_process()?;
-    let _ = child.wait();
-    Ok(())
 }
 
 #[cfg(test)]

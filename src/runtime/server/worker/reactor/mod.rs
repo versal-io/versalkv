@@ -168,6 +168,7 @@ pub(crate) enum RunnableKey {
     DeferredReadiness(Token),
     ClusterBeforeSleep,
     ReplicationAction(u64),
+    ReplicaRdbDecode(u64),
     #[cfg(test)]
     Test(usize),
 }

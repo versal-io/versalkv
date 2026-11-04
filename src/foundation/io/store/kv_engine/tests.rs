@@ -589,6 +589,35 @@ fn random_key_collects_all_expired_keys_for_propagation() {
 }
 
 #[test]
+fn random_key_preserves_a_key_before_its_exact_expiration() {
+    #[cfg(not(feature = "wasm"))]
+    let _time = crate::foundation::io::sys::time::enter_command_time_snapshot(1_000);
+    let now = now_ms();
+    let mut db = Db::new();
+    db.set(b"future".to_vec(), Robj::string("value"));
+    db.set_expire(b"future", now + 50);
+
+    assert_eq!(db.random_key(), Some(b"future".as_slice()));
+    assert!(db.expired_deletions.is_empty());
+    assert_eq!(db.get_expire(b"future"), Some(now + 50));
+}
+
+#[test]
+fn random_key_preserves_upstream_owned_expired_keys_on_a_replica() {
+    #[cfg(not(feature = "wasm"))]
+    let _time = crate::foundation::io::sys::time::enter_command_time_snapshot(1_000);
+    let now = now_ms();
+    let mut db = Db::new();
+    db.set(b"upstream".to_vec(), Robj::string("value"));
+    db.set_expire(b"upstream", now - 500);
+    db.set_replica_local_expire_only(true);
+
+    assert_eq!(db.random_key(), Some(b"upstream".as_slice()));
+    assert!(db.expired_deletions.is_empty());
+    assert_eq!(db.get_expire(b"upstream"), Some(now - 500));
+}
+
+#[test]
 fn random_key_reads_nonzero_shard_bucket() {
     let mut db = Db::new_with_slot_router(2, first_byte_slot);
     db.set(vec![1, b'a'], Robj::string("value"));

@@ -389,6 +389,14 @@ fn forkless_capture_postpones_cross_database_move_and_copy_targets() {
     let mut backend = ServerWorkerState::new(2).unwrap();
     crate::framework::commands::register_all(&mut backend.registry);
     let connection_token = add_fake_connection(&mut backend);
+    // Startup captures up to 128 items before priority keys can be requested.
+    // Keep DB 0 larger than startup plus the next bounded capture turn.
+    for index in 256..512 {
+        backend.ctx.db_mut(0).unwrap().set(
+            format!("capture-{index}").into_bytes(),
+            crate::foundation::io::store::Robj::string("value"),
+        );
+    }
     for key in [b"capture-0".as_slice(), b"capture-1".as_slice()] {
         backend.ctx.db_mut(1).unwrap().set(
             key.to_vec(),
@@ -396,17 +404,32 @@ fn forkless_capture_postpones_cross_database_move_and_copy_targets() {
         );
     }
     let dir = start_test_forkless_capture(&mut backend, "forkless-cross-db");
-    while !backend
+    assert!(backend
+        .ctx
+        .prioritize_forkless_keys(0, [b"capture-0".to_vec(), b"capture-1".to_vec()]));
+    // A full serializer queue may postpone priority work across calls.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while (!backend
         .ctx
         .persistence()
         .forkless_key_captured(0, b"capture-0")
         || !backend
             .ctx
             .persistence()
-            .forkless_key_captured(0, b"capture-1")
+            .forkless_key_captured(0, b"capture-1"))
+        && std::time::Instant::now() < deadline
     {
         backend.ctx.drive_forkless_feed();
+        std::thread::yield_now();
     }
+    assert!(backend
+        .ctx
+        .persistence()
+        .forkless_key_captured(0, b"capture-0"));
+    assert!(backend
+        .ctx
+        .persistence()
+        .forkless_key_captured(0, b"capture-1"));
     assert!(!backend
         .ctx
         .persistence()

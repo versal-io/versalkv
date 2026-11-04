@@ -17,6 +17,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 
 mod codec_fix_tests;
+mod rdb_cohort;
 
 fn offset(value: i64) -> ReplicationOffset {
     ReplicationOffset::try_from(value).expect("valid test offset")
@@ -2153,8 +2154,8 @@ fn unpaired_rdb_candidate_starts_pipe_relay_after_endoff_flush() {
         .as_ref()
         .expect("pipe relay must be retained while the main association catches up");
     assert!(
-        relay.targets.is_empty(),
-        "the replica target is attached only after set-rdb-client-id proves ownership"
+        relay.targets.len() == 1,
+        "the dedicated RDB session owns transport before main-channel association"
     );
 
     backend
@@ -2165,7 +2166,6 @@ fn unpaired_rdb_candidate_starts_pipe_relay_after_endoff_flush() {
         .replication_runtime
         .finalize_dual_channel_rdb_association(ConnectionId(main_token), rdb_id)
         .unwrap();
-    backend.associate_diskless_relay_target(rdb_id, ConnectionId(main_token));
     assert_eq!(
         backend
             .replication_runtime
@@ -2190,8 +2190,9 @@ fn unpaired_rdb_candidate_starts_pipe_relay_after_endoff_flush() {
             .as_ref()
             .expect("pipe relay must survive association")
             .targets
-            .contains(&replica_id),
-        "late main association must attach the already-started pipe relay target"
+            .iter().any(|target| matches!(target,
+                super::diskless_child::DisklessTarget::Rdb { connection_id, .. } if *connection_id == rdb_id)),
+        "late association must retain the original dedicated RDB transport target"
     );
 
     backend.abort_diskless_relay_for_dataset_flush();
@@ -2560,7 +2561,9 @@ fn eof_marker_only_on_rdb_channel_in_dual_mode() {
     );
 }
 
+mod diskless_completion;
 mod dual;
+mod dual_pause;
 mod full_sync;
 mod import_tracking;
 mod paused_dual;

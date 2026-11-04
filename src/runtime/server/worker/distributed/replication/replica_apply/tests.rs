@@ -21,6 +21,73 @@ fn offset(value: i64) -> ReplicationOffset {
     ReplicationOffset::try_from(value).expect("valid test offset")
 }
 
+#[test]
+fn paused_dual_handoff_keeps_new_socket_bytes_until_local_replay_finishes() {
+    let mut backend = ServerWorkerState::new(1).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let connected = backend.transport.connect_tcp(addr).unwrap();
+    let (mut peer, _) = listener.accept().unwrap();
+    backend.add_connection(
+        crate::runtime::server::worker::reactor::transport::RuntimeConnectedPeer {
+            token: connected.token,
+            peer_addr: addr,
+        },
+    );
+    let main = connected.token;
+    let mut link = ReplicaLink::streaming(
+        ConnectionId(main.0),
+        MasterInfo {
+            host: "127.0.0.1".to_string(),
+            port: 6379,
+        },
+        "0123456789abcdef0123456789abcdef01234567".to_string(),
+        offset(100),
+    );
+    for state in [
+        ReplicaRdbChannelState::Connecting,
+        ReplicaRdbChannelState::Handshake,
+        ReplicaRdbChannelState::WaitingForEndOffset,
+        ReplicaRdbChannelState::ReceivingRdb,
+        ReplicaRdbChannelState::RdbLoaded,
+    ] {
+        link.transition_rdb_channel_state(state).unwrap();
+    }
+    link.provisional_primary = Some(ProvisionalPrimary {
+        replid: "0123456789abcdef0123456789abcdef01234567".to_string(),
+        end_offset: offset(100),
+        db_id: 0,
+        rdb_client_id: 42,
+    });
+    backend.replication_runtime.set_replica_link(link);
+    backend
+        .replication_runtime
+        .set_replica_main_read_paused(true);
+    let mut link = backend.replication_runtime.take_replica_link().unwrap();
+    let frame = crate::engine::distributed::replication::protocol::encode_command(&[b"PING"]);
+    peer.write_all(&frame).unwrap();
+    backend
+        .transport
+        .wait_pending_bytes_for_test(main, frame.len());
+
+    backend
+        .drain_dual_main_before_handoff(main.0, &mut link)
+        .unwrap();
+
+    assert_eq!(link.received_position(), offset(100));
+    assert!(backend
+        .replication_runtime
+        .replica_pending_buffer()
+        .is_none());
+    backend
+        .replication_runtime
+        .set_replica_main_read_paused(false);
+    backend
+        .drain_dual_main_before_handoff(main.0, &mut link)
+        .unwrap();
+    assert_eq!(link.received_position(), offset(100 + frame.len() as i64));
+}
+
 fn no_command_host(
     request: crate::engine::host::HostRequest<'_>,
 ) -> Result<crate::engine::host::HostReply, crate::engine::host::HostError> {

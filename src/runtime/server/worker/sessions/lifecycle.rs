@@ -184,6 +184,8 @@ impl ServerWorkerState {
         self.retire_runtime_source(token);
         self.ctx.throttled_clients_mut().shift_remove(&token);
         self.full_sync.pending_dual_rdb_snapshots.remove(&token);
+        self.full_sync.paused_dual_main_replies.remove(&token);
+        self.full_sync.paused_dual_clients.remove(&token);
         self.cancel_runtime_runnable(
             crate::runtime::server::worker::reactor::RunnableKey::ClientRead(token),
         );
@@ -405,6 +407,16 @@ impl ServerWorkerState {
         reconnect_cause: Option<MasterReconnectCause>,
     ) {
         let token = Token(plan.token_value);
+        let diskless_target = self.diskless_relay_target_for_connection(plan.connection_id);
+        let completed_unpaired_rdb_public_id = self
+            .replication_runtime
+            .has_completed_unpaired_rdb_snapshot(plan.connection_id)
+            .then(|| {
+                self.connection_registry
+                    .get(token)
+                    .map(Connection::client_id)
+            })
+            .flatten();
         self.socket_owners.remove(&token);
         // 1. Detach migration.
         if let Some(migration) = &plan.migration {
@@ -470,21 +482,13 @@ impl ServerWorkerState {
                         if let Some(link) =
                             self.replication_runtime.primary_for_connection_mut(main)
                         {
-                            match link.dual_state() {
-                                crate::framework::distributed::replication::PrimaryDualChannelState::WaitingForMainPsync => {
-                                    if had_psync_wait == Some(main) {
-                                        link.rdb_channel_wait_deadline_ms = Some(deadline);
-                                        self.replication_runtime
-                                            .set_grace_psync_wait_deadline(main, deadline);
-                                    }
-                                }
-                                crate::framework::distributed::replication::PrimaryDualChannelState::WaitingForReplicaAck
-                                    if !link.dual_terminal_ack_received() => {
-                                    link.rdb_channel_wait_deadline_ms = Some(deadline);
-                                    self.replication_runtime
-                                        .start_grace_psync_wait_for_main(main, deadline);
-                                }
-                                _ => {}
+                            if had_psync_wait == Some(main)
+                                && link.dual_state()
+                                    == crate::framework::distributed::replication::PrimaryDualChannelState::WaitingForMainPsync
+                            {
+                                link.rdb_channel_wait_deadline_ms = Some(deadline);
+                                self.replication_runtime
+                                    .set_grace_psync_wait_deadline(main, deadline);
                             }
                             crate::server_log!(
                                 debug,
@@ -518,6 +522,22 @@ impl ServerWorkerState {
             .view
             .channel_info
             .remove(&plan.token_value);
+        if let Some(public_client_id) = completed_unpaired_rdb_public_id {
+            // C keeps a protected RDB client and its backlog reference after
+            // EOF until main PSYNC or grace expiry. Retain those facts without
+            // retaining a closed socket or acquiring a reused transport slot.
+            let grace_sec = dual_psync_grace_seconds(
+                self.ctx.config().server.debug_delay_rdb_client_free_seconds,
+                self.ctx.config().replication.repl_diskless_sync_delay,
+            );
+            let deadline = crate::foundation::io::sys::time::mstime()
+                .saturating_add(grace_sec.saturating_mul(1_000));
+            self.replication_runtime.retain_completed_unpaired_rdb_wait(
+                plan.connection_id,
+                public_client_id,
+                deadline,
+            );
+        }
         self.replication_runtime
             .remove_connection(plan.connection_id);
         if self.replication_runtime.primary_links().is_empty() {
@@ -528,9 +548,11 @@ impl ServerWorkerState {
             crate::server_log!(notice, "Connection with replica {} lost.", name);
         }
         if let Some(id) = plan.relayed_replica {
-            let _ = self.on_diskless_target_closed(id);
             self.drop_disk_sync_batch_target(id);
             self.refresh_replication_view();
+        }
+        if let Some(target) = diskless_target {
+            self.drop_diskless_transport_target(target);
         }
         self.refresh_replication_view();
         if plan.was_master_link {
@@ -1097,7 +1119,7 @@ mod tests {
             transfer_id: crate::runtime::server::worker::reactor::sources::TransferId(0),
             source: None,
             child_release_write_end: None,
-            targets: vec![replica_id],
+            targets: vec![replica_id.into()],
             marker: Vec::new(),
             complete_full_resync: true,
             not_before_ms: 0,

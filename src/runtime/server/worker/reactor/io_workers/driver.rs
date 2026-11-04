@@ -119,6 +119,31 @@ impl ServerWorkerState {
         self.sync_io_thread_stats();
     }
 
+    pub(crate) fn quiesce_ordinary_threaded_writes(&mut self) -> std::io::Result<()> {
+        let pending: Vec<_> = self
+            .connection_registry
+            .iter()
+            .filter_map(|(_, connection)| self.io_threads.write_inflight_id(connection.token()))
+            .collect();
+        // Each socket job is bounded and nonblocking. Reclaim its ownership
+        // before entering the pause; retain reads and unrelated completions
+        // without admitting commands that could start another write or fork.
+        // A connection may have changed replication roles after submission;
+        // the in-flight operation, rather than its current role, owns the I/O.
+        for id in pending {
+            if self.io_threads.write_inflight_id(id.token) != Some(id) {
+                continue;
+            }
+            let completion = self
+                .worker_completions
+                .recv_write_completion(id)
+                .map_err(std::io::Error::other)?;
+            self.apply_threaded_write_completion(completion);
+        }
+        self.sync_io_thread_stats();
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn wait_for_io_completion_for_test(
         &mut self,
@@ -364,9 +389,11 @@ impl ServerWorkerState {
     }
 
     pub(crate) fn dispatch_worker_completion_events(&mut self) {
-        let completions = self.worker_completions.drain();
+        // Keep undispatched completions reachable when a read command needs
+        // to reclaim an in-flight write before entering a replication pause.
+        self.worker_completions.stage_pending();
         self.begin_cluster_bus_receive_batch();
-        for completion in completions {
+        while let Some(completion) = self.worker_completions.pop_staged() {
             self.dispatch_worker_completion_now(completion);
         }
         self.finish_cluster_bus_receive_batch();

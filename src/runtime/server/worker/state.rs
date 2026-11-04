@@ -516,6 +516,10 @@ impl ServerWorkerState {
         token: Token,
         frame: Vec<u8>,
     ) -> bool {
+        if let Some(replies) = self.full_sync.paused_dual_main_replies.get_mut(&token) {
+            replies.push(frame);
+            return false;
+        }
         let Some(connection_token) = self
             .connection_registry
             .contains(crate::framework::capabilities::io::Token(token.0))
@@ -557,13 +561,7 @@ impl ServerWorkerState {
         if self.enforce_client_output_buffer_limit_for(token.0) {
             return false;
         }
-        let interest = if self.replication_runtime.replica_main_read_paused()
-            && self.ctx.persistence().forkless_capture_in_progress()
-            && self
-                .replication_runtime
-                .replica_link()
-                .is_some_and(|link| link.connection_id().0 == token.0)
-        {
+        let interest = if self.replica_main_read_is_paused(token) {
             crate::foundation::io::transport::Interest::Writable
         } else {
             crate::foundation::io::transport::Interest::ReadWritable

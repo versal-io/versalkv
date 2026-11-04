@@ -1006,7 +1006,7 @@ impl ServerWorkerState {
         options: FullSyncOptions,
         replies: &mut Vec<Vec<u8>>,
     ) -> bool {
-        if !self.ctx.persistence().has_active_child() {
+        if !self.ctx.persistence().has_active_child() && self.full_sync.diskless_relay.is_none() {
             return false;
         }
         crate::server_log!(

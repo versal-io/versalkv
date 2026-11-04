@@ -98,7 +98,6 @@ impl ReplicationRuntime {
     /// Move a marker-complete, unpaired wait away from its closing transport.
     /// Validation precedes removal so duplicate public ids or already-paired
     /// waits cannot lose the live owner.
-    #[cfg(test)]
     pub(crate) fn retain_completed_unpaired_rdb_wait(
         &mut self,
         rdb_connection_id: ConnectionId,
@@ -550,19 +549,6 @@ impl ReplicationRuntime {
                 retained.deadline_ms = deadline_ms;
             }
         }
-    }
-
-    pub fn start_grace_psync_wait_for_main(&mut self, main: ConnectionId, deadline_ms: i64) {
-        let pin_cursor = self
-            .primary_for_connection(main)
-            .and_then(|link| link.dual_main_backlog_pin_cursor());
-        self.grace_psync_pin_by_main.insert(
-            main,
-            GracePsyncWait {
-                deadline_ms,
-                pin_cursor,
-            },
-        );
     }
 
     pub fn clear_grace_psync_wait_for_main(&mut self, main: ConnectionId) {

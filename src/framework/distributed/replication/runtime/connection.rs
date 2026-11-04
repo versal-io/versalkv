@@ -19,6 +19,8 @@ pub(super) struct ChannelRecord {
     pub(super) replica_version: u32,
     pub(super) rdb_only: bool,
     pub(super) snapshot_options: Option<RdbSnapshotOptions>,
+    /// Physical RDB transport completion may precede main-channel pairing.
+    pub(super) rdb_snapshot_complete: bool,
 }
 
 #[derive(Clone, Default)]
