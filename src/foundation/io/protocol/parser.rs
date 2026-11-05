@@ -25,6 +25,7 @@ const PROT_MAX_BULK: i64 = 512 * 1024 * 1024;
 const PROT_INLINE_MAX: usize = 65536;
 const PROT_MBULK_COUNT_MAX: usize = 65536;
 const PROT_BULK_COUNT_MAX: usize = 65536;
+const INITIAL_ARGUMENT_CAPACITY_MAX: usize = 1024;
 const QUERY_BUFFER_RETAIN_CAPACITY: usize = 16 * 1024;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -220,7 +221,11 @@ impl Parser {
                                     self.pos = line_end;
                                     self.args.clear();
                                     self.pending_mbulk_count = n;
-                                    self.args = Vec::with_capacity(n as usize);
+                                    // A header alone must not commit memory for every declared
+                                    // argument. Grow the vector as payloads actually arrive.
+                                    self.args = Vec::with_capacity(
+                                        (n as usize).min(INITIAL_ARGUMENT_CAPACITY_MAX),
+                                    );
                                     self.state = MultiBulkLen { remaining: n };
                                 }
                                 Ok(None) => {
