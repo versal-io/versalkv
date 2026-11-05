@@ -1,9 +1,8 @@
 use crate::engine::command::{CommandArgs, CommandError};
 use crate::engine::core::{CommandOutcome, Value};
 use crate::framework::commands::command_runtime::CommandRuntime;
+use crate::framework::commands::pattern::string_match;
 use command_macros::command;
-
-use super::keys;
 
 #[command("SCAN", runtime)]
 pub fn scan(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> CommandOutcome {
@@ -74,7 +73,7 @@ pub fn scan(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> CommandOutc
         });
     }
     if let Some(pattern) = pattern {
-        keys.retain(|key| keys::glob_match(pattern, key));
+        keys.retain(|key| string_match(pattern, key, false));
     }
     if !suppress_lazy_expire {
         let mut live_keys = Vec::with_capacity(keys.len());
