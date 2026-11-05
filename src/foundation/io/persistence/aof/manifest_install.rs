@@ -1,5 +1,14 @@
-use std::io::Write;
+use std::fs::{self, File};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ManifestInstallState {
+    Prepared,
+    Published,
+    Durable,
+    Finalized,
+}
 
 pub struct PreparedSyncedRdbAofBase {
     app_dir: PathBuf,
@@ -9,8 +18,7 @@ pub struct PreparedSyncedRdbAofBase {
     incr_path: PathBuf,
     old_entries: Vec<super::manifest::AofManifestEntry>,
     old_manifest: Option<Vec<u8>>,
-    manifest_committed: bool,
-    finalized: bool,
+    state: ManifestInstallState,
 }
 
 impl PreparedSyncedRdbAofBase {
@@ -19,13 +27,27 @@ impl PreparedSyncedRdbAofBase {
     }
 
     pub fn commit_manifest(&mut self) -> std::io::Result<()> {
-        std::fs::rename(&self.temp_manifest, &self.manifest_path)?;
-        self.manifest_committed = true;
+        self.commit_manifest_with_sync(sync_directory)
+    }
+
+    fn commit_manifest_with_sync(
+        &mut self,
+        sync: impl FnOnce(&Path) -> io::Result<()>,
+    ) -> io::Result<()> {
+        fs::rename(&self.temp_manifest, &self.manifest_path)?;
+        // Record publication before the fallible durability barrier so Drop
+        // restores the previous manifest if the directory sync fails.
+        self.state = ManifestInstallState::Published;
+        sync(&self.app_dir)?;
+        self.state = ManifestInstallState::Durable;
         Ok(())
     }
 
     pub fn finalize(mut self) {
-        self.finalized = true;
+        if self.state != ManifestInstallState::Durable {
+            return;
+        }
+        self.state = ManifestInstallState::Finalized;
         for entry in &self.old_entries {
             let old_path = self.app_dir.join(&entry.filename);
             if old_path != self.base_path && old_path != self.incr_path {
@@ -34,33 +56,44 @@ impl PreparedSyncedRdbAofBase {
         }
     }
 
-    fn rollback_manifest(&self) {
+    fn rollback_manifest(&self) -> io::Result<()> {
         match &self.old_manifest {
             Some(content) => {
                 let rollback = self.manifest_path.with_extension("manifest.rollback.tmp");
-                if std::fs::write(&rollback, content).is_ok() {
-                    let _ = std::fs::rename(rollback, &self.manifest_path);
-                }
+                let mut file = File::create(&rollback)?;
+                file.write_all(content)?;
+                file.sync_all()?;
+                fs::rename(rollback, &self.manifest_path)?;
             }
             None => {
-                let _ = std::fs::remove_file(&self.manifest_path);
+                fs::remove_file(&self.manifest_path)?;
             }
         }
+        sync_directory(&self.app_dir)
     }
 }
 
 impl Drop for PreparedSyncedRdbAofBase {
     fn drop(&mut self) {
-        if self.finalized {
+        if self.state == ManifestInstallState::Finalized {
             return;
         }
-        if self.manifest_committed {
-            self.rollback_manifest();
+        if self.state != ManifestInstallState::Prepared {
+            if let Err(error) = self.rollback_manifest() {
+                // Either manifest may survive a crash. Preserve both sets of
+                // data files until recovery can establish which one is active.
+                log::warn!("Failed to roll back AOF manifest; retaining data files: {error}");
+                return;
+            }
         }
         let _ = std::fs::remove_file(&self.temp_manifest);
         let _ = std::fs::remove_file(&self.base_path);
         let _ = std::fs::remove_file(&self.incr_path);
     }
+}
+
+fn sync_directory(directory: &Path) -> io::Result<()> {
+    File::open(directory)?.sync_all()
 }
 
 pub fn prepare_synced_rdb_as_aof_base(
@@ -93,8 +126,7 @@ pub fn prepare_synced_rdb_as_aof_base(
         incr_path,
         old_entries,
         old_manifest,
-        manifest_committed: false,
-        finalized: false,
+        state: ManifestInstallState::Prepared,
     };
     write_prepared_files(&mut prepared, base_sequence, incr_sequence, rdb)?;
     Ok(prepared)
@@ -140,4 +172,106 @@ pub fn install_synced_rdb_as_aof_base(
     prepared.commit_manifest()?;
     prepared.finalize();
     Ok(paths)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::io;
+    use std::path::PathBuf;
+
+    use super::PreparedSyncedRdbAofBase;
+
+    const OLD_MANIFEST: &str = "file appendonly.aof.1.base.rdb seq 1 type b\n\
+                               file appendonly.aof.1.incr.aof seq 1 type i\n";
+
+    fn prepare_fixture(label: &str) -> (PathBuf, PreparedSyncedRdbAofBase) {
+        let directory = std::env::temp_dir().join(format!(
+            "versal-manifest-{label}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let app_dir = directory.join("appendonlydir");
+        fs::create_dir_all(&app_dir).expect("create AOF directory");
+        fs::write(app_dir.join("appendonly.aof.1.base.rdb"), b"old base").expect("write old base");
+        fs::write(app_dir.join("appendonly.aof.1.incr.aof"), b"old increment")
+            .expect("write old increment");
+        fs::write(app_dir.join("appendonly.aof.manifest"), OLD_MANIFEST)
+            .expect("write old manifest");
+        let prepared = super::prepare_synced_rdb_as_aof_base(
+            directory.to_str().expect("UTF-8 fixture path"),
+            "appendonly.aof",
+            "appendonlydir",
+            b"new base",
+        )
+        .expect("prepare new AOF files");
+        (directory, prepared)
+    }
+
+    #[test]
+    fn directory_sync_follows_publication_and_precedes_old_file_removal() {
+        let (directory, mut prepared) = prepare_fixture("sync-order");
+        prepared
+            .commit_manifest_with_sync(|app_dir| {
+                let manifest = fs::read_to_string(app_dir.join("appendonly.aof.manifest"))?;
+                assert!(manifest.contains("appendonly.aof.2.base.rdb"));
+                assert!(app_dir.join("appendonly.aof.1.base.rdb").exists());
+                assert!(app_dir.join("appendonly.aof.1.incr.aof").exists());
+                super::sync_directory(app_dir)
+            })
+            .expect("commit durable manifest");
+        prepared.finalize();
+        assert!(!directory
+            .join("appendonlydir/appendonly.aof.1.base.rdb")
+            .exists());
+        fs::remove_dir_all(directory).expect("remove fixture");
+    }
+
+    #[test]
+    fn failed_directory_sync_restores_the_previous_recovery_point() {
+        let (directory, mut prepared) = prepare_fixture("sync-error");
+        let error = prepared
+            .commit_manifest_with_sync(|_| Err(io::Error::other("injected directory sync failure")))
+            .expect_err("a failed durability barrier must fail the commit");
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        // Even an accidental finalize after a failed commit must keep old data.
+        prepared.finalize();
+        let app_dir = directory.join("appendonlydir");
+        assert_eq!(
+            fs::read_to_string(app_dir.join("appendonly.aof.manifest")).expect("read manifest"),
+            OLD_MANIFEST
+        );
+        assert!(app_dir.join("appendonly.aof.1.base.rdb").exists());
+        assert!(app_dir.join("appendonly.aof.1.incr.aof").exists());
+        assert!(!app_dir.join("appendonly.aof.2.base.rdb").exists());
+        assert!(!app_dir.join("appendonly.aof.2.incr.aof").exists());
+        fs::remove_dir_all(directory).expect("remove fixture");
+    }
+
+    #[test]
+    fn failed_rollback_keeps_files_referenced_by_the_published_manifest() {
+        let (directory, mut prepared) = prepare_fixture("rollback-error");
+        prepared.commit_manifest().expect("publish new manifest");
+        let rollback = prepared
+            .manifest_path
+            .with_extension("manifest.rollback.tmp");
+        fs::create_dir(rollback).expect("prevent rollback file creation");
+        drop(prepared);
+        let app_dir = directory.join("appendonlydir");
+        assert!(fs::read_to_string(app_dir.join("appendonly.aof.manifest"))
+            .expect("read manifest")
+            .contains("appendonly.aof.2.base.rdb"));
+        for filename in [
+            "appendonly.aof.1.base.rdb",
+            "appendonly.aof.1.incr.aof",
+            "appendonly.aof.2.base.rdb",
+            "appendonly.aof.2.incr.aof",
+        ] {
+            assert!(
+                app_dir.join(filename).exists(),
+                "lost recovery file {filename}"
+            );
+        }
+        fs::remove_dir_all(directory).expect("remove fixture");
+    }
 }
