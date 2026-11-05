@@ -353,9 +353,8 @@ impl Parser {
                     if total > self.buf.len() {
                         return Ok(None);
                     }
-                    if bulk_len >= 2
-                        && (self.buf[self.pos + bulk_len] != b'\r'
-                            || self.buf[self.pos + bulk_len + 1] != b'\n')
+                    if self.buf[self.pos + bulk_len] != b'\r'
+                        || self.buf[self.pos + bulk_len + 1] != b'\n'
                     {
                         self.reset();
                         return Err(ParseError::Protocol(
