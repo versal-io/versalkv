@@ -571,6 +571,21 @@ fn random_key_reads_nonzero_shard_bucket() {
 }
 
 #[test]
+fn random_key_preserves_expired_key_when_local_expire_is_disallowed() {
+    let mut db = Db::new();
+    db.set(b"primary".to_vec(), Robj::string("value"));
+    db.set_expire(b"primary", past_ms());
+    db.set_replica_local_expire_only(true);
+
+    assert_eq!(db.random_key(), Some(&b"primary"[..]));
+    assert_eq!(
+        db.get_allow_expired(b"primary").unwrap().as_bytes(),
+        b"value"
+    );
+    assert!(db.expired_deletions.is_empty());
+}
+
+#[test]
 fn module_values_and_key_metadata_follow_key_lifecycle() {
     let mut db = Db::new();
     db.set(b"k".to_vec(), Robj::string("v"));

@@ -201,6 +201,20 @@ impl<K: Eq + Hash, V> KVStore<K, V> {
             .and_then(|dict| dict.get(key))
     }
 
+    pub fn get_key_value_in_slot<Q: Hash + Eq + ?Sized>(
+        &self,
+        slot: usize,
+        key: &Q,
+    ) -> Option<(&K, &V)>
+    where
+        K: Borrow<Q>,
+    {
+        self.slots
+            .get(slot)
+            .and_then(|s| s.as_ref())
+            .and_then(|dict| dict.get_key_value(key))
+    }
+
     pub fn get_mut<Q: Hash + Eq + ?Sized>(&mut self, key: &Q) -> Option<&mut V>
     where
         K: Borrow<Q>,

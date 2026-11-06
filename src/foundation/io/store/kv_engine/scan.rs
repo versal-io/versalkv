@@ -1,91 +1,45 @@
 use super::db::Db;
 use super::now_ms;
 use crate::foundation::io::store::Robj;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-static RANDOM_KEY_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 impl Db {
     pub fn random_key(&mut self) -> Option<&[u8]> {
-        if !self.no_lazy_expire && !self.pause_skip_expire {
-            for _ in 0..10 {
-                self.delete_expired();
-            }
-            self.delete_expired_with_grace();
-        }
         let now = now_ms();
-        let snapshot: Vec<Vec<u8>> = self
-            .data
-            .keys()
-            .map(|key| key.as_bytes().to_vec())
-            .collect();
-        if snapshot.is_empty() {
-            return None;
-        }
-        let entropy = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
-        let idx = entropy
-            .wrapping_add(RANDOM_KEY_COUNTER.fetch_add(1, Ordering::Relaxed))
-            .wrapping_mul(0x9e3779b97f4a7c15)
-            .rotate_left(17)
-            .wrapping_rem(snapshot.len() as u64) as usize;
-        let first = &snapshot[idx];
-        let first_expired =
-            !self.no_lazy_expire && !self.pause_skip_expire && self.is_expired_at(first, now);
-        let mut fallback: Option<Vec<u8>> = None;
-        let mut expired: Vec<Vec<u8>> = Vec::new();
-        for key in &snapshot {
-            if self.no_lazy_expire || self.pause_skip_expire {
-                if fallback.is_none()
-                    && self
-                        .data
-                        .contains_key_in_slot(self.key_slot(key), key.as_slice())
-                {
-                    fallback = Some(key.clone());
-                    if self.pause_skip_expire {
-                        break;
+        let allvolatile = self.data.len() == self.expires.len();
+        let mut maxtries = 100;
+
+        loop {
+            let candidate = self
+                .data
+                .random_entry()
+                .map(|(key, _)| key.as_bytes().to_vec())?;
+            if !self.is_expired_at(&candidate, now) {
+                return self.stored_key_bytes(&candidate);
+            }
+
+            let restricted_expire = self.no_lazy_expire
+                || self.pause_skip_expire
+                || !self.should_expire_locally(&candidate);
+            if restricted_expire {
+                if allvolatile {
+                    maxtries -= 1;
+                    if maxtries == 0 {
+                        return self.stored_key_bytes(&candidate);
                     }
                 }
                 continue;
             }
-            if self.is_expired_at(key, now) {
-                expired.push(key.clone());
-            } else if fallback.is_none()
-                && self
-                    .data
-                    .contains_key_in_slot(self.key_slot(key), key.as_slice())
-            {
-                fallback = Some(key.clone());
-            }
+
+            self.del(&candidate);
+            self.expired_deletions.push(candidate);
         }
-        for key in &expired {
-            self.del(key);
-            self.expired_deletions.push(key.clone());
-        }
-        if self.pause_skip_expire {
-            self.data
-                .iter()
-                .find(|(key, _)| key.as_bytes() == first.as_slice())
-                .map(|(key, _)| key.as_bytes())
-        } else if !first_expired
-            && self
-                .data
-                .contains_key_in_slot(self.key_slot(first), first.as_slice())
-        {
-            self.data
-                .iter()
-                .find(|(key, _)| key.as_bytes() == first.as_slice())
-                .map(|(key, _)| key.as_bytes())
-        } else if let Some(k) = fallback {
-            self.data
-                .iter()
-                .find(|(key, _)| key.as_bytes() == k.as_slice())
-                .map(|(key, _)| key.as_bytes())
-        } else {
-            None
-        }
+    }
+
+    fn stored_key_bytes(&self, key: &[u8]) -> Option<&[u8]> {
+        let slot = self.key_slot(key);
+        self.data
+            .get_key_value_in_slot(slot, key)
+            .map(|(stored_key, _)| stored_key.as_bytes())
     }
 
     pub fn delete_expired(&mut self) {
