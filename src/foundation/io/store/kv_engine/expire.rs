@@ -42,16 +42,19 @@ pub fn active_expire_cycle_with_effort_and_filter(
     let start = Instant::now();
     let mut expired: u64 = 0;
 
-    let volatile_hash_keys = db.hash_keys_with_volatile_fields();
-    for key in &volatile_hash_keys {
-        if should_expire_key(key) {
-            expired += db.cleanup_expired_hash_fields(key);
-        }
+    let lookups =
+        ACTIVE_EXPIRE_CYCLE_LOOKUPS_PER_LOOP + ACTIVE_EXPIRE_CYCLE_LOOKUPS_PER_LOOP / 4 * effort;
+    loop {
+        let (removed, visited) = db.expire_hash_fields_batch(lookups, &should_expire_key);
+        expired += removed;
         if start.elapsed().as_micros() as u64 >= timelimit {
             return (
                 expired,
                 db.expires_count() + db.keys_with_volatile_items_count(),
             );
+        }
+        if visited < lookups {
+            break;
         }
     }
 
@@ -60,8 +63,6 @@ pub fn active_expire_cycle_with_effort_and_filter(
     }
 
     loop {
-        let lookups = ACTIVE_EXPIRE_CYCLE_LOOKUPS_PER_LOOP
-            + ACTIVE_EXPIRE_CYCLE_LOOKUPS_PER_LOOP / 4 * effort;
         let num = lookups.min(db.expires_count());
         if num == 0 {
             break;
@@ -100,7 +101,7 @@ pub fn active_expire_cycle_with_effort_and_filter(
         }
     }
 
-    let remaining = db.expires_count();
+    let remaining = db.expires_count() + db.keys_with_volatile_items_count();
     (expired, remaining)
 }
 

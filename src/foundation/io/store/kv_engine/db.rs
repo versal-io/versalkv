@@ -11,12 +11,13 @@ use crate::foundation::io::sys::time;
 use crate::foundation::memory::metrics::memory_stats::{self, MemoryCategory};
 use crate::foundation::memory::value::{EncodingChange, ZSetOps};
 use bytes::Bytes;
-use indexmap::IndexMap;
-use std::collections::{HashMap, HashSet};
+use indexmap::{IndexMap, IndexSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::c_void;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
+use super::hash_field_expires::HashFieldExpiry;
 use super::{now_ms, EvictionCandidate, EvictionPolicy};
 type SlotRouter = fn(&[u8]) -> usize;
 const RESIZE_SLOTS_PER_CRON: usize = 16;
@@ -31,12 +32,14 @@ pub struct Db {
     pub(super) expiry_cursor: u64,
     pub expired_deletions: Vec<Vec<u8>>,
     pub active_expired_deletions: Vec<Vec<u8>>,
-    pub(super) hash_field_expires: HashMap<Vec<u8>, HashMap<Vec<u8>, u64>>,
+    pub(super) hash_field_expires: HashMap<Bytes, HashMap<Vec<u8>, u64>>,
+    pub(super) hash_field_expiry_index: BTreeSet<HashFieldExpiry>,
+    pub(super) hash_field_expiry_cursor: Option<HashFieldExpiry>,
     hash_string_refs: HashMap<Vec<u8>, HashSet<Vec<u8>>>,
     pub(super) keys_with_volatile_items: usize,
     pub(super) module_values: HashMap<Vec<u8>, (u64, *mut c_void)>,
     pub lazy_expired_hash_fields: u64,
-    pub pending_hexpired: Vec<(Vec<u8>, Vec<u8>)>,
+    pub pending_hexpired: IndexSet<(Vec<u8>, Vec<u8>)>,
     pub(super) no_lazy_expire: bool,
     pub(super) pause_skip_expire: bool,
     /// Keys whose TTL was assigned by a local writable-replica client.
@@ -269,9 +272,11 @@ impl Db {
             expired_deletions: Vec::new(),
             active_expired_deletions: Vec::new(),
             hash_field_expires: HashMap::new(),
+            hash_field_expiry_index: BTreeSet::new(),
+            hash_field_expiry_cursor: None,
             hash_string_refs: HashMap::new(),
             keys_with_volatile_items: 0,
-            pending_hexpired: Vec::new(),
+            pending_hexpired: IndexSet::new(),
             module_values: HashMap::new(),
             no_lazy_expire: false,
             pause_skip_expire: false,
@@ -1257,6 +1262,8 @@ impl Db {
         self.expired_deletions.clear();
         self.active_expired_deletions.clear();
         self.hash_field_expires.clear();
+        self.hash_field_expiry_index.clear();
+        self.hash_field_expiry_cursor = None;
         self.hash_string_refs.clear();
         self.keys_with_volatile_items = 0;
         self.module_values.clear();
@@ -1271,9 +1278,7 @@ impl Db {
         let slot = self.key_slot(key);
         self.replica_local_expire_keys.remove(key);
         self.expires.remove_in_slot(slot, key);
-        if self.hash_field_expires.remove(key).is_some() {
-            self.keys_with_volatile_items = self.keys_with_volatile_items.saturating_sub(1);
-        }
+        self.clear_hash_field_expires(key);
         self.hash_string_refs.remove(key);
         self.module_values.remove(key);
         let removed = self.data.remove_in_slot(slot, key);

@@ -49,7 +49,7 @@ impl HashOps for HashHt {
     }
 
     fn del(&mut self, field: &[u8]) -> Result<bool, EncodingChange> {
-        Ok(self.data.shift_remove(field).is_some())
+        Ok(self.data.swap_remove(field).is_some())
     }
 
     fn len(&self) -> usize {
