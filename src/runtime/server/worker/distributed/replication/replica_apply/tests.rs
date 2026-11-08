@@ -985,6 +985,7 @@ fn replica_applied_swapdb_invalidates_only_the_affected_local_watch() {
             CommandOrigin::Replication,
         )
         .unwrap();
+    backend.process_ready_keys();
 
     assert_replica_swapdb_outcome(&mut backend, affected, unaffected, blocked, &watched_key);
 }

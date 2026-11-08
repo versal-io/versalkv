@@ -683,7 +683,7 @@ impl ServerWorkerState {
             dirty.extend(self.wakeup_blocked_client(token, None, None));
         }
         if !dirty.is_empty() {
-            self.wakeup_blocked_on_keys(&dirty, None, None);
+            self.signal_keys_ready(&dirty);
         }
     }
 }

@@ -183,9 +183,9 @@ impl ServerWorkerState {
         );
         if let Some((db1, db2)) = swapdb {
             self.apply_swapdb_watch_state(db1, db2);
-            self.wakeup_blocked_on_keys(&dirty_keys, None, None);
+            self.signal_keys_ready(&dirty_keys);
         } else if !committed_keys.is_empty() {
-            self.wakeup_blocked_on_keys(&committed_keys, None, None);
+            self.signal_keys_ready(&committed_keys);
         }
     }
 

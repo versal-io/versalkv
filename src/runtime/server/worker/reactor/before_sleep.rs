@@ -89,6 +89,7 @@ impl ServerWorkerState {
         {
             return Ok(LoopControl::Stop);
         }
+        self.process_ready_keys();
         if self.dispatch_before_poll_slot(BeforePollSlot::PreAof, DispatchContext::Normal)?
             == LoopControl::Stop
         {

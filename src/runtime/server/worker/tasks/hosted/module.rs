@@ -16,7 +16,7 @@ impl ServerWorkerState {
         let dirty_keys = self.commit_pending_module_effects(pending, None, None, None);
         self.deliver_monitor(monitor_events);
         if !dirty_keys.is_empty() {
-            self.wakeup_blocked_on_keys(&dirty_keys, None, None);
+            self.signal_keys_ready(&dirty_keys);
         }
         self.flush_aof_if_needed();
         self.schedule_pending_replica_writes_before_sleep();

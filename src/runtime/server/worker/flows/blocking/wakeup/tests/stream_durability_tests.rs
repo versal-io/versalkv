@@ -272,6 +272,7 @@ fn stream_durability_reblock_owns_its_new_offset_not_trigger_offset() {
         before + 1
     );
     backend.process_dirty_keys_in_loop(trigger.0, &mut batch);
+    backend.process_ready_keys();
     assert!(backend.connection_registry[reader].blocked.is_some());
     assert_eq!(
         backend.ctx.replication().primary_repl_offset().get(),
