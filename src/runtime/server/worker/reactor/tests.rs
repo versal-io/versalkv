@@ -2111,6 +2111,10 @@ fn readable_hup_preserves_pipeline_while_a_command_is_blocked() {
     );
     backend.drive_one_pending_client_read();
 
+    backend.process_ready_keys();
+    backend.drive_one_pending_client_read();
+    backend.writes.ordinary.begin_turn();
+    backend.drive_pending_ordinary_writes();
     let mut replies = Vec::new();
     blocked_client.read_to_end(&mut replies).unwrap();
     assert_eq!(replies, b"*2\r\n$8\r\nhup-list\r\n$5\r\nvalue\r\n+PONG\r\n");

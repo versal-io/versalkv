@@ -406,12 +406,7 @@ impl ServerWorkerState {
         );
     }
 
-    pub(crate) fn wakeup_blocked_on_keys(
-        &mut self,
-        dirty_keys: &[(u32, Bytes)],
-        mut pending_replication: Option<&mut Vec<Vec<u8>>>,
-        mut pending_aof: Option<&mut Vec<Vec<u8>>>,
-    ) {
+    pub(crate) fn wakeup_blocked_on_keys(&mut self, dirty_keys: &[(u32, Bytes)]) {
         if self.processing_blocked_clients {
             return;
         }
@@ -422,14 +417,7 @@ impl ServerWorkerState {
 
         while let Some((db_id, key)) = ready.pop() {
             ready_seen.remove(&(db_id, key.clone()));
-            self.process_ready_key(
-                db_id,
-                &key,
-                &mut ready,
-                &mut ready_seen,
-                pending_replication.as_deref_mut(),
-                pending_aof.as_deref_mut(),
-            );
+            self.process_ready_key(db_id, &key, &mut ready, &mut ready_seen);
         }
 
         self.processing_blocked_clients = false;
@@ -441,8 +429,6 @@ impl ServerWorkerState {
         key: &[u8],
         ready: &mut Vec<(u32, Bytes)>,
         ready_seen: &mut HashSet<(u32, Bytes)>,
-        mut pending_replication: Option<&mut Vec<Vec<u8>>>,
-        mut pending_aof: Option<&mut Vec<Vec<u8>>>,
     ) {
         let waiters = self.ctx.blocking_registry().waiters_for_key(db_id, key);
         for session in waiters {
@@ -452,11 +438,7 @@ impl ServerWorkerState {
             if !self.blocked_key_is_eligible_for_wake(token, db_id, key) {
                 continue;
             }
-            let new_dirty = self.wakeup_blocked_client(
-                token,
-                pending_replication.as_deref_mut(),
-                pending_aof.as_deref_mut(),
-            );
+            let new_dirty = self.wakeup_blocked_client(token, None, None);
             for dk in new_dirty {
                 if ready_seen.insert(dk.clone()) {
                     ready.push(dk);
@@ -792,7 +774,7 @@ impl ServerWorkerState {
                 all_dirty.extend(dirty);
             }
             if !all_dirty.is_empty() {
-                self.wakeup_blocked_on_keys(&all_dirty, None, None);
+                self.signal_keys_ready(&all_dirty);
             }
         }
     }

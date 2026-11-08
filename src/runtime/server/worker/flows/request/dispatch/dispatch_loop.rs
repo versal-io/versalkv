@@ -500,11 +500,7 @@ impl ServerWorkerState {
                     .touch_watched_key(*db_id, key, exists_after);
             }
         }
-        self.wakeup_blocked_on_keys(
-            &effects.watch_dirty,
-            Some(&mut effects.replication_only),
-            Some(&mut effects.aof_only),
-        );
+        self.signal_keys_ready(&effects.watch_dirty);
         effects.watch_dirty.clear();
     }
 }

@@ -2911,6 +2911,7 @@ fn replicated_xadd_wakes_readonly_replica_xread() {
         )
         .unwrap();
 
+    backend.process_ready_keys();
     assert!(
         backend.connection_registry[crate::framework::capabilities::io::Token(reader_key)]
             .blocked

@@ -1493,7 +1493,7 @@ impl ServerWorkerState {
         if let Some((db1, db2)) = outcome.swapdb {
             self.apply_swapdb_watch_state(db1, db2);
         }
-        self.wakeup_blocked_on_keys(&outcome.dirty_keys, None, None);
+        self.signal_keys_ready(&outcome.dirty_keys);
         if relay_stream {
             self.propagate_replication_frame(&outcome.frame);
         }

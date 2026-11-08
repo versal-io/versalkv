@@ -114,6 +114,7 @@ fn assert_replica_swapdb_outcome(
     blocked: Token,
     watched_key: &[u8],
 ) {
+    backend.process_ready_keys();
     assert!(backend.connection_registry[blocked].blocked.is_none());
     assert!(backend
         .ctx

@@ -836,7 +836,6 @@ fn pipelined_write_and_unblocked_write_share_the_next_aof_boundary() {
         },
         false,
     );
-
     assert_eq!(
         backend
             .ctx
@@ -849,6 +848,7 @@ fn pipelined_write_and_unblocked_write_share_the_next_aof_boundary() {
         initial_size,
         "pipelined and unblocked command completion must not flush AOF inline"
     );
+    backend.process_ready_keys();
     assert!(backend.ctx.db(0).unwrap().get_no_expire(b"key").is_none());
     assert_eq!(
         backend
@@ -922,6 +922,7 @@ fn run_failing_aof_barrier_child(
         },
         false,
     );
+    backend.process_ready_keys();
     assert_eq!(backend.ctx.blocking_registry().count(), 0);
     let _ = backend.run_before_poll_phase();
     panic!("appendfsync always unexpectedly survived /dev/null fsync");

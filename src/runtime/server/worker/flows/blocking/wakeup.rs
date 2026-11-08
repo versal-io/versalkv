@@ -585,11 +585,7 @@ impl ServerWorkerState {
         pending_replication: Option<&mut Vec<Vec<u8>>>,
         pending_aof: Option<&mut Vec<Vec<u8>>>,
     ) -> Vec<(u32, Bytes)> {
-        self.wakeup_blocked_on_keys(
-            &effects.wakeup_only,
-            Some(&mut effects.replication_only),
-            Some(&mut effects.aof_only),
-        );
+        self.signal_keys_ready(&effects.wakeup_only);
         self.apply_wakeup_exec_propagation(
             effects.replication_only,
             effects.aof_only,

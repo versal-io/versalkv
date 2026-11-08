@@ -62,8 +62,9 @@ fn teardown_isolates_blpop_before_lpush_and_retries_l1_only() {
     );
 
     backend.transport.clear_interest_requests_for_test();
-    let (mut replication, mut aof) = (Vec::new(), Vec::new());
-    backend.wakeup_blocked_on_keys(&[(0, key.clone())], Some(&mut replication), Some(&mut aof));
+    let replication: Vec<Vec<u8>> = Vec::new();
+    let aof: Vec<Vec<u8>> = Vec::new();
+    backend.wakeup_blocked_on_keys(&[(0, key.clone())]);
 
     // The isolated client is not woken by the LPUSH; value stays, nothing propagates.
     assert_eq!(
