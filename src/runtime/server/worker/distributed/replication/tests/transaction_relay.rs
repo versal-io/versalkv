@@ -58,6 +58,7 @@ fn replicated_transaction_wakes_waiters_in_first_ready_key_order() {
     primary.write_all(&stream).unwrap();
     backend.transport.wait_readable_for_test(Token(token));
     backend.recv_replication_stream(token, token);
+    backend.process_ready_keys();
     assert!(
         backend.connection_registry[Token(first)].blocked.is_none(),
         "the first waiter for the first ready key must receive its value"
@@ -128,6 +129,7 @@ fn unfinished_replication_transactions_do_not_cross_snapshot_or_promotion_bounda
         primary.write_all(&stream).unwrap();
         backend.transport.wait_readable_for_test(Token(token));
         backend.recv_replication_stream(token, token);
+        backend.process_ready_keys();
         assert_eq!(
             backend.ctx.replication().backlog.next_stream_cursor(),
             start,
@@ -148,6 +150,7 @@ fn unfinished_replication_transactions_do_not_cross_snapshot_or_promotion_bounda
         primary.write_all(&writes).unwrap();
         backend.transport.wait_readable_for_test(Token(token));
         backend.recv_replication_stream(token, token);
+        backend.process_ready_keys();
         stream.extend_from_slice(&writes);
         assert_eq!(backend.ctx.db(1).unwrap().dbsize(), 0);
         assert_eq!(
@@ -166,6 +169,7 @@ fn unfinished_replication_transactions_do_not_cross_snapshot_or_promotion_bounda
             primary.write_all(&finish).unwrap();
             backend.transport.wait_readable_for_test(Token(token));
             backend.recv_replication_stream(token, token);
+            backend.process_ready_keys();
             stream.extend_from_slice(&finish);
             assert_eq!(backend.ctx.db(1).unwrap().dbsize(), 64);
             assert_eq!(backend.ctx.repl_seldb(), 1);
@@ -257,6 +261,7 @@ fn committed_replication_transaction_restores_the_aof_starting_database() {
     primary.write_all(&stream).unwrap();
     backend.transport.wait_readable_for_test(Token(token));
     backend.recv_replication_stream(token, token);
+    backend.process_ready_keys();
     assert_eq!(backend.ctx.persistence().aof_selected_db(), 0);
     let journal = std::fs::read(&aof_path).unwrap();
     let mut restored = ServerContext::new(2);
@@ -351,6 +356,7 @@ fn replicated_transaction_is_journaled_before_writable_replica_blocked_pops() {
     primary.write_all(&stream).unwrap();
     backend.transport.wait_readable_for_test(Token(token));
     backend.recv_replication_stream(token, token);
+    backend.process_ready_keys();
     assert!(backend.connection_registry[Token(blocked)]
         .blocked
         .is_none());

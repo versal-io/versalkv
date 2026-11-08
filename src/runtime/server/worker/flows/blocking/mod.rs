@@ -865,7 +865,7 @@ impl ServerWorkerState {
                 all_dirty.extend(dirty);
             }
             if !all_dirty.is_empty() {
-                self.wakeup_blocked_on_keys(&all_dirty, None, None);
+                self.signal_keys_ready(&all_dirty);
             }
         }
     }

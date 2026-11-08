@@ -157,13 +157,15 @@ impl ServerWorkerState {
             }
         }
         if !effects.watch_dirty.is_empty() {
-            self.wakeup_blocked_on_keys(&effects.watch_dirty, None, None);
+            self.signal_keys_ready(&effects.watch_dirty);
+            self.process_ready_keys();
         }
         if let Some((db1, db2)) = effects.swapdb {
             self.apply_swapdb_watch_state(db1, db2);
         }
         if !effects.wakeup_only.is_empty() {
-            self.wakeup_blocked_on_keys(&effects.wakeup_only, None, None);
+            self.signal_keys_ready(&effects.wakeup_only);
+            self.process_ready_keys();
         }
     }
 

@@ -1237,7 +1237,7 @@ impl ServerWorkerState {
         // Keep those effects after the committed transaction that made the keys ready.
         // The wakeup loop pops keys from a stack, so preserve first-ready order.
         dirty_keys.reverse();
-        self.wakeup_blocked_on_keys(&dirty_keys, None, None);
+        self.signal_keys_ready(&dirty_keys);
         Ok(duration_us)
     }
 
@@ -1642,7 +1642,7 @@ impl ServerWorkerState {
         }
         match pending_wakeup {
             Some(keys) => keys.extend(outcome.dirty_keys),
-            None => self.wakeup_blocked_on_keys(&outcome.dirty_keys, None, None),
+            None => self.signal_keys_ready(&outcome.dirty_keys),
         }
         if relay_stream {
             self.propagate_replication_frame(&outcome.frame);

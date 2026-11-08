@@ -2286,6 +2286,8 @@ fn readable_hup_preserves_pipeline_while_a_command_is_blocked() {
         true,
     );
     backend.drive_one_pending_client_read();
+    backend.process_ready_keys();
+    backend.drive_pending_ordinary_writes();
 
     let mut replies = Vec::new();
     blocked_client.read_to_end(&mut replies).unwrap();

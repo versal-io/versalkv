@@ -28,6 +28,7 @@ use crate::runtime::server::worker::reactor::transport::{
 };
 use crate::runtime::server::worker::sessions::write_state::WriteSchedulers;
 use crate::runtime::server::worker::sessions::{ConnectionRegistry, ListenerSet};
+use bytes::Bytes;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::net::SocketAddr;
@@ -157,6 +158,11 @@ pub(crate) struct ServerWorkerState {
     /// tick; normal C-compatible ownership updates use the bus path directly.
     pub(in crate::runtime::server) last_stale_primary_guard_ms: Option<i64>,
     pub(in crate::runtime::server) active_defrag: ActiveDefragState,
+    /// Ready keys accumulated during the current event-loop turn, processed
+    /// once at the start of the next BeforePoll phase (Valkey-aligned
+    /// signalKeyAsReady → beforeSleep batching).
+    pub(in crate::runtime::server) ready_keys: Vec<(u32, Bytes)>,
+    pub(in crate::runtime::server) ready_keys_set: HashSet<(u32, Bytes)>,
 }
 
 impl ServerWorkerState {
@@ -170,6 +176,22 @@ impl ServerWorkerState {
         }
         self.debug_pause_after_fork_consumed = true;
         true
+    }
+
+    pub(crate) fn signal_keys_ready(&mut self, keys: &[(u32, Bytes)]) {
+        for key in keys {
+            if self.ready_keys_set.insert(key.clone()) {
+                self.ready_keys.push(key.clone());
+            }
+        }
+    }
+
+    pub(crate) fn process_ready_keys(&mut self) {
+        let keys: Vec<(u32, Bytes)> = std::mem::take(&mut self.ready_keys);
+        self.ready_keys_set.clear();
+        if !keys.is_empty() {
+            self.wakeup_blocked_on_keys(&keys, None, None);
+        }
     }
 
     pub fn new(num_dbs: u32) -> std::io::Result<Self> {
@@ -281,6 +303,8 @@ impl ServerWorkerState {
             blocked_cron_calls: 0,
             last_stale_primary_guard_ms: None,
             active_defrag: ActiveDefragState::default(),
+            ready_keys: Vec::new(),
+            ready_keys_set: HashSet::new(),
         })
     }
 
