@@ -20,7 +20,7 @@ use crate::runtime::server::worker::event_loop::queue::EventBatch;
 use crate::runtime::server::worker::event_loop::sources::{
     ChildRegistry, ChildSignalOwner, RuntimeSourceHandle, RuntimeSourceRegistry, SourceOwner,
 };
-use crate::runtime::server::worker::event_loop::timers::{
+use crate::runtime::server::worker::event_loop::timer::{
     DueTimeEvent, TimeEventId, TimeEventRegistry,
 };
 use crate::runtime::server::worker::event_loop::transport::{

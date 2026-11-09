@@ -237,7 +237,7 @@ def command_check_directory_layout(_args: argparse.Namespace, ctx: RepoContext) 
         "framework/capabilities", "framework/generated/commands", "framework/observability",
         "framework/distributed/migration", "runtime/driver", "runtime/embedded",
         "runtime/server/supervisor/shutdown", "runtime/server/worker/event_loop",
-        "runtime/server/worker/event_loop/io_workers", "runtime/server/worker/event_loop/timers",
+        "runtime/server/worker/event_loop/io_workers", "runtime/server/worker/event_loop/timer",
         "runtime/server/worker/event_loop/transport", "runtime/server/worker/connection",
         "runtime/server/worker/command", "runtime/server/worker/command/blocking",
         "runtime/server/worker/command/dispatch", "runtime/server/worker/command/transaction",

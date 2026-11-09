@@ -4,7 +4,7 @@ use crate::foundation::io::store::Robj;
 use crate::foundation::io::sys::time::MonotonicInstant;
 use crate::framework::capabilities::io::Token;
 use crate::runtime::server::worker::event_loop::queue::EventBatch;
-use crate::runtime::server::worker::event_loop::timers::{
+use crate::runtime::server::worker::event_loop::timer::{
     RuntimeTimeEvent, TimeEventId, TimeEventRegistry,
 };
 use crate::runtime::server::worker::event_loop::{

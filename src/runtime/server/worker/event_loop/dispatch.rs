@@ -356,7 +356,7 @@ impl ServerWorkerState {
     pub(super) fn enqueue_due_timer(
         &mut self,
         due_at: crate::foundation::io::sys::time::MonotonicInstant,
-        id: super::timers::TimeEventId,
+        id: super::timer::TimeEventId,
         payload: super::TimerEvent,
     ) {
         self.ctx.record_eventloop_event_collected(1);

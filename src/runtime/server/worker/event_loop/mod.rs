@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 pub(crate) mod io_workers;
-pub(crate) mod timers;
+pub(crate) mod timer;
 pub(crate) mod transport;
 
 use self::blocked_events::BlockedOperation;
@@ -11,14 +11,14 @@ use self::sources::{ChildCompletionEvent, ChildHandle};
 use super::ServerWorkerState;
 use crate::framework::capabilities::io::Token;
 use crate::runtime::server::worker::event_loop::io_workers::WorkerCompletionEvent;
-use crate::runtime::server::worker::event_loop::timers::TimeEventId;
+use crate::runtime::server::worker::event_loop::timer::TimeEventId;
 use crate::runtime::server::worker::event_loop::transport::RuntimeEvent;
 
-mod before_sleep;
 pub(crate) mod blocked_events;
 mod blocked_service;
 mod dispatch;
-mod pending_input;
+mod pending;
+mod phases;
 mod poll;
 pub(crate) mod queue;
 pub(crate) mod sources;

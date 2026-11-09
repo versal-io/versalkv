@@ -4,7 +4,7 @@ use std::collections::{BinaryHeap, HashMap};
 
 use crate::foundation::io::sys::time::MonotonicInstant;
 use crate::framework::capabilities::io::Token;
-use crate::runtime::server::worker::event_loop::timers::TimeEventId;
+use crate::runtime::server::worker::event_loop::timer::TimeEventId;
 
 use super::{
     BeforePollSlot, EventLane, EventLimits, EventLoopEvent, EventOwner, EventPayload, EventPhase,
