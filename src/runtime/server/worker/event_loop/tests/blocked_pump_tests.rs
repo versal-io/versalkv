@@ -213,7 +213,7 @@ fn run_failing_blocked_pump_child(client_address: SocketAddr, control_address: S
 fn blocked_pump_never_exposes_a_reply_before_a_failed_fsync() {
     const CHILD_MARKER: &str = "VERSAL_BLOCKED_PUMP_AOF_FAILURE_CHILD";
     const TEST_NAME: &str = concat!(
-        "runtime::server::worker::reactor::tests::blocked_pump_tests::",
+        "runtime::server::worker::event_loop::tests::blocked_pump_tests::",
         "blocked_pump_never_exposes_a_reply_before_a_failed_fsync"
     );
     if std::env::var_os(CHILD_MARKER).is_some() {
@@ -231,7 +231,7 @@ fn blocked_pump_never_exposes_a_reply_before_a_failed_fsync() {
 
     let client_listener = TcpListener::bind("127.0.0.1:0").expect("bind client listener");
     let control_listener = TcpListener::bind("127.0.0.1:0").expect("bind control listener");
-    let mut child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+    let child = std::process::Command::new(std::env::current_exe().expect("test binary"))
         .args(["--exact", TEST_NAME, "--nocapture"])
         .env(CHILD_MARKER, "1")
         .env(
@@ -253,7 +253,8 @@ fn blocked_pump_never_exposes_a_reply_before_a_failed_fsync() {
         .expect("write SET");
     control.write_all(&[1]).expect("release child");
 
-    let child_status = child.wait().expect("wait for blocked-pump child");
+    let child_status =
+        super::wait_child_with_timeout(child, Duration::from_secs(10), "blocked-pump");
     assert_eq!(child_status.code(), Some(1));
     let mut reply = Vec::new();
     client.read_to_end(&mut reply).expect("read client EOF");

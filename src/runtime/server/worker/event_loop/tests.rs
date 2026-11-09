@@ -25,6 +25,34 @@ fn offset(value: i64) -> ReplicationOffset {
     ReplicationOffset::try_from(value).expect("valid test offset")
 }
 
+fn wait_child_with_timeout(
+    mut child: std::process::Child,
+    timeout: Duration,
+    label: &str,
+) -> std::process::ExitStatus {
+    let child_id = child.id();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait());
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(result) => result.expect("child process failed"),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            let _ = std::process::Command::new("kill")
+                .arg("-9")
+                .arg(child_id.to_string())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+            panic!(
+                "{label} child process (pid {child_id}) timed out after {}s",
+                timeout.as_secs()
+            );
+        }
+        Err(_) => unreachable!(),
+    }
+}
+
 #[path = "tests/event_model_tests.rs"]
 mod event_model_tests;
 #[path = "tests/lifecycle_diagnostics_tests.rs"]
@@ -1173,7 +1201,7 @@ fn run_failed_fsync_pending_pump_child(
 fn blocked_pumps_never_expose_pending_reply_before_failed_fsync() {
     const CHILD_MARKER: &str = "VERSAL_PENDING_AOF_FAILURE_CHILD";
     const TEST_NAME: &str = concat!(
-        "runtime::server::worker::reactor::tests::",
+        "runtime::server::worker::event_loop::tests::",
         "blocked_pumps_never_expose_pending_reply_before_failed_fsync"
     );
     if std::env::var_os(CHILD_MARKER).is_some() {
@@ -1193,7 +1221,7 @@ fn blocked_pumps_never_expose_pending_reply_before_failed_fsync() {
     for pump in ["loading", "command"] {
         let client_listener = TcpListener::bind("127.0.0.1:0").expect("bind client listener");
         let control_listener = TcpListener::bind("127.0.0.1:0").expect("bind control listener");
-        let mut child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        let child = std::process::Command::new(std::env::current_exe().expect("test binary"))
             .args(["--exact", TEST_NAME, "--nocapture"])
             .env(CHILD_MARKER, "1")
             .env(
@@ -1216,7 +1244,11 @@ fn blocked_pumps_never_expose_pending_reply_before_failed_fsync() {
             .expect("write pending SET");
         control.write_all(&[1]).expect("release child");
 
-        let child_status = child.wait().expect("wait for pending-AOF child");
+        let child_status = wait_child_with_timeout(
+            child,
+            Duration::from_secs(10),
+            &format!("pending-AOF ({pump})"),
+        );
         assert_eq!(child_status.code(), Some(1), "pump={pump}");
         let mut reply = Vec::new();
         client.read_to_end(&mut reply).expect("read client EOF");
