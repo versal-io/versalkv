@@ -86,6 +86,12 @@ impl ServerWorkerRuntime {
         RuntimeCapabilities::server()
     }
 
+    /// Runs the event loop.
+    ///
+    /// `self.kernel` is `RuntimeKernel<ServerWorkerMachine>`.
+    /// Each call to [`kernel.dispatch`](RuntimeKernel::dispatch) drives
+    /// [`ServerWorkerMachine::accept`] then [`ServerWorkerMachine::advance`]
+    /// in a bounded quantum loop.
     pub fn run(&mut self) -> io::Result<()> {
         crate::server_log!(notice, "Event loop started");
         self.kernel.machine_mut().initialize();

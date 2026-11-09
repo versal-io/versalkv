@@ -1,13 +1,16 @@
-mod driver;
+mod completions;
+mod core;
+mod lifecycle;
+mod poll_offload;
 mod pool;
+mod registry;
 mod stats;
+mod submit;
 
 use crate::foundation::io::transport::{
     ReadOutcome, ThreadIoHandle, TransportWakeHandle, WriteOutcome,
 };
-use crate::framework::capabilities::io::mt_driver::IoDriverMtConfig;
 use crate::framework::capabilities::io::Token;
-use crate::framework::context::IoThreadInfo;
 use crate::runtime::server::worker::event_loop::transport::{
     RuntimePollCompletion, RuntimePollJob,
 };
@@ -294,16 +297,16 @@ impl<T> SubmitError<T> {
     }
 }
 
-struct IoConnectionState {
-    is_cluster_bus: bool,
-    read_deferred: bool,
-    generation: u64,
-    next_sequence: u64,
-    read_handle: Option<ThreadIoHandle>,
-    write_handle: Option<ThreadIoHandle>,
-    read_inflight: Option<IoOperationId>,
-    write_inflight: Option<IoOperationId>,
-    close_pending: bool,
+pub(crate) struct IoConnectionState {
+    pub(crate) is_cluster_bus: bool,
+    pub(crate) read_deferred: bool,
+    pub(crate) generation: u64,
+    pub(crate) next_sequence: u64,
+    pub(crate) read_handle: Option<ThreadIoHandle>,
+    pub(crate) write_handle: Option<ThreadIoHandle>,
+    pub(crate) read_inflight: Option<IoOperationId>,
+    pub(crate) write_inflight: Option<IoOperationId>,
+    pub(crate) close_pending: bool,
 }
 
 #[derive(Debug)]
@@ -338,490 +341,21 @@ pub(crate) enum WriteCompletionAction {
 }
 
 pub(crate) struct IoThreadRuntime {
-    pool: SharedIoPool,
-    connections: HashMap<Token, IoConnectionState>,
-    next_generation: u64,
+    pub(crate) pool: SharedIoPool,
+    pub(crate) connections: HashMap<Token, IoConnectionState>,
+    pub(crate) next_generation: u64,
     #[cfg(test)]
-    wake_token: Token,
-    counter_reset_generation: u64,
-    reads_processed_baseline: u64,
-    writes_processed_baseline: u64,
-    polls_processed_baseline: u64,
+    pub(crate) wake_token: Token,
+    pub(crate) counter_reset_generation: u64,
+    pub(crate) reads_processed_baseline: u64,
+    pub(crate) writes_processed_baseline: u64,
+    pub(crate) polls_processed_baseline: u64,
 }
 
 impl IoThreadRuntime {
     #[cfg(test)]
-    pub(crate) fn new(
-        config: IoDriverMtConfig,
-        wake_token: Token,
-        wake: TransportWakeHandle,
-    ) -> std::io::Result<Self> {
-        #[cfg(not(test))]
-        let _ = wake_token;
-        Ok(Self {
-            pool: SharedIoPool::new(config, wake)?,
-            connections: HashMap::new(),
-            next_generation: 0,
-            #[cfg(test)]
-            wake_token,
-            counter_reset_generation: 0,
-            reads_processed_baseline: 0,
-            writes_processed_baseline: 0,
-            polls_processed_baseline: 0,
-        })
-    }
-
-    pub(crate) fn new_with_completion_sender(
-        config: IoDriverMtConfig,
-        wake_token: Token,
-        wake: TransportWakeHandle,
-        shared_completions: WorkerCompletionSender,
-    ) -> std::io::Result<Self> {
-        #[cfg(not(test))]
-        let _ = wake_token;
-        Ok(Self {
-            pool: SharedIoPool::with_completion_sender(config, wake, shared_completions)?,
-            connections: HashMap::new(),
-            next_generation: 0,
-            #[cfg(test)]
-            wake_token,
-            counter_reset_generation: 0,
-            reads_processed_baseline: 0,
-            writes_processed_baseline: 0,
-            polls_processed_baseline: 0,
-        })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn new_with_queue_capacity_for_test(
-        config: IoDriverMtConfig,
-        wake_token: Token,
-        wake: TransportWakeHandle,
-        queue_capacity: usize,
-    ) -> std::io::Result<Self> {
-        Ok(Self {
-            pool: SharedIoPool::new_with_queue_capacity_for_test(config, wake, queue_capacity)?,
-            connections: HashMap::new(),
-            next_generation: 0,
-            wake_token,
-            counter_reset_generation: 0,
-            reads_processed_baseline: 0,
-            writes_processed_baseline: 0,
-            polls_processed_baseline: 0,
-        })
-    }
-
-    pub(crate) fn register_connection(
-        &mut self,
-        token: Token,
-        read_handle: ThreadIoHandle,
-        write_handle: ThreadIoHandle,
-    ) -> u64 {
-        self.next_generation = self.next_generation.saturating_add(1).max(1);
-        let generation = self.next_generation;
-        self.connections.insert(
-            token,
-            IoConnectionState {
-                is_cluster_bus: false,
-                read_deferred: false,
-                generation,
-                next_sequence: 0,
-                read_handle: Some(read_handle),
-                write_handle: Some(write_handle),
-                read_inflight: None,
-                write_inflight: None,
-                close_pending: false,
-            },
-        );
-        generation
-    }
-
-    #[cfg(test)]
-    pub(crate) fn connection_generation(&self, token: Token) -> Option<u64> {
-        self.connections.get(&token).map(|state| state.generation)
-    }
-
-    pub(crate) fn has_connection(&self, token: Token) -> bool {
-        self.connections.contains_key(&token)
-    }
-
-    pub(crate) fn register_cluster_bus(
-        &mut self,
-        token: Token,
-        read: ThreadIoHandle,
-        write: ThreadIoHandle,
-    ) {
-        self.register_connection(token, read, write);
-        if let Some(state) = self.connections.get_mut(&token) {
-            state.is_cluster_bus = true;
-        }
-    }
-
-    pub(crate) fn is_cluster_bus(&self, token: Token) -> bool {
-        self.connections
-            .get(&token)
-            .is_some_and(|state| state.is_cluster_bus)
-    }
-
-    pub(crate) fn cluster_read_deferred(&self, token: Token) -> bool {
-        self.connections
-            .get(&token)
-            .is_some_and(|state| state.is_cluster_bus && state.read_deferred)
-    }
-
-    pub(crate) fn take_read_job(
-        &mut self,
-        token: Token,
-        max_bytes: usize,
-        drain_to_budget: bool,
-    ) -> Option<ReadJob> {
-        let state = self.connections.get_mut(&token)?;
-        if state.close_pending || state.read_inflight.is_some() {
-            return None;
-        }
-        let handle = state.read_handle.take()?;
-        state.next_sequence = state.next_sequence.saturating_add(1).max(1);
-        let id = IoOperationId {
-            token,
-            generation: state.generation,
-            sequence: state.next_sequence,
-        };
-        state.read_inflight = Some(id);
-        Some(ReadJob {
-            id,
-            handle,
-            max_bytes,
-            drain_to_budget,
-        })
-    }
-
-    fn restore_read_job(&mut self, job: ReadJob) {
-        let Some(state) = self.connections.get_mut(&job.id.token) else {
-            return;
-        };
-        if state.generation == job.id.generation && state.read_inflight == Some(job.id) {
-            state.read_inflight = None;
-            state.read_handle = Some(job.handle);
-        }
-    }
-
-    pub(crate) fn submit_read(
-        &mut self,
-        token: Token,
-        max_bytes: usize,
-        drain_to_budget: bool,
-    ) -> bool {
-        if let Some(state) = self.connections.get_mut(&token) {
-            if state.is_cluster_bus && state.write_inflight.is_some() {
-                state.read_deferred = true;
-                return true;
-            }
-            state.read_deferred = false;
-        }
-        if self
-            .connections
-            .get(&token)
-            .is_some_and(|state| state.read_inflight.is_some())
-        {
-            return true;
-        }
-        if self.pool.active_workers() == 0 {
-            return false;
-        }
-        let Some(job) = self.take_read_job(token, max_bytes, drain_to_budget) else {
-            return false;
-        };
-        match self.pool.try_submit_read(job) {
-            Ok(()) => true,
-            Err(error) => {
-                self.restore_read_job(error.into_inner());
-                false
-            }
-        }
-    }
-
-    pub(crate) fn submit_write(
-        &mut self,
-        token: Token,
-        frames: std::collections::VecDeque<Vec<u8>>,
-        byte_budget: usize,
-    ) -> WriteSubmission {
-        if self.connections.get(&token).is_some_and(|state| {
-            state.is_cluster_bus && (state.read_inflight.is_some() || state.read_deferred)
-        }) {
-            return WriteSubmission::AlreadyPending(frames);
-        }
-        if self
-            .connections
-            .get(&token)
-            .is_some_and(|state| state.write_inflight.is_some())
-        {
-            return WriteSubmission::AlreadyPending(frames);
-        }
-        if self.pool.active_workers() == 0 {
-            return WriteSubmission::Unavailable(frames);
-        }
-        let Some(state) = self.connections.get_mut(&token) else {
-            return WriteSubmission::Unavailable(frames);
-        };
-        if state.close_pending {
-            return WriteSubmission::Unavailable(frames);
-        }
-        let Some(handle) = state.write_handle.take() else {
-            return WriteSubmission::Unavailable(frames);
-        };
-        state.next_sequence = state.next_sequence.saturating_add(1).max(1);
-        let id = IoOperationId {
-            token,
-            generation: state.generation,
-            sequence: state.next_sequence,
-        };
-        state.write_inflight = Some(id);
-        let job = WriteJob {
-            id,
-            handle,
-            frames,
-            byte_budget,
-        };
-        match self.pool.try_submit_write(job) {
-            Ok(()) => WriteSubmission::Submitted,
-            Err(error) => {
-                let job = error.into_inner();
-                state.write_inflight = None;
-                state.write_handle = Some(job.handle);
-                WriteSubmission::Unavailable(job.frames)
-            }
-        }
-    }
-
-    pub(crate) fn begin_close(&mut self, token: Token) -> bool {
-        let Some(state) = self.connections.get_mut(&token) else {
-            return false;
-        };
-        state.close_pending = true;
-        if state.read_inflight.is_none() && state.write_inflight.is_none() {
-            self.connections.remove(&token);
-            false
-        } else {
-            true
-        }
-    }
-
-    pub(crate) fn is_close_pending(&self, token: Token) -> bool {
-        self.connections
-            .get(&token)
-            .is_some_and(|state| state.close_pending)
-    }
-
-    pub(crate) fn is_write_inflight(&self, token: Token) -> bool {
-        self.connections
-            .get(&token)
-            .is_some_and(|state| state.write_inflight.is_some())
-    }
-
-    pub(crate) fn read_inflight_id(&self, token: Token) -> Option<IoOperationId> {
-        self.connections.get(&token)?.read_inflight
-    }
-
-    pub(crate) fn write_inflight_id(&self, token: Token) -> Option<IoOperationId> {
-        self.connections.get(&token)?.write_inflight
-    }
-
-    pub(crate) fn complete_read(&mut self, completion: ReadCompletion) -> ReadCompletionAction {
-        if completion.cancelled {
-            self.pool.stats().cancel_read_submission();
-        } else {
-            self.pool.stats().record_read_completed();
-        }
-        let Some(state) = self.connections.get_mut(&completion.id.token) else {
-            return ReadCompletionAction::Stale;
-        };
-        if state.generation != completion.id.generation
-            || state.read_inflight != Some(completion.id)
-        {
-            return ReadCompletionAction::Stale;
-        }
-        state.read_inflight = None;
-        if state.close_pending {
-            let token = completion.id.token;
-            if state.write_inflight.is_none() {
-                self.connections.remove(&token);
-                return ReadCompletionAction::CloseTransport(token);
-            }
-            return ReadCompletionAction::Stale;
-        }
-        state.read_handle = Some(completion.handle);
-        if completion.cancelled {
-            return ReadCompletionAction::Cancelled;
-        }
-        ReadCompletionAction::Apply {
-            token: completion.id.token,
-            bytes: completion.bytes,
-            outcome: completion.outcome,
-            drain_to_budget: completion.drain_to_budget,
-        }
-    }
-
-    pub(crate) fn complete_write(&mut self, completion: WriteCompletion) -> WriteCompletionAction {
-        if completion.cancelled {
-            self.pool.stats().cancel_write_submission();
-        } else {
-            self.pool.stats().record_write_completed();
-        }
-        let Some(state) = self.connections.get_mut(&completion.id.token) else {
-            return WriteCompletionAction::Stale;
-        };
-        if state.generation != completion.id.generation
-            || state.write_inflight != Some(completion.id)
-        {
-            return WriteCompletionAction::Stale;
-        }
-        state.write_inflight = None;
-        if state.close_pending {
-            let token = completion.id.token;
-            if state.read_inflight.is_none() {
-                self.connections.remove(&token);
-                return WriteCompletionAction::CloseTransport(token);
-            }
-            return WriteCompletionAction::Stale;
-        }
-        state.write_handle = Some(completion.handle);
-        WriteCompletionAction::Apply {
-            token: completion.id.token,
-            frames: completion.frames,
-            written: completion.written,
-            released_allocation_bytes: completion.released_allocation_bytes,
-            outcome: completion.outcome,
-        }
-    }
-
-    #[cfg(test)]
     pub(crate) fn wake_token(&self) -> Token {
         self.wake_token
-    }
-
-    pub(crate) fn pool(&self) -> &SharedIoPool {
-        &self.pool
-    }
-
-    pub(crate) fn try_submit_poll(
-        &mut self,
-        job: RuntimePollJob,
-    ) -> Result<(), SubmitError<RuntimePollJob>> {
-        self.pool.try_submit_poll(job)
-    }
-
-    pub(crate) fn record_poll_completion(&self, cancelled: bool) {
-        if cancelled {
-            self.pool.stats().cancel_poll_submission();
-        } else {
-            self.pool.stats().record_poll_completed();
-        }
-    }
-
-    pub(crate) fn discard_read_completion_for_shutdown(&self, completion: ReadCompletion) {
-        if completion.cancelled {
-            self.pool.stats().cancel_read_submission();
-        } else {
-            self.pool.stats().record_read_completed();
-        }
-    }
-
-    pub(crate) fn discard_write_completion_for_shutdown(&self, completion: WriteCompletion) {
-        if completion.cancelled {
-            self.pool.stats().cancel_write_submission();
-        } else {
-            self.pool.stats().record_write_completed();
-        }
-    }
-
-    pub(crate) fn shutdown_and_drain(&mut self) -> Vec<IoCompletion> {
-        self.pool.shutdown_and_drain()
-    }
-
-    pub(crate) fn should_offload_poll(&self) -> bool {
-        self.pool.configured_threads() > 1
-            && self.pool.active_workers() > 0
-            && self.pool.has_pending_io()
-    }
-
-    pub(crate) fn configure(
-        &mut self,
-        configured_threads: usize,
-        always_active: bool,
-    ) -> std::io::Result<()> {
-        self.pool.resize(configured_threads)?;
-        let active = if always_active {
-            configured_threads.saturating_sub(1)
-        } else {
-            0
-        };
-        self.pool.set_active_workers(active);
-        Ok(())
-    }
-
-    pub(crate) fn after_poll(&mut self, event_count: usize, always_active: bool) {
-        let configured_workers = self.pool.configured_threads().saturating_sub(1);
-        if configured_workers == 0 {
-            self.pool.set_active_workers(0);
-        } else if always_active && event_count > 0 {
-            self.pool.set_active_workers(configured_workers);
-        } else if !always_active && event_count >= 4 {
-            let next = self
-                .pool
-                .active_workers()
-                .saturating_add(1)
-                .min(configured_workers);
-            self.pool.set_active_workers(next);
-        }
-    }
-
-    pub(crate) fn before_sleep(&mut self, always_active: bool) {
-        if !always_active && !self.pool.has_pending_io() {
-            self.pool.set_active_workers(0);
-        }
-    }
-
-    pub(crate) fn observe_counter_reset(&mut self, generation: u64) {
-        if generation == self.counter_reset_generation {
-            return;
-        }
-        self.counter_reset_generation = generation;
-        self.reads_processed_baseline = self.pool.stats().reads_processed();
-        self.writes_processed_baseline = self.pool.stats().writes_processed();
-        self.polls_processed_baseline = self.pool.stats().polls_processed();
-    }
-
-    pub(crate) fn info(&self) -> IoThreadInfo {
-        let configured_threads = self.pool.configured_threads();
-        IoThreadInfo {
-            configured_threads,
-            active_threads: self.pool.active_workers().saturating_add(1),
-            active_time_us: (0..configured_threads)
-                .map(|id| self.pool.stats().active_time_us(id))
-                .collect(),
-            reads_processed: self
-                .pool
-                .stats()
-                .reads_processed()
-                .saturating_sub(self.reads_processed_baseline),
-            writes_processed: self
-                .pool
-                .stats()
-                .writes_processed()
-                .saturating_sub(self.writes_processed_baseline),
-            polls_processed: self
-                .pool
-                .stats()
-                .polls_processed()
-                .saturating_sub(self.polls_processed_baseline),
-            reads_pending: self.pool.stats().reads_pending(),
-            writes_pending: self.pool.stats().writes_pending(),
-            polls_pending: self.pool.stats().polls_pending(),
-            main_thread_utilization_pct: 0,
-            queue_depth_average: self.pool.queue_depth() as u64,
-            counter_reset_generation: self.counter_reset_generation,
-        }
     }
 }
 
