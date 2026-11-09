@@ -11,8 +11,8 @@ use crate::runtime::driver::{
 };
 use crate::runtime::server::message::{WorkerControl, WorkerId};
 use crate::runtime::server::shared::ServerShared;
-use crate::runtime::server::worker::reactor::transport::RuntimeEvent;
-use crate::runtime::server::worker::reactor::{DispatchContext, LoopControl};
+use crate::runtime::server::worker::event_loop::transport::RuntimeEvent;
+use crate::runtime::server::worker::event_loop::{DispatchContext, LoopControl};
 use crate::runtime::server::worker::ServerWorkerState;
 
 pub(crate) struct ServerWorkerRuntime {

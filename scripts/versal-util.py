@@ -236,18 +236,22 @@ def command_check_directory_layout(_args: argparse.Namespace, ctx: RepoContext) 
         "engine/state", "engine/persistence", "engine/extension", "framework/config",
         "framework/capabilities", "framework/generated/commands", "framework/observability",
         "framework/distributed/migration", "runtime/driver", "runtime/embedded",
-        "runtime/server/supervisor/shutdown", "runtime/server/worker/reactor",
-        "runtime/server/worker/reactor/io_workers", "runtime/server/worker/reactor/timers",
-        "runtime/server/worker/reactor/transport", "runtime/server/worker/flows/request",
-        "runtime/server/worker/flows/blocking", "runtime/server/worker/flows/maintenance",
-        "runtime/server/worker/sessions", "runtime/server/worker/tasks/hosted",
-        "runtime/server/worker/distributed/migration", "server",
+        "runtime/server/supervisor/shutdown", "runtime/server/worker/event_loop",
+        "runtime/server/worker/event_loop/io_workers", "runtime/server/worker/event_loop/timers",
+        "runtime/server/worker/event_loop/transport", "runtime/server/worker/connection",
+        "runtime/server/worker/command", "runtime/server/worker/command/blocking",
+        "runtime/server/worker/command/dispatch", "runtime/server/worker/command/transaction",
+        "runtime/server/worker/maintenance", "runtime/server/worker/hosted",
+        "runtime/server/worker/cluster/migration", "runtime/server/worker/cluster/bus",
+        "runtime/server/worker/cluster/pubsub", "runtime/server/worker/replication", "server",
     )
     required_files = (
         "bin/server.rs", "framework/generated/mod.rs", "framework/generated/commands/mod.rs",
         "framework/generated/commands/catalog.rs", "runtime/server/message.rs",
         "runtime/server/shared.rs", "runtime/server/worker/runtime.rs",
-        "runtime/server/worker/state.rs", "runtime/server/worker/distributed/cluster.rs",
+        "runtime/server/worker/state.rs", "runtime/server/worker/cluster/bus.rs",
+        "runtime/server/worker/cluster/pubsub.rs", "runtime/server/worker/cluster/propagation.rs",
+        "runtime/server/worker/replication.rs",
     )
     retired = (
         "main.rs", "config", "event_loop", "engine/data", "engine/request", "engine/persist",
@@ -260,6 +264,9 @@ def command_check_directory_layout(_args: argparse.Namespace, ctx: RepoContext) 
         "runtime/clients", "runtime/background", "runtime/blocked_clients",
         "runtime/host_tasks", "runtime/shutdown", "runtime/io_workers", "runtime/timers",
         "runtime/transport", "runtime/distributed", "runtime/state.rs",
+        "runtime/server/worker/reactor", "runtime/server/worker/flows",
+        "runtime/server/worker/sessions", "runtime/server/worker/tasks",
+        "runtime/server/worker/distributed",
     )
     for relative in required_dirs:
         if not (src / relative).is_dir():

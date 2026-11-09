@@ -7,27 +7,29 @@ use crate::framework::capabilities::io::Token;
 use crate::framework::context::ServerContext;
 use crate::framework::distributed::sentinel::link::SentinelLinkManager;
 use crate::framework::CommandRegistry;
-use crate::runtime::server::worker::distributed::replication::pending_lazyfree::PendingReplicationLazyfree;
-use crate::runtime::server::worker::distributed::replication::FullSyncCoordinator;
-use crate::runtime::server::worker::flows::maintenance::lazyfree::DataLazyfree;
-use crate::runtime::server::worker::reactor::blocked_events::{
+use crate::runtime::server::worker::connection::write_state::WriteSchedulers;
+use crate::runtime::server::worker::connection::{ConnectionRegistry, ListenerSet};
+use crate::runtime::server::worker::event_loop::blocked_events::{
     BlockedEventState, PendingReplayContinuation, RdbLoadProgress,
 };
-use crate::runtime::server::worker::reactor::io_workers::IoOperationId;
-use crate::runtime::server::worker::reactor::io_workers::{IoThreadRuntime, WorkerCompletionQueue};
-use crate::runtime::server::worker::reactor::queue::EventBatch;
-use crate::runtime::server::worker::reactor::sources::{
+use crate::runtime::server::worker::event_loop::io_workers::IoOperationId;
+use crate::runtime::server::worker::event_loop::io_workers::{
+    IoThreadRuntime, WorkerCompletionQueue,
+};
+use crate::runtime::server::worker::event_loop::queue::EventBatch;
+use crate::runtime::server::worker::event_loop::sources::{
     ChildRegistry, ChildSignalOwner, RuntimeSourceHandle, RuntimeSourceRegistry, SourceOwner,
 };
-use crate::runtime::server::worker::reactor::timers::{
+use crate::runtime::server::worker::event_loop::timers::{
     DueTimeEvent, TimeEventId, TimeEventRegistry,
 };
-use crate::runtime::server::worker::reactor::transport::{
+use crate::runtime::server::worker::event_loop::transport::{
     deregister_or_defer, retire_route_for_teardown, RuntimeEvent, RuntimeTransport,
     SourceInstallRollback,
 };
-use crate::runtime::server::worker::sessions::write_state::WriteSchedulers;
-use crate::runtime::server::worker::sessions::{ConnectionRegistry, ListenerSet};
+use crate::runtime::server::worker::maintenance::lazyfree::DataLazyfree;
+use crate::runtime::server::worker::replication::pending_lazyfree::PendingReplicationLazyfree;
+use crate::runtime::server::worker::replication::FullSyncCoordinator;
 use bytes::Bytes;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -56,7 +58,7 @@ pub(in crate::runtime::server) struct EventLoopCycleStart {
     pub(in crate::runtime::server) commands_processed: u64,
 }
 
-pub(in crate::runtime::server) use crate::runtime::server::worker::reactor::transport::{
+pub(in crate::runtime::server) use crate::runtime::server::worker::event_loop::transport::{
     PendingRemovalOwner, PendingTransportRemoval,
 };
 
@@ -126,11 +128,11 @@ pub(crate) struct ServerWorkerState {
     pub(in crate::runtime::server) slot_migration_runtime:
         crate::framework::distributed::migration::SlotMigrationRuntime,
     pub(in crate::runtime::server) slot_migration_snapshot:
-        Option<crate::runtime::server::worker::distributed::migration::SlotSnapshotRelay>,
+        Option<crate::runtime::server::worker::cluster::migration::SlotSnapshotRelay>,
     pub(in crate::runtime::server) processing_blocked_clients: bool,
     pub(in crate::runtime::server) initial_rdb_replication_info_installed: bool,
     pub(in crate::runtime::server) cluster_config:
-        crate::runtime::server::worker::distributed::cluster::ClusterConfigFile,
+        crate::runtime::server::worker::cluster::bus::ClusterConfigFile,
     pub(in crate::runtime::server) io_threads: IoThreadRuntime,
     pub(in crate::runtime::server) worker_completions: WorkerCompletionQueue,
     pub(in crate::runtime::server) time_events: TimeEventRegistry,
@@ -141,16 +143,16 @@ pub(crate) struct ServerWorkerState {
     pub(crate) priority_command_token: Option<Token>,
     pub(crate) priority_command_is_nested: bool,
     pub(crate) command_execution_depth: usize,
-    pub(crate) priority_cycle: Option<super::sessions::qos::PriorityCycle>,
+    pub(crate) priority_cycle: Option<super::connection::qos::PriorityCycle>,
     #[cfg(test)]
     pub(in crate::runtime::server) test_time_event_callbacks:
         Vec<Option<Box<dyn FnOnce(&mut ServerWorkerState) + 'static>>>,
     #[cfg(test)]
     pub(in crate::runtime::server) turn_trace:
-        Vec<crate::runtime::server::worker::reactor::TurnTracePoint>,
+        Vec<crate::runtime::server::worker::event_loop::TurnTracePoint>,
     #[cfg(test)]
     pub(in crate::runtime::server) blocked_round_trace:
-        Vec<crate::runtime::server::worker::reactor::BlockedRoundPhase>,
+        Vec<crate::runtime::server::worker::event_loop::BlockedRoundPhase>,
     #[cfg(test)]
     pub(in crate::runtime::server) blocked_cron_calls: usize,
     /// Stale-primary recovery guard. It compares full slot
@@ -281,7 +283,7 @@ impl ServerWorkerState {
             processing_blocked_clients: false,
             initial_rdb_replication_info_installed: false,
             cluster_config:
-                crate::runtime::server::worker::distributed::cluster::ClusterConfigFile::default(),
+                crate::runtime::server::worker::cluster::bus::ClusterConfigFile::default(),
             io_threads,
             worker_completions,
             time_events: TimeEventRegistry::default(),
@@ -480,9 +482,9 @@ impl ServerWorkerState {
 
     pub(in crate::runtime::server) fn route_listener_handle(
         &mut self,
-        handle: crate::runtime::server::worker::reactor::transport::RuntimeListenerHandle,
+        handle: crate::runtime::server::worker::event_loop::transport::RuntimeListenerHandle,
         owner: SourceOwner,
-    ) -> std::io::Result<crate::runtime::server::worker::reactor::transport::RuntimeListenerHandle>
+    ) -> std::io::Result<crate::runtime::server::worker::event_loop::transport::RuntimeListenerHandle>
     {
         self.route_runtime_source(handle.token, owner)?;
         Ok(handle)
@@ -490,8 +492,8 @@ impl ServerWorkerState {
 
     pub(in crate::runtime::server) fn route_cluster_bus_listener_handle(
         &mut self,
-        handle: crate::runtime::server::worker::reactor::transport::RuntimeListenerHandle,
-    ) -> std::io::Result<crate::runtime::server::worker::reactor::transport::RuntimeListenerHandle>
+        handle: crate::runtime::server::worker::event_loop::transport::RuntimeListenerHandle,
+    ) -> std::io::Result<crate::runtime::server::worker::event_loop::transport::RuntimeListenerHandle>
     {
         self.route_listener_handle(handle, SourceOwner::ClusterBus)
     }
@@ -529,7 +531,7 @@ impl ServerWorkerState {
     /// are already isolated, so a successful deregister just drops the retry
     /// entry; the transport registry frees the `TransportId` only here.
     pub(in crate::runtime::server) fn retry_pending_transport_removals(&mut self) {
-        crate::runtime::server::worker::reactor::transport::retry_pending_transport_removals(
+        crate::runtime::server::worker::event_loop::transport::retry_pending_transport_removals(
             &mut self.transport,
             &mut self.pending_transport_removals,
         );
@@ -667,7 +669,7 @@ impl ServerWorkerState {
 
     fn register_tls_listener(
         &mut self,
-        handle: crate::runtime::server::worker::reactor::transport::RuntimeListenerHandle,
+        handle: crate::runtime::server::worker::event_loop::transport::RuntimeListenerHandle,
     ) {
         self.listeners.all.push(handle.token);
         self.listeners.tls.push(handle.token);
@@ -680,7 +682,7 @@ impl ServerWorkerState {
     fn register_tcp_listener(
         &mut self,
         addr: SocketAddr,
-        handle: crate::runtime::server::worker::reactor::transport::RuntimeListenerHandle,
+        handle: crate::runtime::server::worker::event_loop::transport::RuntimeListenerHandle,
     ) {
         self.listeners.all.push(handle.token);
         self.listeners.tcp.push(handle.token);
@@ -755,7 +757,7 @@ impl ServerWorkerState {
 }
 
 fn source_install_error(
-    error: crate::runtime::server::worker::reactor::sources::RuntimeSourceRegistryError,
+    error: crate::runtime::server::worker::event_loop::sources::RuntimeSourceRegistryError,
     cleanup_error: Option<std::io::Error>,
 ) -> std::io::Error {
     let message = match cleanup_error {
