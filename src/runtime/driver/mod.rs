@@ -11,8 +11,7 @@ pub use capabilities::RuntimeCapabilities;
 pub use clock::{RuntimeClock, RuntimeInstant};
 pub use command::{CommandEffectSink, CommandTransition, OwnedCommandContinuation};
 pub use continuation::{
-    ContinuationId, ContinuationRegistry, ExternalEventKey, SuspendedCommand,
-    WaitCondition,
+    ContinuationId, ContinuationRegistry, ExternalEventKey, SuspendedCommand, WaitCondition,
 };
 pub use input::{RuntimeDispatch, RuntimeInput};
 pub use kernel::{RuntimeConfigurationError, RuntimeDriverError, RuntimeKernel, RuntimeTurnLimits};
