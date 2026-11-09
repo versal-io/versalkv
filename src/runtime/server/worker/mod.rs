@@ -1,9 +1,11 @@
-pub(crate) mod distributed;
-pub(crate) mod flows;
-pub(crate) mod reactor;
+pub(crate) mod cluster;
+pub(crate) mod command;
+pub(crate) mod connection;
+pub(crate) mod event_loop;
+pub(crate) mod hosted;
+pub(crate) mod maintenance;
+pub(crate) mod replication;
 mod runtime;
-pub(crate) mod sessions;
-pub(crate) mod tasks;
 
 mod state;
 mod tls;

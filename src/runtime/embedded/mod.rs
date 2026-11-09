@@ -20,17 +20,11 @@ pub use output::{EmbeddedOutput, Reply};
 pub use session::EmbeddedEvent;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EmbeddedRuntimeError {
-    UnsupportedHostCompletion,
-}
+pub enum EmbeddedRuntimeError {}
 
 impl fmt::Display for EmbeddedRuntimeError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::UnsupportedHostCompletion => {
-                formatter.write_str("embedded runtime has no pending owned host operation")
-            }
-        }
+    fn fmt(&self, _formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {}
     }
 }
 

@@ -3,15 +3,13 @@ use std::convert::Infallible;
 use std::time::Duration;
 
 use super::{
-    ContinuationRegistry, ExternalEventKey, HostOperationId, HostOperationResult, RuntimeClock,
-    RuntimeConfigurationError, RuntimeDispatch, RuntimeDriver, RuntimeDriverError, RuntimeInput,
-    RuntimeInstant, RuntimeKernel, RuntimeMachine, RuntimeProgress, RuntimeTurnLimits, RuntimeWait,
+    ContinuationRegistry, ExternalEventKey, RuntimeClock, RuntimeConfigurationError,
+    RuntimeDispatch, RuntimeDriver, RuntimeDriverError, RuntimeInput, RuntimeInstant,
+    RuntimeKernel, RuntimeMachine, RuntimeProgress, RuntimeTurnLimits, RuntimeWait,
     SuspendedCommand, WaitCondition,
 };
 use crate::engine::command::SessionId;
 use bytes::Bytes;
-
-mod faas_host;
 
 #[derive(Default)]
 struct TestMachine {
@@ -33,7 +31,6 @@ impl RuntimeMachine for TestMachine {
         match dispatch.input {
             RuntimeInput::External(values) => self.queued.extend(values),
             RuntimeInput::Wake => {}
-            RuntimeInput::HostCompletion(_) => {}
             RuntimeInput::Shutdown => self.stopped = true,
         }
         Ok(())
@@ -319,7 +316,7 @@ fn continuation_registry_cancels_only_one_session() {
     );
     let retained = registry.register(
         SessionId(2),
-        WaitCondition::HostOperation(HostOperationId::from_u64(3)),
+        WaitCondition::External(ExternalEventKey::from_u64(10)),
         2,
     );
     let cancelled = registry.cancel_session(SessionId(1));
@@ -389,26 +386,6 @@ fn continuation_registry_times_out_only_due_waits() {
 }
 
 #[test]
-fn continuation_registry_ignores_late_or_duplicate_host_completion() {
-    let mut registry = ContinuationRegistry::default();
-    let operation = HostOperationId::from_u64(12);
-    registry.register(
-        SessionId(1),
-        WaitCondition::HostOperation(operation),
-        "pending",
-    );
-
-    assert_eq!(
-        registry.complete_host_operation(operation).unwrap().state,
-        "pending"
-    );
-    assert!(registry.complete_host_operation(operation).is_none());
-    assert!(registry
-        .complete_host_operation(HostOperationId::from_u64(99))
-        .is_none());
-}
-
-#[test]
 fn suspended_command_is_fully_owned() {
     let mut registry = ContinuationRegistry::default();
     let id = registry.register(
@@ -422,14 +399,4 @@ fn suspended_command_is_fully_owned() {
         wait,
         WaitCondition::Deadline(RuntimeInstant::from_millis(1_200))
     );
-}
-
-#[test]
-fn host_completion_is_an_owned_driver_input() {
-    let completion = super::OwnedHostCompletion {
-        operation: HostOperationId::from_u64(4),
-        result: HostOperationResult::Data(Bytes::from_static(b"result")),
-    };
-    let input: RuntimeInput<Vec<u64>> = RuntimeInput::HostCompletion(completion.clone());
-    assert_eq!(input, RuntimeInput::HostCompletion(completion));
 }

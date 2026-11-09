@@ -11,8 +11,8 @@ use crate::runtime::driver::{
 };
 use crate::runtime::server::message::{WorkerControl, WorkerId};
 use crate::runtime::server::shared::ServerShared;
-use crate::runtime::server::worker::reactor::transport::RuntimeEvent;
-use crate::runtime::server::worker::reactor::{DispatchContext, LoopControl};
+use crate::runtime::server::worker::event_loop::transport::RuntimeEvent;
+use crate::runtime::server::worker::event_loop::{DispatchContext, LoopControl};
 use crate::runtime::server::worker::ServerWorkerState;
 
 pub(crate) struct ServerWorkerRuntime {
@@ -144,12 +144,6 @@ impl RuntimeMachine for ServerWorkerMachine {
                 self.phase = WorkerPhase::Ready;
             }
             RuntimeInput::Wake => {}
-            RuntimeInput::HostCompletion(_) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "server runtime has no pending owned host operation",
-                ));
-            }
             RuntimeInput::Shutdown => self.phase = WorkerPhase::Stopped,
         }
         Ok(())
@@ -345,24 +339,5 @@ mod tests {
             RuntimeProgress::Progress
         );
         assert_eq!(machine.runtime.cluster_bus_receive_batch_depth, 0);
-    }
-
-    #[test]
-    fn native_machine_rejects_unowned_host_completion() {
-        let mut machine = ServerWorkerMachine {
-            runtime: ServerWorkerState::new(1).unwrap(),
-            phase: WorkerPhase::AwaitingReady,
-            ready_batch: None,
-            clock: RuntimeClock::new(1_000, 1_000),
-        };
-        let result = machine.accept(RuntimeDispatch::new(
-            RuntimeClock::new(1_000, 1_000),
-            RuntimeInput::HostCompletion(crate::runtime::driver::OwnedHostCompletion {
-                operation: crate::runtime::driver::HostOperationId::from_u64(1),
-                result: crate::runtime::driver::HostOperationResult::Ack,
-            }),
-        ));
-
-        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Unsupported);
     }
 }
