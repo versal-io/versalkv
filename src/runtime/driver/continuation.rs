@@ -20,19 +20,6 @@ impl ContinuationId {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct HostOperationId(u64);
-
-impl HostOperationId {
-    pub const fn from_u64(value: u64) -> Self {
-        Self(value)
-    }
-
-    pub const fn as_u64(self) -> u64 {
-        self.0
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ExternalEventKey(u64);
 
 impl ExternalEventKey {
@@ -45,7 +32,6 @@ impl ExternalEventKey {
 pub enum WaitCondition {
     Keys { db: u32, keys: Vec<Bytes> },
     Deadline(RuntimeInstant),
-    HostOperation(HostOperationId),
     External(ExternalEventKey),
 }
 
@@ -124,15 +110,6 @@ impl<T> ContinuationRegistry<T> {
         )
     }
 
-    pub fn complete_host_operation(
-        &mut self,
-        operation: HostOperationId,
-    ) -> Option<SuspendedCommand<T>> {
-        self.take_first_matching(|entry| {
-            matches!(entry.wait, WaitCondition::HostOperation(candidate) if candidate == operation)
-        })
-    }
-
     pub fn signal_external(&mut self, event: ExternalEventKey) -> Vec<SuspendedCommand<T>> {
         self.take_matching(
             |entry| matches!(entry.wait, WaitCondition::External(candidate) if candidate == event),
@@ -145,18 +122,6 @@ impl<T> ContinuationRegistry<T> {
 
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
-    }
-
-    fn take_first_matching(
-        &mut self,
-        predicate: impl Fn(&SuspendedCommand<T>) -> bool,
-    ) -> Option<SuspendedCommand<T>> {
-        let id = self
-            .entries
-            .iter()
-            .filter_map(|(id, entry)| predicate(entry).then_some(*id))
-            .min()?;
-        self.entries.remove(&id)
     }
 
     fn take_matching(

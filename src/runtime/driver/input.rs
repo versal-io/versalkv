@@ -1,10 +1,9 @@
-use super::{OwnedHostCompletion, RuntimeClock};
+use super::RuntimeClock;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RuntimeInput<E> {
     External(E),
     Wake,
-    HostCompletion(OwnedHostCompletion),
     Shutdown,
 }
 

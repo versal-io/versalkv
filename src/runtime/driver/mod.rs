@@ -2,7 +2,6 @@ mod capabilities;
 mod clock;
 mod command;
 mod continuation;
-mod host;
 mod input;
 mod kernel;
 mod machine;
@@ -12,10 +11,9 @@ pub use capabilities::RuntimeCapabilities;
 pub use clock::{RuntimeClock, RuntimeInstant};
 pub use command::{CommandEffectSink, CommandTransition, OwnedCommandContinuation};
 pub use continuation::{
-    ContinuationId, ContinuationRegistry, ExternalEventKey, HostOperationId, SuspendedCommand,
+    ContinuationId, ContinuationRegistry, ExternalEventKey, SuspendedCommand,
     WaitCondition,
 };
-pub use host::{HostOperationResult, OwnedHostCompletion, OwnedHostRequest};
 pub use input::{RuntimeDispatch, RuntimeInput};
 pub use kernel::{RuntimeConfigurationError, RuntimeDriverError, RuntimeKernel, RuntimeTurnLimits};
 pub use machine::{RuntimeMachine, RuntimeProgress};

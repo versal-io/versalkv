@@ -37,9 +37,6 @@ impl RuntimeMachine for EmbeddedRuntimeMachine {
                 self.state.wake_pending = true;
             }
             RuntimeInput::Wake => self.state.wake_pending = true,
-            RuntimeInput::HostCompletion(_) => {
-                return Err(EmbeddedRuntimeError::UnsupportedHostCompletion);
-            }
             RuntimeInput::Shutdown => self.state.stopped = true,
         }
         Ok(())

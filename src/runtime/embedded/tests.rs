@@ -1,4 +1,4 @@
-use super::{EmbeddedEvent, EmbeddedOutput, EmbeddedRuntime, EmbeddedRuntimeError, Reply};
+use super::{EmbeddedEvent, EmbeddedOutput, EmbeddedRuntime, Reply};
 use crate::engine::command::CommandArgs;
 use crate::runtime::driver::{
     RuntimeClock, RuntimeDispatch, RuntimeInput, RuntimeInstant, RuntimeWait,
@@ -81,25 +81,6 @@ fn idle_runtime_waits_without_a_deadline() {
 
     assert!(step.outputs.is_empty());
     assert_eq!(step.wait, RuntimeWait::Event { deadline: None });
-}
-
-#[test]
-fn embedded_rejects_unowned_host_completion() {
-    let mut runtime = EmbeddedRuntime::new();
-    let result = runtime.dispatch(RuntimeDispatch::new(
-        RuntimeClock::new(1_000, 10_000),
-        RuntimeInput::HostCompletion(crate::runtime::driver::OwnedHostCompletion {
-            operation: crate::runtime::driver::HostOperationId::from_u64(1),
-            result: crate::runtime::driver::HostOperationResult::Ack,
-        }),
-    ));
-
-    assert!(matches!(
-        result,
-        Err(crate::runtime::driver::RuntimeDriverError::Machine(
-            EmbeddedRuntimeError::UnsupportedHostCompletion
-        ))
-    ));
 }
 
 #[test]
