@@ -97,13 +97,33 @@ impl ServerWorkerState {
         pending_replies: &[Vec<u8>],
         fx: &mut CommandEffects,
     ) -> LoopAction {
-        let token_value = input.token.0;
         let diagnostic = self.record_command_diagnostic(&input);
         let _diagnostic_guard = crate::foundation::io::sys::log::enter_active_command(diagnostic);
-        if !self.should_defer_slot_import_write(token_value, &input.args)
-            && self.apply_slot_import_command(token_value, input.args.clone())
+        if let Some(action) = self.try_apply_slot_import(&input, fx) {
+            return action;
+        }
+        if let Some(action) = self.reject_unauthenticated_command(&input, fx) {
+            return action;
+        }
+        self.apply_client_test_tcp_buffer_policy(input.token, &input.name, &input.args);
+        self.dispatch_admitted_command(input, pending_replies, fx)
+    }
+
+    /// Slot-import admission guard. Returns an action when the command is
+    /// consumed by the import path, otherwise `None` to continue admission.
+    fn try_apply_slot_import(
+        &mut self,
+        input: &ParsedCommandInput,
+        fx: &mut CommandEffects,
+    ) -> Option<LoopAction> {
+        let token_value = input.token.0;
+        if self.should_defer_slot_import_write(token_value, &input.args)
+            || !self.apply_slot_import_command(token_value, input.args.clone())
         {
-            return if self
+            return None;
+        }
+        Some(
+            if self
                 .connection_registry
                 .get(input.token)
                 .is_none_or(|connection| connection.state == ConnectionState::Closing)
@@ -112,13 +132,19 @@ impl ServerWorkerState {
                 LoopAction::Break
             } else {
                 LoopAction::Continue
-            };
-        }
-        if let Some(action) = self.reject_unauthenticated_command(&input, fx) {
-            return action;
-        }
-        self.apply_client_test_tcp_buffer_policy(input.token, &input.name, &input.args);
+            },
+        )
+    }
 
+    /// Default admission path once slot-import and authentication guards have
+    /// passed: book the admitted command, route special dispatch groups, then
+    /// fall back to ordinary command execution.
+    fn dispatch_admitted_command(
+        &mut self,
+        input: ParsedCommandInput,
+        pending_replies: &[Vec<u8>],
+        fx: &mut CommandEffects,
+    ) -> LoopAction {
         self.ctx.begin_cmd();
         let (dispatch_group, command_flags) = {
             let spec = self.registry.lookup(&input.args.name);

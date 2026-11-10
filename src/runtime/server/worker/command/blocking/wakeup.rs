@@ -10,7 +10,7 @@ use crate::foundation::io::sys::time::mstime;
 #[cfg(test)]
 use crate::framework::capabilities::connection::TransactionEnd;
 use crate::framework::capabilities::connection::{
-    BlockedCmd, CommandEffectDrain, Connection, ConnectionCommandEffects,
+    BlockedCmd, CommandEffectDrain, Connection, ConnectionCommandEffects, ConnectionState,
 };
 use crate::framework::capabilities::io::Token;
 use crate::framework::context::PauseAction;
@@ -151,18 +151,7 @@ impl ServerWorkerState {
         };
         self.resume_wakeup_command_effects(connection_token, was_paused);
 
-        if was_paused
-            && !self.should_defer_slot_import_write(connection_token, &args)
-            && self.apply_slot_import_command(connection_token, args.clone())
-        {
-            if self.connection_registry.contains(token) {
-                let is_closing = self.connection_registry[token].state
-                    == crate::framework::capabilities::connection::ConnectionState::Closing;
-                self.connection_registry[token].complete_command();
-                if !is_closing {
-                    self.queue_client_for_reprocessing(token);
-                }
-            }
+        if self.divert_paused_slot_import(token, connection_token, &args, was_paused) {
             return Vec::new();
         }
 
@@ -279,6 +268,33 @@ impl ServerWorkerState {
             self.queue_client_for_reprocessing(token);
         }
         dirty_keys
+    }
+
+    /// Paused slot-import diversion. A resumed write that the import path can
+    /// consume locally never re-enters the blocked command pipeline: complete
+    /// its accounting and requeue the connection instead. Returns whether the
+    /// caller must short-circuit with an empty dirty-key set.
+    fn divert_paused_slot_import(
+        &mut self,
+        token: Token,
+        connection_token: usize,
+        args: &CommandArgs,
+        was_paused: bool,
+    ) -> bool {
+        if !was_paused
+            || self.should_defer_slot_import_write(connection_token, args)
+            || !self.apply_slot_import_command(connection_token, args.clone())
+        {
+            return false;
+        }
+        if self.connection_registry.contains(token) {
+            let is_closing = self.connection_registry[token].state == ConnectionState::Closing;
+            self.connection_registry[token].complete_command();
+            if !is_closing {
+                self.queue_client_for_reprocessing(token);
+            }
+        }
+        true
     }
 
     fn finish_paused_transaction_queue_wakeup(
@@ -540,66 +556,77 @@ impl ServerWorkerState {
         } else if is_exec {
             (Value::Null, false, true)
         } else {
-            let Some((executor, meta)) = self.registry.lookup(&args.name).map(|spec| {
-                (
-                    spec.executor,
-                    CmdPreconditions {
-                        name: spec.name.clone(),
-                        arity: spec.arity,
-                        flags: crate::runtime::server::worker::command::dispatch::subcmd_flags::effective_command_flags_for_call(
+            self.dispatch_resumed_paused_command(connection_token, args, blocked_req_bytes, token)
+        }
+    }
+
+    /// Re-dispatch a paused command through the normal preflight pipeline once
+    /// the pause no longer blocks it. Returns the same
+    /// `(reply, rejected, is_exec_paused)` triple as `wakeup_handle_paused`.
+    fn dispatch_resumed_paused_command(
+        &mut self,
+        connection_token: usize,
+        args: &CommandArgs,
+        blocked_req_bytes: usize,
+        token: Token,
+    ) -> (Value, bool, bool) {
+        let Some((executor, meta)) = self.registry.lookup(&args.name).map(|spec| {
+            (
+                spec.executor,
+                CmdPreconditions {
+                    name: spec.name.clone(),
+                    arity: spec.arity,
+                    flags: crate::runtime::server::worker::command::dispatch::subcmd_flags::effective_command_flags_for_call(
+                        spec.name.as_str(),
+                        spec.flags,
+                        args,
+                        &self.ctx,
+                    ),
+                    first_key: spec.first_key,
+                    last_key: spec.last_key,
+                    key_step: spec.key_step,
+                    key_flags: spec.key_flags,
+                    acl_categories:
+                        crate::runtime::server::worker::command::dispatch::subcmd_flags::effective_acl_categories(
                             spec.name.as_str(),
-                            spec.flags,
-                            args,
-                            &self.ctx,
+                            spec.acl_categories,
+                            args.args.first().map(|arg| arg.as_ref()),
                         ),
-                        first_key: spec.first_key,
-                        last_key: spec.last_key,
-                        key_step: spec.key_step,
-                        key_flags: spec.key_flags,
-                        acl_categories:
-                            crate::runtime::server::worker::command::dispatch::subcmd_flags::effective_acl_categories(
-                                spec.name.as_str(),
-                                spec.acl_categories,
-                                args.args.first().map(|arg| arg.as_ref()),
-                            ),
-                        get_keys: spec.get_keys,
-                    },
-                )
-            }) else {
-                return (CommandError::unknown(&args.name), true, false);
-            };
-            let outcome = self.pre_dispatch_exec(connection_token, meta, args);
-            match outcome.action {
-                DispatchAction::Execute => {
-                    let val = self.invoke_command_executor(token, executor, args);
-                    (val, false, false)
-                }
-                DispatchAction::Rejected => {
-                    (outcome.reject_reply.unwrap_or(Value::Null), true, false)
-                }
-                DispatchAction::Postpone(reason) => {
-                    let is_throttled = reason == PostponeReason::ReplicationThrottle;
-                    let is_forkless = reason == PostponeReason::ForklessKey;
-                    let command = match reason {
-                        PostponeReason::ClientPause => BlockedCmd::Paused,
-                        PostponeReason::ForklessKey => BlockedCmd::Forkless,
-                        PostponeReason::ReplicationThrottle => BlockedCmd::Throttled,
-                        PostponeReason::SlotMigration(job_id) => BlockedCmd::SlotMigration(job_id),
-                    };
-                    let conn = &mut self.connection_registry
-                        [crate::framework::capabilities::io::Token(connection_token)];
-                    conn.postpone_command(command, Vec::new(), 0, args, blocked_req_bytes);
-                    if is_throttled {
-                        self.ctx.throttled_clients_mut().insert(token);
-                        self.schedule_replication_throttle();
-                    } else {
-                        self.ctx.paused_clients_mut().insert(token);
-                        if is_forkless {
-                            self.ctx.forkless_clients_mut().insert(token);
-                        }
+                    get_keys: spec.get_keys,
+                },
+            )
+        }) else {
+            return (CommandError::unknown(&args.name), true, false);
+        };
+        let outcome = self.pre_dispatch_exec(connection_token, meta, args);
+        match outcome.action {
+            DispatchAction::Execute => {
+                let val = self.invoke_command_executor(token, executor, args);
+                (val, false, false)
+            }
+            DispatchAction::Rejected => (outcome.reject_reply.unwrap_or(Value::Null), true, false),
+            DispatchAction::Postpone(reason) => {
+                let is_throttled = reason == PostponeReason::ReplicationThrottle;
+                let is_forkless = reason == PostponeReason::ForklessKey;
+                let command = match reason {
+                    PostponeReason::ClientPause => BlockedCmd::Paused,
+                    PostponeReason::ForklessKey => BlockedCmd::Forkless,
+                    PostponeReason::ReplicationThrottle => BlockedCmd::Throttled,
+                    PostponeReason::SlotMigration(job_id) => BlockedCmd::SlotMigration(job_id),
+                };
+                let conn = &mut self.connection_registry
+                    [crate::framework::capabilities::io::Token(connection_token)];
+                conn.postpone_command(command, Vec::new(), 0, args, blocked_req_bytes);
+                if is_throttled {
+                    self.ctx.throttled_clients_mut().insert(token);
+                    self.schedule_replication_throttle();
+                } else {
+                    self.ctx.paused_clients_mut().insert(token);
+                    if is_forkless {
+                        self.ctx.forkless_clients_mut().insert(token);
                     }
-                    (Value::Null, false, false)
                 }
+                (Value::Null, false, false)
             }
         }
     }

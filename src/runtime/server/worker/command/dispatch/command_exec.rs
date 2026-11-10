@@ -235,71 +235,89 @@ impl ServerWorkerState {
         ) {
             self.refresh_replication_view();
         }
-        if dispatch_group == DispatchGroup::Shutdown {
-            let reply = crate::runtime::server::supervisor::shutdown::execute(&mut self.ctx, args);
-            let abort = args
-                .args
-                .iter()
-                .any(|arg| arg.eq_ignore_ascii_case(b"abort"));
-            if abort {
-                crate::runtime::server::supervisor::shutdown::clear_shutdown_pause(&mut self.ctx);
-                self.reply_to_shutdown_clients();
-            }
-            if self.ctx.is_shutdown_requested() {
-                // C exits directly from shutdownCommand() after
-                // finishShutdown(), whose final steps close every listener.
-                // Close them before publishing this command's reply as well,
-                // so a client cannot reconnect into the short window before
-                // the outer Rust event-loop observes shutdown_requested.
-                self.close_listeners_for_shutdown();
-            }
-            let accepted = !matches!(reply, Value::Error(_));
-            let shutdown_in_progress = accepted
-                && !abort
-                && (self.ctx.is_shutdown_requested()
-                    || self.ctx.shutdown_state().initiated
-                    || self.ctx.shutdown_state().asap);
-            if shutdown_in_progress {
-                let conn = &mut self.connection_registry
-                    [crate::framework::capabilities::io::Token(connection_token)];
-                conn.enter_blocking(
-                    BlockedCmd::Shutdown,
-                    Vec::new(),
-                    0,
-                    args,
-                    conn.request_bytes_current_command(),
-                );
-                self.ctx.shutdown_state_mut().blocked_clients += 1;
-                if self.ctx.shutdown_state().mstime_deadline != 0 {
-                    self.send_shutdown_getack_if_needed();
-                }
-            }
-            reply
-        } else {
-            if let Some(reply) = self.prepare_cluster_setslot_block(
-                crate::framework::capabilities::io::Token(connection_token),
-                args,
-            ) {
-                return reply;
-            }
-            // C Valkey's commandTimeSnapshot() is stable for the lifetime of
-            // one command. Keep wall-clock helpers on the same snapshot so a
-            // short relative TTL cannot expire merely because the handler was
-            // descheduled between parsing and applying it. Install this only
-            // after synchronous pre-handler waits, whose deadlines must keep
-            // observing real time.
-            let _time_guard = crate::foundation::io::sys::time::enter_command_time_snapshot(
-                crate::foundation::io::sys::time::mstime(),
-            );
-            let reply = self.invoke_command_executor(
-                crate::framework::capabilities::io::Token(connection_token),
-                executor,
-                args,
-            );
-            // CLIENT UNPAUSE and save handlers can change DB-local guards.
-            self.ctx.set_forkless_capture_expiration_paused(false);
-            reply
+        match dispatch_group {
+            DispatchGroup::Shutdown => self.execute_shutdown_group(connection_token, args),
+            _ => self.execute_ordinary_handler(connection_token, executor, args),
         }
+    }
+
+    /// Shutdown dispatch group: run the supervisor handler, honour ABORT, and
+    /// park accepted shutdown clients in the `BlockedCmd::Shutdown` continuation
+    /// once the shutdown is actually in progress.
+    fn execute_shutdown_group(&mut self, connection_token: usize, args: &CommandArgs) -> Value {
+        let reply = crate::runtime::server::supervisor::shutdown::execute(&mut self.ctx, args);
+        let abort = args
+            .args
+            .iter()
+            .any(|arg| arg.eq_ignore_ascii_case(b"abort"));
+        if abort {
+            crate::runtime::server::supervisor::shutdown::clear_shutdown_pause(&mut self.ctx);
+            self.reply_to_shutdown_clients();
+        }
+        if self.ctx.is_shutdown_requested() {
+            // C exits directly from shutdownCommand() after
+            // finishShutdown(), whose final steps close every listener.
+            // Close them before publishing this command's reply as well,
+            // so a client cannot reconnect into the short window before
+            // the outer Rust event-loop observes shutdown_requested.
+            self.close_listeners_for_shutdown();
+        }
+        let accepted = !matches!(reply, Value::Error(_));
+        let shutdown_in_progress = accepted
+            && !abort
+            && (self.ctx.is_shutdown_requested()
+                || self.ctx.shutdown_state().initiated
+                || self.ctx.shutdown_state().asap);
+        if shutdown_in_progress {
+            let conn = &mut self.connection_registry
+                [crate::framework::capabilities::io::Token(connection_token)];
+            conn.enter_blocking(
+                BlockedCmd::Shutdown,
+                Vec::new(),
+                0,
+                args,
+                conn.request_bytes_current_command(),
+            );
+            self.ctx.shutdown_state_mut().blocked_clients += 1;
+            if self.ctx.shutdown_state().mstime_deadline != 0 {
+                self.send_shutdown_getack_if_needed();
+            }
+        }
+        reply
+    }
+
+    /// Ordinary dispatch group: install the SETSLOT blocking continuation when
+    /// eligible, then invoke the registered executor inside a stable command
+    /// time snapshot.
+    fn execute_ordinary_handler(
+        &mut self,
+        connection_token: usize,
+        executor: CommandExecutor,
+        args: &CommandArgs,
+    ) -> Value {
+        if let Some(reply) = self.prepare_cluster_setslot_block(
+            crate::framework::capabilities::io::Token(connection_token),
+            args,
+        ) {
+            return reply;
+        }
+        // C Valkey's commandTimeSnapshot() is stable for the lifetime of
+        // one command. Keep wall-clock helpers on the same snapshot so a
+        // short relative TTL cannot expire merely because the handler was
+        // descheduled between parsing and applying it. Install this only
+        // after synchronous pre-handler waits, whose deadlines must keep
+        // observing real time.
+        let _time_guard = crate::foundation::io::sys::time::enter_command_time_snapshot(
+            crate::foundation::io::sys::time::mstime(),
+        );
+        let reply = self.invoke_command_executor(
+            crate::framework::capabilities::io::Token(connection_token),
+            executor,
+            args,
+        );
+        // CLIENT UNPAUSE and save handlers can change DB-local guards.
+        self.ctx.set_forkless_capture_expiration_paused(false);
+        reply
     }
 
     fn command_propagation_plan<'a>(

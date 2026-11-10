@@ -29,13 +29,6 @@ pub enum CommandExecutor {
 }
 
 impl CommandExecutor {
-    pub fn runtime_handler(self) -> Option<RuntimeCommandHandler> {
-        match self {
-            Self::Runtime(handler) => Some(handler),
-            Self::Immediate(_) | Self::Hosted { .. } => None,
-        }
-    }
-
     pub fn execute(
         self,
         conn: &mut dyn CommandConn,
@@ -249,27 +242,8 @@ pub(crate) fn normalize_forkless_key_targets(
 
 #[cfg(test)]
 mod tests {
-    use crate::engine::core::CommandOutcome;
-    use crate::framework::commands::command_runtime::CommandRuntime;
-    use crate::framework::{CommandArgs, CommandExecutor};
+    use crate::framework::CommandArgs;
     use bytes::Bytes;
-
-    fn test_runtime_handler(
-        _runtime: &mut dyn CommandRuntime,
-        _args: &CommandArgs,
-    ) -> CommandOutcome {
-        CommandOutcome::reply(crate::engine::core::Value::ok())
-    }
-
-    #[test]
-    fn runtime_executor_exposes_its_injected_handler() {
-        let executor = CommandExecutor::Runtime(test_runtime_handler);
-        let expected: super::RuntimeCommandHandler = test_runtime_handler;
-        assert!(std::ptr::fn_addr_eq(
-            executor.runtime_handler().unwrap(),
-            expected
-        ));
-    }
 
     #[test]
     fn generated_acl_categories_reach_command_spec() {

@@ -243,35 +243,48 @@ impl ServerWorkerState {
         let Some(blocked) = &connection.blocked else {
             return false;
         };
-        if matches!(
-            blocked.cmd,
-            BlockedCmd::Wait { .. } | BlockedCmd::WaitAof { .. } | BlockedCmd::SetSlot { .. }
-        ) {
-            self.ctx
-                .blocking_registry_mut()
-                .register_keyless_client(connection.session_id());
+        match &blocked.cmd {
+            BlockedCmd::Wait { .. } | BlockedCmd::WaitAof { .. } => {
+                self.ctx
+                    .blocking_registry_mut()
+                    .register_keyless_client(connection.session_id());
+                true
+            }
             // SETSLOT already force-propagated its frame together with the
             // GETACK request, so it must not trigger the empty-command GETACK
             // that WAIT/WAITAOF rely on.
-            return matches!(
-                blocked.cmd,
-                BlockedCmd::Wait { .. } | BlockedCmd::WaitAof { .. }
-            );
-        }
-        if !matches!(
-            blocked.cmd,
+            BlockedCmd::SetSlot { .. } => {
+                self.ctx
+                    .blocking_registry_mut()
+                    .register_keyless_client(connection.session_id());
+                false
+            }
             BlockedCmd::Paused
-                | BlockedCmd::Forkless
-                | BlockedCmd::Throttled
-                | BlockedCmd::Shutdown
-        ) {
-            self.ctx.blocking_registry_mut().register_client(
-                connection.selected_db,
-                &blocked.keys,
-                connection.session_id(),
-            );
+            | BlockedCmd::Forkless
+            | BlockedCmd::Throttled
+            | BlockedCmd::Shutdown => false,
+            BlockedCmd::Blpop
+            | BlockedCmd::Brpop
+            | BlockedCmd::Brpoplpush { .. }
+            | BlockedCmd::Blmove { .. }
+            | BlockedCmd::Blmpop { .. }
+            | BlockedCmd::Bzpopmin
+            | BlockedCmd::Bzpopmax
+            | BlockedCmd::Bzmpop { .. }
+            | BlockedCmd::Xread
+            | BlockedCmd::Xreadgroup
+            | BlockedCmd::SlotMigration(_)
+            // Script currently has no constructor; keep the historical
+            // fall-through so behaviour is unchanged if it gets enabled.
+            | BlockedCmd::Script => {
+                self.ctx.blocking_registry_mut().register_client(
+                    connection.selected_db,
+                    &blocked.keys,
+                    connection.session_id(),
+                );
+                false
+            }
         }
-        false
     }
 
     fn capture_reply(

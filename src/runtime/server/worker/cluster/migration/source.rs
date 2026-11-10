@@ -574,6 +574,42 @@ impl ServerWorkerState {
         true
     }
 
+    /// Pure counterpart of the interception guard inside
+    /// [`Self::handle_slot_export_readable`]. Returns true exactly when that
+    /// handler would consume the readable event, so readiness routing can
+    /// select the slot-export route without running its side effects.
+    pub(crate) fn is_slot_export_read_intercept(&self, token_value: usize) -> bool {
+        if !self
+            .slot_migration_runtime
+            .is_export_connection(token_value)
+        {
+            return false;
+        }
+        let Some(connection) = self
+            .connection_registry
+            .get(crate::framework::capabilities::io::Token(token_value))
+        else {
+            // The handler reports true for an export connection whose registry
+            // entry has already been removed.
+            return true;
+        };
+        let Some(id) = connection
+            .slot_migration_role
+            .as_ref()
+            .map(|role| role.job_id().clone())
+        else {
+            return false;
+        };
+        matches!(
+            self.migration_phase(&id),
+            Some(MigrationPhase::Export(
+                ExportPhase::Connecting
+                    | ExportPhase::ReadingAuthResponse
+                    | ExportPhase::ReadingEstablishResponse
+            ))
+        )
+    }
+
     pub(crate) fn handle_slot_export_readable(&mut self, token_value: usize) -> bool {
         if !self
             .slot_migration_runtime
