@@ -38,7 +38,7 @@ fn priority_arriving_during_normal_batch_obeys_preemption_setting() {
         let (slow_token, mut slow_client) = connect_client(&mut runtime);
         let (query_token, mut query_client) = connect_client(&mut runtime);
         let (priority_token, mut priority_client) = connect_client(&mut runtime);
-        runtime.prioritize_connection(priority_token);
+        runtime.mark_client_subnet_priority(priority_token);
         slow_client
             .write_all(b"DEBUG SLEEP 0.01\r\n")
             .expect("send ordinary slow command");
@@ -91,31 +91,28 @@ fn priority_arriving_during_normal_batch_obeys_preemption_setting() {
 }
 
 #[test]
-fn priority_reclassification_moves_queued_readiness_in_both_turns() {
+fn priority_events_remain_in_normal_lane_after_config_change() {
+    // With dual-epoll, lane reclassification is no longer needed:
+    // preempted priority events are dispatched immediately via
+    // dispatch_readiness_now instead of being enqueued. Events
+    // always remain in their original lane.
     for is_next_turn in [false, true] {
-        for should_upgrade in [false, true] {
+        for mark_priority in [false, true] {
             let mut runtime = ServerWorkerState::new(1).expect("create classification runtime");
             let (token, _client) = connect_client(&mut runtime);
-            if !should_upgrade {
-                runtime.prioritize_connection(token);
-            }
             runtime.event_batch.push(EventLoopEvent::readiness(
                 EventPhase::Ready,
-                if should_upgrade {
-                    EventLane::Normal
-                } else {
-                    EventLane::Upstream
-                },
+                EventLane::Normal,
                 ReadinessEvent::readable(token, ReadinessOrigin::Polled),
             ));
             if is_next_turn {
                 runtime.event_batch.finish_phase(EventPhase::Ready);
             }
-            if should_upgrade {
-                runtime.prioritize_connection(token);
+            if mark_priority {
+                runtime.mark_client_subnet_priority(token);
             } else {
                 runtime.ctx.config_mut().server.priority_subnets_generation += 1;
-                runtime.refresh_connection_priorities();
+                runtime.scan_and_apply_priority_subnets();
             }
             if is_next_turn {
                 assert!(runtime.event_batch.pop_ready().is_none());
@@ -129,12 +126,8 @@ fn priority_reclassification_moves_queued_readiness_in_both_turns() {
             assert_eq!(event.phase, EventPhase::Ready);
             assert_eq!(
                 event.lane,
-                if should_upgrade {
-                    EventLane::Upstream
-                } else {
-                    EventLane::Normal
-                },
-                "next turn {is_next_turn}, upgrade {should_upgrade}"
+                EventLane::Normal,
+                "next turn {is_next_turn}, mark_priority {mark_priority}"
             );
             assert!(runtime.event_batch.pop_ready().is_none());
         }

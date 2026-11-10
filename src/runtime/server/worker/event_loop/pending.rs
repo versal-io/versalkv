@@ -40,7 +40,7 @@ impl ServerWorkerState {
                 });
             }
         }
-        events.sort_by_key(|event| !self.is_priority_connection(event.token));
+        events.sort_by_key(|event| !self.is_client_subnet_priority(event.token));
         events
     }
 

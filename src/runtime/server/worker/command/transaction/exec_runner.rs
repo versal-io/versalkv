@@ -123,9 +123,9 @@ impl ServerWorkerState {
             || self.prepare_exec_decision(token, effects),
             ExecDecision::RouteRejected,
         );
-        self.command_execution_depth += 1;
+        self.qos.command_depth += 1;
         let execution = self.apply_exec_decision(context, decision, effects);
-        self.command_execution_depth -= 1;
+        self.qos.command_depth -= 1;
         let disposition = self.finish_exec(context, execution, effects);
         SpecialCommandResult::Handled(disposition)
     }
@@ -447,9 +447,9 @@ impl ServerWorkerState {
         execution: &ExecExecution,
     ) -> ExecAccounting {
         let rejected = execution.status.is_rejected();
-        let should_sample_priority = self.command_execution_depth == 0
+        let should_sample_priority = self.qos.command_depth == 0
             && execution.disposition != CommandDisposition::Blocked
-            && self.is_priority_connection(context.target.token());
+            && self.is_client_subnet_priority(context.target.token());
         let was_priority = self
             .ctx
             .stats_mut()

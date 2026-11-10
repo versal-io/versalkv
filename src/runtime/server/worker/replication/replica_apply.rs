@@ -1098,7 +1098,7 @@ impl ServerWorkerState {
             &apply,
             ReplicationApply::Command(args) if args.name.eq_ignore_ascii_case(b"EXEC")
         );
-        let is_outer_execution = self.command_execution_depth == 0;
+        let is_outer_execution = self.qos.command_depth == 0;
         let execution =
             match self.handle_replication_transaction_frame(connection_token, link, &apply) {
                 Ok(Some(duration_us)) => Ok(duration_us),
@@ -1108,10 +1108,10 @@ impl ServerWorkerState {
                 Err(error) => Err(error),
             };
         let duration_us = execution?;
-        self.refresh_connection_priorities();
+        self.scan_and_apply_priority_subnets();
         if is_outer_execution
             && (!was_transaction_active || is_exec)
-            && self.is_priority_connection(Token(connection_token))
+            && self.is_client_subnet_priority(Token(connection_token))
             && duration_us > 0
         {
             self.ctx.stats_mut().record_priority_command(duration_us);
@@ -1193,7 +1193,7 @@ impl ServerWorkerState {
         }
         frame.extend(crate::engine::distributed::replication::protocol::encode_command(&[b"EXEC"]));
         let mut dirty_keys = Vec::new();
-        self.command_execution_depth += 1;
+        self.qos.command_depth += 1;
         let execution = (|| {
             for args in queued {
                 let apply = if args.name.eq_ignore_ascii_case(b"SELECT") {
@@ -1217,7 +1217,7 @@ impl ServerWorkerState {
             }
             Ok::<(), ()>(())
         })();
-        self.command_execution_depth -= 1;
+        self.qos.command_depth -= 1;
         execution?;
         let exec = CommandArgs::from_parts(vec![Bytes::from_static(b"EXEC")]);
         // MULTI also opens transactions in tracking imports. Complete those
@@ -1452,7 +1452,7 @@ impl ServerWorkerState {
                 .args
                 .first()
                 .is_some_and(|subcmd| subcmd.eq_ignore_ascii_case(b"FAILOVER"));
-        self.command_execution_depth += 1;
+        self.qos.command_depth += 1;
         let result = if cleanup_command {
             let mut deleted = 0i64;
             let selected_db = self.connection_registry
@@ -1490,7 +1490,7 @@ impl ServerWorkerState {
                 &mut self.ctx,
             )
         };
-        self.command_execution_depth -= 1;
+        self.qos.command_depth -= 1;
         let duration_us = (started.elapsed().as_micros() as u64).max(1);
         let propagation_error = matches!(result, crate::foundation::io::protocol::Value::Error(_));
         let should_panic_on_error = propagation_error

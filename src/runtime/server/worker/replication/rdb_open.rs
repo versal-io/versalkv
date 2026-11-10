@@ -110,7 +110,7 @@ impl ServerWorkerState {
         self.connection_registry
             .register(Connection::new(handle.token, resolved, false))
             .expect("a newly connected RDB transport token must be unique");
-        self.prioritize_connection(handle.token);
+        self.mark_client_subnet_priority(handle.token);
         crate::server_log!(
             debug,
             "dual-rdb open: connected transport rdb={} main={} slab={}",

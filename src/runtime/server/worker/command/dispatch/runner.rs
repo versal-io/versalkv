@@ -266,7 +266,7 @@ impl ServerWorkerState {
         let propagation_rejected =
             execution.status.is_rejected() || matches!(&reply, Value::Error(_));
         let stats_name = super::command_stats_name(invocation.name, invocation.args);
-        self.refresh_connection_priorities();
+        self.scan_and_apply_priority_subnets();
         let duration_us = if let Some(duration_us) = execution.duration_us {
             self.ctx
                 .end_cmd_with_duration(&stats_name, execution.status.is_rejected(), duration_us)

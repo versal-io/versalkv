@@ -1,6 +1,8 @@
 #[cfg(test)]
 use crate::foundation::io::sys::time::MonotonicInstant;
+use crate::framework::capabilities::io::Token;
 use crate::runtime::server::worker::event_loop::transport::RuntimeEvent;
+use std::collections::HashSet;
 
 use super::ServerWorkerState;
 #[cfg(test)]
@@ -25,10 +27,28 @@ impl ServerWorkerState {
         events.sort_by_key(|(token, _, _, _, _)| self.upstream_readiness_rank(*token));
     }
 
-    fn prioritize_runtime_events(&self, events: &mut [RuntimeEvent]) {
+    /// Non-blocking drain of the priority epoll. Returns RuntimeEvents
+    /// converted from PriorityEvents.
+    fn drain_priority_poller(&mut self) -> std::io::Result<Vec<RuntimeEvent>> {
+        let priority_events = self
+            .priority_poller
+            .poll_events(Some(std::time::Duration::ZERO))?;
+        Ok(priority_events
+            .into_iter()
+            .map(|pe| RuntimeEvent {
+                token: pe.token,
+                readable: pe.readable,
+                writable: pe.writable,
+                read_hup: false,
+                error: false,
+            })
+            .collect())
+    }
+
+    fn sort_events_by_subnet_priority(&self, events: &mut [RuntimeEvent]) {
         events.sort_by_key(|event| {
             (
-                !self.is_priority_connection(event.token),
+                !self.is_client_subnet_priority(event.token),
                 self.upstream_readiness_rank(event.token),
             )
         });
@@ -62,7 +82,7 @@ impl ServerWorkerState {
         &mut self,
         poll_timeout: Option<std::time::Duration>,
     ) -> std::io::Result<Option<(std::time::Instant, Vec<RuntimeEvent>)>> {
-        self.refresh_connection_priorities();
+        self.scan_and_apply_priority_subnets();
         self.events_buf.clear();
         #[cfg(test)]
         self.trace_turn_for_test(TurnTracePoint::Poll);
@@ -71,7 +91,36 @@ impl ServerWorkerState {
             crate::engine::extension::module::VALKEYMODULE_SUBEVENT_EVENTLOOP_BEFORE_SLEEP,
         );
         self.apply_pending_module_effects();
-        let (mut events, deferred_io_completions) = self.poll_with_io_threads(poll_timeout)?;
+        // Drain the priority epoll first (non-blocking). Priority events
+        // arrive independently and must precede normal transport events.
+        let front_priority_events = self.drain_priority_poller()?;
+        let priority_tokens: HashSet<Token> =
+            front_priority_events.iter().map(|e| e.token).collect();
+        // If we already have priority events, do a non-blocking main poll to
+        // avoid unnecessary latency.
+        let effective_timeout = if priority_tokens.is_empty() {
+            poll_timeout
+        } else {
+            Some(std::time::Duration::ZERO)
+        };
+        let (mut events, deferred_io_completions) = self.poll_with_io_threads(effective_timeout)?;
+        // Filter out priority tokens from the main poll: these fds are
+        // registered in both pollers, but the PriorityPoller already
+        // captured their readiness.
+        events.retain(|e| !priority_tokens.contains(&e.token));
+        // Drain any priority events that arrived during the main poll.
+        let back_priority_events = self.drain_priority_poller()?;
+        let back_tokens: HashSet<Token> = back_priority_events.iter().map(|e| e.token).collect();
+        events.retain(|e| !back_tokens.contains(&e.token));
+        // Merge: priority events first, then normal transport events, then
+        // late-arriving priority events.
+        let mut all_events = Vec::with_capacity(
+            front_priority_events.len() + events.len() + back_priority_events.len(),
+        );
+        all_events.extend(front_priority_events);
+        all_events.append(&mut events);
+        all_events.extend(back_priority_events);
+        events = all_events;
         // Snapshot read ownership before completions can release the lease.
         // An ordinary LT read already in flight covers this observation; unread
         // or newly arrived bytes remain visible to the next poll or continuation.
@@ -113,13 +162,18 @@ impl ServerWorkerState {
             return Ok(None);
         }
         let mut events = std::mem::take(&mut self.events_buf);
-        self.prioritize_runtime_events(&mut events);
+        // With dual-epoll, priority events already arrive first; sorting by
+        // subnet priority is no longer necessary for ordering, but the
+        // upstream readiness rank (replica RDB > master link > other) still
+        // provides useful intra-class ordering.
+        self.sort_events_by_subnet_priority(&mut events);
         Ok(Some((cycle_start, events)))
     }
 
-    pub(super) fn collect_preemptive_priority_events(
+    pub(super) fn poll_priority_events_preemptively(
         &mut self,
         last_poll: &mut std::time::Instant,
+        context: &super::DispatchContext,
     ) -> std::io::Result<()> {
         let interval_us = self
             .ctx
@@ -133,14 +187,29 @@ impl ServerWorkerState {
         {
             return Ok(());
         }
-        // Poll synchronously without moving the multiplexer to an I/O worker.
-        // Enqueue all returned readiness: EventBatch preserves lane ordering,
-        // coalescing, and the existing current/next-turn dispatch budgets.
+        // Poll both the priority epoll (for production priority fds) and
+        // the main transport (for test event queues and non-priority
+        // sources). Dispatch each readiness event immediately so that
+        // priority work executes before returning to the batch loop.
         *last_poll = std::time::Instant::now();
-        let events = self
+        let mut events = self.drain_priority_poller()?;
+        let mut transport_events = self
             .transport
             .poll_events(Some(std::time::Duration::ZERO))?;
-        self.collect_after_poll_events(Some((*last_poll, events)));
+        events.append(&mut transport_events);
+        for event in events {
+            self.dispatch_readiness_now(
+                context.clone(),
+                super::ReadinessEvent {
+                    token: event.token,
+                    origin: super::ReadinessOrigin::Polled,
+                    readable: event.readable,
+                    writable: event.writable,
+                    read_closed: event.read_hup,
+                    error: event.error,
+                },
+            );
+        }
         Ok(())
     }
 

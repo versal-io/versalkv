@@ -139,11 +139,9 @@ pub(crate) struct ServerWorkerState {
     pub(in crate::runtime::server) pending_due_time_events: HashMap<TimeEventId, DueTimeEvent>,
     pub(in crate::runtime::server) module_timer_event: Option<TimeEventId>,
     pub(in crate::runtime::server) event_loop_cycle_start: Option<EventLoopCycleStart>,
-    pub(crate) priority_subnets_generation: u64,
-    pub(crate) priority_command_token: Option<Token>,
-    pub(crate) priority_command_is_nested: bool,
-    pub(crate) command_execution_depth: usize,
-    pub(crate) priority_cycle: Option<super::connection::qos::PriorityCycle>,
+    pub(crate) qos: super::connection::qos::QosState,
+    pub(in crate::runtime::server) priority_poller:
+        crate::runtime::server::worker::event_loop::transport::priority::PriorityPoller,
     #[cfg(test)]
     pub(in crate::runtime::server) test_time_event_callbacks:
         Vec<Option<Box<dyn FnOnce(&mut ServerWorkerState) + 'static>>>,
@@ -242,6 +240,18 @@ impl ServerWorkerState {
         crate::foundation::io::sys::signal::install_child_signal_wake(
             child_signal_write.as_raw_fd(),
         );
+        let priority_poller =
+            crate::runtime::server::worker::event_loop::transport::priority::PriorityPoller::new()?;
+        let priority_wake_file = priority_poller.wake_reader_file()?;
+        let priority_wake_source = OwnedPollSource::readable(priority_wake_file);
+        let priority_wake_token = transport.register_source(priority_wake_source)?;
+        if let Err(error) = runtime_sources.install(
+            priority_wake_token,
+            SourceOwner::ChildSignal(ChildSignalOwner::SelfPipe),
+        ) {
+            let cleanup = transport.remove_registered(priority_wake_token);
+            return Err(source_install_error(error, cleanup.err()));
+        }
         Ok(Self {
             transport,
             runtime_sources,
@@ -290,11 +300,8 @@ impl ServerWorkerState {
             pending_due_time_events: HashMap::new(),
             module_timer_event: None,
             event_loop_cycle_start: None,
-            priority_subnets_generation: 0,
-            priority_command_token: None,
-            priority_command_is_nested: false,
-            command_execution_depth: 0,
-            priority_cycle: None,
+            qos: super::connection::qos::QosState::default(),
+            priority_poller,
             #[cfg(test)]
             test_time_event_callbacks: Vec::new(),
             #[cfg(test)]

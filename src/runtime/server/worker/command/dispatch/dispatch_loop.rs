@@ -60,18 +60,18 @@ impl ServerWorkerState {
             // before that path changes either stream's selected database.
             self.queue_command_propagation(batch);
         }
-        self.refresh_connection_priorities();
-        let is_priority = self.is_priority_connection(token);
-        let previous_token = self.priority_command_token.replace(token);
+        self.scan_and_apply_priority_subnets();
+        let is_priority = self.is_client_subnet_priority(token);
+        let previous_token = self.qos.active_command_token.replace(token);
         let previous_nested = std::mem::replace(
-            &mut self.priority_command_is_nested,
-            self.command_execution_depth != 0,
+            &mut self.qos.active_command_is_nested,
+            self.qos.command_depth != 0,
         );
         let previous_priority = self
             .ctx
             .stats_mut()
-            .set_priority_command(is_priority && !self.priority_command_is_nested);
-        let owns_priority_cycle = is_priority && self.begin_priority_cycle();
+            .set_priority_command(is_priority && !self.qos.active_command_is_nested);
+        let owns_priority_cycle = is_priority && self.start_priority_cycle();
         let input = ParsedCommandInput {
             token,
             args,
@@ -81,12 +81,12 @@ impl ServerWorkerState {
         let mut effects = CommandEffects::default();
         let token = input.token;
         let action = self.dispatch_parsed_command(input, &batch.replies, &mut effects);
-        self.refresh_connection_priorities();
+        self.scan_and_apply_priority_subnets();
         self.account_command_reply_effects(token, &mut effects);
         batch.commit(effects);
         self.finish_priority_cycle(owns_priority_cycle);
-        self.priority_command_token = previous_token;
-        self.priority_command_is_nested = previous_nested;
+        self.qos.active_command_token = previous_token;
+        self.qos.active_command_is_nested = previous_nested;
         self.ctx.stats_mut().set_priority_command(previous_priority);
         action
     }

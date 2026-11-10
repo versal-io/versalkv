@@ -69,7 +69,7 @@ impl ServerWorkerState {
         }
         let default_user_requires_auth = !crate::engine::extension::acl::default_user_has_nopass();
         let mut conn = Connection::new(client.token, client.peer_addr, default_user_requires_auth);
-        conn.is_priority = self.peer_is_priority(client.peer_addr);
+        conn.is_priority = self.is_peer_in_priority_subnet(client.peer_addr);
         let client_id = conn.client_id();
         let io_handles = self
             .transport
@@ -90,8 +90,13 @@ impl ServerWorkerState {
         self.connection_registry
             .register(conn)
             .expect("a newly accepted transport token and client id must be unique");
-        if self.is_priority_connection(client.token) {
+        if self.is_client_subnet_priority(client.token) {
             self.ctx.stats_mut().connected_priority_clients += 1;
+            // Register this priority fd in the priority epoll so
+            // readiness arrives through the dedicated poller.
+            if let Ok(fd) = self.transport.raw_fd(client.token) {
+                let _ = self.priority_poller.register_fd(client.token, fd);
+            }
         }
         self.refresh_client_memory_usage(client.token, true);
         match io_handles {
@@ -648,7 +653,7 @@ impl ServerWorkerState {
             return;
         }
         let maxclients = self.ctx.config().server.maxclients;
-        self.refresh_connection_priorities();
+        self.scan_and_apply_priority_subnets();
         for _ in 0..accept_budget {
             match self.transport.accept(listener) {
                 Ok(Some(c)) => {
@@ -670,7 +675,9 @@ impl ServerWorkerState {
                         c.peer_addr,
                     ) {
                         self.reject_protected_mode_client(c);
-                    } else if !self.has_client_capacity(self.peer_is_priority(c.peer_addr)) {
+                    } else if !self
+                        .check_client_capacity(self.is_peer_in_priority_subnet(c.peer_addr))
+                    {
                         self.reject_accepted_client(c, maxclients);
                     } else {
                         self.add_connection(c);
@@ -701,7 +708,7 @@ impl ServerWorkerState {
             let _ = stream.write_all(error);
         }
         self.ctx.incr_rejected_connections();
-        if self.peer_is_priority(client.peer_addr) {
+        if self.is_peer_in_priority_subnet(client.peer_addr) {
             self.ctx.stats_mut().rejected_priority_connections += 1;
         }
         // A rejected client was never inserted into any business index, so

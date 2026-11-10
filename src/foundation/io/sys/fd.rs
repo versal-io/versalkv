@@ -124,3 +124,15 @@ pub fn set_nonblocking(fd: BorrowedFd<'_>, enabled: bool) -> io::Result<()> {
         Err(io::Error::last_os_error())
     }
 }
+
+pub fn dup_fd_to_file(fd: BorrowedFd<'_>) -> io::Result<File> {
+    // SAFETY: dup allocates a new descriptor that is independent of the
+    // source; the caller does not need to retain the original.
+    let duped = unsafe { libc::dup(fd.as_raw_fd()) };
+    if duped < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: duped is a newly allocated descriptor owned exclusively by
+    // the returned File.
+    Ok(unsafe { File::from_raw_fd(duped) })
+}

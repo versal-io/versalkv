@@ -82,15 +82,16 @@ impl ServerWorkerState {
         let frame =
             crate::runtime::server::worker::cluster::propagation::encode_command_args(&args);
         let command_name = args.name.clone();
-        let is_outer_execution = self.command_execution_depth == 0;
-        self.command_execution_depth += 1;
+        let is_outer_execution = self.qos.command_depth == 0;
+        self.qos.command_depth += 1;
         let (result, execution, selected_db) =
             self.ctx
                 .apply_slot_import_with_execution(&id, args, &self.registry);
-        self.command_execution_depth -= 1;
+        self.qos.command_depth -= 1;
         if is_outer_execution
-            && self
-                .is_priority_connection(crate::framework::capabilities::io::Token(connection_token))
+            && self.is_client_subnet_priority(crate::framework::capabilities::io::Token(
+                connection_token,
+            ))
         {
             if let Some(duration_us) = execution.duration_us() {
                 self.ctx.stats_mut().record_priority_command(duration_us);

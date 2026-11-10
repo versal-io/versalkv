@@ -1230,7 +1230,7 @@ fn sync_admission_waits_for_threaded_output_settlement() {
             runtime.complete_io_read(read);
             if settle_before_read {
                 assert_eq!(runtime.ctx.stats().sync_full, 1);
-                assert!(runtime.is_priority_connection(peer.token));
+                assert!(runtime.is_client_subnet_priority(peer.token));
                 assert!(runtime
                     .replication_runtime
                     .primary_for_connection(
@@ -1262,7 +1262,7 @@ fn sync_admission_waits_for_threaded_output_settlement() {
                 );
                 assert_eq!(runtime.ctx.stats().sync_full, 0);
                 assert_eq!(runtime.ctx.stats().sync_partial_err, 0);
-                assert!(!runtime.is_priority_connection(peer.token));
+                assert!(!runtime.is_client_subnet_priority(peer.token));
                 assert!(runtime
                     .replication_runtime
                     .primary_for_connection(

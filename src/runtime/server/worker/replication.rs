@@ -1269,7 +1269,7 @@ impl ServerWorkerState {
                 self.connection_registry
                     .register(conn)
                     .expect("a newly connected primary transport token must be unique");
-                self.prioritize_connection(handle.token);
+                self.mark_client_subnet_priority(handle.token);
                 let master = MasterInfo {
                     host: args.host.clone(),
                     port: args.port,

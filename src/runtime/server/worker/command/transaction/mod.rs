@@ -399,7 +399,7 @@ impl ServerWorkerState {
         self.connection_registry[state.token].begin_nested_command_effects();
         self.record_nonblocking_cluster_setslot_propagation(state.token, args);
         let reply = self.exec_invoke_queued_item(state.token, &spec, args);
-        self.refresh_connection_priorities();
+        self.scan_and_apply_priority_subnets();
         let Some(token) = state.target.resolve(self) else {
             return false;
         };

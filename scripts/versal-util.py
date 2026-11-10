@@ -205,6 +205,7 @@ def command_check_boundaries(_args: argparse.Namespace, ctx: RepoContext) -> int
     polling_owners = {
         (src / "foundation/io/transport/polling.rs").resolve(),
         (src / "foundation/io/sys/polling.rs").resolve(),
+        (src / "runtime/server/worker/event_loop/transport/priority.rs").resolve(),
     }
     polling_pattern = re.compile(r"(?:^|[^A-Za-z0-9_:])(?:::)?\s*polling\s*::")
     for source in iter_files(src, ".rs"):

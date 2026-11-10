@@ -436,7 +436,7 @@ fn replication_priority_samples_cover_controls_and_outer_transaction() {
             },
         );
         if is_priority {
-            backend.prioritize_connection(Token(token));
+            backend.mark_client_subnet_priority(Token(token));
         }
         let sample = u64::from(is_priority);
         for (index, apply) in [

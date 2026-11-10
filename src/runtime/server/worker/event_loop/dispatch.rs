@@ -435,9 +435,9 @@ impl ServerWorkerState {
             if event.lane == EventLane::Normal {
                 normal_event_count = normal_event_count.saturating_add(1);
             }
-            if self.event_is_priority(&event) {
+            if self.is_event_subnet_priority(&event) {
                 if !owns_priority_cycle {
-                    owns_priority_cycle = self.begin_priority_cycle();
+                    owns_priority_cycle = self.start_priority_cycle();
                 }
             } else {
                 self.finish_priority_cycle(std::mem::take(&mut owns_priority_cycle));
@@ -450,7 +450,8 @@ impl ServerWorkerState {
                 return Ok(LoopControl::Stop);
             }
             if should_check_preemption {
-                if let Err(error) = self.collect_preemptive_priority_events(&mut last_priority_poll)
+                if let Err(error) =
+                    self.poll_priority_events_preemptively(&mut last_priority_poll, &context)
                 {
                     self.finish_priority_cycle(owns_priority_cycle);
                     self.event_batch.finish_phase(EventPhase::Ready);
@@ -552,7 +553,8 @@ impl ServerWorkerState {
         context: &DispatchContext,
     ) -> DispatchOutcome {
         let started_at = std::time::Instant::now();
-        let owns_priority_cycle = self.event_is_priority(&event) && self.begin_priority_cycle();
+        let owns_priority_cycle =
+            self.is_event_subnet_priority(&event) && self.start_priority_cycle();
         let payload_kind = match event.payload {
             EventPayload::Readiness(_) => EventPayloadKind::Readiness,
             EventPayload::Timer(_) => EventPayloadKind::Timer,
@@ -600,7 +602,7 @@ impl ServerWorkerState {
         outcome
     }
 
-    fn event_is_priority(&self, event: &EventLoopEvent) -> bool {
+    fn is_event_subnet_priority(&self, event: &EventLoopEvent) -> bool {
         let token = match &event.payload {
             EventPayload::Readiness(event) => event.token,
             EventPayload::Runnable(event) => match event.key {
@@ -617,7 +619,7 @@ impl ServerWorkerState {
             },
             _ => return false,
         };
-        self.is_priority_connection(token)
+        self.is_client_subnet_priority(token)
             || self
                 .runtime_sources
                 .resolve_token(token)
@@ -966,7 +968,6 @@ impl ServerWorkerState {
                 | SourceOwner::ChildSignal(_)
                 | SourceOwner::ClusterBus,
             ) => EventLane::Control,
-            _ if self.is_priority_connection(token) => EventLane::Upstream,
             _ => EventLane::Normal,
         }
     }

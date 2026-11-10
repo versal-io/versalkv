@@ -12,7 +12,7 @@ use super::{
 };
 
 const BEFORE_POLL_SLOT_COUNT: usize = 7;
-const READY_LANE_COUNT: usize = 3;
+const READY_LANE_COUNT: usize = 2;
 const PHASE_COUNT: usize = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -761,16 +761,14 @@ impl EventLane {
     fn index(self) -> usize {
         match self {
             Self::Control => 0,
-            Self::Upstream => 1,
-            Self::Normal => 2,
+            Self::Normal => 1,
         }
     }
 
     fn from_index(index: usize) -> Self {
         match index {
             0 => Self::Control,
-            1 => Self::Upstream,
-            2 => Self::Normal,
+            1 => Self::Normal,
             _ => unreachable!("ready lane index is bounded by the queue array"),
         }
     }

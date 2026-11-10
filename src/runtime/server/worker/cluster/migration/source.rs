@@ -413,7 +413,7 @@ impl ServerWorkerState {
         self.connection_registry
             .register(connection)
             .expect("a newly connected migration transport token must be unique");
-        self.prioritize_connection(peer.token);
+        self.mark_client_subnet_priority(peer.token);
         let connection_token = peer.token.0;
         self.ctx.incr_connection();
         self.slot_migration_runtime

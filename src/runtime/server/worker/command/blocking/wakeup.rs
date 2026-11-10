@@ -183,9 +183,9 @@ impl ServerWorkerState {
         let (reply, rejected, is_exec_paused) = if was_paused {
             self.wakeup_handle_paused(connection_token, &args, blocked_req_bytes, token)
         } else {
-            self.command_execution_depth += usize::from(is_key_wakeup);
+            self.qos.command_depth += usize::from(is_key_wakeup);
             let (reply, rejected) = self.wakeup_execute_command(connection_token, &args);
-            self.command_execution_depth -= usize::from(is_key_wakeup);
+            self.qos.command_depth -= usize::from(is_key_wakeup);
             (reply, rejected, false)
         };
         if !self.connection_registry.contains(token) {

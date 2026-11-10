@@ -57,7 +57,6 @@ pub(crate) enum LoopControl {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum EventLane {
     Control,
-    Upstream,
     Normal,
 }
 

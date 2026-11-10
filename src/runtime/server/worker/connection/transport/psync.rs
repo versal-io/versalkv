@@ -536,7 +536,9 @@ impl ServerWorkerState {
         {
             return false;
         }
-        self.prioritize_connection(crate::framework::capabilities::io::Token(connection_token));
+        self.mark_client_subnet_priority(crate::framework::capabilities::io::Token(
+            connection_token,
+        ));
         if request.has_invalid_offset {
             self.reject_invalid_psync_offset(request, replies);
             return false;
@@ -1341,7 +1343,7 @@ mod tests {
         assert!(replies
             .first()
             .is_some_and(|reply| reply.starts_with(b"+FULLRESYNC ")));
-        assert!(backend.is_priority_connection(token));
+        assert!(backend.is_client_subnet_priority(token));
         assert!(backend
             .replication_runtime
             .primary_for_connection(ConnectionId(token.0))
@@ -1385,7 +1387,7 @@ mod tests {
         assert_eq!(backend.ctx.config().replication.master_port, 0);
         assert_eq!(backend.ctx.config().replication.master_link_status, "down");
         assert_eq!(backend.ctx.replication().backlog.second_replid(), replid);
-        assert!(backend.is_priority_connection(token));
+        assert!(backend.is_client_subnet_priority(token));
         assert_eq!(
             replies,
             vec![b"-ERR value is not an integer or out of range\r\n".to_vec()]

@@ -23,12 +23,12 @@ impl ServerWorkerState {
             .slot_migration_role
             .is_some();
         let samples_independently =
-            self.command_execution_depth == 0 && self.priority_command_token != Some(token);
+            self.qos.command_depth == 0 && self.qos.active_command_token != Some(token);
         let owns_priority_cycle = samples_independently
-            && self.is_priority_connection(token)
-            && self.begin_priority_cycle();
+            && self.is_client_subnet_priority(token)
+            && self.start_priority_cycle();
         let started = std::time::Instant::now();
-        self.command_execution_depth += 1;
+        self.qos.command_depth += 1;
         let reply = if let Some(prepare) = executor.hosted() {
             match prepare(&mut self.connection_registry[token], args, &mut self.ctx) {
                 Ok(task) => self.run_prepared_host_task(token, task),
@@ -46,9 +46,9 @@ impl ServerWorkerState {
         };
         self.kill_acl_subscribers();
         self.drain_acl_kills_for_command(Some(token));
-        self.command_execution_depth -= 1;
+        self.qos.command_depth -= 1;
         let duration_us = (started.elapsed().as_micros() as u64).max(1);
-        self.refresh_connection_priorities();
+        self.scan_and_apply_priority_subnets();
         if !had_migration_role
             && self.connection_registry.get(token).is_some_and(|connection| {
                 matches!(
@@ -57,9 +57,9 @@ impl ServerWorkerState {
                 )
             })
         {
-            self.prioritize_connection(token);
+            self.mark_client_subnet_priority(token);
         }
-        if samples_independently && self.is_priority_connection(token) {
+        if samples_independently && self.is_client_subnet_priority(token) {
             self.ctx.stats_mut().record_priority_command(duration_us);
         }
         self.finish_priority_cycle(owns_priority_cycle);

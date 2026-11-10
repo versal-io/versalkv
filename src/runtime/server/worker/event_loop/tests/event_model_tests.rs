@@ -346,12 +346,12 @@ fn event_batch_overwrites_external_sequence_values() {
 }
 
 #[test]
-fn ready_lanes_dispatch_control_then_upstream_then_normal() {
+fn ready_lanes_dispatch_control_then_normal() {
     let mut batch = EventBatch::default();
     for (lane, token) in [
         (EventLane::Normal, 30),
         (EventLane::Control, 10),
-        (EventLane::Upstream, 20),
+        (EventLane::Normal, 20),
     ] {
         batch.push(EventLoopEvent::readiness(
             EventPhase::Ready,
@@ -363,7 +363,7 @@ fn ready_lanes_dispatch_control_then_upstream_then_normal() {
     let tokens: Vec<_> = (0..3)
         .map(|_| readiness(batch.pop_ready().expect("ready lane event")).token)
         .collect();
-    assert_eq!(tokens, vec![Token(10), Token(20), Token(30)]);
+    assert_eq!(tokens, vec![Token(10), Token(30), Token(20)]);
 }
 
 #[test]

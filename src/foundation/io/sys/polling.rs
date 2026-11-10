@@ -13,3 +13,9 @@ pub fn add_with_mode(
     // dropping the slab entry, so the raw fd remains valid while registered.
     unsafe { poller.add_with_mode(fd, interest, mode) }
 }
+
+pub fn delete_fd(poller: &Poller, fd: RawFd) -> io::Result<()> {
+    // SAFETY: callers ensure fd was previously registered via add_with_mode
+    // and is still valid (the owning transport holds the descriptor).
+    unsafe { poller.delete(std::os::fd::BorrowedFd::borrow_raw(fd)) }
+}

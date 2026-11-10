@@ -116,6 +116,7 @@ impl ServerWorkerState {
             self.enqueue_io_completion(completion);
         }
         self.dispatch_worker_completion_events();
+        self.process_pending_fd_migrations();
         self.sync_io_thread_stats();
     }
 
@@ -256,6 +257,7 @@ impl ServerWorkerState {
             self.enqueue_io_completion(completion);
         }
         self.dispatch_worker_completion_events();
+        self.process_pending_fd_migrations();
         self.sync_io_thread_stats();
     }
 
