@@ -4,7 +4,7 @@ use crate::framework::capabilities::connection::Connection;
 use crate::framework::capabilities::io::Token;
 use crate::runtime::server::worker::command::dispatch::SpecialCommandCompletion;
 use crate::runtime::server::worker::command::invocation::CommandTarget;
-use crate::runtime::server::worker::command::outcome::{CommandDisposition, SpecialCommandResult};
+use crate::runtime::server::worker::command::outcome::CommandDisposition;
 
 #[test]
 fn suppressed_exec_aggregate_reply_records_zero_slot_egress() {
@@ -90,11 +90,8 @@ fn exec_records_transaction_wire_bytes_for_its_single_slot() {
     let _connection_token = backend.connection_registry.insert(connection);
     let mut effects = CommandEffects::default();
 
-    let result = backend.try_handle_exec(CommandTarget::new(Token(9)), "exec", false, &mut effects);
-    assert_eq!(
-        result,
-        SpecialCommandResult::Handled(CommandDisposition::Completed)
-    );
+    let result = backend.handle_exec(CommandTarget::new(Token(9)), "exec", false, &mut effects);
+    assert_eq!(result, CommandDisposition::Completed);
     let reply_end = effects.replies().len();
     effects.attribute_replies(0, reply_end);
     assert_eq!(

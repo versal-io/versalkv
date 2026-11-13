@@ -398,7 +398,16 @@ impl ServerWorkerState {
         self.ctx.begin_cmd();
         self.connection_registry[state.token].begin_nested_command_effects();
         self.record_nonblocking_cluster_setslot_propagation(state.token, args);
-        let reply = self.exec_invoke_queued_item(state.token, &spec, args);
+        let admin_reply =
+            if spec.dispatch_group == crate::engine::command::DispatchGroup::ClientAdmin {
+                self.exec_client_admin_value(state.token.0, args)
+            } else {
+                None
+            };
+        let reply = match admin_reply {
+            Some(reply) => reply,
+            None => self.invoke_command_executor(state.token, spec.executor, args),
+        };
         self.refresh_connection_priorities();
         let Some(token) = state.target.resolve(self) else {
             return false;
@@ -477,20 +486,6 @@ impl ServerWorkerState {
             self.exec_emit_item_monitor(state.token, args, flags, true);
         }
         Some((spec, flags))
-    }
-
-    fn exec_invoke_queued_item(
-        &mut self,
-        token: Token,
-        spec: &CommandSpec,
-        args: &CommandArgs,
-    ) -> Value {
-        if spec.dispatch_group == crate::engine::command::DispatchGroup::ClientAdmin {
-            if let Some(reply) = self.exec_client_admin_value(token.0, args) {
-                return reply;
-            }
-        }
-        self.invoke_command_executor(token, spec.executor, args)
     }
 
     fn exec_emit_item_monitor(
@@ -1267,9 +1262,7 @@ mod cluster_publish_tests {
         use crate::engine::extension::config::persistence::BgsaveMethod;
         use crate::foundation::io::store::Robj;
         use crate::runtime::server::worker::command::dispatch::CommandEffects;
-        use crate::runtime::server::worker::command::outcome::{
-            CommandDisposition, SpecialCommandResult,
-        };
+        use crate::runtime::server::worker::command::outcome::CommandDisposition;
 
         let mut backend = ServerWorkerState::new(1).unwrap();
         crate::framework::commands::register_all(&mut backend.registry);
@@ -1306,8 +1299,7 @@ mod cluster_publish_tests {
         assert!(backend.ctx.persistence().forkless_capture_in_progress());
         let mut effects = CommandEffects::default();
 
-        let result =
-            backend.try_handle_exec(CommandTarget::new(Token(7)), "exec", false, &mut effects);
+        let result = backend.handle_exec(CommandTarget::new(Token(7)), "exec", false, &mut effects);
         let key_is_absent = backend
             .ctx
             .db(0)
@@ -1324,10 +1316,7 @@ mod cluster_publish_tests {
             .abort_forkless_save(crate::foundation::io::sys::time::mstime() / 1_000);
         let _ = std::fs::remove_dir_all(dir);
 
-        assert_eq!(
-            result,
-            SpecialCommandResult::Handled(CommandDisposition::Blocked)
-        );
+        assert_eq!(result, CommandDisposition::Blocked);
         assert!(key_is_absent);
         assert!(transaction_is_active);
         assert!(client_is_blocked);
@@ -1342,9 +1331,7 @@ mod standalone_redirect_tests {
     use crate::framework::capabilities::io::Token;
     use crate::runtime::server::worker::command::dispatch::CommandEffects;
     use crate::runtime::server::worker::command::invocation::CommandTarget;
-    use crate::runtime::server::worker::command::outcome::{
-        CommandDisposition, SpecialCommandResult,
-    };
+    use crate::runtime::server::worker::command::outcome::CommandDisposition;
     use bytes::Bytes;
 
     #[test]
@@ -1373,8 +1360,8 @@ mod standalone_redirect_tests {
         let mut effects = CommandEffects::default();
 
         assert_eq!(
-            backend.try_handle_exec(CommandTarget::new(Token(9)), "exec", false, &mut effects,),
-            SpecialCommandResult::Handled(CommandDisposition::Completed)
+            backend.handle_exec(CommandTarget::new(Token(9)), "exec", false, &mut effects,),
+            CommandDisposition::Completed
         );
         assert_eq!(
             effects.replies(),

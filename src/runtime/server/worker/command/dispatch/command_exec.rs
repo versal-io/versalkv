@@ -106,14 +106,6 @@ struct ConnectionPropagationState {
     skip_propagation: bool,
 }
 
-impl ConnectionPropagationState {
-    fn should_propagate(&self, plan: &CommandPropagationPlan<'_>) -> bool {
-        self.has_script_ops
-            || self.force_propagate
-            || (!plan.rejected && !self.skip_propagation && (plan.is_write || plan.may_replicate))
-    }
-}
-
 impl ServerWorkerState {
     /// Install the C `BLOCKED_WAIT` continuation for `CLUSTER SETSLOT`.
     /// Mirrors `clusterCommandSetSlot` (cluster_legacy.c): force-propagate the
@@ -399,7 +391,10 @@ impl ServerWorkerState {
         if let Some(delta) = dirty_delta {
             self.ctx.persistence_mut().add_dirty(delta);
         }
-        if !state.should_propagate(plan) {
+        let should_propagate = state.has_script_ops
+            || state.force_propagate
+            || (!plan.rejected && !state.skip_propagation && (plan.is_write || plan.may_replicate));
+        if !should_propagate {
             return Vec::new();
         }
         if dirty_delta.is_none()
@@ -409,7 +404,15 @@ impl ServerWorkerState {
             self.ctx.persistence_mut().add_dirty(1);
         }
         if !plan.rejected && plan.is_write && !state.has_explicit_dirty_keys {
-            self.collect_inferred_write_keys(state.selected_db, plan.args, fx);
+            if let Some(spec) = self.registry.lookup(&plan.args.name) {
+                if let Some(keys) = crate::runtime::server::worker::command::extract_write_keys(
+                    spec,
+                    plan.args,
+                    state.selected_db,
+                ) {
+                    fx.watch_dirty.extend(keys);
+                }
+            }
         }
         let mut operations = connection_effects.take_script_propagation();
         let generated_command = operations.is_empty().then(|| {
@@ -418,8 +421,16 @@ impl ServerWorkerState {
             operations = direct;
             generated
         });
-        if mode == PropagationCaptureMode::Direct && generated_command == Some(true) {
-            self.record_propagation_network_bytes(plan, &operations[0]);
+        if mode == PropagationCaptureMode::Direct
+            && generated_command == Some(true)
+            && (plan.is_write || plan.may_replicate)
+        {
+            self.ctx.slot_metrics_mut().record(
+                &plan.metric_slots,
+                0,
+                0,
+                (operations[0].bytes.len() as u64).saturating_mul(plan.streaming_replicas),
+            );
         }
         operations
     }
@@ -444,50 +455,6 @@ impl ServerWorkerState {
             );
         }
         (Vec::new(), false)
-    }
-
-    fn record_propagation_network_bytes(
-        &mut self,
-        plan: &CommandPropagationPlan<'_>,
-        operation: &PropagationOp,
-    ) {
-        if plan.is_write || plan.may_replicate {
-            self.ctx.slot_metrics_mut().record(
-                &plan.metric_slots,
-                0,
-                0,
-                (operation.bytes.len() as u64).saturating_mul(plan.streaming_replicas),
-            );
-        }
-    }
-
-    fn collect_inferred_write_keys(
-        &mut self,
-        selected_db: u32,
-        args: &CommandArgs,
-        fx: &mut CommandEffects,
-    ) {
-        let Some(spec) = self.registry.lookup(&args.name) else {
-            return;
-        };
-        if let Some(keys) =
-            crate::runtime::server::worker::command::extract_write_keys(spec, args, selected_db)
-        {
-            fx.watch_dirty.extend(keys);
-        }
-    }
-
-    fn merge_connection_notifications(
-        connection_effects: &mut ConnectionCommandEffects,
-        fx: &mut CommandEffects,
-    ) {
-        fx.publish.extend(connection_effects.take_notifications());
-        fx.publish_shard
-            .extend(connection_effects.take_shard_notifications());
-        fx.cluster_publish
-            .extend(connection_effects.take_cluster_notifications());
-        fx.cluster_publish_shard
-            .extend(connection_effects.take_cluster_shard_notifications());
     }
 
     fn collect_expired_propagation(&mut self, fx: &mut CommandEffects) -> Vec<PropagationOp> {
@@ -651,21 +618,6 @@ impl ServerWorkerState {
         }
     }
 
-    fn reset_connection_after_command(
-        &mut self,
-        connection_token: usize,
-        token_value: usize,
-        name: &str,
-        rejected: bool,
-    ) {
-        if rejected {
-            return;
-        }
-        if name == "reset" {
-            self.reset_client_connection(connection_token, token_value);
-        }
-    }
-
     fn reset_client_connection(&mut self, connection_token: usize, token_value: usize) {
         let conn = &mut self.connection_registry
             [crate::framework::capabilities::io::Token(connection_token)];
@@ -742,7 +694,9 @@ impl ServerWorkerState {
             self.connection_registry[crate::framework::capabilities::io::Token(connection_token)]
                 .set_last_write_offset(offset_after);
         }
-        self.reset_connection_after_command(connection_token, token_value, name_lower, rejected);
+        if !rejected && name_lower == "reset" {
+            self.reset_client_connection(connection_token, token_value);
+        }
         self.queue_slot_migration_mutations(&migration_ops);
         capture.swapdb
     }
@@ -785,7 +739,18 @@ impl ServerWorkerState {
         );
         let operations =
             self.take_command_propagation_ops(plan, &state, &mut connection_effects, effects, mode);
-        Self::merge_connection_notifications(&mut connection_effects, effects);
+        effects
+            .publish
+            .extend(connection_effects.take_notifications());
+        effects
+            .publish_shard
+            .extend(connection_effects.take_shard_notifications());
+        effects
+            .cluster_publish
+            .extend(connection_effects.take_cluster_notifications());
+        effects
+            .cluster_publish_shard
+            .extend(connection_effects.take_cluster_shard_notifications());
         self.dispose_data_lazyfree_objects(connection_effects.take_lazyfree_objects());
         CommandPropagationCapture {
             swapdb: state.swapdb,

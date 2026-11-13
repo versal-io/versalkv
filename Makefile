@@ -4,11 +4,12 @@ CARGO ?= cargo
 NODE ?= node
 PYTHON ?= python3
 WASM_PACK ?= wasm-pack
+DOT ?= dot
 PROPTEST_CASES ?= 1000
 FUZZ_TIME ?= 30
 
-.PHONY: help build check ci generated-fmt check-generated-command-metadata check-config-parity fmt clippy ffi-boundaries check-unsafe-safety check-unsafe-boundaries check-host-dispatcher check-boundaries check-file-sizes check-ci-support check-sentinel-tcl-support check-architecture unit integration wasm-check wasm-web wasm-dist tcl sentinel-tcl property fault bench daily-performance weekly-soak nightly \
-	fuzz-build fuzz-smoke mutation coverage coverage-core miri doc install-test-tools clean \
+.PHONY: help build check ci generated-fmt check-generated-command-metadata check-config-parity fmt clippy ffi-boundaries check-unsafe-safety check-unsafe-boundaries check-host-dispatcher check-boundaries check-file-sizes check-ci-support check-sentinel-tcl-support check-architecture unit integration wasm-check wasm-web wasm-dist tcl sentinel-tcl property fault bench daily-performance nightly \
+	fuzz-build fuzz-smoke mutation coverage coverage-core miri doc flow-diagram install-test-tools clean \
 	formal-verify formal-tests formal
 
 help:
@@ -33,7 +34,6 @@ help:
 		'fault              Run deterministic RDB IO fault-injection tests' \
 		'bench              Run Criterion microbenchmarks' \
 		'daily-performance  Check startup performance baseline regression gate' \
-		'weekly-soak        Run weekly long-stability entry point' \
 		'nightly            Run nightly property gate' \
 		'fuzz-build         Compile all fuzz targets' \
 		'fuzz-smoke         Run each fuzz target for FUZZ_TIME seconds' \
@@ -42,6 +42,7 @@ help:
 		'coverage-core      Require 60% line coverage on src/ core runtime modules' \
 		'miri               Run strict-provenance Miri against Dict lifecycle tests' \
 		'doc                Run documentation tests' \
+		'flow-diagram       Build the centered React Flow HTML and light/dark SVGs' \
 		'formal-verify      Run P language model checker on replication spec' \
 		'formal-tests       Run P language generated integration tests' \
 		'formal             Run all P language formal verification (verify + tests)' \
@@ -158,9 +159,6 @@ bench:
 daily-performance:
 	$(PYTHON) scripts/versal-util.py ci performance --baseline-ms "$${BASELINE_MS:?}" --current-ms "$${CURRENT_MS:?}"
 
-weekly-soak:
-	$(PYTHON) scripts/versal-util.py ci weekly-soak
-
 nightly:
 	$(MAKE) property
 
@@ -185,6 +183,9 @@ miri:
 
 doc:
 	$(CARGO) test --doc
+
+flow-diagram:
+	$(NODE) docs/react-flow/build.mjs
 
 install-test-tools:
 	$(CARGO) install cargo-fuzz
@@ -212,4 +213,3 @@ formal-tests:
 
 .PHONY: formal
 formal: formal-verify formal-tests
-

@@ -35,13 +35,24 @@ impl ServerWorkerState {
         if !self.should_queue_in_transaction(token, name) {
             return None;
         }
+        Some(self.handle_multi_queue(token, args, name, resp3, replies))
+    }
+
+    pub(crate) fn handle_multi_queue(
+        &mut self,
+        token: Token,
+        args: &CommandArgs,
+        name: &str,
+        resp3: bool,
+        replies: &mut Vec<Vec<u8>>,
+    ) -> bool {
         let input = MultiQueueInput {
             token,
             args,
             name,
             resp3,
         };
-        let rejected = match self.decide_multi_queue(&input) {
+        match self.decide_multi_queue(&input) {
             MultiQueueDecision::Queue => {
                 let conn = &mut self.connection_registry[token];
                 conn.transaction.queue(self.ctx.num_dbs(), args.clone());
@@ -58,11 +69,10 @@ impl ServerWorkerState {
             MultiQueueDecision::Dispatch(outcome) => {
                 self.finish_multi_dispatch_outcome(input, replies, outcome)
             }
-        };
-        Some(rejected)
+        }
     }
 
-    fn should_queue_in_transaction(&self, token: Token, name: &str) -> bool {
+    pub(crate) fn should_queue_in_transaction(&self, token: Token, name: &str) -> bool {
         self.connection_registry[token].transaction.is_active()
             && !matches!(name, "multi" | "discard" | "reset" | "watch" | "unwatch")
     }

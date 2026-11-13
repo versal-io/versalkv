@@ -24,7 +24,7 @@ use crate::runtime::server::worker::command::dispatch::{
     CommandEffects, EffectQueue, ExecCollectedEffects, SpecialCommandCompletion,
 };
 use crate::runtime::server::worker::command::invocation::CommandOrigin;
-use crate::runtime::server::worker::command::outcome::{CommandDisposition, SpecialCommandResult};
+use crate::runtime::server::worker::command::outcome::CommandDisposition;
 use crate::runtime::server::worker::ServerWorkerState;
 use bytes::Bytes;
 
@@ -161,12 +161,16 @@ impl ServerWorkerState {
                 .is_active()
             && !args.name.eq_ignore_ascii_case(b"EXEC")
         {
-            return self.finish_paused_transaction_queue_wakeup(
+            return match self.wakeup_handle_paused_transaction_command(
                 connection_token,
                 token,
                 &args,
                 blocked_start_ms,
-            );
+            ) {
+                WakeupSpecialResult::Completed(dirty_keys)
+                | WakeupSpecialResult::ConnectionGone(dirty_keys) => dirty_keys,
+                WakeupSpecialResult::Reblocked => Vec::new(),
+            };
         }
 
         let (reply, rejected, is_exec_paused) = if was_paused {
@@ -255,7 +259,11 @@ impl ServerWorkerState {
                 &connection_effects,
             );
         }
-        self.deliver_wakeup_reply(token, reply_output);
+        if let Some(frame) = reply_output.frame {
+            self.queue_client_reply(token, frame);
+        } else if reply_output.arm_existing_output {
+            let _ = self.queue_client_reply(token, Vec::new());
+        }
         if let Some((db1, db2)) = swapdb {
             self.apply_swapdb_watch_state(db1, db2);
         } else {
@@ -295,25 +303,6 @@ impl ServerWorkerState {
             }
         }
         true
-    }
-
-    fn finish_paused_transaction_queue_wakeup(
-        &mut self,
-        connection_token: usize,
-        token: Token,
-        args: &CommandArgs,
-        blocked_start_ms: i64,
-    ) -> Vec<(u32, Bytes)> {
-        match self.wakeup_handle_paused_transaction_command(
-            connection_token,
-            token,
-            args,
-            blocked_start_ms,
-        ) {
-            WakeupSpecialResult::Completed(dirty_keys)
-            | WakeupSpecialResult::ConnectionGone(dirty_keys) => dirty_keys,
-            WakeupSpecialResult::Reblocked => Vec::new(),
-        }
     }
 
     fn finish_paused_exec_wakeup(
@@ -723,16 +712,12 @@ impl ServerWorkerState {
         .resp_version
             >= 3;
         let mut effects = CommandEffects::default();
-        let result = self.try_handle_exec(
+        let disposition = self.handle_exec(
             crate::runtime::server::worker::command::invocation::CommandTarget::new(token),
             "exec",
             resp3,
             &mut effects,
         );
-        let disposition = match result {
-            SpecialCommandResult::Handled(disposition) => disposition,
-            SpecialCommandResult::NotHandled => CommandDisposition::ConnectionGone,
-        };
         let disposition = self.complete_wakeup_special(token, disposition, &mut effects);
         if disposition == CommandDisposition::Blocked {
             return WakeupSpecialResult::Reblocked;
@@ -929,20 +914,15 @@ impl ServerWorkerState {
             self.ctx.incr_total_commands(1);
             0
         };
-        self.record_wakeup_error(&name_lower, reply, completion.rejected);
-        duration_us
-    }
-
-    fn record_wakeup_error(&mut self, name: &str, reply: &Value, rejected: bool) {
-        let Value::Error(error) = reply else {
-            return;
-        };
-        let error = String::from_utf8_lossy(error);
-        self.ctx
-            .incr_error_reply(error.split_whitespace().next().unwrap_or("ERR"));
-        if !rejected {
-            self.ctx.incr_cmd_failed(name);
+        if let Value::Error(error) = reply {
+            let error = String::from_utf8_lossy(error);
+            self.ctx
+                .incr_error_reply(error.split_whitespace().next().unwrap_or("ERR"));
+            if !completion.rejected {
+                self.ctx.incr_cmd_failed(&name_lower);
+            }
         }
+        duration_us
     }
 
     fn prepare_wakeup_reply(
@@ -1017,14 +997,6 @@ impl ServerWorkerState {
         (frame, visible_reply_bytes)
     }
 
-    fn deliver_wakeup_reply(&mut self, token: Token, output: WakeupReplyOutput) {
-        if let Some(frame) = output.frame {
-            self.queue_client_reply(token, frame);
-        } else if output.arm_existing_output {
-            let _ = self.queue_client_reply(token, Vec::new());
-        }
-    }
-
     pub(super) fn wakeup_collect_propagation_and_dirty(
         &mut self,
         connection_token: usize,
@@ -1044,7 +1016,14 @@ impl ServerWorkerState {
         let selected_db = self.connection_registry
             [crate::framework::capabilities::io::Token(connection_token)]
         .selected_db;
-        let command_flags = self.wakeup_command_flags(args);
+        let command_flags = self.registry.lookup(&args.name).map_or(0, |spec| {
+            crate::runtime::server::worker::command::dispatch::subcmd_flags::effective_command_flags_for_call(
+                spec.name.as_str(),
+                spec.flags,
+                args,
+                &self.ctx,
+            )
+        });
         let is_write = (command_flags & CMD_WRITE) != 0;
         let may_replicate = (command_flags & CMD_MAY_REPLICATE) != 0;
         let dirty_keys = self.wakeup_dirty_keys(selected_db, args, is_write, rejected, effects);
@@ -1088,14 +1067,6 @@ impl ServerWorkerState {
         } else {
             Vec::new()
         }
-    }
-
-    fn wakeup_command_flags(&self, args: &CommandArgs) -> u64 {
-        self.registry.lookup(&args.name).map_or(0, |spec| {
-            crate::runtime::server::worker::command::dispatch::subcmd_flags::effective_command_flags_for_call(
-                spec.name.as_str(), spec.flags, args, &self.ctx,
-            )
-        })
     }
 
     fn wakeup_propagation_ops(

@@ -145,25 +145,12 @@ impl ServerWorkerState {
                 .latency_mut()
                 .add_sample(event_name, (duration_us / 1000) as i64);
         }
-        self.sync_client_info_after_command(
-            connection_token,
-            invocation.target.token_value(),
-            invocation,
-        );
-    }
-
-    fn sync_client_info_after_command(
-        &mut self,
-        connection_token: usize,
-        token_value: usize,
-        invocation: CommandInvocation<'_>,
-    ) {
         let connection =
             &self.connection_registry[crate::framework::capabilities::io::Token(connection_token)];
         let selected_db = connection.selected_db;
         let watched_keys = connection.transaction.watched_key_count();
         let flags = connection_info_flags(connection);
-        if let Some(info) = self.ctx.client_info_mut(token_value) {
+        if let Some(info) = self.ctx.client_info_mut(invocation.target.token_value()) {
             info.last_cmd = client_last_command_name(invocation.name, invocation.args);
             info.db = selected_db;
             info.watched_keys = watched_keys;
@@ -186,7 +173,16 @@ impl ServerWorkerState {
             return false;
         }
         if !was_blocked_before {
-            self.rollback_incomplete_command_stats(invocation.name, invocation.args, duration_us);
+            self.ctx.decr_total_commands(1);
+            let stats_name = super::command_stats_name(invocation.name, invocation.args);
+            let stat = self
+                .ctx
+                .stats_mut()
+                .cmd_stats
+                .entry(stats_name)
+                .or_default();
+            stat.calls = stat.calls.saturating_sub(1);
+            stat.usec = stat.usec.saturating_sub(duration_us);
         }
         self.commit_blocked_stream_read_effects(connection_token, None, None, Some(effects));
         let request_wait_ack = self.register_blocked_command(connection_token);
@@ -216,24 +212,6 @@ impl ServerWorkerState {
             self.propagate_to_replicas_with_ack(&[], true);
         }
         true
-    }
-
-    fn rollback_incomplete_command_stats(
-        &mut self,
-        name: &str,
-        args: &crate::engine::command::CommandArgs,
-        duration_us: u64,
-    ) {
-        self.ctx.decr_total_commands(1);
-        let stats_name = super::command_stats_name(name, args);
-        let stat = self
-            .ctx
-            .stats_mut()
-            .cmd_stats
-            .entry(stats_name)
-            .or_default();
-        stat.calls = stat.calls.saturating_sub(1);
-        stat.usec = stat.usec.saturating_sub(duration_us);
     }
 
     fn register_blocked_command(&mut self, connection_token: usize) -> bool {

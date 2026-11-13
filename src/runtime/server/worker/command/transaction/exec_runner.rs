@@ -12,7 +12,7 @@ use crate::runtime::server::worker::command::dispatch::{
 };
 use crate::runtime::server::worker::command::invocation::CommandTarget;
 use crate::runtime::server::worker::command::outcome::{
-    CommandDisposition, CommandExecutionStatus, SpecialCommandResult,
+    CommandDisposition, CommandExecutionStatus,
 };
 use bytes::Bytes;
 use std::time::Instant;
@@ -84,21 +84,18 @@ struct ExecContext<'a> {
 }
 
 impl ServerWorkerState {
-    pub(crate) fn try_handle_exec(
+    pub(crate) fn handle_exec(
         &mut self,
         target: CommandTarget,
-        name_lower: &str,
+        log_name: &str,
         resp3: bool,
         effects: &mut CommandEffects,
-    ) -> SpecialCommandResult {
-        if !name_lower.eq_ignore_ascii_case("exec") {
-            return SpecialCommandResult::NotHandled;
-        }
+    ) -> CommandDisposition {
         let Some(token) = target.resolve(self) else {
-            return SpecialCommandResult::Handled(CommandDisposition::ConnectionGone);
+            return CommandDisposition::ConnectionGone;
         };
         let args = crate::engine::command::CommandArgs {
-            name: Bytes::copy_from_slice(name_lower.as_bytes()),
+            name: Bytes::copy_from_slice(log_name.as_bytes()),
             args: self.connection_registry[token]
                 .transaction
                 .exec_arguments()
@@ -108,7 +105,7 @@ impl ServerWorkerState {
             started: Instant::now(),
             target,
             name: "exec",
-            log_name: name_lower,
+            log_name,
             resp3,
             args: &args,
             cluster_metric_slot: self.exec_cluster_metric_slot(token.0),
@@ -126,8 +123,7 @@ impl ServerWorkerState {
         self.command_execution_depth += 1;
         let execution = self.apply_exec_decision(context, decision, effects);
         self.command_execution_depth -= 1;
-        let disposition = self.finish_exec(context, execution, effects);
-        SpecialCommandResult::Handled(disposition)
+        self.finish_exec(context, execution, effects)
     }
 
     fn exec_acl_admission(
@@ -416,29 +412,33 @@ impl ServerWorkerState {
         let Some(token) = context.target.resolve(self) else {
             return CommandDisposition::ConnectionGone;
         };
-        self.capture_exec_monitor(token, context.args);
-        let accounting = self.record_exec_completion(context, &execution);
-        if execution.disposition == CommandDisposition::Blocked {
-            self.finish_blocked_exec(token);
-            return CommandDisposition::Blocked;
-        }
-        self.queue_exec_reply(context, execution, accounting, effects);
-        CommandDisposition::Completed
-    }
-
-    fn capture_exec_monitor(&mut self, token: Token, args: &crate::engine::command::CommandArgs) {
-        let connection = &self.connection_registry[token];
+        let monitor_connection = &self.connection_registry[token];
         if let Some(event) = self.ctx.monitor_event(
-            connection.selected_db,
-            connection.peer_addr.to_string(),
-            std::iter::once(args.name.clone())
-                .chain(args.args.iter().cloned())
+            monitor_connection.selected_db,
+            monitor_connection.peer_addr.to_string(),
+            std::iter::once(context.args.name.clone())
+                .chain(context.args.args.iter().cloned())
                 .collect(),
             crate::framework::generated::commands::EXEC_META.flags,
             false,
         ) {
             self.ctx.script_mut().pending_internal_monitor.push(event);
         }
+        let accounting = self.record_exec_completion(context, &execution);
+        if execution.disposition == CommandDisposition::Blocked {
+            if let Some(info) = self.ctx.client_info_mut(token.0) {
+                info.flags.retain(|flag| flag != 'N');
+                if !info.flags.contains('b') {
+                    info.flags.push('b');
+                }
+            }
+            let blocked_connection = &mut self.connection_registry[token];
+            blocked_connection.cmd_count = blocked_connection.cmd_count.saturating_sub(1);
+            blocked_connection.set_custom_reply_enabled(false);
+            return CommandDisposition::Blocked;
+        }
+        self.queue_exec_reply(context, execution, accounting, effects);
+        CommandDisposition::Completed
     }
 
     fn record_exec_completion(
@@ -483,18 +483,6 @@ impl ServerWorkerState {
             duration_us,
             transaction_input_bytes: context.transaction_input_bytes,
         }
-    }
-
-    fn finish_blocked_exec(&mut self, token: Token) {
-        if let Some(info) = self.ctx.client_info_mut(token.0) {
-            info.flags.retain(|flag| flag != 'N');
-            if !info.flags.contains('b') {
-                info.flags.push('b');
-            }
-        }
-        let connection = &mut self.connection_registry[token];
-        connection.cmd_count = connection.cmd_count.saturating_sub(1);
-        connection.set_custom_reply_enabled(false);
     }
 
     fn queue_exec_reply(

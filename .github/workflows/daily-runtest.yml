@@ -17,7 +17,7 @@ permissions:
 jobs:
   tcl-build:
     name: Tcl Binary Build
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout repository and submodules
         uses: actions/checkout@v4
@@ -53,7 +53,7 @@ jobs:
 
   runtest:
     name: Tcl Regression (runtest)
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     needs: tcl-build
     steps:
       - name: Checkout repository and submodules
@@ -99,7 +99,7 @@ jobs:
 
   runtest-sentinel:
     name: Sentinel Tcl Regression
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     needs: tcl-build
     steps:
       - name: Checkout repository and submodules
@@ -144,7 +144,7 @@ jobs:
 
   runtest-moduleapi:
     name: Module API Tcl Tests
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     needs: tcl-build
     steps:
       - name: Checkout repository and submodules
