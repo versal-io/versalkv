@@ -518,54 +518,14 @@ impl ServerWorkerState {
             || args.name.eq_ignore_ascii_case(b"flushdb")
             || args.name.eq_ignore_ascii_case(b"flushall")
             || args.name.eq_ignore_ascii_case(b"shutdown");
-        if !is_capture_control && self.ctx.persistence().forkless_capture_in_progress() {
-            if !facts.transaction && args.name.eq_ignore_ascii_case(b"swapdb") {
-                return None;
-            }
-            let has_indirect_writes = facts.transaction
-                || [
-                    b"eval".as_slice(),
-                    b"evalsha".as_slice(),
-                    b"fcall".as_slice(),
-                ]
-                .iter()
-                .any(|name| args.name.eq_ignore_ascii_case(name))
-                || key_targets.iter().any(|(db_id, key)| {
-                    !self
-                        .ctx
-                        .blocking_registry()
-                        .waiters_for_key(*db_id, key)
-                        .is_empty()
-                });
-            if has_indirect_writes || key_targets.is_empty() {
-                self.ctx.persistence().set_forkless_key_delay(0);
-                return Some(DispatchOutcome {
-                    action: DispatchAction::Postpone(PostponeReason::ForklessKey),
-                    call_flags,
-                    reject_reply: None,
-                });
-            }
-            let uncaptured_keys = key_targets
-                .iter()
-                .filter(|(db_id, key)| !self.ctx.persistence().forkless_key_captured(*db_id, key))
-                .cloned()
-                .collect::<Vec<_>>();
-            if !uncaptured_keys.is_empty() {
-                let mut can_capture_all_now = true;
-                for (db_id, key) in uncaptured_keys {
-                    can_capture_all_now &= self
-                        .ctx
-                        .prioritize_forkless_keys(db_id, std::iter::once(key));
-                }
-                if !can_capture_all_now {
-                    self.ctx.persistence().set_forkless_key_delay(0);
-                }
-                return Some(DispatchOutcome {
-                    action: DispatchAction::Postpone(PostponeReason::ForklessKey),
-                    call_flags,
-                    reject_reply: None,
-                });
-            }
+        if let Some(outcome) = self.evaluate_forkless_capture_barrier(
+            facts,
+            args,
+            call_flags,
+            is_capture_control,
+            &key_targets,
+        ) {
+            return Some(outcome);
         }
         if facts.transaction {
             return None;
@@ -578,6 +538,71 @@ impl ServerWorkerState {
                 call_flags,
                 reject_reply: None,
             })
+    }
+
+    /// Gate writes while a forkless snapshot capture is in flight. Indirect
+    /// writes (transaction, scripts, key waiters) and keyless commands must
+    /// wait for the whole capture; direct key writes only wait when at least
+    /// one target key cannot be prioritized for capture immediately.
+    fn evaluate_forkless_capture_barrier(
+        &mut self,
+        facts: &CommandClientFacts,
+        args: &CommandArgs,
+        call_flags: CmdCallFlags,
+        is_capture_control: bool,
+        key_targets: &[(u32, Vec<u8>)],
+    ) -> Option<DispatchOutcome> {
+        if is_capture_control || !self.ctx.persistence().forkless_capture_in_progress() {
+            return None;
+        }
+        if !facts.transaction && args.name.eq_ignore_ascii_case(b"swapdb") {
+            return None;
+        }
+        let has_indirect_writes = facts.transaction
+            || [
+                b"eval".as_slice(),
+                b"evalsha".as_slice(),
+                b"fcall".as_slice(),
+            ]
+            .iter()
+            .any(|name| args.name.eq_ignore_ascii_case(name))
+            || key_targets.iter().any(|(db_id, key)| {
+                !self
+                    .ctx
+                    .blocking_registry()
+                    .waiters_for_key(*db_id, key)
+                    .is_empty()
+            });
+        if has_indirect_writes || key_targets.is_empty() {
+            self.ctx.persistence().set_forkless_key_delay(0);
+            return Some(DispatchOutcome {
+                action: DispatchAction::Postpone(PostponeReason::ForklessKey),
+                call_flags,
+                reject_reply: None,
+            });
+        }
+        let uncaptured_keys = key_targets
+            .iter()
+            .filter(|(db_id, key)| !self.ctx.persistence().forkless_key_captured(*db_id, key))
+            .cloned()
+            .collect::<Vec<_>>();
+        if uncaptured_keys.is_empty() {
+            return None;
+        }
+        let mut can_capture_all_now = true;
+        for (db_id, key) in uncaptured_keys {
+            can_capture_all_now &= self
+                .ctx
+                .prioritize_forkless_keys(db_id, std::iter::once(key));
+        }
+        if !can_capture_all_now {
+            self.ctx.persistence().set_forkless_key_delay(0);
+        }
+        Some(DispatchOutcome {
+            action: DispatchAction::Postpone(PostponeReason::ForklessKey),
+            call_flags,
+            reject_reply: None,
+        })
     }
 
     pub(super) fn stage_slot_migration_pause(

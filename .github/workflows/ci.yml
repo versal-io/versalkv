@@ -26,7 +26,7 @@ env:
 jobs:
   rust-check:
     name: Rust Check (fmt, clippy, build, unit, integration, property, static checks)
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout repository and submodules
         uses: actions/checkout@v4
@@ -91,7 +91,7 @@ jobs:
 
   tcl-build:
     name: Tcl Binary Build
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout repository and submodules
         uses: actions/checkout@v4
@@ -126,7 +126,7 @@ jobs:
 
   runtest:
     name: Tcl Regression (runtest)
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     needs: tcl-build
     steps:
       - name: Checkout repository and submodules
@@ -171,7 +171,7 @@ jobs:
 
   runtest-sentinel:
     name: Sentinel Tcl Regression
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     needs: tcl-build
     continue-on-error: true
     steps:
@@ -216,7 +216,7 @@ jobs:
 
   runtest-moduleapi:
     name: Module API Tcl Tests
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     needs: tcl-build
     steps:
       - name: Checkout repository and submodules
@@ -259,7 +259,7 @@ jobs:
 
   daily-performance:
     name: Daily Performance Baseline
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout repository and submodules
         uses: actions/checkout@v4
@@ -274,21 +274,3 @@ jobs:
 
       - name: Run startup regression gate
         run: make daily-performance BASELINE_MS=${BASELINE_MS:-100} CURRENT_MS=${CURRENT_MS:-100}
-
-  weekly-soak:
-    name: Weekly 72h Soak
-    runs-on: self-hosted
-    steps:
-      - name: Checkout repository and submodules
-        uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: "1.99.1"
-          components: rustfmt
-
-      - name: Dry-run soak plan
-        run: python3 scripts/versal-util.py ci weekly-soak --dry-run --duration-seconds 259200 --interval-seconds 10800

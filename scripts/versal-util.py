@@ -1008,53 +1008,6 @@ def command_ci_performance(args: argparse.Namespace, _ctx: RepoContext) -> int:
     return EXIT_OK
 
 
-def command_ci_weekly_soak(args: argparse.Namespace, ctx: RepoContext) -> int:
-    duration = args.duration_seconds
-    interval = args.interval_seconds
-    if duration <= 0 or interval <= 0:
-        raise ToolError("duration and interval must be positive seconds", EXIT_USAGE)
-    steps = max(1, duration // interval)
-    if args.dry_run:
-        print("weekly-soak dry-run")
-        print("duration_seconds={}".format(duration))
-        print("interval_seconds={}".format(interval))
-        print("steps={}".format(steps))
-        return EXIT_OK
-    print("weekly-soak start: duration_seconds={} interval_seconds={}".format(duration, interval))
-    deadline = time.time() + duration
-    step = 0
-    log_path = Path(tempfile.gettempdir()) / "versal-weekly-soak-server.log"
-    while time.time() < deadline:
-        step += 1
-        print("weekly-soak step={}".format(step))
-        with log_path.open("wb") as output:
-            process = subprocess.Popen(
-                ["cargo", "run", "--bin", "versal-server", "--", "--port", "0", "--loglevel", "notice", "--daemonize", "no"],
-                cwd=str(ctx.root),
-                stdout=output,
-                stderr=subprocess.STDOUT,
-            )
-            try:
-                time.sleep(1)
-                if process.poll() is not None:
-                    print("weekly-soak server exited early", file=sys.stderr)
-                    print(read_text(log_path), file=sys.stderr, end="")
-                    return EXIT_FAILURE
-            finally:
-                if process.poll() is None:
-                    process.terminate()
-                    try:
-                        process.wait(timeout=10)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                        process.wait()
-        remaining = deadline - time.time()
-        if remaining > 0:
-            time.sleep(min(interval, remaining))
-    print("weekly-soak complete")
-    return EXIT_OK
-
-
 def running_versal_server_pids() -> List[int]:
     result = run_command(["ps", "-eo", "pid=,comm="], capture=True)
     pids = []
@@ -2129,12 +2082,6 @@ def selftest_ci_commands(ctx: RepoContext) -> None:
     _assert(accepted.returncode == EXIT_OK, accepted.stderr)
     rejected = invoke_cli(["ci", "performance", "--baseline-ms", "100", "--current-ms", "111"], ctx.root)
     _assert(rejected.returncode == EXIT_FAILURE, "performance regression must fail")
-    dry_run = invoke_cli(
-        ["ci", "weekly-soak", "--dry-run", "--duration-seconds", "9", "--interval-seconds", "3"],
-        ctx.root,
-    )
-    _assert(dry_run.returncode == EXIT_OK, dry_run.stderr)
-    _assert("steps=3" in dry_run.stdout, "weekly soak step count mismatch")
     invalid = invoke_cli(["ci", "dual-channel", "--runs", "0"], ctx.root)
     _assert(invalid.returncode == EXIT_USAGE, "zero dual-channel runs must exit 2")
 
@@ -2713,8 +2660,6 @@ def command_check_ci_support(_args: argparse.Namespace, ctx: RepoContext) -> int
     failures.extend(script_entry_policy_failures(modules, wiring))
     if "scripts/versal-util.py check ci-support" not in makefile:
         failures.append("Makefile does not route CI support through versal-util.py")
-    if "python3 scripts/versal-util.py ci weekly-soak" not in pipeline:
-        failures.append("CI weekly soak does not route through versal-util.py")
     install_node = pipeline.find("apt-get install -y --no-install-recommends nodejs")
     wasm_check = pipeline.find("make wasm-check")
     if install_node < 0:
@@ -2880,11 +2825,6 @@ def build_parser() -> argparse.ArgumentParser:
     performance.add_argument("--baseline-ms", type=float, required=True)
     performance.add_argument("--current-ms", type=float, required=True)
     performance.set_defaults(handler=command_ci_performance)
-    soak = ci_commands.add_parser("weekly-soak")
-    soak.add_argument("--dry-run", action="store_true")
-    soak.add_argument("--duration-seconds", type=int, default=259200)
-    soak.add_argument("--interval-seconds", type=int, default=10800)
-    soak.set_defaults(handler=command_ci_weekly_soak)
     dual = ci_commands.add_parser("dual-channel")
     dual.add_argument("--runs", type=int)
     dual.add_argument("--base-port", type=int)

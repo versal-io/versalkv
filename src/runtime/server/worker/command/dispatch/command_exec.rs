@@ -106,14 +106,6 @@ struct ConnectionPropagationState {
     skip_propagation: bool,
 }
 
-impl ConnectionPropagationState {
-    fn should_propagate(&self, plan: &CommandPropagationPlan<'_>) -> bool {
-        self.has_script_ops
-            || self.force_propagate
-            || (!plan.rejected && !self.skip_propagation && (plan.is_write || plan.may_replicate))
-    }
-}
-
 impl ServerWorkerState {
     /// Install the C `BLOCKED_WAIT` continuation for `CLUSTER SETSLOT`.
     /// Mirrors `clusterCommandSetSlot` (cluster_legacy.c): force-propagate the
@@ -235,71 +227,89 @@ impl ServerWorkerState {
         ) {
             self.refresh_replication_view();
         }
-        if dispatch_group == DispatchGroup::Shutdown {
-            let reply = crate::runtime::server::supervisor::shutdown::execute(&mut self.ctx, args);
-            let abort = args
-                .args
-                .iter()
-                .any(|arg| arg.eq_ignore_ascii_case(b"abort"));
-            if abort {
-                crate::runtime::server::supervisor::shutdown::clear_shutdown_pause(&mut self.ctx);
-                self.reply_to_shutdown_clients();
-            }
-            if self.ctx.is_shutdown_requested() {
-                // C exits directly from shutdownCommand() after
-                // finishShutdown(), whose final steps close every listener.
-                // Close them before publishing this command's reply as well,
-                // so a client cannot reconnect into the short window before
-                // the outer Rust event-loop observes shutdown_requested.
-                self.close_listeners_for_shutdown();
-            }
-            let accepted = !matches!(reply, Value::Error(_));
-            let shutdown_in_progress = accepted
-                && !abort
-                && (self.ctx.is_shutdown_requested()
-                    || self.ctx.shutdown_state().initiated
-                    || self.ctx.shutdown_state().asap);
-            if shutdown_in_progress {
-                let conn = &mut self.connection_registry
-                    [crate::framework::capabilities::io::Token(connection_token)];
-                conn.enter_blocking(
-                    BlockedCmd::Shutdown,
-                    Vec::new(),
-                    0,
-                    args,
-                    conn.request_bytes_current_command(),
-                );
-                self.ctx.shutdown_state_mut().blocked_clients += 1;
-                if self.ctx.shutdown_state().mstime_deadline != 0 {
-                    self.send_shutdown_getack_if_needed();
-                }
-            }
-            reply
-        } else {
-            if let Some(reply) = self.prepare_cluster_setslot_block(
-                crate::framework::capabilities::io::Token(connection_token),
-                args,
-            ) {
-                return reply;
-            }
-            // C Valkey's commandTimeSnapshot() is stable for the lifetime of
-            // one command. Keep wall-clock helpers on the same snapshot so a
-            // short relative TTL cannot expire merely because the handler was
-            // descheduled between parsing and applying it. Install this only
-            // after synchronous pre-handler waits, whose deadlines must keep
-            // observing real time.
-            let _time_guard = crate::foundation::io::sys::time::enter_command_time_snapshot(
-                crate::foundation::io::sys::time::mstime(),
-            );
-            let reply = self.invoke_command_executor(
-                crate::framework::capabilities::io::Token(connection_token),
-                executor,
-                args,
-            );
-            // CLIENT UNPAUSE and save handlers can change DB-local guards.
-            self.ctx.set_forkless_capture_expiration_paused(false);
-            reply
+        match dispatch_group {
+            DispatchGroup::Shutdown => self.execute_shutdown_group(connection_token, args),
+            _ => self.execute_ordinary_handler(connection_token, executor, args),
         }
+    }
+
+    /// Shutdown dispatch group: run the supervisor handler, honour ABORT, and
+    /// park accepted shutdown clients in the `BlockedCmd::Shutdown` continuation
+    /// once the shutdown is actually in progress.
+    fn execute_shutdown_group(&mut self, connection_token: usize, args: &CommandArgs) -> Value {
+        let reply = crate::runtime::server::supervisor::shutdown::execute(&mut self.ctx, args);
+        let abort = args
+            .args
+            .iter()
+            .any(|arg| arg.eq_ignore_ascii_case(b"abort"));
+        if abort {
+            crate::runtime::server::supervisor::shutdown::clear_shutdown_pause(&mut self.ctx);
+            self.reply_to_shutdown_clients();
+        }
+        if self.ctx.is_shutdown_requested() {
+            // C exits directly from shutdownCommand() after
+            // finishShutdown(), whose final steps close every listener.
+            // Close them before publishing this command's reply as well,
+            // so a client cannot reconnect into the short window before
+            // the outer Rust event-loop observes shutdown_requested.
+            self.close_listeners_for_shutdown();
+        }
+        let accepted = !matches!(reply, Value::Error(_));
+        let shutdown_in_progress = accepted
+            && !abort
+            && (self.ctx.is_shutdown_requested()
+                || self.ctx.shutdown_state().initiated
+                || self.ctx.shutdown_state().asap);
+        if shutdown_in_progress {
+            let conn = &mut self.connection_registry
+                [crate::framework::capabilities::io::Token(connection_token)];
+            conn.enter_blocking(
+                BlockedCmd::Shutdown,
+                Vec::new(),
+                0,
+                args,
+                conn.request_bytes_current_command(),
+            );
+            self.ctx.shutdown_state_mut().blocked_clients += 1;
+            if self.ctx.shutdown_state().mstime_deadline != 0 {
+                self.send_shutdown_getack_if_needed();
+            }
+        }
+        reply
+    }
+
+    /// Ordinary dispatch group: install the SETSLOT blocking continuation when
+    /// eligible, then invoke the registered executor inside a stable command
+    /// time snapshot.
+    fn execute_ordinary_handler(
+        &mut self,
+        connection_token: usize,
+        executor: CommandExecutor,
+        args: &CommandArgs,
+    ) -> Value {
+        if let Some(reply) = self.prepare_cluster_setslot_block(
+            crate::framework::capabilities::io::Token(connection_token),
+            args,
+        ) {
+            return reply;
+        }
+        // C Valkey's commandTimeSnapshot() is stable for the lifetime of
+        // one command. Keep wall-clock helpers on the same snapshot so a
+        // short relative TTL cannot expire merely because the handler was
+        // descheduled between parsing and applying it. Install this only
+        // after synchronous pre-handler waits, whose deadlines must keep
+        // observing real time.
+        let _time_guard = crate::foundation::io::sys::time::enter_command_time_snapshot(
+            crate::foundation::io::sys::time::mstime(),
+        );
+        let reply = self.invoke_command_executor(
+            crate::framework::capabilities::io::Token(connection_token),
+            executor,
+            args,
+        );
+        // CLIENT UNPAUSE and save handlers can change DB-local guards.
+        self.ctx.set_forkless_capture_expiration_paused(false);
+        reply
     }
 
     fn command_propagation_plan<'a>(
@@ -381,7 +391,10 @@ impl ServerWorkerState {
         if let Some(delta) = dirty_delta {
             self.ctx.persistence_mut().add_dirty(delta);
         }
-        if !state.should_propagate(plan) {
+        let should_propagate = state.has_script_ops
+            || state.force_propagate
+            || (!plan.rejected && !state.skip_propagation && (plan.is_write || plan.may_replicate));
+        if !should_propagate {
             return Vec::new();
         }
         if dirty_delta.is_none()
@@ -391,7 +404,15 @@ impl ServerWorkerState {
             self.ctx.persistence_mut().add_dirty(1);
         }
         if !plan.rejected && plan.is_write && !state.has_explicit_dirty_keys {
-            self.collect_inferred_write_keys(state.selected_db, plan.args, fx);
+            if let Some(spec) = self.registry.lookup(&plan.args.name) {
+                if let Some(keys) = crate::runtime::server::worker::command::extract_write_keys(
+                    spec,
+                    plan.args,
+                    state.selected_db,
+                ) {
+                    fx.watch_dirty.extend(keys);
+                }
+            }
         }
         let mut operations = connection_effects.take_script_propagation();
         let generated_command = operations.is_empty().then(|| {
@@ -400,8 +421,16 @@ impl ServerWorkerState {
             operations = direct;
             generated
         });
-        if mode == PropagationCaptureMode::Direct && generated_command == Some(true) {
-            self.record_propagation_network_bytes(plan, &operations[0]);
+        if mode == PropagationCaptureMode::Direct
+            && generated_command == Some(true)
+            && (plan.is_write || plan.may_replicate)
+        {
+            self.ctx.slot_metrics_mut().record(
+                &plan.metric_slots,
+                0,
+                0,
+                (operations[0].bytes.len() as u64).saturating_mul(plan.streaming_replicas),
+            );
         }
         operations
     }
@@ -426,50 +455,6 @@ impl ServerWorkerState {
             );
         }
         (Vec::new(), false)
-    }
-
-    fn record_propagation_network_bytes(
-        &mut self,
-        plan: &CommandPropagationPlan<'_>,
-        operation: &PropagationOp,
-    ) {
-        if plan.is_write || plan.may_replicate {
-            self.ctx.slot_metrics_mut().record(
-                &plan.metric_slots,
-                0,
-                0,
-                (operation.bytes.len() as u64).saturating_mul(plan.streaming_replicas),
-            );
-        }
-    }
-
-    fn collect_inferred_write_keys(
-        &mut self,
-        selected_db: u32,
-        args: &CommandArgs,
-        fx: &mut CommandEffects,
-    ) {
-        let Some(spec) = self.registry.lookup(&args.name) else {
-            return;
-        };
-        if let Some(keys) =
-            crate::runtime::server::worker::command::extract_write_keys(spec, args, selected_db)
-        {
-            fx.watch_dirty.extend(keys);
-        }
-    }
-
-    fn merge_connection_notifications(
-        connection_effects: &mut ConnectionCommandEffects,
-        fx: &mut CommandEffects,
-    ) {
-        fx.publish.extend(connection_effects.take_notifications());
-        fx.publish_shard
-            .extend(connection_effects.take_shard_notifications());
-        fx.cluster_publish
-            .extend(connection_effects.take_cluster_notifications());
-        fx.cluster_publish_shard
-            .extend(connection_effects.take_cluster_shard_notifications());
     }
 
     fn collect_expired_propagation(&mut self, fx: &mut CommandEffects) -> Vec<PropagationOp> {
@@ -633,21 +618,6 @@ impl ServerWorkerState {
         }
     }
 
-    fn reset_connection_after_command(
-        &mut self,
-        connection_token: usize,
-        token_value: usize,
-        name: &str,
-        rejected: bool,
-    ) {
-        if rejected {
-            return;
-        }
-        if name == "reset" {
-            self.reset_client_connection(connection_token, token_value);
-        }
-    }
-
     fn reset_client_connection(&mut self, connection_token: usize, token_value: usize) {
         let conn = &mut self.connection_registry
             [crate::framework::capabilities::io::Token(connection_token)];
@@ -724,7 +694,9 @@ impl ServerWorkerState {
             self.connection_registry[crate::framework::capabilities::io::Token(connection_token)]
                 .set_last_write_offset(offset_after);
         }
-        self.reset_connection_after_command(connection_token, token_value, name_lower, rejected);
+        if !rejected && name_lower == "reset" {
+            self.reset_client_connection(connection_token, token_value);
+        }
         self.queue_slot_migration_mutations(&migration_ops);
         capture.swapdb
     }
@@ -767,7 +739,18 @@ impl ServerWorkerState {
         );
         let operations =
             self.take_command_propagation_ops(plan, &state, &mut connection_effects, effects, mode);
-        Self::merge_connection_notifications(&mut connection_effects, effects);
+        effects
+            .publish
+            .extend(connection_effects.take_notifications());
+        effects
+            .publish_shard
+            .extend(connection_effects.take_shard_notifications());
+        effects
+            .cluster_publish
+            .extend(connection_effects.take_cluster_notifications());
+        effects
+            .cluster_publish_shard
+            .extend(connection_effects.take_cluster_shard_notifications());
         self.dispose_data_lazyfree_objects(connection_effects.take_lazyfree_objects());
         CommandPropagationCapture {
             swapdb: state.swapdb,

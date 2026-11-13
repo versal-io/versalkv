@@ -182,8 +182,29 @@ fn acl_denial_outcome(
                 ),
             )
         }
-        AclDenial::Command => command_denial_details(request),
-        AclDenial::Key(index) => key_denial_details(request, key_requirements, index),
+        AclDenial::Command => {
+            let object = ServerWorkerState::acl_command_object_name(
+                request.meta.name.as_str(),
+                request.args,
+            );
+            let message = format!(
+                "NOPERM User {} has no permissions to run the '{}' command",
+                request.facts.username, object
+            );
+            (ACL_DENIED_CMD, object, message)
+        }
+        AclDenial::Key(index) => {
+            let key = key_requirements
+                .get(index)
+                .map(|(key, _)| std::str::from_utf8(key).unwrap_or("<binary>"))
+                .unwrap_or("<binary>")
+                .to_string();
+            let message = format!(
+                "NOPERM User {} has no permissions to access a key",
+                request.facts.username
+            );
+            (ACL_DENIED_KEY, key, message)
+        }
         AclDenial::Channel(index) => {
             let object = request
                 .args
@@ -210,33 +231,6 @@ fn acl_denial_outcome(
         client_info,
     );
     rejected(request.call_flags, message)
-}
-
-fn command_denial_details(request: &AclRequest<'_>) -> (i32, String, String) {
-    let object =
-        ServerWorkerState::acl_command_object_name(request.meta.name.as_str(), request.args);
-    let message = format!(
-        "NOPERM User {} has no permissions to run the '{}' command",
-        request.facts.username, object
-    );
-    (ACL_DENIED_CMD, object, message)
-}
-
-fn key_denial_details(
-    request: &AclRequest<'_>,
-    key_requirements: &[(&[u8], u8)],
-    index: usize,
-) -> (i32, String, String) {
-    let key = key_requirements
-        .get(index)
-        .map(|(key, _)| std::str::from_utf8(key).unwrap_or("<binary>"))
-        .unwrap_or("<binary>")
-        .to_string();
-    let message = format!(
-        "NOPERM User {} has no permissions to access a key",
-        request.facts.username
-    );
-    (ACL_DENIED_KEY, key, message)
 }
 
 fn channel_denial_outcome(user: &AclUser, request: &AclRequest<'_>) -> Option<DispatchOutcome> {

@@ -29,20 +29,24 @@ impl ServerWorkerState {
             && self.begin_priority_cycle();
         let started = std::time::Instant::now();
         self.command_execution_depth += 1;
-        let reply = if let Some(prepare) = executor.hosted() {
-            match prepare(&mut self.connection_registry[token], args, &mut self.ctx) {
-                Ok(task) => self.run_prepared_host_task(token, task),
-                Err(reply) => reply,
+        let reply = match executor {
+            CommandExecutor::Hosted { prepare, .. } => {
+                match prepare(&mut self.connection_registry[token], args, &mut self.ctx) {
+                    Ok(task) => self.run_prepared_host_task(token, task),
+                    Err(reply) => reply,
+                }
             }
-        } else if let Some(handler) = executor.runtime_handler() {
-            execute_runtime_command(
+            CommandExecutor::Runtime(handler) => execute_runtime_command(
                 &mut self.connection_registry[token],
                 args,
                 &mut self.ctx,
                 handler,
-            )
-        } else {
-            executor.execute(&mut self.connection_registry[token], args, &mut self.ctx)
+            ),
+            // CommandExecutor is Copy, so the original execute entry point stays
+            // available here, preserving its hotkeys scope wrapper for Immediate.
+            CommandExecutor::Immediate(_) => {
+                executor.execute(&mut self.connection_registry[token], args, &mut self.ctx)
+            }
         };
         self.kill_acl_subscribers();
         self.drain_acl_kills_for_command(Some(token));

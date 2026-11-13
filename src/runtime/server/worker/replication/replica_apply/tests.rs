@@ -10,7 +10,7 @@ use crate::framework::capabilities::io::Token;
 use crate::framework::distributed::replication::{ConnectionId, MasterInfo, ProvisionalPrimary};
 use crate::runtime::server::worker::command::dispatch::CommandEffects;
 use crate::runtime::server::worker::command::invocation::CommandTarget;
-use crate::runtime::server::worker::command::outcome::{CommandDisposition, SpecialCommandResult};
+use crate::runtime::server::worker::command::outcome::CommandDisposition;
 use std::collections::VecDeque;
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
@@ -273,8 +273,8 @@ fn assert_replica_swapdb_outcome(
         .is_watch_dirty());
     let mut effects = CommandEffects::default();
     assert_eq!(
-        backend.try_handle_exec(CommandTarget::new(affected), "exec", false, &mut effects),
-        SpecialCommandResult::Handled(CommandDisposition::Completed)
+        backend.handle_exec(CommandTarget::new(affected), "exec", false, &mut effects),
+        CommandDisposition::Completed
     );
     assert_eq!(effects.replies(), &[b"*-1\r\n".to_vec()]);
     assert!(backend.connection_registry[unaffected]

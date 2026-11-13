@@ -18,20 +18,6 @@ mod wakeup;
 #[path = "module_fifo_tests.rs"]
 mod module_fifo_tests;
 
-fn xreadgroup_group_name(args: &[Bytes]) -> Option<&[u8]> {
-    let mut i = 0;
-    while i < args.len() {
-        if args[i].eq_ignore_ascii_case(b"GROUP") {
-            return args.get(i + 1).map(|group| group.as_ref());
-        }
-        if args[i].eq_ignore_ascii_case(b"STREAMS") {
-            return None;
-        }
-        i += 1;
-    }
-    None
-}
-
 fn wakeup_check_acl_keys(
     username: &str,
     spec: &crate::framework::CommandSpec,
@@ -622,7 +608,12 @@ impl ServerWorkerState {
             // C `unblockClientOnTimeout` maps a BLOCKED_WAIT `CLUSTER SETSLOT`
             // to `NOREPLICAS`; unlike C, the Rust continuation does not
             // requeue the client, so the command body never runs twice.
-            if self.blocked_cmd_is_setslot(token) {
+            let is_setslot_block = self
+                .connection_registry
+                .get(crate::framework::capabilities::io::Token(token.0))
+                .and_then(|connection| connection.blocked.as_ref())
+                .is_some_and(|blocked| matches!(blocked.cmd, BlockedCmd::SetSlot { .. }));
+            if is_setslot_block {
                 let reply =
                     Value::error("NOREPLICAS Not enough good replicas to write.".to_string());
                 self.complete_blocked_command_reply(token, reply, false);
@@ -632,13 +623,6 @@ impl ServerWorkerState {
             let reply = wait_reply.unwrap_or(Value::NullArray);
             self.complete_blocked_command_reply(token, reply, true);
         }
-    }
-
-    fn blocked_cmd_is_setslot(&self, token: Token) -> bool {
-        self.connection_registry
-            .get(crate::framework::capabilities::io::Token(token.0))
-            .and_then(|connection| connection.blocked.as_ref())
-            .is_some_and(|blocked| matches!(blocked.cmd, BlockedCmd::SetSlot { .. }))
     }
 
     pub(crate) fn check_wait_replica_wakeups(&mut self) {
@@ -694,7 +678,7 @@ impl ServerWorkerState {
             }
         }
         for (token, reply) in to_wake {
-            self.reply_to_unblocked_wait(token, reply);
+            self.complete_blocked_command_reply(token, reply, true);
         }
         for token in to_rerun {
             self.wakeup_blocked_client(token, None, None);
@@ -772,21 +756,12 @@ impl ServerWorkerState {
             })
             .collect();
         for token in tokens {
-            self.reply_to_unblocked_error(
-                token,
-                "ERR WAITAOF cannot be used when numlocal is set but appendonly is disabled.",
-            );
+            let error =
+                "ERR WAITAOF cannot be used when numlocal is set but appendonly is disabled.";
+            self.ctx
+                .incr_error_reply(error.split_whitespace().next().unwrap_or("ERR"));
+            self.complete_blocked_command_reply(token, Value::error(error), true);
         }
-    }
-
-    fn reply_to_unblocked_error(&mut self, token: Token, error: &'static str) {
-        self.ctx
-            .incr_error_reply(error.split_whitespace().next().unwrap_or("ERR"));
-        self.complete_blocked_command_reply(token, Value::error(error), true);
-    }
-
-    fn reply_to_unblocked_wait(&mut self, token: Token, reply: Value) {
-        self.complete_blocked_command_reply(token, reply, true);
     }
 
     pub(crate) fn check_xreadgroup_nogroup_wakeups(&mut self) {
@@ -798,7 +773,21 @@ impl ServerWorkerState {
             if !matches!(blocked.cmd, BlockedCmd::Xreadgroup) {
                 continue;
             }
-            let Some(group_name) = xreadgroup_group_name(&blocked.orig_args.args) else {
+            let mut group_name = None;
+            for (idx, arg) in blocked.orig_args.args.iter().enumerate() {
+                if arg.eq_ignore_ascii_case(b"GROUP") {
+                    group_name = blocked
+                        .orig_args
+                        .args
+                        .get(idx + 1)
+                        .map(|group| group.as_ref());
+                    break;
+                }
+                if arg.eq_ignore_ascii_case(b"STREAMS") {
+                    break;
+                }
+            }
+            let Some(group_name) = group_name else {
                 continue;
             };
             let should_wake = blocked.keys.iter().any(|key| {

@@ -4,7 +4,6 @@ use crate::engine::command::context::CommandConn;
 use crate::engine::extension::script::{PropagationOp, PropagationTargets};
 use crate::foundation::io::protocol::serializer::{serialize_to_vec_resp2, serialize_to_vec_resp3};
 use crate::foundation::io::protocol::Value;
-use crate::framework::capabilities::connection::Connection;
 use crate::framework::capabilities::io::Token;
 use crate::framework::context::TrackingState;
 use crate::runtime::server::worker::cluster::propagation::sequence_propagation;
@@ -102,7 +101,15 @@ fn resolve_tracking_target(
         return TrackingTarget::MissingOwner;
     };
     let Some(redirect_client_id) = owner_connection.tracking_redirect() else {
-        return direct_tracking_target(owner_token, owner_connection);
+        return if owner_connection.resp_version < 3 {
+            TrackingTarget::MissingOwner
+        } else {
+            TrackingTarget::Deliver {
+                token: owner_token,
+                resp3: true,
+                pubsub_message: false,
+            }
+        };
     };
     let Some(target) = connections.token_for_client_id(redirect_client_id as u64) else {
         return broken_tracking_redirect(owner_token, redirect_client_id, connections);
@@ -121,18 +128,6 @@ fn resolve_tracking_target(
         token: target,
         resp3: target_connection.resp_version >= 3,
         pubsub_message,
-    }
-}
-
-fn direct_tracking_target(owner: Token, connection: &Connection) -> TrackingTarget {
-    if connection.resp_version < 3 {
-        TrackingTarget::MissingOwner
-    } else {
-        TrackingTarget::Deliver {
-            token: owner,
-            resp3: true,
-            pubsub_message: false,
-        }
     }
 }
 
@@ -166,7 +161,10 @@ fn collect_tracking_deliveries(
             .collect();
     }
 
-    let dirty_counts = dirty_key_counts(dirty_keys);
+    let mut dirty_counts = HashMap::new();
+    for (_, key) in dirty_keys {
+        *dirty_counts.entry(key.clone()).or_insert(0) += 1;
+    }
     let mut deliveries =
         direct_tracking_invalidations(tracking, connections, dirty_keys, &dirty_counts, source);
     deliveries.extend(broadcast_tracking_invalidations(
@@ -176,14 +174,6 @@ fn collect_tracking_deliveries(
         source,
     ));
     deliveries
-}
-
-fn dirty_key_counts(dirty_keys: &[(u32, Bytes)]) -> HashMap<Bytes, usize> {
-    let mut counts = HashMap::new();
-    for (_, key) in dirty_keys {
-        *counts.entry(key.clone()).or_insert(0) += 1;
-    }
-    counts
 }
 
 fn direct_tracking_invalidations(
@@ -232,7 +222,15 @@ fn broadcast_tracking_invalidations(
             {
                 continue;
             }
-            let Some(group) = broadcast_tracking_group(connection, key) else {
+            let group = if connection.tracking_prefixes().is_empty() {
+                Some(0)
+            } else {
+                connection
+                    .tracking_prefixes()
+                    .iter()
+                    .position(|prefix| key.as_ref().starts_with(prefix.as_ref()))
+            };
+            let Some(group) = group else {
                 continue;
             };
             let keys = groups.entry((connection.token(), group)).or_default();
@@ -245,16 +243,6 @@ fn broadcast_tracking_invalidations(
         .into_iter()
         .map(|((token, _), keys)| TrackingDelivery::new(TrackingOwner::from_token(token), keys))
         .collect()
-}
-
-fn broadcast_tracking_group(connection: &Connection, key: &Bytes) -> Option<usize> {
-    if connection.tracking_prefixes().is_empty() {
-        return Some(0);
-    }
-    connection
-        .tracking_prefixes()
-        .iter()
-        .position(|prefix| key.as_ref().starts_with(prefix.as_ref()))
 }
 
 impl ServerWorkerState {

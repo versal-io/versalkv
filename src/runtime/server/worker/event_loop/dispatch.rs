@@ -12,7 +12,9 @@ use crate::framework::capabilities::io::Token;
 use crate::framework::distributed::replication::ConnectionId;
 use crate::runtime::server::worker::connection::ClientReadMode;
 use crate::runtime::server::worker::event_loop::blocked_events::DeferredReadyEvent;
-use crate::runtime::server::worker::event_loop::sources::{SourceOwner, SourceRoute};
+use crate::runtime::server::worker::event_loop::sources::{
+    InternalPipeOwner, SourceOwner, SourceRoute,
+};
 use crate::runtime::server::worker::event_loop::transport::{
     PendingRemovalOwner, RuntimeSentinelIo,
 };
@@ -21,6 +23,27 @@ use crate::runtime::server::worker::event_loop::transport::{
 enum RunnableTurn {
     Current,
     Next,
+}
+
+/// Exclusive route selected for one connection readiness event. Variant
+/// order documents the historical if/else-if precedence: the decision block
+/// evaluates them top to bottom and the first match wins.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConnectionReadinessRoute {
+    /// Main channel parked behind an in-flight RDB replay.
+    DeferRdbReplay,
+    /// Slot-migration export handshake consumes the readable bytes.
+    SlotExportIntercept,
+    /// Readable HUP on the RDB receive channel.
+    RdbMainHup,
+    /// Readable HUP on a streaming replica link with no pending RDB.
+    ReplicaStreamingHup,
+    /// Orderly client EOF: drain admitted commands before teardown.
+    DrainAfterHup,
+    /// Ordinary fair read, optionally followed by a flush write.
+    NormalRead,
+    /// No readable work; only writable/HUP bookkeeping remains.
+    WritableOnly,
 }
 
 impl ServerWorkerState {
@@ -510,30 +533,19 @@ impl ServerWorkerState {
                 return TransportEventDispatchOutcome::handled();
             }
         }
-        if let SourceOwner::InternalPipe(
-            crate::runtime::server::worker::event_loop::sources::InternalPipeOwner::DisklessRdb {
-                transfer_id,
-            },
-        ) = route.owner.clone()
-        {
-            if ready.error {
+        if ready.error {
+            if let SourceOwner::InternalPipe(pipe_owner) = &route.owner {
                 self.log_readiness_failure(ready, &route.owner);
-                return TransportEventDispatchOutcome {
-                    outcome: self.on_diskless_pipe_error(transfer_id),
-                    may_request_shutdown: false,
+                let outcome = match pipe_owner {
+                    InternalPipeOwner::DisklessRdb { transfer_id } => {
+                        self.on_diskless_pipe_error(*transfer_id)
+                    }
+                    InternalPipeOwner::SlotSnapshot { job_id } => {
+                        self.on_slot_snapshot_pipe_error(job_id.clone())
+                    }
                 };
-            }
-        }
-        if let SourceOwner::InternalPipe(
-            crate::runtime::server::worker::event_loop::sources::InternalPipeOwner::SlotSnapshot {
-                job_id,
-            },
-        ) = route.owner.clone()
-        {
-            if ready.error {
-                self.log_readiness_failure(ready, &route.owner);
                 return TransportEventDispatchOutcome {
-                    outcome: self.on_slot_snapshot_pipe_error(job_id),
+                    outcome,
                     may_request_shutdown: false,
                 };
             }
@@ -1078,74 +1090,121 @@ impl ServerWorkerState {
         if preflush_writable_before_read {
             self.dispatch_client_write(token);
         }
-        if ready.is_readable()
-            && self
-                .pending_replication_replay
-                .as_ref()
-                .is_some_and(|continuation| continuation.main.0 == token.0)
-        {
-            // RDB completion may disable this main channel after poll() has
-            // already returned a readable event for it. Keep that event until
-            // the older pending stream is drained, matching C's temporary
-            // removal of the primary read handler around streamReplDataBufToDb.
-            self.blocked_events.defer(DeferredReadyEvent::new(
-                token,
-                true,
-                false,
-                ready.read_hup,
-                false,
-            ));
-            self.schedule_runtime_runnable_next_turn(RunnableKey::DeferredReadiness(token));
-            if ready.is_writable() {
-                self.dispatch_client_write(token);
-            }
-            return TransportEventDispatchOutcome::deferred();
-        }
-        if ready.is_readable() && self.handle_slot_export_readable(token.0) {
-            if ready.is_writable()
+
+        // Decision block: immutable borrow only. Variant order mirrors the
+        // historical if/else-if precedence and the first match wins.
+        let route = {
+            use ConnectionReadinessRoute::*;
+            if ready.is_readable()
                 && self
+                    .pending_replication_replay
+                    .as_ref()
+                    .is_some_and(|continuation| continuation.main.0 == token.0)
+            {
+                DeferRdbReplay
+            } else if ready.is_readable() && self.is_slot_export_read_intercept(token.0) {
+                SlotExportIntercept
+            } else if ready.has_readable_hup() && self.replica_rdb_main_for_failure(token).is_some()
+            {
+                RdbMainHup
+            } else if ready.has_readable_hup()
+                && self.replication_runtime.replica_link().is_some_and(|link| {
+                    link.connection_id().0 == token.0
+                        && link.is_streaming()
+                        && !link.has_pending_rdb_receive()
+                })
+            {
+                ReplicaStreamingHup
+            } else if ready.has_readable_hup() && !self.is_master_link(token.0) {
+                DrainAfterHup
+            } else if ready.is_readable() {
+                NormalRead
+            } else {
+                WritableOnly
+            }
+        };
+
+        // Execution block: every &mut self side effect lives below this line.
+        match route {
+            ConnectionReadinessRoute::DeferRdbReplay => {
+                // RDB completion may disable this main channel after poll() has
+                // already returned a readable event for it. Keep that event until
+                // the older pending stream is drained, matching C's temporary
+                // removal of the primary read handler around streamReplDataBufToDb.
+                self.blocked_events.defer(DeferredReadyEvent::new(
+                    token,
+                    true,
+                    false,
+                    ready.read_hup,
+                    false,
+                ));
+                self.schedule_runtime_runnable_next_turn(RunnableKey::DeferredReadiness(token));
+                if ready.is_writable() {
+                    self.dispatch_client_write(token);
+                }
+                TransportEventDispatchOutcome::deferred()
+            }
+            ConnectionReadinessRoute::SlotExportIntercept => {
+                self.handle_slot_export_readable(token.0);
+                if ready.is_writable()
+                    && self
+                        .connection_registry
+                        .contains(crate::framework::capabilities::io::Token(token.0))
+                {
+                    self.dispatch_client_write(token);
+                }
+                self.finish_readable_hup(token, &SourceOwner::Connection, ready.read_hup);
+                self.source_dispatch_outcome(token, &SourceOwner::Connection, false)
+            }
+            ConnectionReadinessRoute::RdbMainHup => {
+                if let Some(connection_token) = self
                     .connection_registry
                     .contains(crate::framework::capabilities::io::Token(token.0))
-            {
-                self.dispatch_client_write(token);
+                    .then_some(token.0)
+                {
+                    self.recv_rdb_channel_streaming_after_hup(token.0, connection_token);
+                }
+                self.finish_connection_readiness_tail(token, ready, preflush_writable_before_read)
             }
-            self.finish_readable_hup(token, &SourceOwner::Connection, ready.read_hup);
-            return self.source_dispatch_outcome(token, &SourceOwner::Connection, false);
-        }
-        if ready.has_readable_hup() && self.replica_rdb_main_for_failure(token).is_some() {
-            if let Some(connection_token) = self
-                .connection_registry
-                .contains(crate::framework::capabilities::io::Token(token.0))
-                .then_some(token.0)
-            {
-                self.recv_rdb_channel_streaming_after_hup(token.0, connection_token);
+            ConnectionReadinessRoute::ReplicaStreamingHup => {
+                if let Some(connection_token) = self
+                    .connection_registry
+                    .contains(crate::framework::capabilities::io::Token(token.0))
+                    .then_some(token.0)
+                {
+                    self.recv_replication_stream_after_hup(token.0, connection_token);
+                }
+                self.finish_connection_readiness_tail(token, ready, preflush_writable_before_read)
             }
-        } else if ready.has_readable_hup()
-            && self.replication_runtime.replica_link().is_some_and(|link| {
-                link.connection_id().0 == token.0
-                    && link.is_streaming()
-                    && !link.has_pending_rdb_receive()
-            })
-        {
-            if let Some(connection_token) = self
-                .connection_registry
-                .contains(crate::framework::capabilities::io::Token(token.0))
-                .then_some(token.0)
-            {
-                self.recv_replication_stream_after_hup(token.0, connection_token);
+            ConnectionReadinessRoute::DrainAfterHup => {
+                self.drain_client_readable_after_hup(token.0);
+                self.source_dispatch_outcome(token, &SourceOwner::Connection, true)
             }
-        } else if ready.has_readable_hup() && !self.is_master_link(token.0) {
-            self.drain_client_readable_after_hup(token.0);
-            return self.source_dispatch_outcome(token, &SourceOwner::Connection, true);
-        } else if ready.is_readable() {
-            self.dispatch_client_read(token.0, ClientReadMode::Fair);
-            if flush_after_readable
-                && !preflush_writable_before_read
-                && !self.slot_migration_runtime.is_export_connection(token.0)
-            {
-                self.dispatch_client_write(token);
+            ConnectionReadinessRoute::NormalRead => {
+                self.dispatch_client_read(token.0, ClientReadMode::Fair);
+                if flush_after_readable
+                    && !preflush_writable_before_read
+                    && !self.slot_migration_runtime.is_export_connection(token.0)
+                {
+                    self.dispatch_client_write(token);
+                }
+                self.finish_connection_readiness_tail(token, ready, preflush_writable_before_read)
+            }
+            ConnectionReadinessRoute::WritableOnly => {
+                self.finish_connection_readiness_tail(token, ready, preflush_writable_before_read)
             }
         }
+    }
+
+    /// Shared writable/HUP tail for routes that fall through to ordinary
+    /// servicing: flush pending output, finalize readable-HUP handling, and
+    /// report the source as fully dispatched.
+    fn finish_connection_readiness_tail(
+        &mut self,
+        token: Token,
+        ready: ReadyEvent,
+        preflush_writable_before_read: bool,
+    ) -> TransportEventDispatchOutcome {
         if ready.is_writable() && !preflush_writable_before_read {
             self.dispatch_client_write(token);
         }

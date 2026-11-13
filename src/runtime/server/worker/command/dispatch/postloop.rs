@@ -69,12 +69,6 @@ impl ServerWorkerState {
             std::mem::take(&mut effects.publish),
             std::mem::take(&mut effects.publish_shard),
         );
-        let changed_slots = self.take_changed_shard_slots();
-        self.prune_unserved_shard_subscriptions(&changed_slots);
-        self.deliver_monitor(std::mem::take(&mut effects.monitor));
-    }
-
-    fn take_changed_shard_slots(&mut self) -> Vec<u16> {
         let changed_slots = self
             .ctx
             .cluster_state_mut()
@@ -84,13 +78,8 @@ impl ServerWorkerState {
         for &slot in &changed_slots {
             self.ctx.slot_metrics_mut().reset_slot(slot as usize);
         }
-        changed_slots
-    }
-
-    fn process_pending_unblocks(&mut self, pending: Vec<(usize, bool)>) {
-        for (client_id, is_error) in pending {
-            self.process_pending_unblock(client_id, is_error);
-        }
+        self.prune_unserved_shard_subscriptions(&changed_slots);
+        self.deliver_monitor(std::mem::take(&mut effects.monitor));
     }
 
     fn process_pending_unblock(&mut self, client_id: usize, is_error: bool) {
@@ -120,13 +109,8 @@ impl ServerWorkerState {
             [crate::framework::capabilities::io::Token(connection_token)]
         .resp_version
             >= 3;
-        let reply = self.unblock_reply(is_error, resp3, blocked_name.as_deref());
-        self.complete_blocked_command_reply(token, reply, true);
-    }
-
-    fn unblock_reply(&mut self, is_error: bool, resp3: bool, command_name: Option<&str>) -> Value {
-        if is_error {
-            if let Some(command_name) = command_name {
+        let reply = if is_error {
+            if let Some(command_name) = blocked_name.as_deref() {
                 self.ctx
                     .stats_mut()
                     .cmd_stats
@@ -135,13 +119,13 @@ impl ServerWorkerState {
                     .rejected_calls += 1;
             }
             self.ctx.incr_error_reply("UNBLOCKED");
-            return Value::error("UNBLOCKED client unblocked via CLIENT UNBLOCK");
-        }
-        if resp3 {
+            Value::error("UNBLOCKED client unblocked via CLIENT UNBLOCK")
+        } else if resp3 {
             Value::Null
         } else {
             Value::NullArray
-        }
+        };
+        self.complete_blocked_command_reply(token, reply, true);
     }
 
     fn process_watch_and_wakeup(&mut self, effects: &ReadBatchEffects) {
@@ -188,7 +172,9 @@ impl ServerWorkerState {
             self.queue_origin_replies(connection_token, token_value, &mut fx.replies);
 
         self.deliver_observer_effects(&mut fx);
-        self.process_pending_unblocks(std::mem::take(&mut fx.unblock));
+        for (client_id, is_error) in std::mem::take(&mut fx.unblock) {
+            self.process_pending_unblock(client_id, is_error);
+        }
         self.process_watch_and_wakeup(&fx);
         // C's beforeSleep broadcasts a locally finalized imported slot before
         // the next heartbeat can reintroduce the source's older ownership.

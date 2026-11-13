@@ -4,7 +4,7 @@ use bytes::Bytes;
 
 use super::command_exec::CommandPropagationInput;
 use super::side_effects::CommandEffects;
-use super::{CmdCallFlags, CmdPreconditions, DispatchAction, PostponeReason, ServerWorkerState};
+use super::{CmdPreconditions, DispatchAction, PostponeReason, ServerWorkerState};
 use crate::engine::command::CommandError;
 use crate::foundation::io::protocol::Value;
 use crate::framework::capabilities::connection::{BlockedCmd, CommandEffectDrain, ConnectionState};
@@ -115,118 +115,86 @@ impl ServerWorkerState {
                     || self.connection_registry[invocation.target.token()].has_pending_output()
                     || self.io_threads.is_write_inflight(invocation.target.token());
                 if is_script_debug && has_pending_replies {
-                    Ok(CommandExecution::rejected(Value::error(
+                    return Ok(CommandExecution::rejected(Value::error(
                         "ERR SCRIPT DEBUG must be called outside a pipeline",
-                    )))
-                } else {
-                    self.execute_admitted_invocation(
-                        invocation,
-                        connection_token,
-                        executor,
-                        decision.call_flags,
-                    )
+                    )));
                 }
+                let call_flags = decision.call_flags;
+                if call_flags.client_asking {
+                    self.connection_registry
+                        [crate::framework::capabilities::io::Token(connection_token)]
+                    .asking = true;
+                }
+                if super::monitor::is_explicit_script_monitor_command(invocation.name) {
+                    let connection = &self.connection_registry
+                        [crate::framework::capabilities::io::Token(connection_token)];
+                    let mut argv = Vec::with_capacity(invocation.args.args.len() + 1);
+                    argv.push(invocation.args.name.clone());
+                    argv.extend(invocation.args.args.iter().cloned());
+                    if let Some(event) = self.ctx.monitor_event(
+                        connection.selected_db,
+                        connection.peer_addr.to_string(),
+                        argv,
+                        invocation.flags,
+                        true,
+                    ) {
+                        self.ctx.script_mut().pending_internal_monitor.push(event);
+                    }
+                }
+                let started = std::time::Instant::now();
+                let reply = self.execute_registered_handler(
+                    invocation.dispatch_group,
+                    connection_token,
+                    executor,
+                    invocation.args,
+                );
+                let duration_us = (started.elapsed().as_micros() as u64).max(1);
+                let connection_token = invocation
+                    .target
+                    .resolve(self)
+                    .ok_or(CommandDisposition::ConnectionGone)?;
+                if call_flags.client_asking && super::consumes_asking(invocation.name) {
+                    self.connection_registry[connection_token].asking = false;
+                }
+                Ok(CommandExecution::executed(reply, Some(duration_us)))
             }
             DispatchAction::Rejected => Ok(CommandExecution::rejected(
                 decision.reject_reply.unwrap_or(Value::null()),
             )),
             DispatchAction::Postpone(reason) => {
-                self.block_postponed_invocation(invocation, connection_token, reason);
+                let is_throttled = reason == PostponeReason::ReplicationThrottle;
+                let is_forkless = reason == PostponeReason::ForklessKey;
+                let command = match reason {
+                    PostponeReason::ClientPause => BlockedCmd::Paused,
+                    PostponeReason::ForklessKey => BlockedCmd::Forkless,
+                    PostponeReason::ReplicationThrottle => BlockedCmd::Throttled,
+                    PostponeReason::SlotMigration(job_id) => BlockedCmd::SlotMigration(job_id),
+                };
+                let connection = &mut self.connection_registry
+                    [crate::framework::capabilities::io::Token(connection_token)];
+                connection.postpone_command(
+                    command,
+                    Vec::new(),
+                    0,
+                    invocation.args,
+                    connection.request_bytes_current_command(),
+                );
+                if is_throttled {
+                    self.ctx
+                        .throttled_clients_mut()
+                        .insert(invocation.target.token());
+                    self.schedule_replication_throttle();
+                } else {
+                    self.ctx
+                        .paused_clients_mut()
+                        .insert(invocation.target.token());
+                    if is_forkless {
+                        self.ctx
+                            .forkless_clients_mut()
+                            .insert(invocation.target.token());
+                    }
+                }
                 Ok(CommandExecution::executed(Value::Null, None))
-            }
-        }
-    }
-
-    fn execute_admitted_invocation(
-        &mut self,
-        invocation: CommandInvocation<'_>,
-        connection_token: usize,
-        executor: crate::framework::spec::CommandExecutor,
-        call_flags: CmdCallFlags,
-    ) -> Result<CommandExecution, CommandDisposition> {
-        if call_flags.client_asking {
-            self.connection_registry[crate::framework::capabilities::io::Token(connection_token)]
-                .asking = true;
-        }
-        self.capture_outer_script_monitor(invocation, connection_token);
-        let started = std::time::Instant::now();
-        let reply = self.execute_registered_handler(
-            invocation.dispatch_group,
-            connection_token,
-            executor,
-            invocation.args,
-        );
-        let duration_us = (started.elapsed().as_micros() as u64).max(1);
-        let connection_token = invocation
-            .target
-            .resolve(self)
-            .ok_or(CommandDisposition::ConnectionGone)?;
-        if call_flags.client_asking && super::consumes_asking(invocation.name) {
-            self.connection_registry[connection_token].asking = false;
-        }
-        Ok(CommandExecution::executed(reply, Some(duration_us)))
-    }
-
-    fn capture_outer_script_monitor(
-        &mut self,
-        invocation: CommandInvocation<'_>,
-        connection_token: usize,
-    ) {
-        if !super::monitor::is_explicit_script_monitor_command(invocation.name) {
-            return;
-        }
-        let connection =
-            &self.connection_registry[crate::framework::capabilities::io::Token(connection_token)];
-        let mut argv = Vec::with_capacity(invocation.args.args.len() + 1);
-        argv.push(invocation.args.name.clone());
-        argv.extend(invocation.args.args.iter().cloned());
-        if let Some(event) = self.ctx.monitor_event(
-            connection.selected_db,
-            connection.peer_addr.to_string(),
-            argv,
-            invocation.flags,
-            true,
-        ) {
-            self.ctx.script_mut().pending_internal_monitor.push(event);
-        }
-    }
-
-    fn block_postponed_invocation(
-        &mut self,
-        invocation: CommandInvocation<'_>,
-        connection_token: usize,
-        reason: PostponeReason,
-    ) {
-        let is_throttled = reason == PostponeReason::ReplicationThrottle;
-        let is_forkless = reason == PostponeReason::ForklessKey;
-        let command = match reason {
-            PostponeReason::ClientPause => BlockedCmd::Paused,
-            PostponeReason::ForklessKey => BlockedCmd::Forkless,
-            PostponeReason::ReplicationThrottle => BlockedCmd::Throttled,
-            PostponeReason::SlotMigration(job_id) => BlockedCmd::SlotMigration(job_id),
-        };
-        let connection = &mut self.connection_registry
-            [crate::framework::capabilities::io::Token(connection_token)];
-        connection.postpone_command(
-            command,
-            Vec::new(),
-            0,
-            invocation.args,
-            connection.request_bytes_current_command(),
-        );
-        if is_throttled {
-            self.ctx
-                .throttled_clients_mut()
-                .insert(invocation.target.token());
-            self.schedule_replication_throttle();
-        } else {
-            self.ctx
-                .paused_clients_mut()
-                .insert(invocation.target.token());
-            if is_forkless {
-                self.ctx
-                    .forkless_clients_mut()
-                    .insert(invocation.target.token());
             }
         }
     }

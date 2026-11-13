@@ -7,6 +7,7 @@ use crate::runtime::server::worker::event_loop::transport::RuntimeListenerHandle
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
+use std::time::Duration;
 
 #[derive(Default)]
 pub(crate) struct ListenerSet {
@@ -259,14 +260,10 @@ impl ServerWorkerState {
         old_addresses: &[SocketAddr],
         old_fds: &[std::os::fd::RawFd],
     ) -> io::Result<()> {
-        let mut handles = Vec::with_capacity(old_addresses.len());
+        let mut handles: Vec<RuntimeListenerHandle> = Vec::with_capacity(old_addresses.len());
         for &address in old_addresses {
-            match self
-                .transport
-                .bind_tcp(address)
-                .and_then(|handle| self.route_listener_handle(handle, SourceOwner::Listener))
-            {
-                Ok(handle) => handles.push(handle),
+            let handle = match self.bind_tcp_reusing_recently_closed_port(address) {
+                Ok(handle) => handle,
                 Err(error) => {
                     for handle in handles {
                         self.retire_runtime_source(handle.token);
@@ -274,10 +271,40 @@ impl ServerWorkerState {
                     }
                     return Err(error);
                 }
-            }
+            };
+            handles.push(handle);
         }
         self.install_tcp_listeners(old_addresses.to_vec(), handles, old_fds);
         Ok(())
+    }
+
+    fn bind_tcp_reusing_recently_closed_port(
+        &mut self,
+        address: SocketAddr,
+    ) -> io::Result<RuntimeListenerHandle> {
+        const REBIND_RETRIES: usize = 10;
+        const REBIND_RETRY_DELAY: Duration = Duration::from_millis(5);
+        let mut last_error = None;
+        for _ in 0..REBIND_RETRIES {
+            match self
+                .transport
+                .bind_tcp(address)
+                .and_then(|handle| self.route_listener_handle(handle, SourceOwner::Listener))
+            {
+                Ok(handle) => return Ok(handle),
+                Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
+                    last_error = Some(error);
+                    std::thread::sleep(REBIND_RETRY_DELAY);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::AddrInUse,
+                "listener rebind exhausted retries",
+            )
+        }))
     }
 
     fn install_tcp_listeners(

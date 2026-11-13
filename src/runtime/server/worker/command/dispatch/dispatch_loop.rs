@@ -17,6 +17,16 @@ struct ParsedCommandInput {
     resp3: bool,
 }
 
+enum SpecialCommandRoute {
+    Transport,
+    ClientAdmin,
+    PubSub,
+    Exec,
+    MultiQueue,
+    RejectSubscribeMode,
+    Ordinary,
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct SpecialCommandCompletion {
     pub(crate) disposition: CommandDisposition,
@@ -97,28 +107,26 @@ impl ServerWorkerState {
         pending_replies: &[Vec<u8>],
         fx: &mut CommandEffects,
     ) -> LoopAction {
-        let token_value = input.token.0;
-        let diagnostic = self.record_command_diagnostic(&input);
+        let diagnostic = {
+            let conn = &mut self.connection_registry[input.token];
+            crate::foundation::io::sys::log::CommandDiagnostic {
+                client_id: conn.client_id(),
+                command_seq: conn.record_received_command(),
+                peer: conn.peer_addr.to_string(),
+                db: conn.selected_db,
+                command: input.name.clone(),
+                argument_count: input.args.args.len(),
+                request_bytes: conn.parser.last_cmd_len(),
+            }
+        };
         let _diagnostic_guard = crate::foundation::io::sys::log::enter_active_command(diagnostic);
-        if !self.should_defer_slot_import_write(token_value, &input.args)
-            && self.apply_slot_import_command(token_value, input.args.clone())
-        {
-            return if self
-                .connection_registry
-                .get(input.token)
-                .is_none_or(|connection| connection.state == ConnectionState::Closing)
-            {
-                fx.mark_closing = true;
-                LoopAction::Break
-            } else {
-                LoopAction::Continue
-            };
+        if let Some(action) = self.try_apply_slot_import(&input, fx) {
+            return action;
         }
         if let Some(action) = self.reject_unauthenticated_command(&input, fx) {
             return action;
         }
         self.apply_client_test_tcp_buffer_policy(input.token, &input.name, &input.args);
-
         self.ctx.begin_cmd();
         let (dispatch_group, command_flags) = {
             let spec = self.registry.lookup(&input.args.name);
@@ -138,8 +146,157 @@ impl ServerWorkerState {
                 .unwrap_or(0),
             )
         };
-        if let Some(action) = self.dispatch_special_group(&input, dispatch_group, fx) {
-            return action;
+        self.dispatch_admitted_command(input, pending_replies, fx, dispatch_group, command_flags)
+    }
+
+    /// Slot-import admission guard. Returns an action when the command is
+    /// consumed by the import path, otherwise `None` to continue admission.
+    fn try_apply_slot_import(
+        &mut self,
+        input: &ParsedCommandInput,
+        fx: &mut CommandEffects,
+    ) -> Option<LoopAction> {
+        let token_value = input.token.0;
+        if self.should_defer_slot_import_write(token_value, &input.args)
+            || !self.apply_slot_import_command(token_value, input.args.clone())
+        {
+            return None;
+        }
+        Some(
+            if self
+                .connection_registry
+                .get(input.token)
+                .is_none_or(|connection| connection.state == ConnectionState::Closing)
+            {
+                fx.mark_closing = true;
+                LoopAction::Break
+            } else {
+                LoopAction::Continue
+            },
+        )
+    }
+
+    /// Default admission path once slot-import and authentication guards have
+    /// passed: route special dispatch groups, then fall back to ordinary
+    /// command execution. Dispatch group and flags are resolved by the caller
+    /// so admission bookkeeping stays in `dispatch_parsed_command`.
+    fn dispatch_admitted_command(
+        &mut self,
+        input: ParsedCommandInput,
+        pending_replies: &[Vec<u8>],
+        fx: &mut CommandEffects,
+        dispatch_group: DispatchGroup,
+        command_flags: u64,
+    ) -> LoopAction {
+        let token_value = input.token.0;
+        let reply_start = fx.replies.len();
+        let disposition = match self.decide_special_command_route(&input, dispatch_group) {
+            SpecialCommandRoute::Transport => self
+                .try_handle_transport_cmd(
+                    token_value,
+                    token_value,
+                    &input.args,
+                    &input.name,
+                    input.resp3,
+                    &mut fx.0.replies,
+                    &mut fx.0.unblock,
+                )
+                .map(|_| CommandDisposition::Completed),
+            SpecialCommandRoute::ClientAdmin => self
+                .try_handle_client_admin(
+                    token_value,
+                    token_value,
+                    &input.args,
+                    &input.name,
+                    input.resp3,
+                    &mut fx.0.replies,
+                    &mut fx.0.unblock,
+                )
+                .map(|_| CommandDisposition::Completed),
+            SpecialCommandRoute::PubSub => self
+                .try_handle_pubsub_cmd(
+                    token_value,
+                    &input.args,
+                    &input.name,
+                    input.resp3,
+                    &mut fx.0.replies,
+                    &mut fx.0.publish,
+                )
+                .map(|_| CommandDisposition::Completed),
+            SpecialCommandRoute::Exec => {
+                self.connection_registry[input.token]
+                    .transaction
+                    .set_exec_arguments(input.args.args.clone());
+                let disposition = self.handle_exec(
+                    CommandTarget::new(input.token),
+                    std::str::from_utf8(&input.args.name).unwrap_or(&input.name),
+                    input.resp3,
+                    fx,
+                );
+                if disposition != CommandDisposition::ConnectionGone {
+                    let internal_monitor =
+                        std::mem::take(&mut self.ctx.script_mut().pending_internal_monitor);
+                    self.deliver_monitor(internal_monitor);
+                }
+                Some(disposition)
+            }
+            SpecialCommandRoute::MultiQueue => {
+                self.handle_multi_queue(
+                    input.token,
+                    &input.args,
+                    &input.name,
+                    input.resp3,
+                    &mut fx.replies,
+                );
+                Some(CommandDisposition::Completed)
+            }
+            SpecialCommandRoute::RejectSubscribeMode => {
+                let reply = Value::error(format!(
+                    "ERR Can't execute '{}': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context",
+                    input.name
+                ));
+                self.ctx.end_cmd(&input.name, true);
+                super::record_error_reply(&mut self.ctx, &reply, None);
+                fx.replies.push(serialize_to_vec_resp2(&reply));
+                Some(CommandDisposition::Completed)
+            }
+            SpecialCommandRoute::Ordinary => None,
+        };
+        let result = disposition.map_or(
+            SpecialCommandResult::NotHandled,
+            SpecialCommandResult::Handled,
+        );
+        let reply_end = self.attribute_special_command_replies(
+            dispatch_group,
+            &input.name,
+            reply_start,
+            result,
+            fx,
+        );
+        match result {
+            SpecialCommandResult::NotHandled => {}
+            SpecialCommandResult::Handled(disposition) => {
+                let disposition = self.complete_special_command(
+                    input.token,
+                    SpecialCommandCompletion {
+                        disposition,
+                        reply_start,
+                        reply_end,
+                    },
+                    fx,
+                );
+                if disposition == CommandDisposition::ConnectionGone {
+                    return LoopAction::Break;
+                }
+                let Some(connection) = self.connection_registry.get(input.token) else {
+                    return LoopAction::Break;
+                };
+                if disposition.stops_read_loop() || connection.blocked.is_some() {
+                    return LoopAction::Break;
+                } else {
+                    return LoopAction::Continue;
+                }
+            }
         }
 
         let invocation = CommandInvocation::direct(
@@ -191,22 +348,6 @@ impl ServerWorkerState {
         }
     }
 
-    fn record_command_diagnostic(
-        &mut self,
-        input: &ParsedCommandInput,
-    ) -> crate::foundation::io::sys::log::CommandDiagnostic {
-        let conn = &mut self.connection_registry[input.token];
-        crate::foundation::io::sys::log::CommandDiagnostic {
-            client_id: conn.client_id(),
-            command_seq: conn.record_received_command(),
-            peer: conn.peer_addr.to_string(),
-            db: conn.selected_db,
-            command: input.name.clone(),
-            argument_count: input.args.args.len(),
-            request_bytes: conn.parser.last_cmd_len(),
-        }
-    }
-
     fn reject_unauthenticated_command(
         &mut self,
         input: &ParsedCommandInput,
@@ -234,66 +375,37 @@ impl ServerWorkerState {
         Some(LoopAction::Continue)
     }
 
-    fn dispatch_special_group(
-        &mut self,
+    fn decide_special_command_route(
+        &self,
         input: &ParsedCommandInput,
         group: DispatchGroup,
-        fx: &mut CommandEffects,
-    ) -> Option<LoopAction> {
-        let token_value = input.token.0;
-        let reply_start = fx.replies.len();
-        let result = match group {
-            DispatchGroup::Transport => {
-                if self
-                    .try_handle_transport_cmd(
-                        token_value,
-                        token_value,
-                        &input.args,
-                        &input.name,
-                        input.resp3,
-                        &mut fx.0.replies,
-                        &mut fx.0.unblock,
-                    )
-                    .is_some()
-                {
-                    SpecialCommandResult::Handled(CommandDisposition::Completed)
-                } else {
-                    SpecialCommandResult::NotHandled
-                }
+    ) -> SpecialCommandRoute {
+        if group == DispatchGroup::Transport {
+            return SpecialCommandRoute::Transport;
+        }
+        if group != DispatchGroup::ClientAdmin {
+            if self.should_reject_subscribe_mode(input) {
+                return SpecialCommandRoute::RejectSubscribeMode;
             }
-            DispatchGroup::ClientAdmin => {
-                if self.dispatch_client_admin_group(input, fx) {
-                    SpecialCommandResult::Handled(CommandDisposition::Completed)
-                } else {
-                    SpecialCommandResult::NotHandled
-                }
+            if input.name.eq_ignore_ascii_case("exec") {
+                return SpecialCommandRoute::Exec;
             }
-            _ => self.dispatch_default_group(input, fx),
-        };
-        let reply_end =
-            self.attribute_special_command_replies(group, &input.name, reply_start, result, fx);
-        match result {
-            SpecialCommandResult::NotHandled => None,
-            SpecialCommandResult::Handled(disposition) => {
-                let disposition = self.complete_special_command(
-                    input.token,
-                    SpecialCommandCompletion {
-                        disposition,
-                        reply_start,
-                        reply_end,
-                    },
-                    fx,
-                );
-                if disposition == CommandDisposition::ConnectionGone {
-                    return Some(LoopAction::Break);
-                }
-                let Some(connection) = self.connection_registry.get(input.token) else {
-                    return Some(LoopAction::Break);
-                };
-                if disposition.stops_read_loop() || connection.blocked.is_some() {
-                    Some(LoopAction::Break)
+        }
+        if self.should_queue_in_transaction(input.token, &input.name) {
+            return SpecialCommandRoute::MultiQueue;
+        }
+        match group {
+            DispatchGroup::Transport => SpecialCommandRoute::Transport,
+            DispatchGroup::ClientAdmin => SpecialCommandRoute::ClientAdmin,
+            DispatchGroup::PubSubControl => SpecialCommandRoute::PubSub,
+            DispatchGroup::Default
+            | DispatchGroup::Transaction
+            | DispatchGroup::Auth
+            | DispatchGroup::Shutdown => {
+                if matches!(input.name.as_str(), "publish" | "spublish") {
+                    SpecialCommandRoute::PubSub
                 } else {
-                    Some(LoopAction::Continue)
+                    SpecialCommandRoute::Ordinary
                 }
             }
         }
@@ -345,8 +457,21 @@ impl ServerWorkerState {
             return CommandDisposition::Blocked;
         }
         self.account_command_reply_effects(token, effects);
-        let (suppress_reply, visible_reply_bytes, lazyfree_objects) =
-            self.take_special_reply_effects(token);
+        let (suppress_reply, visible_reply_bytes, lazyfree_objects) = {
+            let connection = &mut self.connection_registry[token];
+            let mut connection_effects = connection
+                .take_command_effects(CommandEffectDrain::Completed)
+                .expect("a completed special command drains its connection effects exactly once");
+            let suppress_reply = connection_effects.should_suppress_reply();
+            let visible_reply_bytes = if suppress_reply {
+                0
+            } else {
+                connection_effects.reply_bytes()
+            };
+            let lazyfree_objects = connection_effects.take_lazyfree_objects();
+            connection.finish_reply_cycle();
+            (suppress_reply, visible_reply_bytes, lazyfree_objects)
+        };
         self.dispose_data_lazyfree_objects(lazyfree_objects);
         if let Some(metric) = effects.take_deferred_slot_metric() {
             self.ctx.slot_metrics_mut().record(
@@ -368,25 +493,6 @@ impl ServerWorkerState {
         }
     }
 
-    fn take_special_reply_effects(
-        &mut self,
-        token: Token,
-    ) -> (bool, usize, Vec<crate::foundation::io::store::Robj>) {
-        let connection = &mut self.connection_registry[token];
-        let mut effects = connection
-            .take_command_effects(CommandEffectDrain::Completed)
-            .expect("a completed special command drains its connection effects exactly once");
-        let suppress_reply = effects.should_suppress_reply();
-        let visible_reply_bytes = if suppress_reply {
-            0
-        } else {
-            effects.reply_bytes()
-        };
-        let lazyfree_objects = effects.take_lazyfree_objects();
-        connection.finish_reply_cycle();
-        (suppress_reply, visible_reply_bytes, lazyfree_objects)
-    }
-
     pub(crate) fn account_command_reply_effects(
         &mut self,
         token: Token,
@@ -401,115 +507,12 @@ impl ServerWorkerState {
         }
     }
 
-    fn dispatch_default_group(
-        &mut self,
-        input: &ParsedCommandInput,
-        fx: &mut CommandEffects,
-    ) -> SpecialCommandResult {
-        let connection_token = input.token.0;
-        let token_value = input.token.0;
-        let args = &input.args;
-        let name_lower = input.name.as_str();
-        let resp3 = input.resp3;
-        if self.reject_subscribe_mode(input, fx) {
-            return SpecialCommandResult::Handled(CommandDisposition::Completed);
-        }
-
-        if name_lower.eq_ignore_ascii_case("exec") {
-            self.connection_registry[input.token]
-                .transaction
-                .set_exec_arguments(args.args.clone());
-        }
-        let exec_result = self.try_handle_exec(
-            CommandTarget::new(Token(token_value)),
-            std::str::from_utf8(&args.name).unwrap_or(name_lower),
-            resp3,
-            fx,
-        );
-        if let SpecialCommandResult::Handled(disposition) = exec_result {
-            if disposition == CommandDisposition::ConnectionGone {
-                return exec_result;
-            }
-            let internal_monitor =
-                std::mem::take(&mut self.ctx.script_mut().pending_internal_monitor);
-            self.deliver_monitor(internal_monitor);
-            return SpecialCommandResult::Handled(disposition);
-        }
-
-        if self
-            .try_handle_multi_queue(input.token, args, name_lower, resp3, &mut fx.replies)
-            .is_some()
-        {
-            return SpecialCommandResult::Handled(CommandDisposition::Completed);
-        }
-
-        let pubsub_handled = {
-            let effects = &mut fx.0;
-            self.try_handle_pubsub_cmd(
-                connection_token,
-                args,
-                name_lower,
-                resp3,
-                &mut effects.replies,
-                &mut effects.publish,
-            )
-            .is_some()
-        };
-        if pubsub_handled {
-            return SpecialCommandResult::Handled(CommandDisposition::Completed);
-        }
-
-        SpecialCommandResult::NotHandled
-    }
-
-    fn reject_subscribe_mode(
-        &mut self,
-        input: &ParsedCommandInput,
-        fx: &mut CommandEffects,
-    ) -> bool {
+    fn should_reject_subscribe_mode(&self, input: &ParsedCommandInput) -> bool {
         let conn = &self.connection_registry[input.token];
-        let subscribed = conn.sub_channel_count > 0
+        let is_subscribed = conn.sub_channel_count > 0
             || conn.psub_channel_count > 0
             || conn.ssub_channel_count > 0;
-        if !subscribed || input.resp3 || Self::is_subscribe_mode_allowed(&input.name) {
-            return false;
-        }
-        let reply = Value::error(format!(
-            "ERR Can't execute '{}': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context",
-            input.name
-        ));
-        self.ctx.end_cmd(&input.name, true);
-        super::record_error_reply(&mut self.ctx, &reply, None);
-        fx.replies.push(serialize_to_vec_resp2(&reply));
-        true
-    }
-
-    fn dispatch_client_admin_group(
-        &mut self,
-        input: &ParsedCommandInput,
-        fx: &mut CommandEffects,
-    ) -> bool {
-        let connection_token = input.token.0;
-        let token_value = input.token.0;
-        let args = &input.args;
-        let name_lower = input.name.as_str();
-        let resp3 = input.resp3;
-        if self
-            .try_handle_multi_queue(input.token, args, name_lower, resp3, &mut fx.replies)
-            .is_some()
-        {
-            return true;
-        }
-        self.try_handle_client_admin(
-            connection_token,
-            token_value,
-            args,
-            name_lower,
-            resp3,
-            &mut fx.0.replies,
-            &mut fx.0.unblock,
-        )
-        .is_some()
+        is_subscribed && !input.resp3 && !Self::is_subscribe_mode_allowed(&input.name)
     }
 
     pub(crate) fn process_dirty_keys_in_loop(
