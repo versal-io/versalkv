@@ -352,6 +352,39 @@ fn forkless_capture_postpones_keys_until_their_snapshot_state_is_resolved() {
 }
 
 #[test]
+fn forkless_capture_does_not_block_transaction_queueing() {
+    let mut backend = ServerWorkerState::new(1).unwrap();
+    crate::framework::commands::register_all(&mut backend.registry);
+    let connection_token = add_fake_connection(&mut backend);
+    backend.connection_registry[Token(connection_token)].set_custom_reply_enabled(false);
+    backend.ctx.config_mut().persistence.rdb_key_save_delay = 100_000;
+    let dir = start_test_forkless_capture(&mut backend, "forkless-queue-admission");
+    assert!(backend.connection_registry[Token(connection_token)]
+        .transaction
+        .begin(0, 0));
+    let args = make_args(&[b"SET", b"capture-0", b"updated"]);
+    let mut replies = Vec::new();
+
+    backend.handle_multi_queue(Token(connection_token), &args, "set", false, &mut replies);
+    let is_queued = backend.connection_registry[Token(connection_token)]
+        .transaction
+        .queued_commands()
+        .len()
+        == 1;
+    let is_blocked = backend.connection_registry[Token(connection_token)]
+        .blocked
+        .is_some();
+    stop_test_forkless_capture(&mut backend, dir);
+
+    assert!(
+        is_queued,
+        "queueing does not mutate the snapshot's live data"
+    );
+    assert!(!is_blocked);
+    assert_eq!(replies, vec![b"+QUEUED\r\n".to_vec()]);
+}
+
+#[test]
 fn forkless_barrier_never_resets_configured_key_save_delay() {
     use crate::framework::capabilities::connection::TransactionEnd;
 
@@ -367,8 +400,7 @@ fn forkless_barrier_never_resets_configured_key_save_delay() {
         Some(100_000)
     );
 
-    // Writes queued inside MULTI are indirect writes: they postpone until the
-    // whole capture resolves while the configured delay stays authoritative.
+    // MULTI stores commands without mutating snapshot data or the save pace.
     let connection = &mut backend.connection_registry[Token(connection_token)];
     assert!(connection.transaction.begin(0, 0));
     let tx_args = make_args(&[b"SET", b"tx-key", b"value"]);
@@ -376,10 +408,7 @@ fn forkless_barrier_never_resets_configured_key_save_delay() {
     let tx_action = backend
         .pre_dispatch_exec(connection_token, meta_from_spec(spec), &tx_args)
         .action;
-    assert_eq!(
-        tx_action,
-        DispatchAction::Postpone(PostponeReason::ForklessKey)
-    );
+    assert_eq!(tx_action, DispatchAction::Execute);
     assert_eq!(
         backend.ctx.persistence().forkless_key_delay_for_test(),
         Some(100_000)

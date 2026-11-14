@@ -361,6 +361,11 @@ impl ServerWorkerState {
             self.deliver_published(pending_publish, Vec::new());
         }
         if queued_remote_invalidation {
+            // Command dispatch can run after BeforePoll has completed. Make
+            // those writes visible now without resetting per-token service.
+            self.event_batch.activate_next_turn_before_poll_slots(&[
+                crate::runtime::server::worker::event_loop::BeforePollSlot::OrdinaryWrites,
+            ]);
             self.drain_current_ordinary_writes();
         }
     }
@@ -467,6 +472,60 @@ mod tests {
     use crate::framework::context::TrackingState;
     use crate::runtime::server::worker::connection::ConnectionRegistry;
     use bytes::Bytes;
+
+    #[test]
+    fn command_eviction_drains_tracking_after_before_poll_completes() {
+        use crate::runtime::server::worker::event_loop::transport::RuntimeConnectedPeer;
+        use crate::runtime::server::worker::event_loop::EventPhase;
+        use crate::runtime::server::worker::ServerWorkerState;
+        use std::io::Read;
+        use std::net::TcpListener;
+        use std::time::Duration;
+
+        let mut runtime = ServerWorkerState::new(1).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer_addr = listener.local_addr().unwrap();
+        let peer = runtime.transport.connect_tcp(peer_addr).unwrap();
+        let (mut client, _) = listener.accept().unwrap();
+        runtime.add_connection(RuntimeConnectedPeer {
+            token: peer.token,
+            peer_addr,
+        });
+        let key = Bytes::from(vec![b'x'; 1_000]);
+        runtime.connection_registry[peer.token].resp_version = 3;
+        runtime.connection_registry[peer.token].set_tracking(true);
+        runtime.ctx.tracking_mut().remember_key(peer.token.0, &key);
+        runtime.event_batch.finish_phase(EventPhase::BeforePoll);
+        let mut effects = super::CommandEffects::default();
+
+        runtime.apply_command_evictions(usize::MAX, vec![(0, key.clone())], &mut effects);
+
+        assert_eq!(
+            runtime.connection_registry[peer.token].ordinary_output_bytes(),
+            0,
+            "remote invalidations must leave allocator accounting before another command evicts"
+        );
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut prefix = [0; 4];
+        client.read_exact(&mut prefix).unwrap();
+        assert_eq!(&prefix, b">2\r\n");
+
+        runtime.ctx.tracking_mut().remember_key(peer.token.0, &key);
+        runtime.apply_command_evictions(usize::MAX, vec![(0, key)], &mut effects);
+        assert!(
+            runtime.connection_registry[peer.token].ordinary_output_bytes() > 0,
+            "activating deferred writes must preserve the connection's per-turn budget"
+        );
+        runtime.event_batch.begin_next_turn();
+        runtime.writes.begin_turn();
+        runtime.drain_current_ordinary_writes();
+        assert_eq!(
+            runtime.connection_registry[peer.token].ordinary_output_bytes(),
+            0
+        );
+    }
 
     #[test]
     fn invalidation_encoding_is_selected_from_delivery_shape() {

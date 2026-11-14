@@ -21,6 +21,8 @@ use bytes::Bytes;
 mod cluster_route;
 mod exec_acl;
 mod exec_runner;
+#[cfg(test)]
+mod forkless_tests;
 mod multi_queue;
 #[cfg(test)]
 mod slot_accounting_tests;
@@ -29,6 +31,12 @@ mod throttle_tests;
 mod tx_db_object;
 
 use exec_acl::ExecAclRequest;
+
+enum ExecForklessBarrier {
+    Ready,
+    WaitForSnapshot,
+    WaitForKeys(Vec<(u32, Vec<u8>)>),
+}
 
 struct ExecPrechecks {
     noreplicas_reject: bool,
@@ -294,12 +302,13 @@ impl ServerWorkerState {
         }
     }
 
-    fn exec_should_pause_for_forkless(&self, token: Token) -> bool {
+    fn decide_exec_forkless_barrier(&self, token: Token) -> ExecForklessBarrier {
         if !self.ctx.persistence().forkless_save_in_progress() {
-            return false;
+            return ExecForklessBarrier::Ready;
         }
         let connection = &self.connection_registry[token];
-        let mut db_id = connection.selected_db;
+        let mut possible_db_ids = std::collections::HashSet::from([connection.selected_db]);
+        let mut pending_keys = std::collections::HashSet::new();
         for command in connection.transaction.queued_commands() {
             let Some(spec) = self.registry.lookup(&command.name) else {
                 continue;
@@ -311,9 +320,6 @@ impl ServerWorkerState {
                 &self.ctx,
             );
             if super::dispatch::command_may_mutate_dataset(spec.name.as_str(), flags) {
-                if self.ctx.persistence().forkless_capture_in_progress() {
-                    return true;
-                }
                 let meta = super::dispatch::CmdPreconditions {
                     name: spec.name.clone(),
                     arity: spec.arity,
@@ -325,27 +331,35 @@ impl ServerWorkerState {
                     acl_categories: spec.acl_categories,
                     get_keys: spec.get_keys,
                 };
-                let key_targets = Self::forkless_key_targets(&meta, command, db_id);
-                if key_targets.is_empty()
-                    || key_targets.iter().any(|(target_db, key)| {
-                        self.ctx.persistence().forkless_key_blocked(*target_db, key)
-                    })
-                {
-                    return true;
+                for db_id in &possible_db_ids {
+                    let key_targets = Self::forkless_key_targets(&meta, command, *db_id);
+                    if self.forkless_command_needs_full_capture(&meta, command, &key_targets) {
+                        return ExecForklessBarrier::WaitForSnapshot;
+                    }
+                    for (target_db, key) in key_targets {
+                        if target_db as usize >= self.ctx.num_dbs() {
+                            continue;
+                        }
+                        let persistence = self.ctx.persistence();
+                        if (persistence.forkless_capture_in_progress()
+                            && !persistence.forkless_key_captured(target_db, &key))
+                            || persistence.forkless_key_blocked(target_db, &key)
+                        {
+                            pending_keys.insert((target_db, key));
+                        }
+                    }
                 }
             }
-            if command.name.eq_ignore_ascii_case(b"select") {
-                if let Some(next_db) = command
-                    .args
-                    .first()
-                    .and_then(|arg| std::str::from_utf8(arg).ok())
-                    .and_then(|arg| arg.parse::<u32>().ok())
-                {
-                    db_id = next_db;
-                }
-            }
+            // Earlier queued commands can change ACLs. Protect every possible
+            // database after SELECT, including the source if SELECT is denied,
+            // and do not exclude writes based on the pre-EXEC permission state.
+            possible_db_ids.insert(self.forkless_selected_db(command, connection.selected_db));
         }
-        false
+        if pending_keys.is_empty() {
+            ExecForklessBarrier::Ready
+        } else {
+            ExecForklessBarrier::WaitForKeys(pending_keys.into_iter().collect())
+        }
     }
 
     fn exec_run_commands(

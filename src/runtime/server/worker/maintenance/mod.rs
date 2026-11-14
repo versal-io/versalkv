@@ -151,14 +151,8 @@ impl ServerWorkerState {
                 self.release_forkless_clients();
             }
         }
-        // A blocked writer temporarily drops the per-key save delay to zero so
-        // its own keys are captured without waiting for the whole delay-driven
-        // save. Once no forkless writer remains blocked, restore the configured
-        // delay for every remaining turn (including the background serialization
-        // phase after the feed finishes). Otherwise a stale delay of zero would
-        // keep accelerating the serializer and prematurely complete the save,
-        // collapsing the save window that callers and the forkless test suite
-        // rely on.
+        // Keep the serializer synchronized with the configured pace after
+        // waiters resolve, including the final background serialization phase.
         if self.ctx.persistence().forkless_save_in_progress() && !self.ctx.has_forkless_waiters() {
             let configured_delay = self.ctx.config().persistence.rdb_key_save_delay;
             self.ctx
