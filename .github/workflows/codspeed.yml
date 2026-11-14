@@ -1,9 +1,6 @@
 name: CodSpeed
 
 on:
-  push:
-    branches:
-      - "main"
   pull_request:
   # `workflow_dispatch` allows CodSpeed to trigger backtest
   # performance analysis in order to generate initial data.
@@ -19,8 +16,9 @@ permissions:
 
 jobs:
   benchmarks:
-    name: Run benchmarks
+    name: Valkey TCP benchmarks
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout repository and submodules
         uses: actions/checkout@v4
@@ -33,16 +31,51 @@ jobs:
           toolchain: "1.99.1"
           components: rustfmt
 
-      - name: Install cargo-codspeed
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-codspeed
+      - name: Install native build dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential
 
-      - name: Build the benchmark targets
-        run: cargo codspeed build -m simulation --bench dict_micro --bench protocol_micro --bench structure_micro
+      - name: Validate benchmark tooling
+        run: python3 scripts/versal-util.py selftest codspeed
+
+      - name: Build release server and upstream valkey-benchmark
+        run: python3 scripts/versal-util.py ci codspeed build
+
+      - name: Start server and prepare bounded datasets
+        run: python3 scripts/versal-util.py ci codspeed start
 
       - name: Run the benchmarks
+        id: codspeed
         uses: CodSpeedHQ/action@v5
+        env:
+          # The server is a separate process; a load-generator flamegraph is not useful.
+          CODSPEED_PERF_ENABLED: "false"
+          CODSPEED_PROFILER_ENABLED: "false"
         with:
-          mode: simulation
-          run: cargo codspeed run --bench dict_micro --bench protocol_micro --bench structure_micro
+          mode: walltime
+          runner-version: "5.6.3"
+          config: codspeed.yml
+          allow-empty: false
+
+      - name: Require a successful CodSpeed upload
+        env:
+          CODSPEED_RUN_ID: ${{ steps.codspeed.outputs.run-id }}
+        run: |
+          if [ -z "$CODSPEED_RUN_ID" ]; then
+            echo "::error::CodSpeed did not return an uploaded run ID"
+            exit 1
+          fi
+          printf 'CodSpeed run: %s\n' "$CODSPEED_RUN_ID" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Stop benchmark server
+        if: always()
+        run: python3 scripts/versal-util.py ci codspeed stop
+
+      - name: Preserve server diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: codspeed-server-diagnostics
+          path: |
+            target/codspeed/server/server.log
+            target/codspeed/benchmark-source.txt
+          if-no-files-found: ignore

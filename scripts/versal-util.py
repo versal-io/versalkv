@@ -14,8 +14,10 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -1005,6 +1007,202 @@ def command_ci_performance(args: argparse.Namespace, _ctx: RepoContext) -> int:
         )
         return EXIT_FAILURE
     print("startup performance gate ok: current {:.3f}ms <= {:.3f}ms".format(current, limit))
+    return EXIT_OK
+
+
+def command_codspeed_build(args: argparse.Namespace, ctx: RepoContext) -> int:
+    if args.jobs < 1:
+        raise ToolError("build jobs must be at least 1", EXIT_USAGE)
+    built = run_command(["cargo", "build", "--release", "--bin", "versal-server"], cwd=ctx.root)
+    if built.returncode != EXIT_OK:
+        return built.returncode
+    upstream = ctx.root / "thirdparty/valkey"
+    revision = run_command(["git", "rev-parse", "HEAD"], cwd=upstream, capture=True)
+    if revision.returncode != EXIT_OK:
+        raise ToolError("Valkey submodule must be initialized")
+    output = ctx.root / "target/codspeed"
+    output.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="versal-codspeed-build-") as directory:
+        source = Path(directory)
+        archive = source / "valkey.tar"
+        commands = (
+            ["git", "archive", "--format=tar", "--output", str(archive), revision.stdout.strip()],
+            ["tar", "-xf", str(archive), "-C", str(source)],
+            ["make", "-C", str(source / "src"), "-j", str(args.jobs),
+             "valkey-benchmark", "MALLOC=libc", "BUILD_TLS=no", "USE_SYSTEMD=no"],
+        )
+        for command in commands:
+            result = run_command(command, cwd=upstream)
+            if result.returncode != EXIT_OK:
+                return result.returncode
+        shutil.copy2(str(source / "src/valkey-benchmark"), str(output / "valkey-benchmark"))
+    (output / "benchmark-source.txt").write_text(
+        "upstream_commit={}\n".format(revision.stdout.strip()), encoding="utf-8",
+    )
+    print("Built the pinned upstream C valkey-benchmark in {}".format(output))
+    return EXIT_OK
+
+
+def codspeed_pipeline(connection: socket.socket, stream: io.BufferedReader, commands: Sequence[Sequence[str]]) -> List[bytes]:
+    frames = []
+    for command in commands:
+        frames.append("*{}\r\n".format(len(command)).encode("ascii"))
+        for argument in command:
+            value = argument.encode("utf-8")
+            frames.extend(("${}\r\n".format(len(value)).encode("ascii"), value, b"\r\n"))
+    connection.sendall(b"".join(frames))
+    replies = []
+    for _ in commands:
+        line = stream.readline()
+        if not line.endswith(b"\r\n"):
+            raise ToolError("Benchmark server closed the connection during preparation")
+        if line.startswith(b"-"):
+            raise ToolError("Benchmark preparation failed: {}".format(line[1:-2].decode("utf-8", errors="replace")))
+        if line[:1] not in (b"+", b":"):
+            raise ToolError("Unexpected benchmark preparation reply: {!r}".format(line))
+        replies.append(line[1:-2])
+    return replies
+
+
+def prepare_codspeed_data(port: int, keys: int) -> None:
+    payload = "x" * 1024
+    with socket.create_connection(("127.0.0.1", port), timeout=10) as connection:
+        with connection.makefile("rb") as stream:
+            for database in range(7):
+                codspeed_pipeline(connection, stream, [["SELECT", str(database)], ["FLUSHDB"]])
+                if database == 0:
+                    continue
+                for first in range(0, keys, 256):
+                    commands = []
+                    for index in range(first, min(first + 256, keys)):
+                        suffix = "{:012d}".format(index)
+                        if database in (1, 2):
+                            command = ["SET", "key:" + suffix, payload]
+                        elif database == 3:
+                            command = ["SET", "counter:" + suffix, "0"]
+                        elif database == 4:
+                            command = ["HSET", "myhash", "element:" + suffix, payload]
+                        elif database == 5:
+                            command = ["SADD", "myset", "element:" + suffix]
+                        else:
+                            command = ["ZADD", "myzset", str(index), "element:" + suffix]
+                        commands.append(command)
+                    codspeed_pipeline(connection, stream, commands)
+
+
+def codspeed_process_args(pid: int) -> List[str]:
+    result = run_command(["ps", "-ww", "-p", str(pid), "-o", "args="], capture=True)
+    return shlex.split(result.stdout.strip()) if result.returncode == EXIT_OK else []
+
+
+def command_codspeed_stop(args: argparse.Namespace, ctx: RepoContext) -> int:
+    state = Path(args.state_dir).resolve() if args.state_dir else ctx.root / "target/codspeed/server"
+    pid_file = state / "server.pid"
+    if not pid_file.exists():
+        return EXIT_OK
+    try:
+        pid = int(read_text(pid_file).strip())
+    except ValueError:
+        raise ToolError("Invalid benchmark server PID file: {}".format(pid_file))
+    if pid <= 1:
+        raise ToolError("Invalid benchmark server PID: {}".format(pid))
+    command = codspeed_process_args(pid)
+    if command:
+        marker = str(state / "data")
+        server = ctx.root / "target/release/versal-server"
+        is_owned = marker in command and str(server) in command
+        if not is_owned and sys.platform.startswith("linux"):
+            # Linux rewrites argv to the server's listen address after startup.
+            # The executable and working directory still identify this instance.
+            try:
+                proc = Path("/proc") / str(pid)
+                is_owned = (
+                    (proc / "exe").resolve(strict=True) == server.resolve()
+                    and (proc / "cwd").resolve(strict=True) == Path(marker)
+                )
+            except OSError:
+                is_owned = False
+        if not is_owned:
+            raise ToolError("Refusing to stop PID {}: it is not the owned benchmark server".format(pid))
+        try:
+            os.kill(pid, signal.SIGTERM)
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and codspeed_process_args(pid) == command:
+                time.sleep(0.05)
+            if codspeed_process_args(pid) == command:
+                os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    pid_file.unlink()
+    print("Stopped the owned benchmark server")
+    return EXIT_OK
+
+
+def command_codspeed_start(args: argparse.Namespace, ctx: RepoContext) -> int:
+    if not 1 <= args.port <= 65535 or args.keys < 1:
+        raise ToolError("benchmark port must be 1..65535 and keys must be positive", EXIT_USAGE)
+    state = Path(args.state_dir).resolve() if args.state_dir else ctx.root / "target/codspeed/server"
+    state.mkdir(parents=True, exist_ok=True)
+    pid_file = state / "server.pid"
+    if pid_file.exists():
+        raise ToolError("Benchmark server state already in use; run ci codspeed stop first")
+    with socket.socket() as probe:
+        try:
+            probe.bind(("127.0.0.1", args.port))
+        except OSError as error:
+            raise ToolError("Benchmark port {} is already in use: {}".format(args.port, error))
+    server = ctx.root / "target/release/versal-server"
+    if not server.is_file():
+        raise ToolError("Release server missing; run ci codspeed build first")
+    data = state / "data"
+    data.mkdir(exist_ok=True)
+    # Every run starts with empty persistence, including leftovers from a killed run.
+    for entry in data.iterdir():
+        remove_path(entry)
+    config = state / "server.conf"
+    config.write_text(
+        'bind 127.0.0.1\nsave ""\nappendonly no\ndaemonize no\nio-threads 1\nloglevel warning\n',
+        encoding="ascii",
+    )
+    argv = [str(server), str(config), "--port", str(args.port), "--dir", str(data)]
+    process = None
+    try:
+        with (state / "server.log").open("wb") as output:
+            process = subprocess.Popen(argv, cwd=str(ctx.root), stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
+        pid_file.write_text(str(process.pid) + "\n", encoding="ascii")
+        deadline = time.monotonic() + 30
+        while True:
+            if process.poll() is not None:
+                raise ToolError("Benchmark server exited during startup; see {}".format(state / "server.log"))
+            try:
+                with socket.create_connection(("127.0.0.1", args.port), timeout=1) as connection:
+                    with connection.makefile("rb") as stream:
+                        replies = codspeed_pipeline(connection, stream, [["PING"]])
+                if replies != [b"PONG"]:
+                    raise ToolError("Benchmark server did not answer PONG")
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise ToolError("Benchmark server startup timed out")
+                time.sleep(0.05)
+        prepare_codspeed_data(args.port, args.keys)
+        if process.poll() is not None:
+            raise ToolError("Benchmark server exited during preparation")
+    except BaseException as error:
+        if process is not None:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+            if pid_file.exists():
+                pid_file.unlink()
+        if isinstance(error, OSError):
+            raise ToolError("Benchmark server setup failed: {}".format(error))
+        raise
+    print("Benchmark server ready on 127.0.0.1:{} with {} keys per database".format(args.port, args.keys))
     return EXIT_OK
 
 
@@ -2086,6 +2284,118 @@ def selftest_ci_commands(ctx: RepoContext) -> None:
     _assert(invalid.returncode == EXIT_USAGE, "zero dual-channel runs must exit 2")
 
 
+def selftest_codspeed(_ctx: RepoContext) -> None:
+    with tempfile.TemporaryDirectory(prefix="versal-codspeed-selftest-") as directory:
+        root = Path(directory)
+        write_executable(root, "target/release/versal-server", """#!{python}
+import json
+from pathlib import Path
+import socket
+import sys
+root = Path(__file__).resolve().parents[2]
+if "--daemonize" in sys.argv or "--appendonly" in sys.argv:
+    sys.exit("boolean switches must be configured in the server config file")
+port = int(sys.argv[sys.argv.index("--port") + 1])
+with socket.socket() as listener:
+    listener.bind(("127.0.0.1", port))
+    listener.listen()
+    while True:
+        connection, _ = listener.accept()
+        with connection, connection.makefile("rb") as stream:
+            while True:
+                header = stream.readline()
+                if not header:
+                    break
+                args = []
+                for _ in range(int(header[1:])):
+                    size = int(stream.readline()[1:])
+                    args.append(stream.read(size).decode())
+                    stream.read(2)
+                with (root / "requests.jsonl").open("a") as output:
+                    output.write(json.dumps(args) + "\\n")
+                reply = b"+PONG\\r\\n" if args[0] == "PING" else b"+OK\\r\\n"
+                if (root / "fail-setup").exists() and args[0] == "SELECT":
+                    reply = b"-ERR fixture preparation failed\\r\\n"
+                connection.sendall(reply)
+""".format(python=sys.executable))
+        with socket.socket() as occupied:
+            occupied.bind(("127.0.0.1", 0))
+            port = occupied.getsockname()[1]
+            occupied.listen()
+            conflict = invoke_cli(["ci", "codspeed", "start", "--port", str(port), "--keys", "4"], root)
+            _assert(conflict.returncode == EXIT_FAILURE, "occupied benchmark port must fail")
+            _assert("already in use" in conflict.stderr, conflict.stderr)
+            _assert(not (root / "target/codspeed/server/server.pid").exists(), "conflict must not create an owned PID")
+        arguments = ["ci", "codspeed", "start", "--port", str(port), "--keys", "4"]
+        try:
+            started = invoke_cli(arguments, root)
+            _assert(started.returncode == EXIT_OK, started.stderr)
+            commands = [json.loads(line) for line in read_text(root / "requests.jsonl").splitlines()]
+            _assert(["SELECT", "2"] in commands, "GET database must be selected before preparation")
+            _assert(["SET", "key:000000000003", "x" * 1024] in commands, "GET keys must match upstream random keys")
+            _assert(["HSET", "myhash", "element:000000000003", "x" * 1024] in commands, "hash fields must be bounded")
+            duplicate = invoke_cli(arguments, root)
+            _assert(duplicate.returncode == EXIT_FAILURE, "duplicate startup must fail")
+            stopped = invoke_cli(["ci", "codspeed", "stop"], root)
+            _assert(stopped.returncode == EXIT_OK, stopped.stderr)
+            _assert(not (root / "target/codspeed/server/server.pid").exists(), "cleanup must remove owned PID")
+            again = invoke_cli(["ci", "codspeed", "stop"], root)
+            _assert(again.returncode == EXIT_OK, "cleanup must be idempotent")
+            write_fixture(root, "fail-setup", "")
+            failed = invoke_cli(arguments, root)
+            _assert(failed.returncode == EXIT_FAILURE, "RESP preparation error must fail startup")
+            _assert("fixture preparation failed" in failed.stderr, failed.stderr)
+            _assert(not (root / "target/codspeed/server/server.pid").exists(), "setup failure must clean up its server")
+            with socket.socket() as available:
+                available.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                available.bind(("127.0.0.1", port))
+            state = root / "target/codspeed/server"
+            unrelated = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+            try:
+                write_fixture(root, "target/codspeed/server/server.pid", str(unrelated.pid))
+                stale = invoke_cli(["ci", "codspeed", "stop"], root)
+                _assert(stale.returncode == EXIT_FAILURE, "cleanup must reject a PID owned by another process")
+                _assert(unrelated.poll() is None, "cleanup must preserve unrelated processes")
+            finally:
+                unrelated.terminate()
+                unrelated.wait()
+                (state / "server.pid").unlink()
+            write_executable(root, "target/release/versal-server", "#!{}\nimport sys\nsys.exit(2)\n".format(sys.executable))
+            exited = invoke_cli(arguments, root)
+            _assert(exited.returncode == EXIT_FAILURE, "early server exit must fail preparation")
+            _assert(not (state / "server.pid").exists(), "early exit must remove owned PID")
+        finally:
+            invoke_cli(["ci", "codspeed", "stop"], root)
+
+    with tempfile.TemporaryDirectory(prefix="versal-codspeed-build-selftest-") as directory:
+        root = Path(directory)
+        upstream = root / "thirdparty/valkey"
+        write_fixture(root, "thirdparty/valkey/src/benchmark.c", "pinned upstream source\n")
+        write_fixture(root, "thirdparty/valkey/src/Makefile",
+                      "valkey-benchmark:\n\tcp benchmark.c valkey-benchmark\n\tchmod +x valkey-benchmark\n")
+        _assert(run_command(["git", "init", "--quiet"], cwd=upstream).returncode == EXIT_OK, "fixture git init failed")
+        _assert(run_command(["git", "add", "src"], cwd=upstream).returncode == EXIT_OK, "fixture staging failed")
+        tree = run_command(["git", "write-tree"], cwd=upstream, capture=True)
+        _assert(tree.returncode == EXIT_OK, "fixture tree creation failed")
+        # Archive accepts tree objects; no fixture commit or Git identity is needed.
+        write_fixture(root, "thirdparty/valkey/.git/HEAD", tree.stdout)
+        write_fixture(root, "thirdparty/valkey/src/benchmark.c", "uncommitted source changes\n")
+        compatibility = write_fixture(root, "thirdparty/valkey/src/valkey-benchmark", "staged compatibility binary\n")
+        write_executable(root, "tools/cargo",
+                         "#!{}\nimport sys\nsys.exit(101 if '--locked' in sys.argv else 0)\n".format(sys.executable))
+        original_path = os.environ.get("PATH", "")
+        try:
+            os.environ["PATH"] = str(root / "tools") + os.pathsep + original_path
+            built = invoke_cli(["ci", "codspeed", "build", "--jobs", "1"], root)
+        finally:
+            os.environ["PATH"] = original_path
+        _assert(built.returncode == EXIT_OK, built.stderr)
+        _assert(read_text(root / "target/codspeed/valkey-benchmark") == "pinned upstream source\n",
+                "load generator must be built from the pinned archive")
+        _assert(read_text(compatibility) == "staged compatibility binary\n",
+                "benchmark build must preserve Tcl compatibility entries")
+
+
 def selftest_repro_cluster(ctx: RepoContext) -> None:
     help_result = invoke_cli(["tcl", "repro-cluster", "--help"], ctx.root)
     _assert(help_result.returncode == EXIT_OK, help_result.stderr)
@@ -2543,6 +2853,7 @@ SELFTESTS = {
     "cli": selftest_cli,
     "boundaries": selftest_boundaries,
     "ci-commands": selftest_ci_commands,
+    "codspeed": selftest_codspeed,
     "ci-support": selftest_ci_support,
     "config-parity": selftest_config_parity,
     "directory-layout": selftest_directory_layout,
@@ -2746,7 +3057,7 @@ def command_check_ci_support(_args: argparse.Namespace, ctx: RepoContext) -> int
         return EXIT_FAILURE
     return run_selftest_names(
         ctx,
-        ("ci-commands", "tcl-module-fixtures", "runtest", "runtest-moduleapi", "stage-binaries"),
+        ("ci-commands", "codspeed", "tcl-module-fixtures", "runtest", "runtest-moduleapi", "stage-binaries"),
     )
 
 
@@ -2829,6 +3140,20 @@ def build_parser() -> argparse.ArgumentParser:
     dual.add_argument("--runs", type=int)
     dual.add_argument("--base-port", type=int)
     dual.set_defaults(handler=command_ci_dual_channel)
+    codspeed = ci_commands.add_parser("codspeed", help="build and prepare the CodSpeed TCP workloads")
+    codspeed_commands = codspeed.add_subparsers(dest="codspeed_command")
+    codspeed_commands.required = True
+    build = codspeed_commands.add_parser("build")
+    build.add_argument("--jobs", type=int, default=os.cpu_count() or 2)
+    build.set_defaults(handler=command_codspeed_build)
+    start = codspeed_commands.add_parser("start")
+    start.add_argument("--port", type=int, default=16379)
+    start.add_argument("--keys", type=int, default=10000)
+    start.add_argument("--state-dir")
+    start.set_defaults(handler=command_codspeed_start)
+    stop = codspeed_commands.add_parser("stop")
+    stop.add_argument("--state-dir")
+    stop.set_defaults(handler=command_codspeed_stop)
     return parser
 
 

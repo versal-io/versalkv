@@ -1,0 +1,66 @@
+$schema: https://raw.githubusercontent.com/CodSpeedHQ/codspeed/refs/heads/main/schemas/codspeed.schema.json
+
+# Each measurement is the elapsed time for 500,000 requests (lower is better).
+# Server startup and dataset preparation run before the CodSpeed action.
+options:
+  warmup-time: 1s
+  min-rounds: 3
+  max-rounds: 3
+
+benchmarks:
+  - name: valkey-benchmark/PING_MBULK/P1
+    exec: >-
+      ./target/codspeed/valkey-benchmark -h 127.0.0.1 -p 16379
+      --dbnum 0 --threads 2 --seed 42 -c 50 -n 500000 -r 10000 -d 1024 -P 1 -t ping_mbulk --csv
+  - name: valkey-benchmark/PING_MBULK/P16
+    exec: >-
+      ./target/codspeed/valkey-benchmark -h 127.0.0.1 -p 16379
+      --dbnum 0 --threads 2 --seed 42 -c 50 -n 500000 -r 10000 -d 1024 -P 16 -t ping_mbulk --csv
+  - name: valkey-benchmark/SET/P1
+    exec: >-
+      ./target/codspeed/valkey-benchmark -h 127.0.0.1 -p 16379
+      --dbnum 1 --threads 2 --seed 42 -c 50 -n 500000 -r 10000 -d 1024 -P 1 -t set --csv
+  - name: valkey-benchmark/SET/P16
+    exec: >-
+      ./target/codspeed/valkey-benchmark -h 127.0.0.1 -p 16379
+      --dbnum 1 --threads 2 --seed 42 -c 50 -n 500000 -r 10000 -d 1024 -P 16 -t set --csv
+  - name: valkey-benchmark/GET/P1
+    exec: >-
+      ./target/codspeed/valkey-benchmark -h 127.0.0.1 -p 16379
+      --dbnum 2 --threads 2 --seed 42 -c 50 -n 500000 -r 10000 -d 1024 -P 1 -t get --csv
+  - name: valkey-benchmark/GET/P16
+    exec: >-
+      ./target/codspeed/valkey-benchmark -h 127.0.0.1 -p 16379
+      --dbnum 2 --threads 2 --seed 42 -c 50 -n 500000 -r 10000 -d 1024 -P 16 -t get --csv
+  - name: valkey-benchmark/INCR/P1
+    exec: >-
+      ./target/codspeed/valkey-benchmark -h 127.0.0.1 -p 16379
+      --dbnum 3 --threads 2 --seed 42 -c 50 -n 500000 -r 10000 -d 1024 -P 1 -t incr --csv
+  - name: valkey-benchmark/INCR/P16
+    exec: >-
+      ./target/codspeed/valkey-benchmark -h 127.0.0.1 -p 16379
+      --dbnum 3 --threads 2 --seed 42 -c 50 -n 500000 -r 10000 -d 1024 -P 16 -t incr --csv
+  - name: valkey-benchmark/HSET/P1
+    exec: >-
+      ./target/codspeed/valkey-benchmark -h 127.0.0.1 -p 16379
+      --dbnum 4 --threads 2 --seed 42 -c 50 -n 500000 -r 10000 -d 1024 -P 1 -t hset --csv
+  - name: valkey-benchmark/HSET/P16
+    exec: >-
+      ./target/codspeed/valkey-benchmark -h 127.0.0.1 -p 16379
+      --dbnum 4 --threads 2 --seed 42 -c 50 -n 500000 -r 10000 -d 1024 -P 16 -t hset --csv
+  - name: valkey-benchmark/SADD/P1
+    exec: >-
+      ./target/codspeed/valkey-benchmark -h 127.0.0.1 -p 16379
+      --dbnum 5 --threads 2 --seed 42 -c 50 -n 500000 -r 10000 -d 1024 -P 1 -t sadd --csv
+  - name: valkey-benchmark/SADD/P16
+    exec: >-
+      ./target/codspeed/valkey-benchmark -h 127.0.0.1 -p 16379
+      --dbnum 5 --threads 2 --seed 42 -c 50 -n 500000 -r 10000 -d 1024 -P 16 -t sadd --csv
+  - name: valkey-benchmark/ZADD/P1
+    exec: >-
+      ./target/codspeed/valkey-benchmark -h 127.0.0.1 -p 16379
+      --dbnum 6 --threads 2 --seed 42 -c 50 -n 500000 -r 10000 -d 1024 -P 1 -t zadd --csv
+  - name: valkey-benchmark/ZADD/P16
+    exec: >-
+      ./target/codspeed/valkey-benchmark -h 127.0.0.1 -p 16379
+      --dbnum 6 --threads 2 --seed 42 -c 50 -n 500000 -r 10000 -d 1024 -P 16 -t zadd --csv
