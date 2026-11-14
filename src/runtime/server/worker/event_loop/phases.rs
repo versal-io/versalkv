@@ -115,6 +115,9 @@ impl ServerWorkerState {
         {
             return Ok(LoopControl::Stop);
         }
+        // Refill an active forkless snapshot every turn so it is not gated by
+        // the slower cron tick; no-op when no capture is in progress.
+        self.pump_forkless_capture();
         self.record_completed_event_loop_cycle();
         if self.expire_grace_psync_waits() > 0 {
             self.refresh_replication_view();

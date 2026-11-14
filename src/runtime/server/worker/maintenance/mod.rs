@@ -133,6 +133,40 @@ impl ServerWorkerState {
         self.ctx.maxmemory_state().logical
     }
 
+    /// Advance an in-flight forkless snapshot by one bounded feed step and
+    /// release any writers whose keys have just been captured.
+    ///
+    /// Called both from the periodic cron task and from every before-poll
+    /// phase. While a capture is active the poll timeout collapses to zero (see
+    /// `next_poll_timeout`), so the feed is refilled each event-loop turn
+    /// instead of only on the ~100 ms cron tick. This keeps a forkless save
+    /// close to a continuously running background save without holding a single
+    /// turn for the whole dataset; client commands are still serviced between
+    /// turns and writers are unblocked as soon as their keys are captured.
+    pub(crate) fn pump_forkless_capture(&mut self) {
+        if self.ctx.persistence().forkless_capture_in_progress() {
+            let released_forkless_key = self.ctx.drive_forkless_feed();
+            let capture_finished = !self.ctx.persistence().forkless_capture_in_progress();
+            if released_forkless_key || capture_finished {
+                self.release_forkless_clients();
+            }
+        }
+        // A blocked writer temporarily drops the per-key save delay to zero so
+        // its own keys are captured without waiting for the whole delay-driven
+        // save. Once no forkless writer remains blocked, restore the configured
+        // delay for every remaining turn (including the background serialization
+        // phase after the feed finishes). Otherwise a stale delay of zero would
+        // keep accelerating the serializer and prematurely complete the save,
+        // collapsing the save window that callers and the forkless test suite
+        // rely on.
+        if self.ctx.persistence().forkless_save_in_progress() && !self.ctx.has_forkless_waiters() {
+            let configured_delay = self.ctx.config().persistence.rdb_key_save_delay;
+            self.ctx
+                .persistence()
+                .set_forkless_key_delay(configured_delay);
+        }
+    }
+
     pub(crate) fn run_background_tasks(&mut self) {
         let watchdog_period = self.ctx.config().server.watchdog_period;
         if watchdog_period == 0 || !self.ctx.is_loading() {
@@ -146,17 +180,7 @@ impl ServerWorkerState {
         }
         self.drive_pending_shutdown();
         self.retry_pending_transport_removals();
-        let was_forkless_capturing = self.ctx.persistence().forkless_capture_in_progress();
-        let released_forkless_key = self.ctx.drive_forkless_feed();
-        let capture_finished =
-            was_forkless_capturing && !self.ctx.persistence().forkless_capture_in_progress();
-        if released_forkless_key || capture_finished {
-            let configured_delay = self.ctx.config().persistence.rdb_key_save_delay;
-            self.ctx
-                .persistence()
-                .set_forkless_key_delay(configured_delay);
-            self.release_forkless_clients();
-        }
+        self.pump_forkless_capture();
         self.drive_slot_migration_actions();
         self.drive_slot_migration_progress();
         self.send_slot_migration_periodic_acks();

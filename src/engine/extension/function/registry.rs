@@ -126,6 +126,15 @@ impl FunctionRegistry {
         Ok(())
     }
 
+    /// Drop engine callbacks staged by a successful compilation when the
+    /// metadata-level load is rejected afterwards. The active function table
+    /// and the registered libraries are left untouched.
+    pub fn abort_compile(&mut self) {
+        for engine in self.engine_mgr.engines() {
+            engine.discard_pending_compile();
+        }
+    }
+
     pub fn delete_library(&mut self, lib_name: &str) -> Result<bool, ScriptError> {
         let Some(lib) = self.libraries.get(lib_name) else {
             return Ok(false);
