@@ -102,7 +102,7 @@ VersalKV server over loopback TCP. The load generator is built from a clean
 archive of the pinned Valkey submodule, independently of the Tcl compatibility
 binaries. Local Criterion microbenchmarks remain available with `make bench`.
 
-[`codspeed.yml`](codspeed.yml) defines 14 workloads: PING_MBULK, SET, GET, INCR,
+[`codspeed.yml`](codspeed.yml) invokes the utility's 14 workloads: PING_MBULK, SET, GET, INCR,
 HSET, SADD, and ZADD, each with pipeline depths 1 and 16. Each round sends
 500,000 requests using 50 clients and two load-generator threads, with 10,000
 random keys and seed 42. SET, GET, and HSET use 1 KiB values. A single server
@@ -110,10 +110,23 @@ I/O thread is used; persistence is disabled. GET is fully preloaded and
 collection members are bounded so repeated rounds do not grow the dataset.
 Each workload warms up for at least one second, then records three rounds.
 
-CodSpeed's native `exec` harness measures the **elapsed time for the fixed
-workload**, including load-generator startup and connection setup; lower is
-better. Server startup and dataset preparation are outside the measurement.
-The benchmark's CSV throughput output is diagnostic, not an uploaded metric.
+The self-reporting entrypoint uploads **wall-clock cost per completed request**
+to CodSpeed: each round's monotonic elapsed time divided by the exact completed
+request count validated from the native report. Each round has 500,000
+iterations. Min, max, mean, standard deviation, and quartiles describe the
+three round means; warmup requests are counted separately and excluded from
+these statistics. `total_time` remains the sum of measured round times in
+seconds. Benchmark names end with `/per-request` to separate these units from
+historical whole-workload timings.
+
+This cost includes load-generator startup, connection setup, and reporting;
+server startup and dataset preparation are outside measurement. Under
+concurrency, throughput-normalized request cost differs from client-observed
+latency. Native QPS and client latency avg/min/max/p50/p95/p99 are retained for
+every warmup and measured round in `metrics.json` and `metrics.csv`; they are
+not substituted for CodSpeed's round statistics. Raw native reports and the
+uploaded statistics are preserved in the workflow diagnostics artifact and
+the per-request statistics appear in the Action summary.
 The workflow uses `walltime`, GitHub OIDC authentication, and requires a
 nonempty uploaded run ID. Hosted VM timings can be noisy; switching to CodSpeed
 Macro Runners requires provisioning them for the repository.

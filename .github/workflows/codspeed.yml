@@ -70,7 +70,7 @@ jobs:
         if: always()
         run: python3 scripts/versal-util.py ci codspeed stop
 
-      - name: Preserve server diagnostics
+      - name: Preserve benchmark statistics and server diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -78,4 +78,8 @@ jobs:
           path: |
             target/codspeed/server/server.log
             target/codspeed/benchmark-source.txt
+            target/codspeed/codspeed-results.json
+            target/codspeed/metrics.json
+            target/codspeed/metrics.csv
+            target/codspeed/rounds/
           if-no-files-found: ignore

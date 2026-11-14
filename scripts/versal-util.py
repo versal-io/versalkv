@@ -8,9 +8,11 @@ self-tests.  Keep it compatible with Python 3.7 and the standard library.
 import argparse
 from collections import Counter, namedtuple
 import contextlib
+import csv
 import hashlib
 import io
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -18,6 +20,7 @@ import shlex
 import shutil
 import signal
 import socket
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -1040,6 +1043,149 @@ def command_codspeed_build(args: argparse.Namespace, ctx: RepoContext) -> int:
         "upstream_commit={}\n".format(revision.stdout.strip()), encoding="utf-8",
     )
     print("Built the pinned upstream C valkey-benchmark in {}".format(output))
+    return EXIT_OK
+
+
+def parse_codspeed_native_report(text: str, command: str, requests: int) -> dict:
+    """Require a complete native report before using its timing or diagnostics."""
+    headers = re.findall(r"^====== (.+?) ======\s*$", text, re.MULTILINE)
+    counts = re.findall(r"^\s*(\d+) requests completed in [\d.]+ seconds\s*$", text, re.MULTILINE)
+    throughput = re.findall(r"throughput summary:\s*([\d.]+) requests per second", text)
+    latency = re.findall(
+        r"latency summary \(msec\):\s*avg\s+min\s+p50\s+p95\s+p99\s+max\s+"
+        r"([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)", text,
+    )
+    if headers != [command] or len(counts) != 1 or len(throughput) != 1 or len(latency) != 1:
+        raise ToolError("Missing or ambiguous native benchmark report for {}".format(command))
+    completed = int(counts[0])
+    if completed != requests:
+        raise ToolError("{} completed {} requests, expected {}".format(command, completed, requests))
+    qps = float(throughput[0])
+    values = [float(value) for value in latency[0]]
+    if not math.isfinite(qps) or qps <= 0 or any(not math.isfinite(value) or value < 0 for value in values):
+        raise ToolError("Invalid native benchmark metrics for {}".format(command))
+    if not values[1] <= values[2] <= values[3] <= values[4] <= values[5] or not values[1] <= values[0] <= values[5]:
+        raise ToolError("Invalid native latency ordering for {}".format(command))
+    return {"requests": completed, "qps": qps,
+            "latency_ms": dict(zip(("avg", "min", "p50", "p95", "p99", "max"), values))}
+
+
+def codspeed_request_stats(rounds: Sequence[dict], warmup_iters: int) -> dict:
+    """Use the CodSpeed 5.6.3 walltime contract with one iteration per request."""
+    samples = sorted(item["elapsed_ns"] / item["requests"] for item in rounds)
+    count = len(samples)
+    mean = statistics.mean(samples)
+    stdev = statistics.stdev(samples) if count > 1 else 0.0
+
+    def quantile(fraction: float) -> float:
+        if count == 1:
+            return samples[0]
+        if count == 2:
+            return samples[0] * (1 - fraction) + samples[1] * fraction
+        position = fraction * (count + 1) - 1
+        index = int(math.floor(position))
+        remainder = position - index
+        if index + 1 < count:
+            return samples[index] * (1 - remainder) + samples[index + 1] * remainder
+        return samples[min(index, count - 1)]
+
+    q1, q3 = quantile(0.25), quantile(0.75)
+    iqr = q3 - q1
+    return {
+        "min_ns": samples[0], "max_ns": samples[-1], "mean_ns": mean,
+        "stdev_ns": stdev, "q1_ns": q1, "median_ns": statistics.median(samples), "q3_ns": q3,
+        "rounds": count, "total_time": sum(item["elapsed_ns"] for item in rounds) / 1e9,
+        "iqr_outlier_rounds": sum(value < q1 - 1.5 * iqr or value > q3 + 1.5 * iqr for value in samples),
+        "stdev_outlier_rounds": sum(abs(value - mean) > 2 * stdev for value in samples),
+        "iter_per_round": rounds[0]["requests"], "warmup_iters": warmup_iters,
+    }
+
+
+def command_codspeed_measure(args: argparse.Namespace, ctx: RepoContext) -> int:
+    if (not 1 <= args.port <= 65535 or args.keys < 1 or args.requests < 16
+            or args.requests % 16 != 0 or args.rounds < 1
+            or not math.isfinite(args.warmup_sec) or args.warmup_sec < 0
+            or not math.isfinite(args.round_timeout_sec) or args.round_timeout_sec <= 0):
+        raise ToolError("Invalid benchmark options: requests must be a positive multiple of 16; "
+                        "rounds/keys/timeout must be positive and warmup must be finite and nonnegative", EXIT_USAGE)
+    output = ctx.root / "target/codspeed"
+    executable = output / "valkey-benchmark"
+    if not executable.is_file():
+        raise ToolError("Native benchmark missing; run ci codspeed build first")
+    profile = Path(os.environ.get("CODSPEED_PROFILE_FOLDER", str(output / "profile")))
+    results = profile / "results"
+    results.mkdir(parents=True, exist_ok=True)
+    raw = output / "rounds"
+    raw.mkdir(parents=True, exist_ok=True)
+    benchmarks, diagnostics = [], []
+    environment = dict(os.environ, LC_ALL="C")
+    for database, command in enumerate(("PING_MBULK", "SET", "GET", "INCR", "HSET", "SADD", "ZADD")):
+        for pipeline in (1, 16):
+            name = "valkey-benchmark/{}/P{}/per-request".format(command, pipeline)
+            argv = [str(executable), "-h", "127.0.0.1", "-p", str(args.port),
+                    "--dbnum", str(database), "--threads", "2", "--seed", "42", "-c", "50",
+                    "-n", str(args.requests), "-r", str(args.keys), "-d", "1024",
+                    "-P", str(pipeline), "-t", command.lower()]
+
+            def measure_round(phase: str, index: int) -> dict:
+                log = raw / "{}-P{}-{}-{}.txt".format(command, pipeline, phase, index)
+                started = time.perf_counter_ns()
+                try:
+                    result = subprocess.run(argv, cwd=str(ctx.root), env=environment,
+                                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                            universal_newlines=True, timeout=args.round_timeout_sec)
+                except subprocess.TimeoutExpired:
+                    raise ToolError("{} timed out after {} seconds".format(name, args.round_timeout_sec))
+                elapsed_ns = time.perf_counter_ns() - started
+                log.write_text(result.stdout, encoding="utf-8")
+                if result.returncode != EXIT_OK:
+                    raise ToolError("{} exited {}; see {}".format(name, result.returncode, log))
+                measurement = parse_codspeed_native_report(result.stdout, command, args.requests)
+                measurement["elapsed_ns"] = elapsed_ns
+                return measurement
+
+            warmup, elapsed_warmup_ns = [], 0
+            while not warmup or elapsed_warmup_ns < args.warmup_sec * 1e9:
+                sample = measure_round("warmup", len(warmup) + 1)
+                warmup.append(sample)
+                elapsed_warmup_ns += sample["elapsed_ns"]
+            measured = [measure_round("round", index + 1) for index in range(args.rounds)]
+            stats = codspeed_request_stats(measured, sum(item["requests"] for item in warmup))
+            benchmarks.append({"name": name, "uri": "scripts/versal-util.py::" + name, "config": {}, "stats": stats})
+            diagnostics.append({"name": name, "argv": argv, "warmup": warmup, "rounds": measured})
+            print("{}: {:.3f} us/request, min {:.3f}, max {:.3f}, rounds {}, iterations {}".format(
+                name, stats["mean_ns"] / 1000, stats["min_ns"] / 1000, stats["max_ns"] / 1000,
+                stats["rounds"], stats["iter_per_round"]), flush=True)
+    report = {"creator": {"name": "versal-valkey-benchmark", "version": "1.0.0", "pid": os.getpid()},
+              "instrument": {"type": "walltime"}, "benchmarks": benchmarks}
+    encoded = json.dumps(report, indent=2, allow_nan=False) + "\n"
+    (results / "{}.json".format(os.getpid())).write_text(encoded, encoding="utf-8")
+    (output / "codspeed-results.json").write_text(encoded, encoding="utf-8")
+    (output / "metrics.json").write_text(json.dumps(
+        {"metric": "elapsed_ns_per_completed_request", "benchmarks": diagnostics}, indent=2, allow_nan=False) + "\n",
+        encoding="utf-8")
+    with (output / "metrics.csv").open("w", encoding="utf-8", newline="") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(("benchmark", "phase", "round", "requests", "elapsed_ns", "ns_per_request", "qps",
+                         "latency_avg_ms", "latency_min_ms", "latency_p50_ms", "latency_p95_ms", "latency_p99_ms", "latency_max_ms"))
+        for diagnostic in diagnostics:
+            for phase in ("warmup", "rounds"):
+                for index, item in enumerate(diagnostic[phase], 1):
+                    writer.writerow([diagnostic["name"], phase, index, item["requests"], item["elapsed_ns"],
+                                     item["elapsed_ns"] / item["requests"], item["qps"]] +
+                                    [item["latency_ms"][key] for key in ("avg", "min", "p50", "p95", "p99", "max")])
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        with Path(summary).open("a", encoding="utf-8") as stream:
+            stream.write("\nPer-request wall-clock cost (elapsed time / completed requests). "
+                         "Min/max are extrema across round means. Native QPS and client latency are in the diagnostics artifact.\n\n"
+                         "| Benchmark | Mean (us/request) | Min | Max | Rounds | Requests/round | Warmup requests |\n"
+                         "| --- | ---: | ---: | ---: | ---: | ---: | ---: |\n")
+            for benchmark in benchmarks:
+                stats = benchmark["stats"]
+                stream.write("| {} | {:.3f} | {:.3f} | {:.3f} | {} | {} | {} |\n".format(
+                    benchmark["name"], stats["mean_ns"] / 1000, stats["min_ns"] / 1000, stats["max_ns"] / 1000,
+                    stats["rounds"], stats["iter_per_round"], stats["warmup_iters"]))
     return EXIT_OK
 
 
@@ -2285,6 +2431,68 @@ def selftest_ci_commands(ctx: RepoContext) -> None:
 
 
 def selftest_codspeed(_ctx: RepoContext) -> None:
+    known = codspeed_request_stats(
+        [{"elapsed_ns": value, "requests": 10} for value in (6000, 3000, 1000, 2000, 4000)], 20,
+    )
+    _assert((known["min_ns"], known["max_ns"], known["mean_ns"]) == (100, 600, 320),
+            "known samples must report request costs, not round times")
+    _assert((known["q1_ns"], known["median_ns"], known["q3_ns"]) == (150, 300, 500),
+            "quartiles must match the pinned CodSpeed runner")
+    _assert(abs(known["stdev_ns"] - math.sqrt(37000)) < 1e-9, "standard deviation must use the sample denominator")
+    with tempfile.TemporaryDirectory(prefix="versal-codspeed-measure-selftest-") as directory:
+        root = Path(directory)
+        write_executable(root, "target/codspeed/valkey-benchmark", """#!{python}
+from pathlib import Path
+import sys
+root = Path(__file__).resolve().parents[2]
+if (root / "exit-error").exists():
+    sys.exit(1)
+if (root / "missing-report").exists():
+    sys.exit(0)
+requests = int(sys.argv[sys.argv.index("-n") + 1])
+command = sys.argv[sys.argv.index("-t") + 1].upper()
+if (root / "incomplete").exists():
+    requests -= 1
+print("====== " + command + " ======")
+print(str(requests) + " requests completed in 0.10 seconds")
+print("throughput summary: 160000.00 requests per second")
+print("latency summary (msec):")
+print("avg min p50 p95 p99 max")
+print("0.300 0.020 0.200 0.500 0.800 1.000")
+""".format(python=sys.executable))
+        arguments = ["ci", "codspeed", "measure", "--requests", "16000",
+                     "--rounds", "3", "--warmup-sec", "0"]
+        measured = run_command([sys.executable, str(SCRIPT_PATH)] + arguments, capture=True,
+                               env=dict(os.environ, VERSAL_REPO_ROOT=str(root), CODSPEED_PROFILE_FOLDER=str(root / "profile")))
+        _assert(measured.returncode == EXIT_OK, measured.stderr)
+        reports = list((root / "profile/results").glob("*.json"))
+        _assert(len(reports) == 1, "one entrypoint must emit one CodSpeed report")
+        report = json.loads(read_text(reports[0]))
+        diagnostics = json.loads(read_text(root / "target/codspeed/metrics.json"))
+        _assert(report["instrument"]["type"] == "walltime", "incorrect instrument")
+        _assert(len(report["benchmarks"]) == 14, "all TCP workloads must be reported")
+        for benchmark, diagnostic in zip(report["benchmarks"], diagnostics["benchmarks"]):
+            stats = benchmark["stats"]
+            _assert(benchmark["name"].endswith("/per-request"), "metric identity must include its unit")
+            _assert(stats["rounds"] == 3 and stats["iter_per_round"] == 16000, "round/iteration counts must be real")
+            _assert(stats["warmup_iters"] == 16000, "one warmup round must be excluded")
+            samples = [item["elapsed_ns"] / item["requests"] for item in diagnostic["rounds"]]
+            _assert(stats["min_ns"] == min(samples) and stats["max_ns"] == max(samples), "extrema must be per request")
+            _assert(abs(stats["mean_ns"] - sum(samples) / 3) < 1e-9, "mean must be per request")
+            expected_total = sum(item["elapsed_ns"] for item in diagnostic["rounds"]) / 1e9
+            _assert(stats["total_time"] == expected_total, "total time must exclude warmup")
+            _assert(all(item["qps"] == 160000 and item["latency_ms"]["max"] == 1 for item in diagnostic["rounds"]),
+                    "native throughput and latency must be retained")
+        for marker in ("exit-error", "missing-report", "incomplete"):
+            write_fixture(root, marker, "")
+            rejected = invoke_cli(arguments, root)
+            _assert(rejected.returncode == EXIT_FAILURE, "{} must fail measurement".format(marker))
+            (root / marker).unlink()
+        for option, value in (("--requests", "0"), ("--requests", "17"), ("--rounds", "0"),
+                              ("--warmup-sec", "-1"), ("--warmup-sec", "nan")):
+            invalid = invoke_cli(arguments + [option, value], root)
+            _assert(invalid.returncode == EXIT_USAGE, "invalid measurement option must exit 2")
+
     with tempfile.TemporaryDirectory(prefix="versal-codspeed-selftest-") as directory:
         root = Path(directory)
         write_executable(root, "target/release/versal-server", """#!{python}
@@ -3154,6 +3362,14 @@ def build_parser() -> argparse.ArgumentParser:
     stop = codspeed_commands.add_parser("stop")
     stop.add_argument("--state-dir")
     stop.set_defaults(handler=command_codspeed_stop)
+    measure = codspeed_commands.add_parser("measure", help="report per-request walltime and native diagnostics")
+    measure.add_argument("--port", type=int, default=16379)
+    measure.add_argument("--keys", type=int, default=10000)
+    measure.add_argument("--requests", type=int, default=500000)
+    measure.add_argument("--rounds", type=int, default=3)
+    measure.add_argument("--warmup-sec", type=float, default=1.0)
+    measure.add_argument("--round-timeout-sec", type=float, default=120.0)
+    measure.set_defaults(handler=command_codspeed_measure)
     return parser
 
 
