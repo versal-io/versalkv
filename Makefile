@@ -155,6 +155,7 @@ fault:
 bench:
 	$(CARGO) bench --bench dict_micro
 	$(CARGO) bench --bench protocol_micro
+	$(CARGO) bench --bench structure_micro
 
 daily-performance:
 	$(PYTHON) scripts/versal-util.py ci performance --baseline-ms "$${BASELINE_MS:?}" --current-ms "$${CURRENT_MS:?}"

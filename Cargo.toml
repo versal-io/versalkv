@@ -44,7 +44,7 @@ serde-wasm-bindgen = { version = "0.6", optional = true }
 wasm-bindgen = { version = "0.2", optional = true }
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "6", package = "codspeed-criterion-compat", features = ["html_reports"] }
 proptest = "1"
 rand = "0.10"
 
@@ -101,6 +101,10 @@ harness = false
 
 [[bench]]
 name = "protocol_micro"
+harness = false
+
+[[bench]]
+name = "structure_micro"
 harness = false
 
 [[bench]]
