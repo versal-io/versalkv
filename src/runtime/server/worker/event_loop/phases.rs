@@ -245,6 +245,7 @@ impl ServerWorkerState {
             command_time_usec: cycle_cmd_start,
             commands_processed: cycle_processed_start,
         });
+        self.command_eviction_ran_this_turn = false;
     }
 
     pub(super) fn record_completed_event_loop_cycle(&mut self) {

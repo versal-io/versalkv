@@ -917,6 +917,19 @@ impl ServerWorkerState {
     }
 
     pub(crate) fn run_eviction(&mut self) {
+        // C runs the eviction time event in a separate event-loop trip, so a
+        // beforeSleep output flush always separates it from command-driven
+        // eviction. If a command already evicted keys this turn, defer the
+        // continuation to the next turn; otherwise the unflushed tracking
+        // invalidation frames from the first cycle inflate the memory target
+        // and can compound into draining the whole key space.
+        if self.command_eviction_ran_this_turn {
+            // Consume the one-turn guard so an idle server (no further command
+            // turns that would reset it) still makes progress on the next run.
+            self.command_eviction_ran_this_turn = false;
+            self.schedule_eviction();
+            return;
+        }
         let outcome = self.perform_evictions();
         self.apply_background_evictions(outcome.evicted);
     }

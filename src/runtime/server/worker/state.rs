@@ -139,6 +139,14 @@ pub(crate) struct ServerWorkerState {
     pub(in crate::runtime::server) pending_due_time_events: HashMap<TimeEventId, DueTimeEvent>,
     pub(in crate::runtime::server) module_timer_event: Option<TimeEventId>,
     pub(in crate::runtime::server) event_loop_cycle_start: Option<EventLoopCycleStart>,
+    /// Set when the command path performs key eviction during the current
+    /// event-loop turn. The timer-driven eviction continuation defers to the
+    /// next turn when this is set, so every eviction cycle is separated by a
+    /// before-poll output flush. This mirrors C, where the eviction time event
+    /// and command-driven eviction never run back-to-back without a beforeSleep
+    /// flush, and prevents client-side-caching invalidation traffic from
+    /// compounding into an eviction feedback loop.
+    pub(in crate::runtime::server) command_eviction_ran_this_turn: bool,
     pub(crate) priority_subnets_generation: u64,
     pub(crate) priority_command_token: Option<Token>,
     pub(crate) priority_command_is_nested: bool,
@@ -290,6 +298,7 @@ impl ServerWorkerState {
             pending_due_time_events: HashMap::new(),
             module_timer_event: None,
             event_loop_cycle_start: None,
+            command_eviction_ran_this_turn: false,
             priority_subnets_generation: 0,
             priority_command_token: None,
             priority_command_is_nested: false,
