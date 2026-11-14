@@ -207,7 +207,11 @@ impl ServerWorkerState {
         let now_ms = now.wall_ms();
         let has_immediate_work = self.transport.has_pending_data()
             || self.event_batch.has_pending_transport_data()
-            || self.event_batch.has_due_time_events();
+            || self.event_batch.has_due_time_events()
+            // Keep the loop spinning while a forkless capture is active so the
+            // before-poll phase can refill the feed every turn instead of
+            // blocking for the full cron interval.
+            || self.ctx.persistence().forkless_capture_in_progress();
         let blocked_deadline = (self.ctx.blocking_registry().count() > 0)
             .then(|| self.next_blocked_timeout(now_ms))
             .flatten();

@@ -49,6 +49,9 @@ impl ServerContext {
     pub(crate) fn forkless_clients_mut(&mut self) -> &mut indexmap::IndexSet<Token> {
         &mut self.forkless_clients
     }
+    pub(crate) fn has_forkless_waiters(&self) -> bool {
+        !self.forkless_clients.is_empty()
+    }
     pub fn throttled_clients(&self) -> &indexmap::IndexSet<Token> {
         &self.throttled_clients
     }

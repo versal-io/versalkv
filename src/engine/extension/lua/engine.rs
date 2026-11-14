@@ -718,45 +718,50 @@ impl ScriptEngine for LuaEngine {
         with_lua_runtime(false, |runtime| {
             let lua = &runtime.lua;
             let globals = lua.globals();
-            let pending = globals
+            let pending = match globals
                 .raw_get::<Option<LuaTable>>(super::REGISTERED_FUNCS_PENDING_TABLE)
-                .map_err(|error| ScriptError::Runtime(error.to_string()))?;
-            let Some(pending) = pending else {
-                return Ok(());
+                .map_err(|error| ScriptError::Runtime(error.to_string()))?
+            {
+                Some(pending) => pending,
+                None => return Ok(()),
             };
             let active = globals
                 .raw_get::<LuaTable>(super::REGISTERED_FUNCS_TABLE)
                 .map_err(|error| ScriptError::Runtime(error.to_string()))?;
-            let working = lua
-                .create_table()
-                .map_err(|error| ScriptError::Runtime(error.to_string()))?;
-            for pair in active.clone().pairs::<LuaValue, LuaValue>() {
-                let (name, entry) =
-                    pair.map_err(|error| ScriptError::Runtime(error.to_string()))?;
-                working
-                    .raw_set(name, entry)
-                    .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+
+            // Merge the staged entries directly into the active table in
+            // O(pending) instead of cloning the whole active table on every
+            // FUNCTION LOAD. Remember each overwritten value so the merge can
+            // be rolled back, preserving the atomicity contract that the active
+            // table is left untouched on failure.
+            let mut applied: Vec<(String, LuaValue)> = Vec::new();
+            let merge: LuaResult<()> = (|| {
+                for pair in pending.clone().pairs::<LuaString, LuaTable>() {
+                    let (name, entry) = pair?;
+                    let name = name.to_str()?.to_string();
+                    let previous = active.raw_get::<LuaValue>(name.as_str())?;
+                    active.raw_set(name.as_str(), entry)?;
+                    applied.push((name, previous));
+                }
+                Ok(())
+            })();
+            if let Err(error) = merge {
+                for (name, previous) in applied.drain(..) {
+                    let _ = active.raw_set(name.as_str(), previous);
+                }
+                return Err(ScriptError::Runtime(error.to_string()));
             }
-            for pair in pending.clone().pairs::<LuaString, LuaTable>() {
-                let (name, entry) =
-                    pair.map_err(|error| ScriptError::Runtime(error.to_string()))?;
-                working
-                    .raw_set(name, entry)
-                    .map_err(|error| ScriptError::Runtime(error.to_string()))?;
-            }
-            globals
-                .raw_set(super::REGISTERED_FUNCS_TABLE, working)
-                .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+
             if let Err(clear_error) =
                 globals.raw_set(super::REGISTERED_FUNCS_PENDING_TABLE, LuaValue::Nil)
             {
-                return match globals.raw_set(super::REGISTERED_FUNCS_TABLE, active) {
-                    Ok(()) => Err(ScriptError::Runtime(clear_error.to_string())),
-                    Err(restore_error) => Err(ScriptError::Runtime(format!(
-                        "Failed to clear pending functions: {clear_error}; \
-                         failed to restore active functions: {restore_error}"
-                    ))),
-                };
+                // The merge succeeded but clearing the pending table failed.
+                // Restore the active table and keep pending intact for retry.
+                for (name, previous) in applied.drain(..) {
+                    let _ = active.raw_set(name.as_str(), previous);
+                }
+                let _ = globals.raw_set(super::REGISTERED_FUNCS_PENDING_TABLE, pending);
+                return Err(ScriptError::Runtime(clear_error.to_string()));
             }
             Ok(())
         })
@@ -823,7 +828,10 @@ impl ScriptEngine for LuaEngine {
                 .map_err(|error| ScriptError::Runtime(error.to_string()))?;
             lua.unset_named_registry_value(FUNCTION_RESTORE_BACKUP_REGISTRY_KEY)
                 .map_err(|error| ScriptError::Runtime(error.to_string()))?;
-            collect_function_garbage(lua);
+            // Do not force a full-heap garbage collection on every committed
+            // FUNCTION LOAD/RESTORE. The Lua runtime runs incremental GC by
+            // itself, and a full collection per command turned bulk loading into
+            // repeated full-heap scans. Rollback/removal paths still collect.
             Ok(())
         })
     }
@@ -865,6 +873,19 @@ impl ScriptEngine for LuaEngine {
 
     fn clear_functions(&self) {
         super::runtime::clear_function_tables();
+    }
+
+    fn discard_pending_compile(&self) {
+        let result = with_lua_runtime(false, |runtime| {
+            runtime
+                .lua
+                .globals()
+                .raw_set(super::REGISTERED_FUNCS_PENDING_TABLE, LuaValue::Nil)
+                .map_err(|error| ScriptError::Runtime(error.to_string()))
+        });
+        if let Err(error) = result {
+            log::warn!("Failed to discard pending Lua functions: {error}");
+        }
     }
 
     fn remove_functions(&self, functions: &[CompiledFunction]) -> Result<(), ScriptError> {

@@ -275,6 +275,11 @@ pub trait ScriptEngine: Send + Sync {
 
     fn clear_functions(&self) {}
 
+    /// Discard callbacks staged by a successful `compile` when the surrounding
+    /// metadata-level load is rejected afterwards (for example a function name
+    /// collision). Must leave the already-active function table untouched.
+    fn discard_pending_compile(&self) {}
+
     /// Release engine-owned callbacks and metadata for a deleted library.
     fn remove_functions(&self, _functions: &[CompiledFunction]) -> Result<(), ScriptError> {
         Ok(())

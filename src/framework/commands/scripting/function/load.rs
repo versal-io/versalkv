@@ -79,39 +79,59 @@ pub(super) fn function_load(
         ));
     }
 
-    if let Err(error) = ctx.script().function_registry.begin_restore_transaction() {
-        return error.into_value();
-    }
-
-    let old_lib = if replace {
-        ctx.script_mut().function_registry.take_library(&lib_name)
-    } else {
-        None
-    };
-
-    if let Err(error) = ctx
-        .script_mut()
-        .function_registry
-        .load_library(&lib_name, code)
-    {
-        return rollback_function_load(ctx, &lib_name, old_lib, error);
-    }
-
-    if let Some(old) = &old_lib {
+    if !replace {
+        // Fast path: a non-replacing LOAD never removes an existing library or
+        // function. Engine compilation uses an isolated staging table and
+        // `commit_compile` merges it atomically, so the restore transaction
+        // (whose begin step clones the whole active Lua function table) is
+        // unnecessary here. Skipping it keeps bulk FUNCTION LOAD at O(1) per
+        // command instead of re-copying every previously loaded function.
         if let Err(error) = ctx
-            .script()
+            .script_mut()
             .function_registry
-            .finish_library_replacement(old)
+            .load_library(&lib_name, code)
+        {
+            // Remove metadata inserted before the engine commit failed, then
+            // drop any staged Lua callbacks. The active table is untouched.
+            ctx.script_mut().function_registry.take_library(&lib_name);
+            ctx.script_mut().function_registry.abort_compile();
+            return function_load_error(error);
+        }
+    } else {
+        if let Err(error) = ctx.script().function_registry.begin_restore_transaction() {
+            return error.into_value();
+        }
+
+        let old_lib = ctx
+            .script_mut()
+            .function_registry
+            .take_library(&lib_name);
+
+        if let Err(error) = ctx
+            .script_mut()
+            .function_registry
+            .load_library(&lib_name, code)
         {
             return rollback_function_load(ctx, &lib_name, old_lib, error);
         }
+
+        if let Some(old) = &old_lib {
+            if let Err(error) = ctx
+                .script()
+                .function_registry
+                .finish_library_replacement(old)
+            {
+                return rollback_function_load(ctx, &lib_name, old_lib, error);
+            }
+        }
+
+        if let Err(error) = ctx.script().function_registry.commit_restore_transaction() {
+            return rollback_function_load(ctx, &lib_name, old_lib, error);
+        }
+
+        drop(old_lib);
     }
 
-    if let Err(error) = ctx.script().function_registry.commit_restore_transaction() {
-        return rollback_function_load(ctx, &lib_name, old_lib, error);
-    }
-
-    drop(old_lib);
     let mut parts: Vec<&[u8]> = Vec::with_capacity(args.args.len() + 1);
     parts.push(b"FUNCTION");
     for a in &args.args {
