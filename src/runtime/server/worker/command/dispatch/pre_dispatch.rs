@@ -544,6 +544,12 @@ impl ServerWorkerState {
     /// writes (transaction, scripts, key waiters) and keyless commands must
     /// wait for the whole capture; direct key writes only wait when at least
     /// one target key cannot be prioritized for capture immediately.
+    ///
+    /// The barrier only postpones writers and registers priority keys; it
+    /// never modifies the configured per-key save delay. The configured delay
+    /// is the sole authority for the save pace, so a single blocked writer
+    /// cannot collapse the save window that `rdb_bgsave_in_progress` callers
+    /// rely on.
     fn evaluate_forkless_capture_barrier(
         &mut self,
         facts: &CommandClientFacts,
@@ -574,7 +580,12 @@ impl ServerWorkerState {
                     .is_empty()
             });
         if has_indirect_writes || key_targets.is_empty() {
-            self.ctx.persistence().set_forkless_key_delay(0);
+            // The configured per-key save delay remains the authoritative pace
+            // for the whole save. A blocked writer must never reset it to zero,
+            // otherwise the tight per-turn capture pump drains the entire
+            // dataset within a few milliseconds and the save window collapses
+            // while callers still expect `rdb_bgsave_in_progress` to be set.
+            // Writers are released by the existing capture/key-resolution path.
             return Some(DispatchOutcome {
                 action: DispatchAction::Postpone(PostponeReason::ForklessKey),
                 call_flags,
@@ -589,14 +600,15 @@ impl ServerWorkerState {
         if uncaptured_keys.is_empty() {
             return None;
         }
-        let mut can_capture_all_now = true;
+        // Register every uncaptured key with the feed priority queues. Keys in
+        // the database currently being scanned are captured on the next pump,
+        // while keys in later databases wait for the scan to reach them. The
+        // configured save delay stays authoritative: expediting one writer's
+        // keys must not accelerate the whole save, so the command is postponed
+        // until its snapshot state is resolved.
         for (db_id, key) in uncaptured_keys {
-            can_capture_all_now &= self
-                .ctx
+            self.ctx
                 .prioritize_forkless_keys(db_id, std::iter::once(key));
-        }
-        if !can_capture_all_now {
-            self.ctx.persistence().set_forkless_key_delay(0);
         }
         Some(DispatchOutcome {
             action: DispatchAction::Postpone(PostponeReason::ForklessKey),

@@ -212,6 +212,13 @@ impl RdbSaveControl {
         self.changed.notify_all();
     }
 
+    /// Current per-key save delay in microseconds. Test-only helper used to
+    /// assert that event-loop barriers never rewrite the configured pace.
+    #[cfg(test)]
+    pub fn key_delay_us_for_test(&self) -> i64 {
+        self.lock().key_delay_us
+    }
+
     pub fn progress(&self) -> RdbSaveProgress {
         let state = self.lock();
         RdbSaveProgress {

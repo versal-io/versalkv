@@ -494,6 +494,15 @@ impl PersistenceState {
         }
     }
 
+    /// Current per-key save delay of the in-flight forkless save, if any.
+    /// Test-only helper for asserting the configured save pace is preserved.
+    #[cfg(test)]
+    pub fn forkless_key_delay_for_test(&self) -> Option<i64> {
+        self.forkless
+            .as_ref()
+            .map(|(task, _)| task.control().key_delay_us_for_test())
+    }
+
     pub fn cancel_forkless_save(&self) {
         if let Some((task, _)) = &self.forkless {
             task.control().cancel();

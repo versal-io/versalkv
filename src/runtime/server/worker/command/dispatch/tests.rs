@@ -352,6 +352,74 @@ fn forkless_capture_postpones_keys_until_their_snapshot_state_is_resolved() {
 }
 
 #[test]
+fn forkless_barrier_never_resets_configured_key_save_delay() {
+    use crate::framework::capabilities::connection::TransactionEnd;
+
+    let mut backend = ServerWorkerState::new(2).unwrap();
+    crate::framework::commands::register_all(&mut backend.registry);
+    let connection_token = add_fake_connection(&mut backend);
+    // A positive per-key delay keeps the configured save window open. The
+    // barrier must never collapse it by zeroing the delay for blocked writers.
+    backend.ctx.config_mut().persistence.rdb_key_save_delay = 100_000;
+    let dir = start_test_forkless_capture(&mut backend, "forkless-delay-preserved");
+    assert_eq!(
+        backend.ctx.persistence().forkless_key_delay_for_test(),
+        Some(100_000)
+    );
+
+    // Writes queued inside MULTI are indirect writes: they postpone until the
+    // whole capture resolves while the configured delay stays authoritative.
+    let connection = &mut backend.connection_registry[Token(connection_token)];
+    assert!(connection.transaction.begin(0, 0));
+    let tx_args = make_args(&[b"SET", b"tx-key", b"value"]);
+    let spec = backend.registry.lookup(&tx_args.name).unwrap();
+    let tx_action = backend
+        .pre_dispatch_exec(connection_token, meta_from_spec(spec), &tx_args)
+        .action;
+    assert_eq!(
+        tx_action,
+        DispatchAction::Postpone(PostponeReason::ForklessKey)
+    );
+    assert_eq!(
+        backend.ctx.persistence().forkless_key_delay_for_test(),
+        Some(100_000)
+    );
+
+    // A direct write to a database the scan has not reached yet cannot be
+    // prioritized immediately; registering it must not accelerate the save.
+    backend.connection_registry[Token(connection_token)]
+        .transaction
+        .end(TransactionEnd::Reset);
+    backend.connection_registry[Token(connection_token)].selected_db = 1;
+    let cross_db_args = make_args(&[b"SET", b"later-database-key", b"value"]);
+    let spec = backend.registry.lookup(&cross_db_args.name).unwrap();
+    let cross_db_action = backend
+        .pre_dispatch_exec(connection_token, meta_from_spec(spec), &cross_db_args)
+        .action;
+    assert_eq!(
+        cross_db_action,
+        DispatchAction::Postpone(PostponeReason::ForklessKey)
+    );
+    assert_eq!(
+        backend.ctx.persistence().forkless_key_delay_for_test(),
+        Some(100_000)
+    );
+
+    // Pumping the feed keeps the save in flight and still does not touch the
+    // configured pace; completion is only reached through the normal poll path.
+    for _ in 0..3 {
+        backend.ctx.drive_forkless_feed();
+    }
+    assert!(backend.ctx.persistence().forkless_save_in_progress());
+    assert_eq!(
+        backend.ctx.persistence().forkless_key_delay_for_test(),
+        Some(100_000)
+    );
+
+    stop_test_forkless_capture(&mut backend, dir);
+}
+
+#[test]
 fn forkless_capture_allows_top_level_swapdb() {
     let mut backend = ServerWorkerState::new(2).unwrap();
     crate::framework::commands::register_all(&mut backend.registry);
