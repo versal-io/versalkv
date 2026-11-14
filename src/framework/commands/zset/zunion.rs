@@ -3,7 +3,6 @@ use crate::engine::core::{CommandOutcome, Value};
 use crate::framework::commands::command_runtime::CommandRuntime;
 use crate::framework::commands::zset::basic;
 use crate::framework::commands::zset::zunionstore;
-use bytes::Bytes;
 use command_macros::command;
 
 #[command("ZUNION", runtime, get_keys = crate::framework::commands::key_extractors::numkeys_ro_get_keys)]
@@ -11,7 +10,7 @@ pub fn zunion(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> CommandOu
     if args.args.len() < 2 {
         return CommandOutcome::reply(CommandError::syntax_error());
     }
-    let _numkeys = match std::str::from_utf8(&args.args[0])
+    let numkeys = match std::str::from_utf8(&args.args[0])
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
     {
@@ -22,17 +21,31 @@ pub fn zunion(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> CommandOu
             ))
         }
     };
+    if numkeys > args.args.len().saturating_sub(1) {
+        return CommandOutcome::reply(CommandError::syntax_error());
+    }
     let mut has_scores = false;
-    let mut store_args: Vec<Bytes> = Vec::new();
-    let mut i = 0;
-    while i < args.args.len() {
-        if args.args[i].eq_ignore_ascii_case(b"withscores") {
+    let mut store_args = args.args[..=numkeys].to_vec();
+    let mut index = numkeys + 1;
+    while index < args.args.len() {
+        let option = &args.args[index];
+        if option.eq_ignore_ascii_case(b"withscores") {
             has_scores = true;
-            i += 1;
-        } else {
-            store_args.push(args.args[i].clone());
-            i += 1;
+            index += 1;
+            continue;
         }
+        // Preserve option operands even if they happen to spell WITHSCORES;
+        // the store parser must validate weights and aggregate names itself.
+        let operand_count = if option.eq_ignore_ascii_case(b"weights") {
+            numkeys
+        } else if option.eq_ignore_ascii_case(b"aggregate") {
+            1
+        } else {
+            0
+        };
+        let end = index + 1 + operand_count.min(args.args.len() - index - 1);
+        store_args.extend_from_slice(&args.args[index..end]);
+        index = end;
     }
     let (key_weights, aggregate) = match basic::parse_set_operation_args(&store_args, 0, "zunion") {
         Ok(parsed) => parsed,
@@ -150,6 +163,67 @@ mod tests {
             assert_eq!(
                 execute(&mut runtime, &["ZSCORE", key, "member"]).reply,
                 Value::bulk("3")
+            );
+        }
+    }
+
+    #[test]
+    fn withscores_is_only_an_option_after_the_declared_keys() {
+        for command in ["ZUNION", "ZINTER"] {
+            let mut runtime = TestCommandRuntime::new(1, 0);
+            for key in ["withscores", "WITHSCORES"] {
+                assert_eq!(
+                    execute(&mut runtime, &["ZADD", key, "2", "member"]).reply,
+                    Value::integer(1)
+                );
+            }
+            assert_eq!(
+                execute(&mut runtime, &[command, "1", "withscores"]).reply,
+                Value::Array(vec![Value::bulk("member")])
+            );
+            assert_eq!(
+                execute(
+                    &mut runtime,
+                    &[command, "2", "withscores", "WITHSCORES", "WITHSCORES"]
+                ).reply,
+                Value::Array(vec![Value::bulk("member"), Value::bulk("4")])
+            );
+            assert_eq!(
+                execute(
+                    &mut runtime,
+                    &[command, "1", "withscores", "WEIGHTS", "3", "WITHSCORES"]
+                ).reply,
+                Value::Array(vec![Value::bulk("member"), Value::bulk("6")])
+            );
+            assert!(
+                matches!(
+                    execute(
+                        &mut runtime,
+                        &[command, "1", "withscores", "WEIGHTS", "withscores", "3"]
+                    ).reply,
+                    Value::Error(_)
+                ),
+                "an invalid weight must not become a WITHSCORES option"
+            );
+            assert!(
+                matches!(
+                    execute(
+                        &mut runtime,
+                        &[command, "1", "withscores", "AGGREGATE", "withscores", "SUM"]
+                    ).reply,
+                    Value::Error(_)
+                ),
+                "an invalid aggregate must not become a WITHSCORES option"
+            );
+            assert!(
+                matches!(
+                    execute(
+                        &mut runtime,
+                        &[command, "18446744073709551615", "withscores"]
+                    ).reply,
+                    Value::Error(_)
+                ),
+                "an oversized key count must not overflow"
             );
         }
     }
