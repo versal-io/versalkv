@@ -303,4 +303,48 @@ mod tests {
             crate::runtime::server::worker::event_loop::TimerEvent::EvictionContinuation
         ));
     }
+
+    #[test]
+    fn timer_eviction_defers_when_command_eviction_ran_in_the_same_turn() {
+        let mut runtime = crate::runtime::server::worker::ServerWorkerState::new(1).unwrap();
+        runtime.ctx.config_mut().server.maxmemory_policy = "allkeys-random".to_string();
+        runtime.ctx.config_mut().server.maxmemory_eviction_tenacity = 100;
+        for index in 0..128 {
+            runtime.ctx.db_mut(0).unwrap().set(
+                format!("key-{index}").into_bytes(),
+                Robj::string_raw(Bytes::from(vec![b'x'; 4_096])),
+            );
+        }
+        let initial = runtime.ctx.db(0).unwrap().dbsize();
+        let before = runtime.ctx.maxmemory_state().logical;
+        // Leave enough headroom that several eviction cycles are required.
+        runtime.ctx.config_mut().server.maxmemory = (before / 2) as u64;
+
+        // Simulate the command path evicting keys during the Ready phase.
+        let first = runtime.perform_evictions();
+        assert!(!first.evicted.is_empty());
+        runtime.command_eviction_ran_this_turn = true;
+        let after_command_cycle = runtime.ctx.db(0).unwrap().dbsize();
+        assert!(after_command_cycle < initial);
+
+        // The timer continuation in the same turn must not evict again before
+        // the before-poll phase flushes tracking invalidation output.
+        runtime.run_eviction();
+        assert_eq!(
+            runtime.ctx.db(0).unwrap().dbsize(),
+            after_command_cycle,
+            "timer eviction must be deferred to the next turn"
+        );
+        assert!(runtime.time_events.has_due_kind(
+            crate::runtime::server::worker::event_loop::TimerEvent::EvictionContinuation
+        ));
+
+        // A new turn resets the marker. The continuation is no longer blocked
+        // by the same-turn guard; it runs to completion (or no-ops if the
+        // first cycle already reached the target) without extra deferral.
+        runtime.command_eviction_ran_this_turn = false;
+        let before_resume = runtime.ctx.db(0).unwrap().dbsize();
+        runtime.run_eviction();
+        assert!(runtime.ctx.db(0).unwrap().dbsize() <= before_resume);
+    }
 }

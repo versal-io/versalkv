@@ -64,6 +64,9 @@ impl ServerWorkerState {
             self.ctx.set_suppress_eviction_until_write(false);
         }
         let eviction = self.perform_evictions();
+        if !eviction.evicted.is_empty() {
+            self.command_eviction_ran_this_turn = true;
+        }
         self.apply_command_evictions(invocation.target.token_value(), eviction.evicted, effects);
         self.ctx.refresh_dict_resize_budget();
         Ok((connection_token, client_eviction_was_enabled))
