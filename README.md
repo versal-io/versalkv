@@ -95,64 +95,6 @@ VersalKV uses three complementary test lines:
    make fuzz-smoke          # short fuzz runs on parser & RDB loader
    ```
 
-## Continuous performance benchmarks
-
-The CodSpeed workflow runs the upstream C `valkey-benchmark` against a release
-VersalKV server over loopback TCP. The load generator is built from a clean
-archive of the pinned Valkey submodule, independently of the Tcl compatibility
-binaries. Local Criterion microbenchmarks remain available with `make bench`.
-
-[`codspeed.yml`](codspeed.yml) invokes the utility's 14 workloads: PING_MBULK, SET, GET, INCR,
-HSET, SADD, and ZADD, each with pipeline depths 1 and 16. Each round sends
-500,000 requests using 50 clients and two load-generator threads, with 10,000
-random keys and seed 42. SET, GET, and HSET use 1 KiB values. A single server
-I/O thread is used; persistence is disabled. GET is fully preloaded and
-collection members are bounded so repeated rounds do not grow the dataset.
-Each workload warms up for at least one second, then records three rounds.
-
-The self-reporting entrypoint uploads **wall-clock cost per completed request**
-to CodSpeed: each round's monotonic elapsed time divided by the exact completed
-request count validated from the native report. Each round has 500,000
-iterations. Min, max, mean, standard deviation, and quartiles describe the
-three round means; warmup requests are counted separately and excluded from
-these statistics. `total_time` remains the sum of measured round times in
-seconds. Benchmark names end with `/per-request` to separate these units from
-historical whole-workload timings.
-
-This cost includes load-generator startup, connection setup, and reporting;
-server startup and dataset preparation are outside measurement. Under
-concurrency, throughput-normalized request cost differs from client-observed
-latency. Native QPS and client latency avg/min/max/p50/p95/p99 are retained for
-every warmup and measured round in `metrics.json` and `metrics.csv`; they are
-not substituted for CodSpeed's round statistics. Raw native reports and the
-uploaded statistics are preserved in the workflow diagnostics artifact and
-the per-request statistics appear in the Action summary.
-The workflow uses `walltime`, GitHub OIDC authentication, and requires a
-nonempty uploaded run ID. Hosted VM timings can be noisy; switching to CodSpeed
-Macro Runners requires provisioning them for the repository.
-The workflow runs on pull requests and manual dispatch, not on pushes to main.
-After merging new workloads, dispatch the workflow on main once to establish
-their default-branch comparison baseline.
-
-To reproduce locally with the [CodSpeed CLI](https://codspeed.io/docs/cli):
-
-```sh
-python3 scripts/versal-util.py ci codspeed build
-(
-  python3 scripts/versal-util.py ci codspeed start || exit
-  trap 'python3 scripts/versal-util.py ci codspeed stop' EXIT
-  CODSPEED_PERF_ENABLED=false CODSPEED_PROFILER_ENABLED=false \
-    codspeed run --mode walltime --config codspeed.yml --skip-upload
-)
-```
-
-The server binds `127.0.0.1:16379`; an occupied port fails preparation. Logs
-and the upstream commit are retained under `target/codspeed/`. Cleanup only
-stops the recorded benchmark server. Omit `--skip-upload` after authenticating
-to upload a local run. For timing-only validation in containers without
-systemd or writable kernel settings, also set `CODSPEED_ISOLATION=false` and
-add `--skip-setup`; normal CI keeps CodSpeed's system initialization enabled.
-
 ## Architecture
 
 The codebase is organized in five strictly bottom-up layers. Higher layers may
