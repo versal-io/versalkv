@@ -429,6 +429,42 @@ impl ServerWorkerState {
         )
     }
 
+    pub(crate) fn forkless_command_needs_full_capture(
+        &self,
+        meta: &CmdPreconditions,
+        args: &CommandArgs,
+        key_targets: &[(u32, Vec<u8>)],
+    ) -> bool {
+        key_targets.is_empty()
+            || (meta.flags & crate::engine::command::CMD_TOUCHES_ARBITRARY_KEYS) != 0
+            || [
+                b"eval".as_slice(),
+                b"evalsha".as_slice(),
+                b"fcall".as_slice(),
+            ]
+            .iter()
+            .any(|name| args.name.eq_ignore_ascii_case(name))
+            || key_targets.iter().any(|(db_id, key)| {
+                !self
+                    .ctx
+                    .blocking_registry()
+                    .waiters_for_key(*db_id, key)
+                    .is_empty()
+            })
+    }
+
+    pub(crate) fn forkless_selected_db(&self, args: &CommandArgs, selected_db: u32) -> u32 {
+        if !args.name.eq_ignore_ascii_case(b"select") {
+            return selected_db;
+        }
+        args.args
+            .first()
+            .and_then(|arg| std::str::from_utf8(arg).ok())
+            .and_then(|arg| arg.parse::<u32>().ok())
+            .filter(|db_id| (*db_id as usize) < self.ctx.num_dbs())
+            .unwrap_or(selected_db)
+    }
+
     pub(super) fn stage_client_pause(
         &self,
         facts: &CommandClientFacts,
@@ -488,7 +524,9 @@ impl ServerWorkerState {
                 reject_reply: None,
             });
         }
-        if !call_flags.is_write {
+        // MULTI only stores arguments. EXEC applies the snapshot barrier to
+        // the actual write targets before running any queued handler.
+        if !call_flags.is_write || facts.transaction {
             return None;
         }
         let is_slot_import = matches!(
@@ -519,16 +557,13 @@ impl ServerWorkerState {
             || args.name.eq_ignore_ascii_case(b"flushall")
             || args.name.eq_ignore_ascii_case(b"shutdown");
         if let Some(outcome) = self.evaluate_forkless_capture_barrier(
-            facts,
+            meta,
             args,
             call_flags,
             is_capture_control,
             &key_targets,
         ) {
             return Some(outcome);
-        }
-        if facts.transaction {
-            return None;
         }
         key_targets
             .into_iter()
@@ -541,7 +576,7 @@ impl ServerWorkerState {
     }
 
     /// Gate writes while a forkless snapshot capture is in flight. Indirect
-    /// writes (transaction, scripts, key waiters) and keyless commands must
+    /// writes (scripts, key waiters) and keyless commands must
     /// wait for the whole capture; direct key writes only wait when at least
     /// one target key cannot be prioritized for capture immediately.
     ///
@@ -552,7 +587,7 @@ impl ServerWorkerState {
     /// rely on.
     fn evaluate_forkless_capture_barrier(
         &mut self,
-        facts: &CommandClientFacts,
+        meta: &CmdPreconditions,
         args: &CommandArgs,
         call_flags: CmdCallFlags,
         is_capture_control: bool,
@@ -561,25 +596,10 @@ impl ServerWorkerState {
         if is_capture_control || !self.ctx.persistence().forkless_capture_in_progress() {
             return None;
         }
-        if !facts.transaction && args.name.eq_ignore_ascii_case(b"swapdb") {
+        if args.name.eq_ignore_ascii_case(b"swapdb") {
             return None;
         }
-        let has_indirect_writes = facts.transaction
-            || [
-                b"eval".as_slice(),
-                b"evalsha".as_slice(),
-                b"fcall".as_slice(),
-            ]
-            .iter()
-            .any(|name| args.name.eq_ignore_ascii_case(name))
-            || key_targets.iter().any(|(db_id, key)| {
-                !self
-                    .ctx
-                    .blocking_registry()
-                    .waiters_for_key(*db_id, key)
-                    .is_empty()
-            });
-        if has_indirect_writes || key_targets.is_empty() {
+        if self.forkless_command_needs_full_capture(meta, args, key_targets) {
             // The configured per-key save delay remains the authoritative pace
             // for the whole save. A blocked writer must never reset it to zero,
             // otherwise the tight per-turn capture pump drains the entire

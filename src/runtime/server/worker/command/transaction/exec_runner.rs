@@ -1,6 +1,6 @@
 //! EXEC admission, execution, and completion as an explicit linear pipeline.
 
-use super::{ExecPrechecks, ServerWorkerState};
+use super::{ExecForklessBarrier, ExecPrechecks, ServerWorkerState};
 use crate::engine::command::context::CommandConn;
 use crate::engine::distributed::cluster::ClusterRouteDecision;
 use crate::foundation::io::protocol::serializer::{serialize_to_vec_resp2, serialize_to_vec_resp3};
@@ -20,7 +20,7 @@ use std::time::Instant;
 enum ExecDecision {
     Execute,
     Postpone,
-    ForklessPostpone,
+    ForklessPostpone(ExecForklessBarrier),
     Throttled,
     WithoutTransaction,
     RouteRejected(Value),
@@ -39,7 +39,7 @@ struct ExecDecisionInputs {
     standalone: StandaloneExecDecision,
     prechecks: ExecPrechecks,
     should_pause: bool,
-    should_pause_for_forkless: bool,
+    forkless_barrier: ExecForklessBarrier,
 }
 
 struct ExecExecution {
@@ -169,7 +169,7 @@ impl ServerWorkerState {
         }
         let prechecks = self.exec_compute_prechecks(token.0);
         let should_pause = self.exec_should_pause(token.0);
-        let should_pause_for_forkless = self.exec_should_pause_for_forkless(token);
+        let forkless_barrier = self.decide_exec_forkless_barrier(token);
         let decision = self.decide_exec(
             token,
             ExecDecisionInputs {
@@ -177,7 +177,7 @@ impl ServerWorkerState {
                 standalone,
                 prechecks,
                 should_pause,
-                should_pause_for_forkless,
+                forkless_barrier,
             },
         );
         if matches!(decision, ExecDecision::Execute)
@@ -220,10 +220,10 @@ impl ServerWorkerState {
         if inputs.should_pause {
             return ExecDecision::Postpone;
         }
-        if inputs.should_pause_for_forkless {
-            return ExecDecision::ForklessPostpone;
+        match inputs.forkless_barrier {
+            ExecForklessBarrier::Ready => ExecDecision::Execute,
+            barrier => ExecDecision::ForklessPostpone(barrier),
         }
-        ExecDecision::Execute
     }
 
     fn exec_precheck_abort_reply(&self, prechecks: ExecPrechecks) -> Option<Value> {
@@ -304,7 +304,13 @@ impl ServerWorkerState {
                 );
                 ExecExecution::blocked()
             }
-            ExecDecision::ForklessPostpone => {
+            ExecDecision::ForklessPostpone(barrier) => {
+                if let ExecForklessBarrier::WaitForKeys(keys) = barrier {
+                    for (db_id, key) in keys {
+                        self.ctx
+                            .prioritize_forkless_keys(db_id, std::iter::once(key));
+                    }
+                }
                 let token = context.target.token();
                 self.block_exec(
                     token,
