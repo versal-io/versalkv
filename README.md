@@ -1,5 +1,7 @@
 # VersalKV
 
+[![CodSpeed](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json)](https://app.codspeed.io/versal-io/versalkv?utm_source=badge)
+
 A pure-Rust reimplementation of the [Valkey](https://valkey.io) server, wire
 compatible with the RESP protocol. VersalKV targets the same on-disk formats
 (RDB/AOF) and runtime semantics as Valkey while providing a memory-safe,
