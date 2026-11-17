@@ -1,8 +1,8 @@
 use crate::engine::command::SessionId;
+use crate::foundation::memory::util_hash::FxHashMap;
 use crate::framework::capabilities::connection::Connection;
 use crate::framework::capabilities::io::Token;
 use slab::Slab;
-use std::collections::HashMap;
 use std::ops::{Index, IndexMut};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -17,8 +17,8 @@ pub(crate) enum ConnectionRegistryError {
 #[derive(Default)]
 pub(crate) struct ConnectionRegistry {
     connections: Slab<Connection>,
-    token_to_slab: HashMap<Token, usize>,
-    client_id_to_token: HashMap<u64, Token>,
+    token_to_slab: FxHashMap<Token, usize>,
+    client_id_to_token: FxHashMap<u64, Token>,
 }
 
 impl ConnectionRegistry {
@@ -50,16 +50,20 @@ impl ConnectionRegistry {
 
     pub(crate) fn get(&self, token: Token) -> Option<&Connection> {
         let slab_key = *self.token_to_slab.get(&token)?;
-        self.connections
-            .get(slab_key)
-            .filter(|connection| connection.token() == token)
+        // Invariant: `token_to_slab` only maps live tokens to the slab slot
+        // that owns them (register inserts the connection before the mapping;
+        // remove erases the mapping before freeing the slot). The token
+        // equality is verified in debug builds only.
+        let connection = self.connections.get(slab_key)?;
+        debug_assert_eq!(connection.token(), token);
+        Some(connection)
     }
 
     pub(crate) fn get_mut(&mut self, token: Token) -> Option<&mut Connection> {
         let slab_key = *self.token_to_slab.get(&token)?;
-        self.connections
-            .get_mut(slab_key)
-            .filter(|connection| connection.token() == token)
+        let connection = self.connections.get_mut(slab_key)?;
+        debug_assert_eq!(connection.token(), token);
+        Some(connection)
     }
 
     pub(crate) fn contains(&self, token: Token) -> bool {

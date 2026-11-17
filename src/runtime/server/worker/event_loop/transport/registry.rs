@@ -1,19 +1,19 @@
 use crate::engine::command::context::Token;
 use crate::foundation::io::transport::TransportId;
-use std::collections::HashMap;
+use crate::foundation::memory::util_hash::FxHashMap;
 
 pub(crate) struct TransportRegistry {
     next_token: usize,
-    transport_to_token: HashMap<TransportId, Token>,
-    token_to_transport: HashMap<Token, TransportId>,
+    transport_to_token: FxHashMap<TransportId, Token>,
+    token_to_transport: FxHashMap<Token, TransportId>,
 }
 
 impl TransportRegistry {
     pub(crate) fn new() -> Self {
         Self {
             next_token: 0,
-            transport_to_token: HashMap::new(),
-            token_to_transport: HashMap::new(),
+            transport_to_token: FxHashMap::default(),
+            token_to_transport: FxHashMap::default(),
         }
     }
 

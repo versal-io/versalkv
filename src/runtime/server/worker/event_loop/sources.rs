@@ -1,5 +1,6 @@
 use super::EventDependencies;
 use crate::engine::distributed::cluster::migration::MigrationJobId;
+use crate::foundation::memory::util_hash::FxHashMap;
 use crate::framework::capabilities::io::Token;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
@@ -265,6 +266,10 @@ impl ChildRegistry {
         }
     }
 
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty() && self.completions.is_empty()
+    }
+
     pub(crate) fn collect_exited_children(&mut self) {
         let pending: Vec<(ChildHandle, i32)> = self
             .entries
@@ -429,7 +434,8 @@ impl std::error::Error for RuntimeSourceRegistryError {}
 
 #[derive(Default)]
 pub(crate) struct RuntimeSourceRegistry {
-    routes: HashMap<Token, SourceRoute>,
+    routes: FxHashMap<Token, SourceRoute>,
+    cluster_bus_count: usize,
 }
 
 impl RuntimeSourceRegistry {
@@ -440,6 +446,9 @@ impl RuntimeSourceRegistry {
     ) -> Result<RuntimeSourceHandle, RuntimeSourceRegistryError> {
         if self.routes.contains_key(&token) {
             return Err(RuntimeSourceRegistryError::Duplicate(token));
+        }
+        if matches!(owner, SourceOwner::ClusterBus) {
+            self.cluster_bus_count = self.cluster_bus_count.saturating_add(1);
         }
         let blocked_policy = owner.blocked_policy();
         self.routes.insert(
@@ -464,6 +473,13 @@ impl RuntimeSourceRegistry {
         self.routes.get(&token)
     }
 
+    /// Fast path for dispatch priority checks: when no cluster-bus source is
+    /// registered, ordinary connections cannot be priority via the cluster-bus
+    /// route, so callers can skip the `resolve_token` HashMap lookup.
+    pub(crate) fn has_cluster_bus(&self) -> bool {
+        self.cluster_bus_count > 0
+    }
+
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.routes.len()
@@ -473,8 +489,13 @@ impl RuntimeSourceRegistry {
         &mut self,
         handle: RuntimeSourceHandle,
     ) -> Result<SourceRoute, RuntimeSourceRegistryError> {
-        self.routes
+        let route = self
+            .routes
             .remove(&handle.token)
-            .ok_or(RuntimeSourceRegistryError::Stale(handle.token))
+            .ok_or(RuntimeSourceRegistryError::Stale(handle.token))?;
+        if matches!(route.owner, SourceOwner::ClusterBus) {
+            self.cluster_bus_count = self.cluster_bus_count.saturating_sub(1);
+        }
+        Ok(route)
     }
 }

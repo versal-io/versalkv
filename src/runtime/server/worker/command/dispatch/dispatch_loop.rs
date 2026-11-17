@@ -1,6 +1,7 @@
 use super::super::super::ServerWorkerState;
 use super::side_effects::{CommandEffects, ReadBatchEffects};
 use super::types::{CmdPreconditions, LoopAction};
+use crate::engine::command::CommandName;
 use crate::engine::command::{CommandArgs, CommandError, DispatchGroup};
 use crate::engine::distributed::cluster::migration::SlotMigrationConnectionRole;
 use crate::foundation::io::protocol::serializer::{serialize_to_vec_resp2, serialize_to_vec_resp3};
@@ -9,12 +10,20 @@ use crate::framework::capabilities::connection::{CommandEffectDrain, ConnectionS
 use crate::framework::capabilities::io::Token;
 use crate::runtime::server::worker::command::invocation::{CommandInvocation, CommandTarget};
 use crate::runtime::server::worker::command::outcome::{CommandDisposition, SpecialCommandResult};
+use bytes::Bytes;
 
 struct ParsedCommandInput {
     token: Token,
     args: CommandArgs,
-    name: String,
+    name: Bytes,
     resp3: bool,
+}
+
+impl ParsedCommandInput {
+    /// Returns the command name as a UTF-8 string slice (original case).
+    fn name_str(&self) -> &str {
+        std::str::from_utf8(&self.name).unwrap_or("")
+    }
 }
 
 enum SpecialCommandRoute {
@@ -32,6 +41,16 @@ pub(crate) struct SpecialCommandCompletion {
     pub(crate) disposition: CommandDisposition,
     pub(crate) reply_start: usize,
     pub(crate) reply_end: usize,
+}
+
+/// Saved priority-context state for restore after a command completes.
+/// Only populated when at least one priority client is connected; otherwise
+/// the per-command priority bookkeeping is skipped on the hot path.
+struct PriorityState {
+    previous_token: Option<Token>,
+    previous_nested: bool,
+    previous_priority: bool,
+    owns_priority_cycle: bool,
 }
 
 impl ServerWorkerState {
@@ -57,10 +76,11 @@ impl ServerWorkerState {
         &mut self,
         token: Token,
         args: CommandArgs,
-        name_lower: String,
+        name: impl Into<Bytes>,
         resp3: bool,
         batch: &mut ReadBatchEffects,
     ) -> LoopAction {
+        let name = name.into();
         if matches!(
             self.connection_registry[token].slot_migration_role,
             Some(SlotMigrationConnectionRole::Import(_))
@@ -71,21 +91,38 @@ impl ServerWorkerState {
             self.queue_command_propagation(batch);
         }
         self.refresh_connection_priorities();
-        let is_priority = self.is_priority_connection(token);
-        let previous_token = self.priority_command_token.replace(token);
-        let previous_nested = std::mem::replace(
-            &mut self.priority_command_is_nested,
-            self.command_execution_depth != 0,
-        );
-        let previous_priority = self
-            .ctx
-            .stats_mut()
-            .set_priority_command(is_priority && !self.priority_command_is_nested);
-        let owns_priority_cycle = is_priority && self.begin_priority_cycle();
+        // With no priority clients connected, no token can resolve to a
+        // priority connection, so the per-command priority save/restore
+        // (Cell swaps, stats write, priority-cycle bookkeeping) is dead
+        // work. Skip it entirely on the common standalone PING hot path.
+        // `refresh_connection_priorities` still runs to detect subnet
+        // generation changes; its own fast path returns before touching
+        // `priority_command_token` when the count is zero.
+        let priority_state = if self.ctx.stats().connected_priority_clients != 0 {
+            let is_priority = self.is_priority_connection(token);
+            let previous_token = self.priority_command_token.replace(token);
+            let previous_nested = std::mem::replace(
+                &mut self.priority_command_is_nested,
+                self.command_execution_depth != 0,
+            );
+            let previous_priority = self
+                .ctx
+                .stats_mut()
+                .set_priority_command(is_priority && !self.priority_command_is_nested);
+            let owns_priority_cycle = is_priority && self.begin_priority_cycle();
+            Some(PriorityState {
+                previous_token,
+                previous_nested,
+                previous_priority,
+                owns_priority_cycle,
+            })
+        } else {
+            None
+        };
         let input = ParsedCommandInput {
             token,
             args,
-            name: name_lower,
+            name,
             resp3,
         };
         let mut effects = CommandEffects::default();
@@ -94,10 +131,14 @@ impl ServerWorkerState {
         self.refresh_connection_priorities();
         self.account_command_reply_effects(token, &mut effects);
         batch.commit(effects);
-        self.finish_priority_cycle(owns_priority_cycle);
-        self.priority_command_token = previous_token;
-        self.priority_command_is_nested = previous_nested;
-        self.ctx.stats_mut().set_priority_command(previous_priority);
+        if let Some(state) = priority_state {
+            self.finish_priority_cycle(state.owns_priority_cycle);
+            self.priority_command_token = state.previous_token;
+            self.priority_command_is_nested = state.previous_nested;
+            self.ctx
+                .stats_mut()
+                .set_priority_command(state.previous_priority);
+        }
         action
     }
 
@@ -107,35 +148,31 @@ impl ServerWorkerState {
         pending_replies: &[Vec<u8>],
         fx: &mut CommandEffects,
     ) -> LoopAction {
-        let diagnostic = {
-            let conn = &mut self.connection_registry[input.token];
-            crate::foundation::io::sys::log::CommandDiagnostic {
-                client_id: conn.client_id(),
-                command_seq: conn.record_received_command(),
-                peer: conn.peer_addr.to_string(),
-                db: conn.selected_db,
-                command: input.name.clone(),
-                argument_count: input.args.args.len(),
-                request_bytes: conn.parser.last_cmd_len(),
-            }
-        };
-        let _diagnostic_guard = crate::foundation::io::sys::log::enter_active_command(diagnostic);
-        if let Some(action) = self.try_apply_slot_import(&input, fx) {
-            return action;
-        }
-        if let Some(action) = self.reject_unauthenticated_command(&input, fx) {
-            return action;
-        }
-        self.apply_client_test_tcp_buffer_policy(input.token, &input.name, &input.args);
-        self.ctx.begin_cmd();
-        let (dispatch_group, command_flags) = {
+        // Resolve spec-derived routing values once. All are owned or Copy, so
+        // the immutable borrow of self.registry ends before any mutable
+        // access below. canonical_name feeds both the panic diagnostic
+        // (matching C's c->cmd->name) and stats accounting; cloning it is a
+        // &'static str copy or an Arc refcount bump, never a heap alloc.
+        //
+        // The resolved executor and preconditions are also extracted here so
+        // that `execute_invocation` does not need to look up the registry a
+        // second time for known commands, eliminating one HashMap lookup on
+        // the hot path (e.g. every PING). Unknown commands leave both as
+        // `None` and fall back to the lookup in `execute_invocation`.
+        let (
+            canonical_name,
+            dispatch_group,
+            command_flags,
+            resolved_executor,
+            resolved_preconditions,
+        ) = {
             let spec = self.registry.lookup(&input.args.name);
-            self.connection_registry[input.token]
-                .begin_admitted_command(spec.map(|s| s.name.as_str()).unwrap_or(&input.name));
-            (
-                spec.map(|s| s.dispatch_group)
-                    .unwrap_or(DispatchGroup::Default),
-                spec.map(|s| {
+            let canonical_name = spec.map(|s| s.name.clone());
+            let dispatch_group = spec
+                .map(|s| s.dispatch_group)
+                .unwrap_or(DispatchGroup::Default);
+            let command_flags = spec
+                .map(|s| {
                     super::subcmd_flags::effective_command_flags_for_call(
                         s.name.as_str(),
                         s.flags,
@@ -143,10 +180,73 @@ impl ServerWorkerState {
                         &self.ctx,
                     )
                 })
-                .unwrap_or(0),
+                .unwrap_or(0);
+            let (resolved_executor, resolved_preconditions) = match spec {
+                Some(spec) => {
+                    let acl_categories = super::subcmd_flags::effective_acl_categories(
+                        spec.name.as_str(),
+                        spec.acl_categories,
+                        input.args.args.first().map(|arg| arg.as_ref()),
+                    );
+                    let preconditions = super::CmdPreconditions {
+                        name: spec.name.clone(),
+                        arity: spec.arity,
+                        flags: command_flags,
+                        first_key: spec.first_key,
+                        last_key: spec.last_key,
+                        key_step: spec.key_step,
+                        key_flags: spec.key_flags,
+                        acl_categories,
+                        get_keys: spec.get_keys,
+                    };
+                    (Some(spec.executor), Some(preconditions))
+                }
+                None => (None, None),
+            };
+            (
+                canonical_name,
+                dispatch_group,
+                command_flags,
+                resolved_executor,
+                resolved_preconditions,
             )
         };
-        self.dispatch_admitted_command(input, pending_replies, fx, dispatch_group, command_flags)
+        let diagnostic_command = canonical_name
+            .as_ref()
+            .map(|n| n.as_str())
+            .unwrap_or_else(|| input.name_str());
+        let diagnostic = {
+            let conn = &mut self.connection_registry[input.token];
+            crate::foundation::io::sys::log::CommandDiagnostic {
+                client_id: conn.client_id(),
+                command_seq: conn.record_received_command(),
+                peer: conn.peer_addr,
+                db: conn.selected_db,
+                command: diagnostic_command,
+                argument_count: input.args.args.len(),
+                request_bytes: conn.parser.last_cmd_len(),
+            }
+        };
+        let _diagnostic_guard = crate::foundation::io::sys::log::enter_active_command(&diagnostic);
+        if let Some(action) = self.try_apply_slot_import(&input, fx) {
+            return action;
+        }
+        if let Some(action) = self.reject_unauthenticated_command(&input, fx) {
+            return action;
+        }
+        self.apply_client_test_tcp_buffer_policy(input.token, input.name_str(), &input.args);
+        self.ctx.begin_cmd();
+        self.connection_registry[input.token].begin_admitted_command(diagnostic_command);
+        self.dispatch_admitted_command(
+            input,
+            pending_replies,
+            fx,
+            dispatch_group,
+            command_flags,
+            canonical_name.clone(),
+            resolved_executor,
+            resolved_preconditions,
+        )
     }
 
     /// Slot-import admission guard. Returns an action when the command is
@@ -187,6 +287,9 @@ impl ServerWorkerState {
         fx: &mut CommandEffects,
         dispatch_group: DispatchGroup,
         command_flags: u64,
+        canonical_name: Option<CommandName>,
+        resolved_executor: Option<crate::framework::CommandExecutor>,
+        resolved_preconditions: Option<super::CmdPreconditions>,
     ) -> LoopAction {
         let token_value = input.token.0;
         let reply_start = fx.replies.len();
@@ -196,7 +299,7 @@ impl ServerWorkerState {
                     token_value,
                     token_value,
                     &input.args,
-                    &input.name,
+                    input.name_str(),
                     input.resp3,
                     &mut fx.0.replies,
                     &mut fx.0.unblock,
@@ -207,7 +310,7 @@ impl ServerWorkerState {
                     token_value,
                     token_value,
                     &input.args,
-                    &input.name,
+                    input.name_str(),
                     input.resp3,
                     &mut fx.0.replies,
                     &mut fx.0.unblock,
@@ -217,7 +320,7 @@ impl ServerWorkerState {
                 .try_handle_pubsub_cmd(
                     token_value,
                     &input.args,
-                    &input.name,
+                    input.name_str(),
                     input.resp3,
                     &mut fx.0.replies,
                     &mut fx.0.publish,
@@ -229,7 +332,7 @@ impl ServerWorkerState {
                     .set_exec_arguments(input.args.args.clone());
                 let disposition = self.handle_exec(
                     CommandTarget::new(input.token),
-                    std::str::from_utf8(&input.args.name).unwrap_or(&input.name),
+                    std::str::from_utf8(&input.args.name).unwrap_or(input.name_str()),
                     input.resp3,
                     fx,
                 );
@@ -244,7 +347,7 @@ impl ServerWorkerState {
                 self.handle_multi_queue(
                     input.token,
                     &input.args,
-                    &input.name,
+                    input.name_str(),
                     input.resp3,
                     &mut fx.replies,
                 );
@@ -253,9 +356,12 @@ impl ServerWorkerState {
             SpecialCommandRoute::RejectSubscribeMode => {
                 let reply = Value::error(format!(
                     "ERR Can't execute '{}': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context",
-                    input.name
+                    input.name_str()
                 ));
-                self.ctx.end_cmd(&input.name, true);
+                // Slow path: subscribe-mode rejection. Allocate the lowercased
+                // name for stats accounting; this is not on the hot path.
+                self.ctx
+                    .end_cmd(&input.name_str().to_ascii_lowercase(), true);
                 super::record_error_reply(&mut self.ctx, &reply, None);
                 fx.replies.push(serialize_to_vec_resp2(&reply));
                 Some(CommandDisposition::Completed)
@@ -268,7 +374,7 @@ impl ServerWorkerState {
         );
         let reply_end = self.attribute_special_command_replies(
             dispatch_group,
-            &input.name,
+            input.name_str(),
             reply_start,
             result,
             fx,
@@ -299,17 +405,28 @@ impl ServerWorkerState {
             }
         }
 
+        // Use the canonical lowercased name from the resolved spec for stats
+        // accounting. Fall back to the original-case name only for unknown
+        // commands (rare); record_cmd_completion normalizes to lowercase on
+        // its slow path.
+        let stats_name = canonical_name
+            .as_ref()
+            .map(|name| name.as_str())
+            .unwrap_or_else(|| input.name_str());
         let invocation = CommandInvocation::direct(
             CommandTarget::new(input.token),
             &input.args,
-            &input.name,
+            stats_name,
             command_flags,
             dispatch_group,
             pending_replies,
         );
-        let outcome = self.execute_command_and_handle_result(invocation);
-        let (disposition, effects) = outcome.into_parts();
-        fx.commit(effects);
+        let disposition = self.execute_command_and_handle_result(
+            invocation,
+            resolved_executor,
+            resolved_preconditions,
+            fx,
+        );
         if disposition.stops_read_loop() {
             LoopAction::Break
         } else {
@@ -326,15 +443,24 @@ impl ServerWorkerState {
         // Replicas negotiate on an unclassified accepted socket. Keep their
         // kernel defaults, and apply harness backpressure only once a command
         // identifies an ordinary client. Migration has its own explicit policy.
+        //
+        // Cheap command-name checks run before the `replication_runtime.role()`
+        // HashMap lookup so that common commands (PING, AUTH, HELLO, ...) skip
+        // the map entirely. The role lookup is only needed for commands that
+        // could legitimately trigger buffer-limit application.
         if self.connection_registry[token].is_test_tcp_buffer_policy_applied
+            || (name.eq_ignore_ascii_case("ping") && args.args.is_empty())
+            || name.eq_ignore_ascii_case("auth")
+            || name.eq_ignore_ascii_case("hello")
+            || name.eq_ignore_ascii_case("replconf")
+            || name.eq_ignore_ascii_case("psync")
+            || name.eq_ignore_ascii_case("sync")
             || self
                 .replication_runtime
                 .role(crate::framework::distributed::replication::ConnectionId(
                     token.0,
                 ))
                 .is_some()
-            || (name == "ping" && args.args.is_empty())
-            || matches!(name, "auth" | "hello" | "replconf" | "psync" | "sync")
         {
             return;
         }
@@ -359,7 +485,10 @@ impl ServerWorkerState {
         }
         let close = !conn.ever_authenticated && self.ctx.config().server.enforce_reply_list;
         self.ctx.begin_cmd();
-        self.ctx.end_cmd(&input.name, true);
+        // Slow path: authentication rejection. Allocate the lowercased name
+        // for stats accounting; this is not on the hot path.
+        self.ctx
+            .end_cmd(&input.name_str().to_ascii_lowercase(), true);
         let reply = CommandError::noauth();
         super::record_error_reply(&mut self.ctx, &reply, None);
         if close {
@@ -387,11 +516,11 @@ impl ServerWorkerState {
             if self.should_reject_subscribe_mode(input) {
                 return SpecialCommandRoute::RejectSubscribeMode;
             }
-            if input.name.eq_ignore_ascii_case("exec") {
+            if input.name_str().eq_ignore_ascii_case("exec") {
                 return SpecialCommandRoute::Exec;
             }
         }
-        if self.should_queue_in_transaction(input.token, &input.name) {
+        if self.should_queue_in_transaction(input.token, input.name_str()) {
             return SpecialCommandRoute::MultiQueue;
         }
         match group {
@@ -402,7 +531,9 @@ impl ServerWorkerState {
             | DispatchGroup::Transaction
             | DispatchGroup::Auth
             | DispatchGroup::Shutdown => {
-                if matches!(input.name.as_str(), "publish" | "spublish") {
+                if input.name_str().eq_ignore_ascii_case("publish")
+                    || input.name_str().eq_ignore_ascii_case("spublish")
+                {
                     SpecialCommandRoute::PubSub
                 } else {
                     SpecialCommandRoute::Ordinary
@@ -423,7 +554,9 @@ impl ServerWorkerState {
             return reply_start;
         }
         let reply_end = match group {
-            DispatchGroup::Transport if name == "replconf" => reply_start.saturating_add(1),
+            DispatchGroup::Transport if name.eq_ignore_ascii_case("replconf") => {
+                reply_start.saturating_add(1)
+            }
             DispatchGroup::Transport => {
                 if effects
                     .replies
@@ -512,7 +645,7 @@ impl ServerWorkerState {
         let is_subscribed = conn.sub_channel_count > 0
             || conn.psub_channel_count > 0
             || conn.ssub_channel_count > 0;
-        is_subscribed && !input.resp3 && !Self::is_subscribe_mode_allowed(&input.name)
+        is_subscribed && !input.resp3 && !Self::is_subscribe_mode_allowed(input.name_str())
     }
 
     pub(crate) fn process_dirty_keys_in_loop(

@@ -39,6 +39,23 @@ impl SlowLog {
         }
     }
 
+    /// Returns whether a sample with the given duration/byte count would be
+    /// recorded. Mirrors the early-return guards in [`Self::push`] so callers
+    /// can avoid cloning `argv` and formatting the client address for entries
+    /// that would be discarded anyway.
+    pub fn would_record(&self, duration_or_bytes: i64) -> bool {
+        if self.max_len == 0 {
+            return false;
+        }
+        if self.threshold_us < 0 {
+            return false;
+        }
+        if self.threshold_us > 0 && duration_or_bytes < self.threshold_us {
+            return false;
+        }
+        true
+    }
+
     pub fn push(
         &mut self,
         argv: Vec<Bytes>,

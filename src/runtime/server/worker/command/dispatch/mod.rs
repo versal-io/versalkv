@@ -33,6 +33,7 @@ use super::super::ServerWorkerState;
 use crate::engine::command::{CommandArgs, CMD_MAY_REPLICATE, CMD_WRITE};
 use crate::foundation::io::protocol::Value;
 use crate::framework::context::ServerContext;
+use std::borrow::Cow;
 
 pub(crate) use crate::engine::command::command_may_mutate_dataset;
 
@@ -273,10 +274,17 @@ pub(super) fn consumes_asking(command: &str) -> bool {
     !matches!(command, "asking" | "multi")
 }
 
-pub(crate) fn command_stats_name(name_lower: &str, args: &CommandArgs) -> String {
+pub(crate) fn command_stats_name<'a>(name_lower: &'a str, args: &CommandArgs) -> Cow<'a, str> {
     let Some(subcommand) = args.args.first() else {
-        return name_lower.to_string();
+        return Cow::Borrowed(name_lower);
     };
+    // Fast path: only subcommand-container commands (CLUSTER, CONFIG, ...)
+    // produce compound stats names like "config|get". For other commands
+    // (SET, GET, ...) the first argument is a key, never a subcommand, so
+    // skip the `format!` allocation and the SUBCOMMAND_NAMES linear scan.
+    if !crate::engine::command::is_subcommand_container(name_lower) {
+        return Cow::Borrowed(name_lower);
+    }
     let full_name = format!(
         "{}|{}",
         name_lower,
@@ -286,9 +294,9 @@ pub(crate) fn command_stats_name(name_lower: &str, args: &CommandArgs) -> String
         .iter()
         .any(|known| known.eq_ignore_ascii_case(&full_name))
     {
-        full_name
+        Cow::Owned(full_name)
     } else {
-        name_lower.to_string()
+        Cow::Borrowed(name_lower)
     }
 }
 

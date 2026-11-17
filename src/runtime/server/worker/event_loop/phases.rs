@@ -13,6 +13,12 @@ use super::{
 
 impl ServerWorkerState {
     pub(super) fn sync_module_timer_event(&mut self) {
+        // Fast path: no previously registered module timer event and no module
+        // timers pending, so there is nothing to synchronize. Skip the
+        // `MonotonicInstant::now()` syscall on the common no-modules path.
+        if self.module_timer_event.is_none() && !self.ctx.module_registry().has_timers() {
+            return;
+        }
         if let Some(id) = self.module_timer_event.take() {
             self.time_events.delete_time_event(id);
         }
@@ -160,6 +166,9 @@ impl ServerWorkerState {
     }
 
     pub(crate) fn collect_child_completion_events(&mut self) -> usize {
+        if self.child_registry.is_empty() {
+            return 0;
+        }
         self.child_registry.collect_exited_children();
         let completions = self.child_registry.drain_completions();
         let count = completions.len();
@@ -236,7 +245,7 @@ impl ServerWorkerState {
 
     pub(crate) fn start_event_loop_cycle(
         &mut self,
-        cycle_start: std::time::Instant,
+        cycle_start: MonotonicInstant,
         cycle_cmd_start: u64,
         cycle_processed_start: u64,
     ) {
@@ -252,7 +261,9 @@ impl ServerWorkerState {
         let Some(cycle) = self.event_loop_cycle_start.take() else {
             return;
         };
-        let cycle_duration_usec = cycle.started_at.elapsed().as_micros() as u64;
+        let cycle_duration_usec = MonotonicInstant::now()
+            .as_micros()
+            .saturating_sub(cycle.started_at.as_micros());
         let cycle_cmd_duration_usec = self
             .ctx
             .stats()

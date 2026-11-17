@@ -335,10 +335,11 @@ fn query_buffer_accounting_tracks_growth_and_shrink() {
     conn.resize_query_buffer_after_command();
     assert!(conn.query_buffer_total() >= 16 * 1024);
 
-    conn.last_interaction = std::time::Instant::now() - std::time::Duration::from_secs(3);
+    conn.last_interaction =
+        MonotonicInstant::now().saturating_sub(std::time::Duration::from_secs(3));
     assert_eq!(conn.query_buffer_total(), 0);
 
-    conn.last_interaction = std::time::Instant::now();
+    conn.last_interaction = MonotonicInstant::now();
     let big_value = vec![b'a'; 400_000];
     let mut cmd = b"*3\r\n$3\r\nSET\r\n$1\r\nx\r\n$400000\r\n".to_vec();
     cmd.extend_from_slice(&big_value);
@@ -446,7 +447,8 @@ fn idle_incomplete_bulk_shrinks_qbuf_without_dropping_memory_commitment() {
     conn.refresh_query_buffer_capacity();
     assert_eq!(conn.query_buffer_total(), PAYLOAD_LEN);
 
-    conn.last_interaction = std::time::Instant::now() - std::time::Duration::from_secs(3);
+    conn.last_interaction =
+        MonotonicInstant::now().saturating_sub(std::time::Duration::from_secs(3));
     conn.shrink_idle_query_buffer();
 
     assert!(conn.parser.has_inflight_request());
@@ -632,7 +634,7 @@ fn enter_blocking_records_state_but_transactions_return_null_array() {
 #[test]
 fn command_conn_trait_round_trips_session_fields() {
     let mut conn = Connection::new(Token(1), addr(), false);
-    let now = Instant::now();
+    let now = MonotonicInstant::now();
 
     conn.set_resp_version(3);
     conn.set_authenticated(false);

@@ -3,6 +3,7 @@ use super::filters::ClientFilters;
 use crate::engine::command::CommandArgs;
 use crate::foundation::io::protocol::serializer::{serialize_to_vec_resp2, serialize_to_vec_resp3};
 use crate::foundation::io::protocol::Value;
+use crate::foundation::memory::util_time::MonotonicInstant;
 use crate::framework::capabilities::connection::Connection;
 use helpers::flag_char_for_conn;
 
@@ -31,9 +32,12 @@ fn compute_rbs(queued: usize, idle_ms: u64) -> usize {
 /// the original inlined logic).
 fn format_client_list_line(
     conn: &Connection,
-    now: std::time::Instant,
+    now: MonotonicInstant,
     token_value: usize,
-    client_infos: &mut std::collections::HashMap<usize, crate::engine::state::db::ClientInfo>,
+    client_infos: &mut crate::foundation::memory::util_hash::FxHashMap<
+        usize,
+        crate::engine::state::db::ClientInfo,
+    >,
     is_replica: bool,
     is_master_link: bool,
     pubsub_name_memory: usize,
@@ -50,10 +54,8 @@ fn format_client_list_line(
     let flags = flag_char_for_conn(conn, is_replica, is_master_link);
     let cmd_str = if conn.token().0 == token_value {
         "client|list".to_string()
-    } else if let Some(ci) = client_infos.get(&conn.token().0) {
-        ci.last_cmd.clone()
     } else {
-        String::new()
+        conn.last_cmd.clone()
     };
     if let Some(ci) = client_infos.get_mut(&conn.token().0) {
         ci.name = name.clone();
@@ -139,9 +141,8 @@ impl ServerWorkerState {
         self.ctx.set_cmd_fullname("client|list");
         self.ctx.end_cmd(name_lower, is_error);
         if !is_error {
-            if let Some(ci) = self.ctx.client_info_mut(token_value) {
-                ci.last_cmd = "client|list".to_string();
-            }
+            self.connection_registry[crate::framework::capabilities::io::Token(token_value)]
+                .last_cmd = "client|list".to_string();
         }
         replies.push(if resp3 {
             serialize_to_vec_resp3(&value)
@@ -163,7 +164,7 @@ impl ServerWorkerState {
             Ok(f) => f,
             Err(err) => return (err, true),
         };
-        let now = std::time::Instant::now();
+        let now = MonotonicInstant::now();
         let mut out = String::new();
         for (_, conn) in self.connection_registry.iter() {
             if !self.conn_matches_filters(conn, &filters, token_value, false) {

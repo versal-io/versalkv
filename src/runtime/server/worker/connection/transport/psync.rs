@@ -192,9 +192,8 @@ impl ServerWorkerState {
                 .token()
                 .0,
         );
-        if let Some(info) = self.ctx.client_info_mut(connection_id.0) {
-            info.last_cmd = name.to_string();
-        }
+        self.connection_registry[crate::framework::capabilities::io::Token(connection_token)]
+            .last_cmd = name.to_string();
         if matches!(
             self.replication_runtime.role(connection_id),
             Some(ReplicationConnection::RdbChannel { .. })

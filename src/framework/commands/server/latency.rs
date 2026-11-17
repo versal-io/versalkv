@@ -80,12 +80,23 @@ pub fn latency_cmd(
         }
         "histogram" => {
             let mut result = Vec::new();
+            // Ordinary-command sample counts live on CmdStat.latency_samples to
+            // avoid a per-command String allocation. Subcommand-keyed events
+            // (e.g. "config|get") remain in latency_histos. Merge both views.
+            let stats = ctx.stats_mut();
             if args.args.len() == 1 {
-                let mut names: Vec<(&String, &u64)> =
-                    ctx.stats_mut().latency_histos.iter().collect();
-                names.sort_by(|a, b| a.0.cmp(b.0));
-                for (name, &calls) in names {
-                    result.push(Value::bulk(Bytes::from(name.clone().into_bytes())));
+                let mut entries: Vec<(String, u64)> = stats
+                    .cmd_stats
+                    .iter()
+                    .filter(|(_, s)| s.latency_samples > 0)
+                    .map(|(k, s)| (k.clone(), s.latency_samples))
+                    .collect();
+                for (k, &v) in &stats.latency_histos {
+                    entries.push((k.clone(), v));
+                }
+                entries.sort_by(|a, b| a.0.cmp(&b.0));
+                for (name, calls) in entries {
+                    result.push(Value::bulk(Bytes::from(name.into_bytes())));
                     result.push(build_histo_entry(calls));
                 }
             } else {
@@ -95,8 +106,15 @@ pub fn latency_cmd(
                         Ok(s) => s.to_ascii_lowercase(),
                         Err(_) => continue,
                     };
+                    if let Some(stat) = stats.cmd_stats.get(&name) {
+                        if stat.latency_samples > 0
+                            && !matched.iter().any(|(ek, _)| ek == &name)
+                        {
+                            matched.push((name.clone(), stat.latency_samples));
+                        }
+                    }
                     let prefix = format!("{}|", name);
-                    for (k, &v) in &ctx.stats_mut().latency_histos {
+                    for (k, &v) in &stats.latency_histos {
                         if (k == &name || k.starts_with(&prefix))
                             && !matched.iter().any(|(ek, _)| ek == k)
                         {

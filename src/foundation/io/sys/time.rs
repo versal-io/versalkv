@@ -1,49 +1,186 @@
 use std::cell::Cell;
 use std::io;
-use std::sync::OnceLock;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct MonotonicInstant(u64);
+pub use crate::foundation::memory::util_time::{install_monotonic_clock, MonotonicInstant};
 
-impl MonotonicInstant {
-    pub fn now() -> Self {
-        static EPOCH: OnceLock<Instant> = OnceLock::new();
-        let elapsed = EPOCH.get_or_init(Instant::now).elapsed().as_micros();
-        Self(elapsed.min(u64::MAX as u128) as u64)
+/// Select and initialise the fastest available hardware monotonic clock.
+///
+/// Returns `Some(fn)` when a TSC (x86_64 Linux) or CNTVCT (aarch64) counter
+/// is available and calibrated, or `None` when the portable fallback in
+/// `memory::util_time` should be used.
+fn init_monotonic_clock() -> Option<fn() -> u64> {
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    if let Some(f) = monotonic_x86_tsc::init() {
+        return Some(f);
+    }
+    #[cfg(target_arch = "aarch64")]
+    if let Some(f) = monotonic_aarch64_cntvct::init() {
+        return Some(f);
+    }
+    None
+}
+
+/// Install the hardware-accelerated monotonic clock into the shared
+/// `memory::util_time` function pointer. Call once at process startup,
+/// before any `MonotonicInstant::now`, so latency bookkeeping benefits from
+/// TSC/CNTVCT instead of the `Instant` fallback. A no-op when no hardware
+/// counter is available or a clock is already installed.
+pub fn init_hardware_clock() {
+    if let Some(f) = init_monotonic_clock() {
+        let _ = install_monotonic_clock(f);
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+mod monotonic_x86_tsc {
+    use super::*;
+
+    /// Fixed-point shift for `ticks_per_us` reciprocal.
+    const FPMULT_SHIFT: u32 = 24;
+    /// Calibration iterations; the minimum multiplier is kept for accuracy.
+    const CALIBRATION_ITERATIONS: usize = 3;
+    /// Sleep duration between TSC samples, in microseconds.
+    const CALIBRATION_SLEEP_US: u64 = 10_000;
+
+    /// `(1 << FPMULT_SHIFT) / ticks_per_us`, stored so that
+    /// `(rdtsc() * MULT) >> FPMULT_SHIFT` yields microseconds.
+    static TICKS_PER_US_MULT: AtomicU64 = AtomicU64::new(0);
+
+    #[inline]
+    fn rdtsc() -> u64 {
+        // SAFETY: `_rdtsc` reads the time-stamp counter, a baseline x86_64
+        // instruction with no side effects.
+        unsafe { core::arch::x86_64::_rdtsc() }
     }
 
-    pub const fn from_millis(value: u64) -> Self {
-        Self(value.saturating_mul(1_000))
+    pub fn monotonic_us() -> u64 {
+        let mult = TICKS_PER_US_MULT.load(Ordering::Relaxed);
+        ((rdtsc() as u128 * mult as u128) >> FPMULT_SHIFT) as u64
     }
 
-    pub const fn from_micros(value: u64) -> Self {
-        Self(value)
+    /// Returns `true` if the kernel clocksource is `tsc`.
+    fn kernel_clocksource_is_tsc() -> bool {
+        let Ok(name) = std::fs::read_to_string(
+            "/sys/devices/system/clocksource/clocksource0/current_clocksource",
+        ) else {
+            return false;
+        };
+        name.trim() == "tsc"
     }
 
-    pub const fn as_millis(self) -> u64 {
-        self.0 / 1_000
+    /// Returns `true` if `/proc/cpuinfo` advertises the `constant_tsc` flag.
+    fn cpu_has_constant_tsc() -> bool {
+        let Ok(cpuinfo) = std::fs::read_to_string("/proc/cpuinfo") else {
+            return false;
+        };
+        cpuinfo
+            .lines()
+            .filter(|line| line.starts_with("flags"))
+            .any(|line| line.split_whitespace().any(|tok| tok == "constant_tsc"))
     }
 
-    pub const fn as_micros(self) -> u64 {
-        self.0
+    /// Calibrate the TSC-to-microsecond multiplier against `CLOCK_MONOTONIC`.
+    fn calibrate() -> Option<u64> {
+        let mut best_mult: Option<u64> = None;
+        for _ in 0..CALIBRATION_ITERATIONS {
+            // SAFETY: `timespec` is a plain-old-data struct with no Drop
+            // invariants, so a zero-initialized value is a valid bit pattern.
+            let mut start_ts: libc::timespec = unsafe { std::mem::zeroed() };
+            let mut end_ts: libc::timespec = unsafe { std::mem::zeroed() };
+            // SAFETY: both timespec pointers are valid stack allocations.
+            unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut start_ts) };
+            let tsc_start = rdtsc();
+            // SAFETY: usleep only suspends the current thread.
+            unsafe { libc::usleep(CALIBRATION_SLEEP_US as libc::useconds_t) };
+            let tsc_end = rdtsc();
+            // SAFETY: both timespec pointers are valid stack allocations.
+            unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut end_ts) };
+
+            let elapsed_us = (end_ts.tv_sec - start_ts.tv_sec) as u64 * 1_000_000
+                + (end_ts.tv_nsec - start_ts.tv_nsec) as u64 / 1_000;
+            if tsc_end <= tsc_start || elapsed_us == 0 {
+                continue;
+            }
+            let ticks_per_us = (tsc_end - tsc_start) as f64 / elapsed_us as f64;
+            let sample_mult = ((1u128 << FPMULT_SHIFT) as f64 / ticks_per_us) as u64;
+            if sample_mult == 0 {
+                continue;
+            }
+            best_mult = Some(match best_mult {
+                Some(cur) => cur.min(sample_mult),
+                None => sample_mult,
+            });
+        }
+        best_mult
     }
 
-    pub fn saturating_add(self, delay: Duration) -> Self {
-        Self(
-            self.0
-                .saturating_add(delay.as_micros().min(u64::MAX as u128) as u64),
-        )
+    pub fn init() -> Option<fn() -> u64> {
+        if !kernel_clocksource_is_tsc() {
+            return None;
+        }
+        if !cpu_has_constant_tsc() {
+            return None;
+        }
+        let mult = calibrate()?;
+        TICKS_PER_US_MULT.store(mult, Ordering::Relaxed);
+        Some(monotonic_us)
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+mod monotonic_aarch64_cntvct {
+    use super::*;
+
+    /// Counter ticks per microsecond, derived from `cntfrq_el0`.
+    static TICKS_PER_US: AtomicU64 = AtomicU64::new(0);
+
+    #[inline]
+    fn cntvct() -> u64 {
+        let val: u64;
+        // SAFETY: `cntvct_el0` is a user-space readable system register on
+        // aarch64; the `mrs` instruction has no side effects.
+        unsafe {
+            core::arch::asm!("mrs {}, cntvct_el0", out(reg) val, options(nomem, nostack, preserves_flags));
+        }
+        val
     }
 
-    pub fn duration_until(self, now: Self) -> Duration {
-        Duration::from_micros(self.0.saturating_sub(now.0))
+    #[inline]
+    fn cntfrq() -> u64 {
+        let val: u64;
+        // SAFETY: `cntfrq_el0` is a user-space readable system register on
+        // aarch64; the `mrs` instruction has no side effects.
+        unsafe {
+            core::arch::asm!("mrs {}, cntfrq_el0", out(reg) val, options(nomem, nostack, preserves_flags));
+        }
+        val
+    }
+
+    pub fn monotonic_us() -> u64 {
+        let ticks_per_us = TICKS_PER_US.load(Ordering::Relaxed);
+        cntvct() / ticks_per_us
+    }
+
+    pub fn init() -> Option<fn() -> u64> {
+        let ticks_per_us = cntfrq() / 1_000_000;
+        if ticks_per_us == 0 {
+            return None;
+        }
+        TICKS_PER_US.store(ticks_per_us, Ordering::Relaxed);
+        Some(monotonic_us)
     }
 }
 
 thread_local! {
     static COMMAND_TIME_MS: Cell<Option<i64>> = const { Cell::new(None) };
 }
+
+/// Sentinel stored in `COMMAND_TIME_MS` to mark a lazily-resolved snapshot.
+/// A real wall-clock millisecond value is always positive (epoch-based), so
+/// `i64::MIN` is a safe "read on first access" marker with no collision risk.
+const LAZY_SNAPSHOT_PENDING: i64 = i64::MIN;
 
 pub struct CommandTimeSnapshotGuard {
     previous: Option<i64>,
@@ -65,6 +202,21 @@ pub fn enter_command_time_snapshot(ms: i64) -> CommandTimeSnapshotGuard {
     })
 }
 
+/// Enter a command-time snapshot without reading the wall clock eagerly.
+/// The snapshot is resolved on the first call to `mstime`/`ustime`/`unixtime`
+/// during the command. Commands that never consult the clock (e.g. PING) avoid
+/// the `SystemTime::now` syscall entirely. Nested commands keep the outer
+/// snapshot exactly like `enter_command_time_snapshot`.
+pub fn enter_command_time_snapshot_lazy() -> CommandTimeSnapshotGuard {
+    COMMAND_TIME_MS.with(|cell| {
+        let previous = cell.get();
+        if previous.is_none() {
+            cell.set(Some(LAZY_SNAPSHOT_PENDING));
+        }
+        CommandTimeSnapshotGuard { previous }
+    })
+}
+
 /// Install a fresh wall-clock snapshot even when a command is already active.
 /// Nested blocked event-loop servicing uses this to give admitted commands the
 /// current time while restoring the outer command's frozen snapshot on return.
@@ -76,7 +228,16 @@ pub fn enter_fresh_command_time_snapshot() -> CommandTimeSnapshotGuard {
 }
 
 fn command_time_ms() -> Option<i64> {
-    COMMAND_TIME_MS.with(|cell| cell.get())
+    COMMAND_TIME_MS.with(|cell| {
+        let value = cell.get();
+        if value == Some(LAZY_SNAPSHOT_PENDING) {
+            let ms = real_mstime();
+            cell.set(Some(ms));
+            Some(ms)
+        } else {
+            value
+        }
+    })
 }
 
 fn real_mstime() -> i64 {
@@ -213,6 +374,30 @@ mod tests {
             assert_ne!(mstime(), 1000);
         }
         assert_eq!(mstime(), 1000);
+    }
+
+    #[test]
+    fn lazy_snapshot_resolves_on_first_access_and_freezes() {
+        let _guard = enter_command_time_snapshot_lazy();
+        let first = mstime();
+        // The lazy snapshot must resolve to a real (positive) epoch value,
+        // never the internal sentinel.
+        assert!(first > 0);
+        // Subsequent reads within the same snapshot return the frozen value.
+        assert_eq!(mstime(), first);
+        assert_eq!(ustime(), first.saturating_mul(1000));
+    }
+
+    #[test]
+    fn lazy_snapshot_nested_keeps_outer_value() {
+        let _outer = enter_command_time_snapshot_lazy();
+        let outer_ms = mstime();
+        {
+            let _inner = enter_command_time_snapshot_lazy();
+            // The inner lazy entry must not overwrite the outer snapshot.
+            assert_eq!(mstime(), outer_ms);
+        }
+        assert_eq!(mstime(), outer_ms);
     }
 
     #[test]

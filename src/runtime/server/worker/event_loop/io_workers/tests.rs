@@ -3,6 +3,7 @@ use super::{
     IoCompletion, IoOperationId, IoThreadRuntime, ReadCompletion, ReadCompletionAction, ReadJob,
     SharedIoPool, WorkerCompletionEvent, WriteCompletion, WriteCompletionAction, WriteJob,
 };
+use crate::foundation::io::sys::time::MonotonicInstant;
 use crate::foundation::io::transport::{
     PollingTransportRuntime, ReadOutcome, ThreadIoHandle, TransportWorkerBackend, WriteOutcome,
 };
@@ -16,7 +17,7 @@ use std::collections::VecDeque;
 use std::io::{Cursor, Read, Write};
 use std::net::Shutdown;
 use std::os::fd::AsRawFd;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 fn recv_runtime_read_completion(
     runtime: &mut crate::runtime::server::worker::ServerWorkerState,
@@ -330,7 +331,7 @@ fn terminal_io_worker_wake_uses_control_ingress() {
         let handled_before = runtime.ctx.stats().eventloop_events_handled;
 
         runtime.collect_after_poll_events(Some((
-            Instant::now(),
+            MonotonicInstant::now(),
             vec![RuntimeEvent {
                 token: wake_token,
                 readable: false,

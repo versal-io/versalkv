@@ -1,10 +1,10 @@
 use super::RuntimeTransport;
 use crate::engine::command::context::Token;
 use crate::foundation::io::transport::TransportRuntime;
+use crate::foundation::memory::util_hash::FxHashMap;
 use crate::runtime::server::worker::event_loop::sources::{
     RuntimeSourceHandle, RuntimeSourceRegistry, SourceOwner,
 };
-use std::collections::HashMap;
 use std::fmt::Display;
 use std::io;
 
@@ -52,14 +52,14 @@ pub(crate) struct PendingTransportRemoval {
 pub(crate) struct SourceInstallRollback<'a, T: TransportRuntime> {
     transport: &'a mut RuntimeTransport<T>,
     sources: &'a mut RuntimeSourceRegistry,
-    pending_transport_removals: &'a mut HashMap<Token, PendingTransportRemoval>,
+    pending_transport_removals: &'a mut FxHashMap<Token, PendingTransportRemoval>,
 }
 
 impl<'a, T: TransportRuntime> SourceInstallRollback<'a, T> {
     pub(crate) fn new(
         transport: &'a mut RuntimeTransport<T>,
         sources: &'a mut RuntimeSourceRegistry,
-        pending_transport_removals: &'a mut HashMap<Token, PendingTransportRemoval>,
+        pending_transport_removals: &'a mut FxHashMap<Token, PendingTransportRemoval>,
     ) -> Self {
         Self {
             transport,
@@ -109,7 +109,7 @@ impl<'a, T: TransportRuntime> SourceInstallRollback<'a, T> {
 
 pub(crate) fn deregister_or_defer<T: TransportRuntime>(
     transport: &mut RuntimeTransport<T>,
-    pending_transport_removals: &mut HashMap<Token, PendingTransportRemoval>,
+    pending_transport_removals: &mut FxHashMap<Token, PendingTransportRemoval>,
     token: Token,
     owner_kind: PendingRemovalOwner,
 ) -> io::Result<()> {
@@ -138,7 +138,7 @@ pub(crate) fn deregister_or_defer<T: TransportRuntime>(
 
 pub(crate) fn retry_pending_transport_removals<T: TransportRuntime>(
     transport: &mut RuntimeTransport<T>,
-    pending_transport_removals: &mut HashMap<Token, PendingTransportRemoval>,
+    pending_transport_removals: &mut FxHashMap<Token, PendingTransportRemoval>,
 ) {
     let pending: Vec<PendingTransportRemoval> =
         pending_transport_removals.values().copied().collect();
@@ -166,7 +166,7 @@ pub(crate) fn retry_pending_transport_removals<T: TransportRuntime>(
 
 pub(crate) fn retire_route_for_teardown(
     sources: &mut RuntimeSourceRegistry,
-    pending_transport_removals: &HashMap<Token, PendingTransportRemoval>,
+    pending_transport_removals: &FxHashMap<Token, PendingTransportRemoval>,
     token: Token,
     owner_label: &str,
 ) {

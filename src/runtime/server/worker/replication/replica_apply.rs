@@ -1366,12 +1366,12 @@ impl ServerWorkerState {
         let replica_local_expire_only = !cleanup_command
             && self.ctx.replication().is_replica()
             && !self.ctx.config().replication.replica_read_only;
-        if let Some(db) = self.ctx.db_mut(
-            self.connection_registry[crate::framework::capabilities::io::Token(connection_token)]
-                .selected_db,
-        ) {
-            db.set_replica_local_expire_only(replica_local_expire_only);
-        }
+        let selected_db = self.connection_registry
+            [crate::framework::capabilities::io::Token(connection_token)]
+        .selected_db;
+        self.ctx
+            .dbs_mut()
+            .set_db_replica_local_expire_only(selected_db, replica_local_expire_only);
         let frame = encode_command_args(args);
         let import_job = self.connection_registry
             [crate::framework::capabilities::io::Token(connection_token)]
@@ -1515,9 +1515,9 @@ impl ServerWorkerState {
                 return Err(());
             };
             if cleanup_command {
-                if let Some(db) = self.ctx.db_mut(conn.selected_db) {
-                    db.set_replica_local_expire_only(false);
-                }
+                self.ctx
+                    .dbs_mut()
+                    .set_db_replica_local_expire_only(conn.selected_db, false);
             }
             conn.import_source = false;
             if let Some((error, command)) = &replication_error_log {

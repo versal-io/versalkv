@@ -4,11 +4,11 @@ use crate::foundation::io::protocol::parser::Parser;
 use crate::foundation::io::protocol::Value;
 use crate::foundation::io::sys::time::mstime;
 use crate::foundation::memory::client_id::next_client_id;
+use crate::foundation::memory::util_time::MonotonicInstant;
 use crate::framework::capabilities::io::Token;
 use bytes::Bytes;
 use std::collections::VecDeque;
 use std::net::SocketAddr;
-use std::time::Instant;
 
 mod command_conn;
 mod command_cycle;
@@ -106,8 +106,11 @@ pub struct Connection {
     pub(crate) tls_identity_checked: bool,
     pub username: String,
     pub selected_db: u32,
-    pub last_interaction: Instant,
-    pub create_time: Instant,
+    /// Last executed command name, kept on the connection so the hot path
+    /// avoids a `client_info_mut` HashMap lookup on every completion.
+    pub(crate) last_cmd: String,
+    pub last_interaction: MonotonicInstant,
+    pub create_time: MonotonicInstant,
     pub sub_channel_count: usize,
     pub ssub_channel_count: usize,
     command_cycle: CommandCycleState,
@@ -182,7 +185,7 @@ impl Connection {
         peer_addr: SocketAddr,
         requirepass: bool,
     ) -> Self {
-        let now = Instant::now();
+        let now = MonotonicInstant::now();
         let authed = !requirepass;
         Self {
             token,
@@ -201,6 +204,7 @@ impl Connection {
             tls_identity_checked: false,
             username: "default".to_string(),
             selected_db: 0,
+            last_cmd: String::new(),
             last_interaction: now,
             create_time: now,
             sub_channel_count: 0,
@@ -748,7 +752,7 @@ impl Connection {
     }
 
     pub fn query_buffer_total(&self) -> usize {
-        let idle_secs = Instant::now()
+        let idle_secs = MonotonicInstant::now()
             .duration_since(self.last_interaction)
             .as_secs();
         if idle_secs >= 2 {
@@ -805,7 +809,7 @@ impl Connection {
     }
 
     pub fn shrink_idle_query_buffer(&mut self) {
-        let idle_ms = Instant::now()
+        let idle_ms = MonotonicInstant::now()
             .duration_since(self.last_interaction)
             .as_millis() as u64;
         if idle_ms >= 2000 {
@@ -897,7 +901,7 @@ impl Connection {
     }
 
     pub fn new_fake() -> Self {
-        let now = Instant::now();
+        let now = MonotonicInstant::now();
         Self {
             token: Token(usize::MAX),
             client_id: usize::MAX as u64,
@@ -915,6 +919,7 @@ impl Connection {
             tls_identity_checked: false,
             username: "default".to_string(),
             selected_db: 0,
+            last_cmd: String::new(),
             last_interaction: now,
             create_time: now,
             sub_channel_count: 0,

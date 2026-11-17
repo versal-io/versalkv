@@ -485,9 +485,10 @@ impl ServerWorkerState {
             }
         }
         if let Some(ci) = self.ctx.client_info_mut(token.0) {
-            ci.flags.retain(|c| c != 'b' && c != 'h');
-            if ci.flags.is_empty() {
-                ci.flags.push('N');
+            let flags = ci.flags.to_mut();
+            flags.retain(|c| c != 'b' && c != 'h');
+            if flags.is_empty() {
+                flags.push('N');
             }
         }
         Some((
@@ -834,8 +835,9 @@ impl ServerWorkerState {
                 'b'
             };
             if !ci.flags.contains(flag) {
-                ci.flags.retain(|c| c != 'N');
-                ci.flags.push(flag);
+                let flags = ci.flags.to_mut();
+                flags.retain(|c| c != 'N');
+                flags.push(flag);
             }
         }
         let token = conn.token();

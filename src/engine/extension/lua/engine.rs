@@ -122,9 +122,7 @@ impl LuaEngine {
         arguments: Option<(&[bytes::Bytes], &[bytes::Bytes])>,
         dispatcher: &mut crate::engine::host::HostDispatcher<'_>,
     ) -> Result<Value, ScriptError> {
-        let _time_guard = crate::foundation::io::sys::time::enter_command_time_snapshot(
-            crate::foundation::io::sys::time::mstime(),
-        );
+        let _time_guard = crate::foundation::io::sys::time::enter_command_time_snapshot_lazy();
         let (body, flags, _has_shebang) = parse_shebang(code, ctx.flags)?;
         ctx.flags = flags;
 
@@ -216,9 +214,7 @@ impl LuaEngine {
         args: &[bytes::Bytes],
         dispatcher: &mut crate::engine::host::HostDispatcher<'_>,
     ) -> Result<Value, ScriptError> {
-        let _time_guard = crate::foundation::io::sys::time::enter_command_time_snapshot(
-            crate::foundation::io::sys::time::mstime(),
-        );
+        let _time_guard = crate::foundation::io::sys::time::enter_command_time_snapshot_lazy();
         let (body, _, _) = parse_shebang(&func.code, func.flags)?;
         let result = with_lua_runtime(ctx.lua_enable_insecure_api, |runtime| {
             let lua = &runtime.lua;

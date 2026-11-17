@@ -1,4 +1,4 @@
-use crate::engine::extension::acl::AclUser;
+use crate::engine::extension::acl::{refresh_default_user_superuser_flag, AclUser};
 use crate::foundation::io::protocol::Value;
 use crate::framework::context::ServerContext;
 use crate::framework::{CommandArgs, CommandError};
@@ -228,9 +228,12 @@ pub fn acl_setuser(args: &CommandArgs, ctx: &mut ServerContext) -> Value {
     // All modifiers valid: commit the staged user.
     let _ = is_new;
     users.insert(username.to_string(), staged);
+    drop(users);
+    // The default user's superuser status may have changed; refresh the cached
+    // hot-path flag so `stage_acl_permissions` stays correct.
+    refresh_default_user_superuser_flag();
     ctx.pending_acl_client_kills_mut()
         .push(username.to_string());
-    drop(users);
     if !ctx.sentinel_state().sentinel_mode && ctx.config().server.config_file.is_some() {
         let _ = crate::framework::commands::server::config::config_rewrite(ctx);
     }

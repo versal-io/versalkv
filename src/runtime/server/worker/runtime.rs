@@ -33,7 +33,7 @@ enum WorkerEvent {
 }
 
 struct WorkerReadyBatch {
-    cycle_start: std::time::Instant,
+    cycle_start: MonotonicInstant,
     events: Vec<RuntimeEvent>,
 }
 
@@ -309,7 +309,7 @@ mod tests {
             runtime: ServerWorkerState::new(1).unwrap(),
             phase: WorkerPhase::Ready,
             ready_batch: Some(WorkerReadyBatch {
-                cycle_start: std::time::Instant::now(),
+                cycle_start: MonotonicInstant::now(),
                 events: Vec::new(),
             }),
             clock: RuntimeClock::new(1_000, 1_000),

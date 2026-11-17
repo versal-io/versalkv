@@ -433,9 +433,10 @@ impl ServerWorkerState {
         let accounting = self.record_exec_completion(context, &execution);
         if execution.disposition == CommandDisposition::Blocked {
             if let Some(info) = self.ctx.client_info_mut(token.0) {
-                info.flags.retain(|flag| flag != 'N');
-                if !info.flags.contains('b') {
-                    info.flags.push('b');
+                let flags = info.flags.to_mut();
+                flags.retain(|flag| flag != 'N');
+                if !flags.contains('b') {
+                    flags.push('b');
                 }
             }
             let blocked_connection = &mut self.connection_registry[token];
@@ -480,8 +481,8 @@ impl ServerWorkerState {
         let connection = &mut self.connection_registry[token];
         let selected_db = connection.selected_db;
         let watched_keys = connection.transaction.watched_key_count();
+        connection.last_cmd = context.name.to_string();
         if let Some(info) = self.ctx.client_info_mut(token.0) {
-            info.last_cmd = context.name.to_string();
             info.db = selected_db;
             info.watched_keys = watched_keys;
         }

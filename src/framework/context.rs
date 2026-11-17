@@ -9,6 +9,7 @@ use crate::engine::persistence::PersistenceState;
 use crate::engine::state::db::DbContext;
 use crate::foundation::memory::metrics::memory_stats::MemoryCategoryTracker;
 use crate::foundation::memory::metrics::stats::ServerStats;
+use crate::foundation::memory::util_hash::FxIndexSet;
 use crate::framework::capabilities::io::Token;
 use crate::framework::distributed::migration::transport::MigrateSocketCache;
 use crate::framework::observability::commandlog::CommandLog;
@@ -70,9 +71,9 @@ pub struct ServerContext {
     // Match C's tail-queued `server.postponed_clients`: unpause must replay
     // commands in postponement order so an earlier blocking pop is registered
     // before a later push makes the key ready.
-    paused_clients: indexmap::IndexSet<Token>,
-    forkless_clients: indexmap::IndexSet<Token>,
-    throttled_clients: indexmap::IndexSet<Token>,
+    paused_clients: FxIndexSet<Token>,
+    forkless_clients: FxIndexSet<Token>,
+    throttled_clients: FxIndexSet<Token>,
     pending_unpause: bool,
     needs_eviction: bool,
     suppress_eviction_until_write: bool,

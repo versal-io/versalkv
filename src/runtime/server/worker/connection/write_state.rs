@@ -3,16 +3,16 @@
 //! retain only service claims, byte budgets, and allocation accounting.
 
 use super::pending_write::OrdinaryWriteScheduler;
+use crate::foundation::memory::util_hash::{FxHashMap, FxHashSet};
 use crate::framework::capabilities::io::Token;
-use std::collections::{HashMap, HashSet};
 
 #[derive(Default)]
 pub(crate) struct WriteSchedulers {
     pub(crate) ordinary: OrdinaryWriteScheduler,
     pub(crate) slot_exports: SlotExportWriteScheduler,
     pub(crate) slot_export_allocation_bytes: usize,
-    pub(crate) slot_export_allocations: HashMap<Token, usize>,
-    replica_writable_wait: HashSet<Token>,
+    pub(crate) slot_export_allocations: FxHashMap<Token, usize>,
+    replica_writable_wait: FxHashSet<Token>,
 }
 
 impl WriteSchedulers {
@@ -39,7 +39,7 @@ impl WriteSchedulers {
         self.replica_writable_wait.contains(&token)
     }
 
-    pub(crate) fn retain_streaming_replica_waiters(&mut self, streaming: &HashSet<Token>) {
+    pub(crate) fn retain_streaming_replica_waiters(&mut self, streaming: &FxHashSet<Token>) {
         self.replica_writable_wait
             .retain(|token| streaming.contains(token));
     }
@@ -47,8 +47,8 @@ impl WriteSchedulers {
 
 #[derive(Default)]
 pub(crate) struct SlotExportWriteScheduler {
-    serviced_this_turn: HashSet<Token>,
-    remaining_budget: HashMap<Token, usize>,
+    serviced_this_turn: FxHashSet<Token>,
+    remaining_budget: FxHashMap<Token, usize>,
 }
 
 impl SlotExportWriteScheduler {

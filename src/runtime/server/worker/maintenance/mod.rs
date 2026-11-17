@@ -368,15 +368,21 @@ impl ServerWorkerState {
     }
 
     pub(crate) fn enforce_client_output_buffer_limit_for(&mut self, token_value: usize) -> bool {
-        let Some(connection_token) = self
+        let config = &self.ctx.config().replication;
+        let repl_backlog_size = self.ctx.config().server.repl_backlog_size.max(0) as usize;
+        let Some(conn) = self
             .connection_registry
-            .contains(crate::framework::capabilities::io::Token(token_value))
-            .then_some(token_value)
+            .get_mut(crate::framework::capabilities::io::Token(token_value))
         else {
             return false;
         };
-        let config = &self.ctx.config().replication;
-        let repl_backlog_size = self.ctx.config().server.repl_backlog_size.max(0) as usize;
+        let (hard_limit, soft_limit, soft_seconds) =
+            output_buffer_limits_for_connection(conn, config, repl_backlog_size);
+        if hard_limit == 0 && soft_limit == 0 {
+            conn.output.soft_limit_reached_at_ms = None;
+            return false;
+        }
+        let connection_token = token_value;
         let now_ms = mstime();
         // Slot exports use the replica limit class, but unlike ordinary
         // replicas their C output-buffer usage comes from the export client's
@@ -404,8 +410,6 @@ impl ServerWorkerState {
             .connection_registry
             .get_mut(crate::framework::capabilities::io::Token(connection_token))
             .is_some_and(|conn| {
-                let (hard_limit, soft_limit, soft_seconds) =
-                    output_buffer_limits_for_connection(conn, config, repl_backlog_size);
                 let bytes = output_buffer_usage;
                 if hard_limit > 0 && bytes >= hard_limit {
                     return true;
@@ -1737,21 +1741,22 @@ mod tests {
 
     #[test]
     fn client_timeout_closes_only_idle_ordinary_clients() {
+        use crate::foundation::memory::util_time::MonotonicInstant;
         use crate::framework::capabilities::connection::Connection;
         use crate::framework::capabilities::io::Token;
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
 
         let mut runtime = ServerWorkerState::new(1).unwrap();
         runtime.ctx.config_mut().server.client_timeout = 1;
 
         let ordinary_token = Token(41);
         let mut ordinary = Connection::new(ordinary_token, ([127, 0, 0, 1], 6379).into(), false);
-        ordinary.last_interaction = Instant::now() - Duration::from_secs(2);
+        ordinary.last_interaction = MonotonicInstant::now().saturating_sub(Duration::from_secs(2));
         let _ordinary_slab = runtime.connection_registry.insert(ordinary);
 
         let pubsub_token = Token(42);
         let mut pubsub = Connection::new(pubsub_token, ([127, 0, 0, 1], 6380).into(), false);
-        pubsub.last_interaction = Instant::now() - Duration::from_secs(2);
+        pubsub.last_interaction = MonotonicInstant::now().saturating_sub(Duration::from_secs(2));
         pubsub.sub_channel_count = 1;
         let _pubsub_slab = runtime.connection_registry.insert(pubsub);
 

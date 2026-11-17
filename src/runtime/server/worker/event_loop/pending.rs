@@ -25,8 +25,14 @@ impl ServerWorkerState {
     }
 
     pub(crate) fn collect_before_sleep_pending_events(&mut self) -> Vec<RuntimeEvent> {
+        // Fast path: no buffered transport data and no replica input to
+        // process, so return an empty vector without allocating or sorting.
+        let replica_token = self.processable_classic_replica_input_token();
+        if !self.transport.has_pending_data() && replica_token.is_none() {
+            return Vec::new();
+        }
         let mut events = self.transport.process_pending_data();
-        if let Some(token) = self.processable_classic_replica_input_token() {
+        if let Some(token) = replica_token {
             if !events
                 .iter()
                 .any(|event| event.token == token && event.readable)

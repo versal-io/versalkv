@@ -43,14 +43,17 @@ impl ServerWorkerState {
         connection_token: usize,
         token_value: usize,
         args: &CommandArgs,
-        name_lower: &str,
+        name: &str,
         resp3: bool,
         replies: &mut Vec<Vec<u8>>,
         pending_unblock: &mut Vec<(usize, bool)>,
     ) -> Option<bool> {
-        if name_lower != "client" {
+        if !name.eq_ignore_ascii_case("client") {
             return None;
         }
+        // Slow path: CLIENT subcommands. Use the canonical lowercase name for
+        // stats and ACL checks; no hot-path impact.
+        let name_lower = "client";
 
         // ACL check for CLIENT command (ClientAdmin bypasses pre_dispatch_exec)
         if let Some(rejected) =

@@ -15,7 +15,6 @@ pub(crate) struct CommandClientFacts {
     pub(crate) monitoring: bool,
     pub(crate) transaction: bool,
     pub(crate) transaction_db: i64,
-    pub(crate) username: String,
     pub(crate) import_source: bool,
     pub(crate) migration_control: bool,
     pub(crate) keyless_redirect: bool,
@@ -35,7 +34,6 @@ impl CommandClientFacts {
                 .transaction
                 .selected_db()
                 .unwrap_or(i64::from(connection.selected_db)),
-            username: connection.username.clone(),
             import_source: connection.import_source,
             migration_control: connection.slot_migration_role.is_some(),
             keyless_redirect: connection

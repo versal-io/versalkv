@@ -9,12 +9,13 @@ use crate::foundation::io::protocol::parser::ParseError;
 use crate::foundation::io::protocol::serializer::{serialize_to_vec_resp2, serialize_to_vec_resp3};
 use crate::foundation::io::protocol::Value;
 use crate::foundation::io::transport::{Interest, ReadOutcome};
+use crate::foundation::memory::util_time::MonotonicInstant;
 use crate::framework::capabilities::connection::ConnectionState;
 use crate::framework::capabilities::io::Token;
 use crate::runtime::server::worker::command::dispatch::{LoopAction, ReadBatchEffects};
 use crate::runtime::server::worker::event_loop::RunnableKey;
+use bytes::Bytes;
 use std::io::Read;
-use std::time::Instant;
 
 pub(crate) fn command_bulk_limits(authenticated: bool, configured_max_bulk: i64) -> (usize, usize) {
     let configured = usize::try_from(configured_max_bulk).unwrap_or(usize::MAX);
@@ -35,7 +36,7 @@ pub(crate) enum ClientReadMode {
 }
 
 enum ClientParseResult {
-    Command(CommandArgs, String, bool),
+    Command(CommandArgs, Bytes, bool),
     Pending,
     ProtocolError(String, bool),
 }
@@ -45,7 +46,12 @@ fn read_stream_bounded(
     scratch: &mut [u8],
     byte_budget: usize,
 ) -> (Vec<u8>, ReadOutcome) {
-    let mut read_data = Vec::with_capacity(byte_budget.min(scratch.len()));
+    // Start empty and let `extend_from_slice` grow the buffer on demand.
+    // Small commands (e.g. PING, 14 bytes) only allocate a tiny Vec instead
+    // of the full 64 KiB read budget, avoiding a large alloc/dealloc pair on
+    // every hot-path read. Large reads still grow to the budget in one step
+    // because `extend_from_slice` reserves exactly the requested amount.
+    let mut read_data = Vec::new();
     if byte_budget == 0 {
         return (read_data, ReadOutcome::BudgetExhausted);
     }
@@ -234,7 +240,7 @@ impl ServerWorkerState {
         self.refresh_replication_buffer_accounting_if_dirty();
         {
             let conn = &mut self.connection_registry[token];
-            conn.last_interaction = Instant::now();
+            conn.last_interaction = MonotonicInstant::now();
             if !read_data.is_empty() {
                 conn.parser.feed(read_data);
                 conn.remember_query_bytes(read_data);
@@ -252,9 +258,14 @@ impl ServerWorkerState {
         }
         // C updates client memory after socket reads. Enforce the aggregate
         // client limit before another connection can observe this newly grown
-        // query buffer in the same poll batch.
-        self.refresh_client_memory_usage(token, false);
-        self.evict_clients();
+        // query buffer in the same poll batch. Resolve the limit once: both
+        // `refresh_client_memory_usage` and `evict_clients` parse the
+        // `maxmemory-clients` config string internally, and on the common
+        // no-limit path (PING, GET, SET, ...) both return immediately.
+        if self.effective_client_memory_limit().is_some() {
+            self.refresh_client_memory_usage(token, false);
+            self.evict_clients();
+        }
         if !self.connection_registry.contains(token) {
             return false;
         }
@@ -326,7 +337,11 @@ impl ServerWorkerState {
         match conn.parser.try_parse_limited(max_mbulk, max_bulk) {
             Ok(Some(parts)) => {
                 let args = CommandArgs::from_parts(parts);
-                let name = String::from_utf8_lossy(&args.name).to_ascii_lowercase();
+                // Keep the original-case command name as Bytes (cheap refcount
+                // clone). Command lookup is case-insensitive and the canonical
+                // lowercased name comes from the resolved CommandSpec, so no
+                // per-command String allocation is needed here.
+                let name = args.name.clone();
                 ClientParseResult::Command(args, name, conn.resp_version >= 3)
             }
             Err(ParseError::Protocol(message)) => {

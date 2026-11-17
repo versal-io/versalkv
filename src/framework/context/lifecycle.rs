@@ -12,6 +12,7 @@ use crate::engine::persistence::PersistenceState;
 use crate::engine::state::db::DbContext;
 use crate::foundation::memory::metrics::memory_stats::get_tracker;
 use crate::foundation::memory::metrics::stats::ServerStats;
+use crate::foundation::memory::util_hash::FxIndexSet;
 use crate::framework::context::RuntimeConfig;
 use crate::framework::distributed::migration::transport::MigrateSocketCache;
 use crate::framework::observability::commandlog::CommandLog;
@@ -46,7 +47,7 @@ impl ServerContext {
             dbs,
             blocking_registry: crate::engine::state::blocking_registry::BlockingClientRegistry::new(
             ),
-            client_infos: std::collections::HashMap::new(),
+            client_infos: crate::foundation::memory::util_hash::FxHashMap::default(),
         };
         let mut context = Self::from_db_context(db);
         context.rconfig = config;
@@ -99,9 +100,9 @@ impl ServerContext {
                 end_time_ms: 0,
                 reason: "none",
             },
-            paused_clients: indexmap::IndexSet::new(),
-            forkless_clients: indexmap::IndexSet::new(),
-            throttled_clients: indexmap::IndexSet::new(),
+            paused_clients: FxIndexSet::default(),
+            forkless_clients: FxIndexSet::default(),
+            throttled_clients: FxIndexSet::default(),
             pending_unpause: false,
             needs_eviction: false,
             suppress_eviction_until_write: false,
@@ -125,6 +126,28 @@ impl ServerContext {
         }
     }
 
+    /// Returns whether any slowlog/commandlog category would record a command
+    /// with the given duration and request/reply sizes. Used on the hot path to
+    /// skip the `CmdLogEntry` and `redacted_argv` allocations for fast
+    /// commands (e.g. PING) before they are built.
+    pub fn would_log_command(
+        &self,
+        duration_us: u64,
+        req_bytes: usize,
+        reply_bytes: usize,
+        command_flags: u64,
+    ) -> bool {
+        let dur = duration_us as i64;
+        let req = req_bytes as i64;
+        let rep = reply_bytes as i64;
+        (command_flags & CMD_SKIP_SLOWLOG == 0 && self.slowlog.would_record(dur))
+            || (command_flags & CMD_SKIP_COMMANDLOG == 0 && self.commandlog.slow.would_record(dur))
+            || (command_flags & CMD_SKIP_COMMANDLOG == 0
+                && self.commandlog.large_request.would_record(req))
+            || (command_flags & CMD_SKIP_COMMANDLOG == 0
+                && self.commandlog.large_reply.would_record(rep))
+    }
+
     pub fn push_cmd_logs(
         &mut self,
         argv: Vec<Bytes>,
@@ -135,27 +158,51 @@ impl ServerContext {
         reply_bytes: usize,
         command_flags: u64,
     ) {
-        let addr_str = peer_addr.to_string();
         let dur = duration_us as i64;
         let req = req_bytes as i64;
         let rep = reply_bytes as i64;
-        if command_flags & CMD_SKIP_SLOWLOG == 0 {
+
+        // Determine which logs would actually record this entry before
+        // allocating `peer_addr.to_string()` or cloning `argv`. On the common
+        // fast-command path (e.g. PING) all categories are below threshold and
+        // we return without any heap allocation.
+        let slowlog_record =
+            command_flags & CMD_SKIP_SLOWLOG == 0 && self.slowlog.would_record(dur);
+        let cmdlog_slow_record =
+            command_flags & CMD_SKIP_COMMANDLOG == 0 && self.commandlog.slow.would_record(dur);
+        let cmdlog_req_record = command_flags & CMD_SKIP_COMMANDLOG == 0
+            && self.commandlog.large_request.would_record(req);
+        let cmdlog_rep_record = command_flags & CMD_SKIP_COMMANDLOG == 0
+            && self.commandlog.large_reply.would_record(rep);
+
+        if !slowlog_record && !cmdlog_slow_record && !cmdlog_req_record && !cmdlog_rep_record {
+            return;
+        }
+
+        let addr_str = peer_addr.to_string();
+        if slowlog_record {
             self.slowlog
                 .push(argv.clone(), dur, addr_str.clone(), client_name.clone());
         }
-        if command_flags & CMD_SKIP_COMMANDLOG == 0 {
-            self.commandlog
-                .slow
-                .push(argv.clone(), dur, addr_str.clone(), client_name.clone());
-            self.commandlog.large_request.push(
-                argv.clone(),
-                req,
-                addr_str.clone(),
-                client_name.clone(),
-            );
-            self.commandlog
-                .large_reply
-                .push(argv, rep, addr_str, client_name);
+        if cmdlog_slow_record || cmdlog_req_record || cmdlog_rep_record {
+            if cmdlog_slow_record {
+                self.commandlog
+                    .slow
+                    .push(argv.clone(), dur, addr_str.clone(), client_name.clone());
+            }
+            if cmdlog_req_record {
+                self.commandlog.large_request.push(
+                    argv.clone(),
+                    req,
+                    addr_str.clone(),
+                    client_name.clone(),
+                );
+            }
+            if cmdlog_rep_record {
+                self.commandlog
+                    .large_reply
+                    .push(argv, rep, addr_str, client_name);
+            }
         }
     }
 

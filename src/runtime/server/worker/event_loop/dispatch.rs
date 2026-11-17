@@ -6,7 +6,7 @@ use super::{
     LoopControl, ReadinessEvent, ReadinessOrigin, ReadyEvent, RunnableKey, ServerWorkerState,
     TransportEventDispatchOutcome,
 };
-use crate::foundation::io::sys::time::mstime;
+use crate::foundation::io::sys::time::{mstime, MonotonicInstant};
 use crate::foundation::memory::metrics::stats::EventLoopEventOutcome;
 use crate::framework::capabilities::io::Token;
 use crate::framework::distributed::replication::ConnectionId;
@@ -150,6 +150,11 @@ impl ServerWorkerState {
 
     pub(crate) fn register_active_persistence_child(&mut self) {
         let Some(child) = self.ctx.persistence().child() else {
+            // No active persistence child. If the child registry is also empty
+            // there is nothing to retain or retire, so skip the per-cycle scan.
+            if self.child_registry.is_empty() {
+                return;
+            }
             let sources = self.child_registry.retain_only_pid(None);
             self.retire_child_sources(sources);
             return;
@@ -426,7 +431,7 @@ impl ServerWorkerState {
     pub(crate) fn collect_after_poll_events(
         &mut self,
         poll_result: Option<(
-            std::time::Instant,
+            MonotonicInstant,
             Vec<crate::runtime::server::worker::event_loop::transport::RuntimeEvent>,
         )>,
     ) {
@@ -449,7 +454,7 @@ impl ServerWorkerState {
         // election results they carry settle once after the full batch.
         self.begin_cluster_bus_receive_batch();
         let mut owns_priority_cycle = false;
-        let mut last_priority_poll = std::time::Instant::now();
+        let mut last_priority_poll = MonotonicInstant::now();
         let mut normal_event_count = 0usize;
         while let Some(event) = self.event_batch.pop_ready() {
             let should_check_preemption = event.lane == EventLane::Normal
@@ -563,7 +568,6 @@ impl ServerWorkerState {
         event: EventLoopEvent,
         context: &DispatchContext,
     ) -> DispatchOutcome {
-        let started_at = std::time::Instant::now();
         let owns_priority_cycle = self.event_is_priority(&event) && self.begin_priority_cycle();
         let payload_kind = match event.payload {
             EventPayload::Readiness(_) => EventPayloadKind::Readiness,
@@ -604,10 +608,8 @@ impl ServerWorkerState {
         } else {
             outcome
         };
-        self.ctx.record_eventloop_event_dispatch(
-            self.metrics_outcome(outcome),
-            started_at.elapsed().as_micros() as u64,
-        );
+        self.ctx
+            .record_eventloop_event_dispatch(self.metrics_outcome(outcome));
         self.finish_priority_cycle(owns_priority_cycle);
         outcome
     }
@@ -629,8 +631,14 @@ impl ServerWorkerState {
             },
             _ => return false,
         };
-        self.is_priority_connection(token)
-            || self
+        if self.is_priority_connection(token) {
+            return true;
+        }
+        // Fast path: skip the `resolve_token` HashMap lookup when no cluster-bus
+        // source is registered. Cluster-bus connections are the only non-client
+        // sources that run on the priority lane.
+        self.runtime_sources.has_cluster_bus()
+            && self
                 .runtime_sources
                 .resolve_token(token)
                 .is_some_and(|route| matches!(route.owner, SourceOwner::ClusterBus))

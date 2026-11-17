@@ -1,6 +1,5 @@
 use bytes::Bytes;
 use std::net::SocketAddr;
-use std::time::Instant;
 
 use crate::engine::command::{CommandArgs, SessionId};
 use crate::engine::distributed::cluster::migration::SlotMigrationConnectionRole;
@@ -8,6 +7,7 @@ use crate::engine::distributed::replication::ReplicationOffset;
 use crate::engine::extension::script::PropagationOp;
 use crate::foundation::io::protocol::Value;
 use crate::foundation::io::store::Robj;
+use crate::foundation::memory::util_time::MonotonicInstant;
 
 use super::{BlockedCmd, BlockedState, Token};
 
@@ -76,9 +76,9 @@ pub trait CommandConn {
     fn set_username(&mut self, v: String);
     fn selected_db(&self) -> u32;
     fn set_selected_db(&mut self, db: u32);
-    fn last_interaction(&self) -> Instant;
-    fn set_last_interaction(&mut self, t: Instant);
-    fn create_time(&self) -> Instant;
+    fn last_interaction(&self) -> MonotonicInstant;
+    fn set_last_interaction(&mut self, t: MonotonicInstant);
+    fn create_time(&self) -> MonotonicInstant;
     fn name(&self) -> Option<&Bytes>;
     fn set_name(&mut self, name: Option<Bytes>);
     fn lib_name(&self) -> &str;

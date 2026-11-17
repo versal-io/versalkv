@@ -296,6 +296,12 @@ impl ServerWorkerState {
         evicted: Vec<(u32, Bytes)>,
         fx: &mut CommandEffects,
     ) {
+        // Fast path: no keys were evicted (the common case when maxmemory is 0
+        // or the server is under the limit). Skip replication/AOF cursor setup,
+        // propagation byte accounting, and tracking invalidation collection.
+        if evicted.is_empty() {
+            return;
+        }
         let mut queued_remote_invalidation = false;
         let mut pending_publish = Vec::new();
         let replication_start = fx.replication_only.len();

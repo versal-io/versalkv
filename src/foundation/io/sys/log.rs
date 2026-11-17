@@ -1,5 +1,5 @@
 use log::LevelFilter;
-use std::cell::RefCell;
+use std::cell::Cell;
 use std::fs::File;
 use std::io::{self, Write};
 use std::panic::PanicHookInfo;
@@ -19,33 +19,48 @@ static SYSLOG_IDENT: OnceLock<std::ffi::CString> = OnceLock::new();
 static LOGGER: VersalLogger = VersalLogger::new();
 
 thread_local! {
-    static ACTIVE_COMMAND: RefCell<Option<CommandDiagnostic>> = const { RefCell::new(None) };
+    // Stores a raw pointer to the currently executing command's diagnostic.
+    // The diagnostic lives on the caller's stack for the duration of
+    // `enter_active_command`'s guard; the pointer is only dereferenced by the
+    // panic hook while that guard is still live.
+    //
+    // `Cell` is used instead of `RefCell` because the event loop is
+    // single-threaded: no aliased mutable borrows can occur. `NonNull` is
+    // `Copy`, so `Cell::replace`/`set`/`get` avoid RefCell's borrow-flag
+    // check on every command's enter/drop pair.
+    static ACTIVE_COMMAND: Cell<Option<std::ptr::NonNull<CommandDiagnostic<'static>>>> =
+        const { Cell::new(None) };
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CommandDiagnostic {
+pub struct CommandDiagnostic<'a> {
     pub client_id: u64,
     pub command_seq: u64,
-    pub peer: String,
+    pub peer: std::net::SocketAddr,
     pub db: u32,
-    pub command: String,
+    pub command: &'a str,
     pub argument_count: usize,
     pub request_bytes: usize,
 }
 
 pub struct ActiveCommandGuard {
-    previous: Option<CommandDiagnostic>,
+    previous: Option<std::ptr::NonNull<CommandDiagnostic<'static>>>,
 }
 
 impl Drop for ActiveCommandGuard {
     fn drop(&mut self) {
         let previous = self.previous.take();
-        ACTIVE_COMMAND.with(|active| *active.borrow_mut() = previous);
+        ACTIVE_COMMAND.with(|active| active.set(previous));
     }
 }
 
-pub fn enter_active_command(command: CommandDiagnostic) -> ActiveCommandGuard {
-    let previous = ACTIVE_COMMAND.with(|active| active.borrow_mut().replace(command));
+pub fn enter_active_command<'a>(command: &'a CommandDiagnostic<'a>) -> ActiveCommandGuard {
+    // SAFETY: the diagnostic is borrowed for the guard's lifetime. We erase the
+    // lifetime to store it in a `'static` thread-local; the guard restores the
+    // previous pointer on drop, so the stored pointer never outlives the
+    // diagnostic it points at.
+    let ptr = std::ptr::NonNull::from(command).cast::<CommandDiagnostic<'static>>();
+    let previous = ACTIVE_COMMAND.with(|active| active.replace(Some(ptr)));
     ActiveCommandGuard { previous }
 }
 
@@ -59,7 +74,10 @@ fn panic_payload(info: &PanicHookInfo<'_>) -> String {
     }
 }
 
-fn format_panic_report(info: &PanicHookInfo<'_>, command: Option<&CommandDiagnostic>) -> String {
+fn format_panic_report(
+    info: &PanicHookInfo<'_>,
+    command: Option<&CommandDiagnostic<'_>>,
+) -> String {
     let location = info
         .location()
         .map(|location| {
@@ -190,8 +208,15 @@ pub fn install_panic_hook() {
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             if CRASH_LOG_ENABLED.load(Ordering::Relaxed) {
-                let report = ACTIVE_COMMAND
-                    .with(|active| format_panic_report(info, active.borrow().as_ref()));
+                let report = ACTIVE_COMMAND.with(|active| {
+                    let command = active
+                        .get()
+                        // SAFETY: the panic hook only runs while a command is
+                        // executing, and the active-command guard keeps the
+                        // diagnostic alive until after this hook returns.
+                        .map(|ptr| unsafe { ptr.cast::<CommandDiagnostic<'_>>().as_ref() });
+                    format_panic_report(info, command)
+                });
                 // C debug.c emits logStackTrace before bugReportEnd selects
                 // exit or abort. A panic hook is not a signal handler, so it can
                 // capture real frames even when RUST_BACKTRACE is disabled.
@@ -571,16 +596,23 @@ mod tests {
         let outer = CommandDiagnostic {
             client_id: 7,
             command_seq: 3,
-            peer: "127.0.0.1:6379".to_string(),
+            peer: "127.0.0.1:6379".parse().expect("parse socket addr"),
             db: 2,
-            command: "get".to_string(),
+            command: "get",
             argument_count: 1,
             request_bytes: 22,
         };
-        let guard = enter_active_command(outer.clone());
-        ACTIVE_COMMAND.with(|active| assert_eq!(active.borrow().as_ref(), Some(&outer)));
+        let guard = enter_active_command(&outer);
+        ACTIVE_COMMAND.with(|active| {
+            let stored = active.get();
+            // SAFETY: `outer` is still alive on the stack while `guard` is
+            // live, so the stored pointer remains valid. We only read it.
+            let stored_ref =
+                stored.map(|ptr| unsafe { ptr.cast::<CommandDiagnostic<'_>>().as_ref() });
+            assert_eq!(stored_ref, Some(&outer));
+        });
         drop(guard);
-        ACTIVE_COMMAND.with(|active| assert!(active.borrow().is_none()));
+        ACTIVE_COMMAND.with(|active| assert!(active.get().is_none()));
     }
 
     #[test]

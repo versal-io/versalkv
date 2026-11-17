@@ -1,8 +1,7 @@
-use std::time::Instant;
-
 use crate::engine::command::CommandArgs;
 use crate::foundation::io::protocol::serializer::{serialize_to_vec_resp2, serialize_to_vec_resp3};
 use crate::foundation::io::protocol::Value;
+use crate::foundation::memory::util_time::MonotonicInstant;
 use crate::framework::capabilities::connection::Connection;
 use crate::runtime::server::worker::ServerWorkerState;
 
@@ -115,7 +114,7 @@ impl ClientFilters {
             && !self.exclude.matches(conn, context.traits, MatchMode::Any)
     }
 
-    fn matches_time_limits(&self, conn: &Connection, now: Instant) -> bool {
+    fn matches_time_limits(&self, conn: &Connection, now: MonotonicInstant) -> bool {
         let age_matches = self
             .max_age_seconds
             .is_none_or(|minimum| now.duration_since(conn.create_time).as_secs() > minimum);
@@ -387,7 +386,7 @@ struct ConnectionTraits {
 struct ConnectionMatchContext {
     traits: ConnectionTraits,
     is_current: bool,
-    now: Instant,
+    now: MonotonicInstant,
 }
 
 impl ClientSelector {
@@ -601,7 +600,7 @@ impl ServerWorkerState {
                 is_master_link: self.is_master_link(conn.token().0),
             },
             is_current: current_client_id == Some(conn.client_id()),
-            now: Instant::now(),
+            now: MonotonicInstant::now(),
         };
         filters.matches(conn, context, skip_current_default)
     }
@@ -612,9 +611,9 @@ mod tests {
     use super::{ClientFilters, ConnectionMatchContext, ConnectionTraits, MatchMode};
     use crate::engine::command::CommandArgs;
     use crate::foundation::io::protocol::Value;
+    use crate::foundation::memory::util_time::MonotonicInstant;
     use crate::framework::capabilities::connection::Connection;
     use bytes::Bytes;
-    use std::time::Instant;
 
     fn args(parts: &[&str]) -> CommandArgs {
         CommandArgs::from_parts(
@@ -632,7 +631,7 @@ mod tests {
                 is_master_link: false,
             },
             is_current: false,
-            now: Instant::now(),
+            now: MonotonicInstant::now(),
         }
     }
 

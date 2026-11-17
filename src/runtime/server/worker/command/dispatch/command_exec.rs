@@ -36,26 +36,61 @@ fn push_bounded_command_component(output: &mut String, input: &[u8]) {
     }
 }
 
+/// Write the bounded client command name into an existing `String`, reusing
+/// its heap buffer. This avoids per-command allocation for callers (e.g.
+/// `Connection.last_cmd`) that retain the buffer across commands.
+pub(super) fn write_bounded_command_name(
+    output: &mut String,
+    name_lower: &str,
+    subcommand: Option<&[u8]>,
+) {
+    output.clear();
+    // Fast path: no subcommand. Callers pass lower-cased command names that
+    // never contain CR/LF (RESP delimiters), so a plain copy matches the
+    // bounded component logic.
+    let Some(subcommand) = subcommand else {
+        let limit = name_lower.len().min(MAX_CLIENT_COMMAND_NAME_BYTES);
+        output.push_str(&name_lower[..limit]);
+        return;
+    };
+    if output.capacity() < MAX_CLIENT_COMMAND_NAME_BYTES {
+        output.reserve(MAX_CLIENT_COMMAND_NAME_BYTES - output.capacity());
+    }
+    push_bounded_command_component(output, name_lower.as_bytes());
+    if output.len() < MAX_CLIENT_COMMAND_NAME_BYTES {
+        output.push('|');
+        push_bounded_command_component(output, subcommand);
+    }
+}
+
 pub(super) fn bounded_command_name(name_lower: &str, subcommand: Option<&[u8]>) -> String {
     let mut output = String::with_capacity(MAX_CLIENT_COMMAND_NAME_BYTES);
-    push_bounded_command_component(&mut output, name_lower.as_bytes());
-    if let Some(subcommand) = subcommand {
-        if output.len() < MAX_CLIENT_COMMAND_NAME_BYTES {
-            output.push('|');
-            push_bounded_command_component(&mut output, subcommand);
-        }
-    }
+    write_bounded_command_name(&mut output, name_lower, subcommand);
     output
 }
 
-pub(super) fn client_last_command_name(name_lower: &str, args: &CommandArgs) -> String {
+/// Write the client last-command display name into an existing `String`,
+/// reusing its heap buffer. For common commands (e.g. PING) this reuses the
+/// buffer across commands after the first allocation, matching the C server's
+/// refcounted shared command-name object behaviour.
+pub(super) fn write_client_last_command_name(
+    output: &mut String,
+    name_lower: &str,
+    args: &CommandArgs,
+) {
     let subcommand = args.args.first().filter(|_| {
         matches!(
             name_lower,
             "cluster" | "client" | "config" | "xinfo" | "slowlog"
         )
     });
-    bounded_command_name(name_lower, subcommand.map(bytes::Bytes::as_ref))
+    write_bounded_command_name(output, name_lower, subcommand.map(bytes::Bytes::as_ref));
+}
+
+pub(super) fn client_last_command_name(name_lower: &str, args: &CommandArgs) -> String {
+    let mut output = String::with_capacity(MAX_CLIENT_COMMAND_NAME_BYTES);
+    write_client_last_command_name(&mut output, name_lower, args);
+    output
 }
 
 struct CommandPropagationPlan<'a> {
@@ -214,17 +249,24 @@ impl ServerWorkerState {
         self.ctx.set_forkless_capture_expiration_paused(false);
         let replica_local_expire_only =
             self.ctx.replication().is_replica() && !self.ctx.config().replication.replica_read_only;
-        for db_idx in 0..self.ctx.num_dbs() {
-            if let Some(db) = self.ctx.db_mut(db_idx as u32) {
-                db.set_replica_local_expire_only(replica_local_expire_only);
-            }
-        }
-        if matches!(
-            String::from_utf8_lossy(&args.name)
-                .to_ascii_lowercase()
-                .as_str(),
-            "eval" | "evalsha" | "eval_ro" | "evalsha_ro" | "fcall" | "fcall_ro"
-        ) {
+        // Reset every DB's replica-local-expire flag so that per-command
+        // overrides (e.g. RESTORE, EXPIRE) do not leak across commands.
+        // Slice iteration avoids the per-index bounds check of db_mut().
+        self.ctx
+            .dbs_mut()
+            .set_replica_local_expire_only_all(replica_local_expire_only);
+        // Byte-level case-insensitive match avoids the String allocation that
+        // `from_utf8_lossy().to_ascii_lowercase()` would force on every
+        // command. EVAL/FCALL are the only commands that need a fresh
+        // replication view before execution.
+        let name = &args.name;
+        if name.eq_ignore_ascii_case(b"eval")
+            || name.eq_ignore_ascii_case(b"evalsha")
+            || name.eq_ignore_ascii_case(b"eval_ro")
+            || name.eq_ignore_ascii_case(b"evalsha_ro")
+            || name.eq_ignore_ascii_case(b"fcall")
+            || name.eq_ignore_ascii_case(b"fcall_ro")
+        {
             self.refresh_replication_view();
         }
         match dispatch_group {
@@ -298,10 +340,10 @@ impl ServerWorkerState {
         // short relative TTL cannot expire merely because the handler was
         // descheduled between parsing and applying it. Install this only
         // after synchronous pre-handler waits, whose deadlines must keep
-        // observing real time.
-        let _time_guard = crate::foundation::io::sys::time::enter_command_time_snapshot(
-            crate::foundation::io::sys::time::mstime(),
-        );
+        // observing real time. The snapshot is resolved lazily on first
+        // clock access so commands that never consult time (e.g. PING)
+        // avoid the wall-clock syscall entirely.
+        let _time_guard = crate::foundation::io::sys::time::enter_command_time_snapshot_lazy();
         let reply = self.invoke_command_executor(
             crate::framework::capabilities::io::Token(connection_token),
             executor,
@@ -645,9 +687,10 @@ impl ServerWorkerState {
                 .blocking_registry_mut()
                 .unregister_client(db_id, &blocked_keys, &session);
             if let Some(info) = self.ctx.client_info_mut(token_value) {
-                info.flags.retain(|flag| flag != 'b');
-                if info.flags.is_empty() {
-                    info.flags.push('N');
+                let flags = info.flags.to_mut();
+                flags.retain(|flag| flag != 'b');
+                if flags.is_empty() {
+                    flags.push('N');
                 }
             }
         }

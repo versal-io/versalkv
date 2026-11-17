@@ -1,6 +1,8 @@
 use super::*;
+use crate::foundation::io::sys::time::MonotonicInstant;
 use std::cell::RefCell;
 use std::sync::Once;
+use std::time::{Duration, Instant};
 
 thread_local! {
     static CAPTURED_LOGS: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
@@ -213,7 +215,7 @@ fn writable_master_connect_logs_concrete_error_before_removal() {
     let mut backend = ServerWorkerState::new(1).expect("create runtime");
     let token = refused_master(&mut backend);
     backend.collect_after_poll_events(Some((
-        Instant::now(),
+        MonotonicInstant::now(),
         vec![
             crate::runtime::server::worker::event_loop::transport::RuntimeEvent {
                 token,
@@ -246,7 +248,7 @@ fn master_error_readiness_logs_concrete_error_before_removal() {
     let mut backend = ServerWorkerState::new(1).expect("create runtime");
     let token = refused_master(&mut backend);
     backend.collect_after_poll_events(Some((
-        Instant::now(),
+        MonotonicInstant::now(),
         vec![
             crate::runtime::server::worker::event_loop::transport::RuntimeEvent {
                 token,

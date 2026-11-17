@@ -15,19 +15,16 @@ mod cluster_bus;
 mod shard;
 
 impl ServerWorkerState {
-    pub(crate) fn is_subscribe_mode_allowed(name_lower: &str) -> bool {
-        matches!(
-            name_lower,
-            "subscribe"
-                | "unsubscribe"
-                | "psubscribe"
-                | "punsubscribe"
-                | "ssubscribe"
-                | "sunsubscribe"
-                | "ping"
-                | "quit"
-                | "reset"
-        )
+    pub(crate) fn is_subscribe_mode_allowed(name: &str) -> bool {
+        name.eq_ignore_ascii_case("subscribe")
+            || name.eq_ignore_ascii_case("unsubscribe")
+            || name.eq_ignore_ascii_case("psubscribe")
+            || name.eq_ignore_ascii_case("punsubscribe")
+            || name.eq_ignore_ascii_case("ssubscribe")
+            || name.eq_ignore_ascii_case("sunsubscribe")
+            || name.eq_ignore_ascii_case("ping")
+            || name.eq_ignore_ascii_case("quit")
+            || name.eq_ignore_ascii_case("reset")
     }
 
     pub(crate) fn deliver_published(
@@ -135,46 +132,49 @@ impl ServerWorkerState {
         &mut self,
         connection_token: usize,
         args: &CommandArgs,
-        name_lower: &str,
+        name: &str,
         resp3: bool,
         replies: &mut Vec<Vec<u8>>,
         pending_publish: &mut Vec<(Bytes, Bytes)>,
     ) -> Option<bool> {
-        if !self.check_pubsub_acl(connection_token, args, name_lower, resp3, replies) {
+        // Slow path: pubsub commands. Allocate the lowercased name once for
+        // stats, ACL, and routing; this is not on the PING hot path.
+        let name_lower = name.to_ascii_lowercase();
+        if !self.check_pubsub_acl(connection_token, args, &name_lower, resp3, replies) {
             return Some(true);
         }
         if name_lower == "ssubscribe"
             && self.reject_sharded_pubsub_route(connection_token, args, resp3, replies)
         {
-            self.ctx.end_cmd(name_lower, true);
+            self.ctx.end_cmd(&name_lower, true);
             return Some(true);
         }
-        match name_lower {
+        match name_lower.as_str() {
             "subscribe" => {
-                self.handle_subscribe(connection_token, args, name_lower, resp3, replies)
+                self.handle_subscribe(connection_token, args, &name_lower, resp3, replies)
             }
             "unsubscribe" => {
-                self.handle_unsubscribe(connection_token, args, name_lower, resp3, replies)
+                self.handle_unsubscribe(connection_token, args, &name_lower, resp3, replies)
             }
             "publish" => self.handle_publish(
                 connection_token,
                 args,
-                name_lower,
+                &name_lower,
                 resp3,
                 replies,
                 pending_publish,
             ),
             "psubscribe" => {
-                self.handle_psubscribe(connection_token, args, name_lower, resp3, replies)
+                self.handle_psubscribe(connection_token, args, &name_lower, resp3, replies)
             }
             "punsubscribe" => {
-                self.handle_punsubscribe(connection_token, args, name_lower, resp3, replies)
+                self.handle_punsubscribe(connection_token, args, &name_lower, resp3, replies)
             }
             "ssubscribe" => {
-                self.handle_ssubscribe(connection_token, args, name_lower, resp3, replies)
+                self.handle_ssubscribe(connection_token, args, &name_lower, resp3, replies)
             }
             "sunsubscribe" => {
-                self.handle_sunsubscribe(connection_token, args, name_lower, resp3, replies)
+                self.handle_sunsubscribe(connection_token, args, &name_lower, resp3, replies)
             }
             "spublish" => None,
             _ => None,

@@ -1,7 +1,7 @@
 use crate::engine::command::ResolvedCommand;
+use crate::foundation::memory::util_hash::FxHashMap;
 use crate::framework::spec::{CommandExecutor, CommandSpec};
 use slab::Slab;
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_REGISTRY_ID: AtomicU64 = AtomicU64::new(1);
@@ -22,10 +22,10 @@ struct RegisteredExecutor {
 pub struct CommandRegistry {
     /// Active command table — affected by rename-command.
     /// Key is String because renamed commands may have dynamic names.
-    commands: HashMap<String, RegisteredCommand>,
+    commands: FxHashMap<String, RegisteredCommand>,
     /// Original command table — written once at registration, never modified.
     /// Used for ACL permission checks (always based on original name).
-    orig_commands: HashMap<String, CommandSpec>,
+    orig_commands: FxHashMap<String, CommandSpec>,
     executors: Slab<RegisteredExecutor>,
     registry_id: u64,
     next_generation: u64,
@@ -46,8 +46,8 @@ impl Clone for CommandRegistry {
 impl CommandRegistry {
     pub fn new() -> Self {
         Self {
-            commands: HashMap::new(),
-            orig_commands: HashMap::new(),
+            commands: FxHashMap::default(),
+            orig_commands: FxHashMap::default(),
             executors: Slab::new(),
             registry_id: NEXT_REGISTRY_ID.fetch_add(1, Ordering::Relaxed),
             next_generation: 1,
@@ -211,10 +211,27 @@ impl CommandRegistry {
     }
 
     fn lookup_entry(&self, name: &str) -> Option<&RegisteredCommand> {
+        // Fast path: already lowercase, no allocation.
         if name.bytes().all(|byte| !byte.is_ascii_uppercase()) {
             return self.commands.get(name);
         }
-        self.commands.get(&name.to_ascii_lowercase())
+        // Slow path: uppercase bytes present. Use a stack buffer for short
+        // command names to avoid a heap allocation on the hot path (e.g.
+        // PING, SET, GET sent in uppercase by benchmarks and clients).
+        let bytes = name.as_bytes();
+        if bytes.len() <= 32 {
+            let mut buf = [0u8; 32];
+            for (i, &b) in bytes.iter().enumerate() {
+                buf[i] = b.to_ascii_lowercase();
+            }
+            // SAFETY: input is valid UTF-8; ASCII lowercase mapping preserves
+            // UTF-8 validity because uppercase ASCII bytes (0x41..=0x5A) map
+            // one-to-one to lowercase ASCII bytes (0x61..=0x7A).
+            let lower = std::str::from_utf8(&buf[..bytes.len()]).unwrap();
+            self.commands.get(lower)
+        } else {
+            self.commands.get(&name.to_ascii_lowercase())
+        }
     }
 }
 

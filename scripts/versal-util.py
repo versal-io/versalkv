@@ -351,6 +351,12 @@ def command_check_module_layout(_args: argparse.Namespace, ctx: RepoContext) -> 
     public_types = {}  # type: Dict[str, List[str]]
     for source in iter_files(src, ".rs"):
         relative = source.relative_to(root).as_posix()
+        # `src/foundation/io/sys/wasm/` hosts the `wasm` feature's parallel
+        # implementation of the `sys` module; its types intentionally shadow
+        # the native `sys/*.rs` definitions and must not be flagged as
+        # duplicates.
+        if "/sys/wasm/" in relative:
+            continue
         if relative.startswith("src/bin/"):
             continue
         content = read_text(source)

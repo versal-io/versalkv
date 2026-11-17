@@ -1,6 +1,8 @@
-use std::collections::HashMap;
 use std::fmt::Write;
 use std::time::Instant;
+
+use crate::foundation::memory::util_hash::FxHashMap;
+use crate::foundation::memory::util_time::MonotonicInstant;
 
 const ERRORSTATS_LIMIT: usize = 128;
 const ERRORSTATS_OVERFLOW: &str = "ERRORSTATS_OVERFLOW";
@@ -157,6 +159,10 @@ pub struct CmdStat {
     pub usec: u64,
     pub rejected_calls: u64,
     pub failed_calls: u64,
+    /// Count of latency samples recorded for this command. Mirrors
+    /// `latency_histos` for ordinary (non-subcommand) commands so the hot
+    /// path can avoid allocating a `String` key on every completion.
+    pub latency_samples: u64,
     latency_histogram: Option<Box<LatencyHistogram>>,
 }
 
@@ -184,7 +190,7 @@ pub struct ServerStats {
     pub connected_priority_clients: u64,
     pub rejected_connections: u64,
     pub rejected_priority_connections: u64,
-    pub cmd_stats: HashMap<String, CmdStat>,
+    pub cmd_stats: FxHashMap<String, CmdStat>,
     pub active_time_usec: u64,
     pub tcp_port: u16,
     pub clients_hz: u64,
@@ -198,8 +204,8 @@ pub struct ServerStats {
     pub client_query_buffer_limit_disconnections: u64,
     pub client_output_buffer_limit_disconnections: u64,
     pub total_error_replies: u64,
-    pub error_stats: HashMap<String, u64>,
-    pub latency_histos: HashMap<String, u64>,
+    pub error_stats: FxHashMap<String, u64>,
+    pub latency_histos: FxHashMap<String, u64>,
     pub lazyfree_pending_objects: u64,
     pub lazyfreed_objects: u64,
     pub io_threaded_total_prefetch_batches: u64,
@@ -255,7 +261,7 @@ pub struct ServerStats {
     pub acl_access_denied_key: u64,
     pub acl_access_denied_channel: u64,
     pub acl_access_denied_db: u64,
-    last_cmd_start: Option<Instant>,
+    last_cmd_start: Option<MonotonicInstant>,
     pending_latency_name: Option<String>,
     last_sample_time_ms: Option<i64>,
     ops_metric: InstantaneousMetric,
@@ -287,7 +293,7 @@ impl ServerStats {
             connected_priority_clients: 0,
             rejected_connections: 0,
             rejected_priority_connections: 0,
-            cmd_stats: HashMap::new(),
+            cmd_stats: FxHashMap::default(),
             active_time_usec: 0,
             tcp_port: 0,
             clients_hz: 10,
@@ -301,8 +307,8 @@ impl ServerStats {
             client_query_buffer_limit_disconnections: 0,
             client_output_buffer_limit_disconnections: 0,
             total_error_replies: 0,
-            error_stats: HashMap::new(),
-            latency_histos: HashMap::new(),
+            error_stats: FxHashMap::default(),
+            latency_histos: FxHashMap::default(),
             lazyfree_pending_objects: 0,
             lazyfreed_objects: 0,
             io_threaded_total_prefetch_batches: 0,
@@ -558,14 +564,11 @@ impl ServerStats {
             self.eventloop_events_collected.saturating_add(count as u64);
     }
 
-    pub fn record_eventloop_event_dispatch(
-        &mut self,
-        outcome: EventLoopEventOutcome,
-        duration_usec: u64,
-    ) {
-        self.eventloop_events_dispatch_latency_sum = self
-            .eventloop_events_dispatch_latency_sum
-            .saturating_add(duration_usec);
+    pub fn record_eventloop_event_dispatch(&mut self, outcome: EventLoopEventOutcome) {
+        // eventloop_events_dispatch_latency_sum is a Rust-only diagnostic field
+        // absent from the C implementation. Per-event clock reads were removed
+        // from the dispatch hot path; the field stays at zero and is still
+        // emitted by INFO STATS for output compatibility.
         match outcome {
             EventLoopEventOutcome::Handled => {
                 self.eventloop_events_handled = self.eventloop_events_handled.saturating_add(1);
@@ -586,8 +589,16 @@ impl ServerStats {
         }
     }
 
-    pub fn begin_cmd(&mut self) {
-        self.last_cmd_start = Some(Instant::now());
+    pub fn begin_cmd(&mut self, track_latency: bool) {
+        // Only capture the start timestamp when latency tracking is enabled.
+        // When disabled, `last_cmd_start` stays `None` and `end_cmd` skips
+        // the duration computation. `MonotonicInstant::now()` uses the hardware
+        // counter (TSC/CNTVCT) when available, far cheaper than `Instant::now`.
+        self.last_cmd_start = if track_latency {
+            Some(MonotonicInstant::now())
+        } else {
+            None
+        };
     }
 
     pub fn set_cmd_fullname(&mut self, fullname: &str) {
@@ -595,10 +606,11 @@ impl ServerStats {
     }
 
     pub fn end_cmd(&mut self, name: &str, rejected: bool, track_latency: bool) -> u64 {
-        let duration_us = self
-            .last_cmd_start
-            .take()
-            .map(|start| start.elapsed().as_micros() as u64);
+        let duration_us = self.last_cmd_start.take().map(|start| {
+            MonotonicInstant::now()
+                .as_micros()
+                .saturating_sub(start.as_micros())
+        });
         self.record_cmd_completion(name, rejected, track_latency, duration_us)
     }
 
@@ -619,7 +631,18 @@ impl ServerStats {
         track_latency: bool,
         elapsed_us: Option<u64>,
     ) -> u64 {
-        let stat = self.cmd_stats.entry(name.to_ascii_lowercase()).or_default();
+        // Production callers always pass a lower-cased command name, so the
+        // entry already exists under `name`. A borrowed `get_mut` avoids the
+        // owned-key allocation that `entry().or_default()` would force on the
+        // hot path (every command after the first one).
+        let stat = if let Some(stat) = self.cmd_stats.get_mut(name) {
+            stat
+        } else {
+            // Slow path: first occurrence or a caller that did not lowercase.
+            // Normalize to lowercase to match C's case-insensitive accounting.
+            let lower = name.to_ascii_lowercase();
+            self.cmd_stats.entry(lower).or_default()
+        };
         let mut duration_us = 0u64;
         if rejected {
             stat.rejected_calls += 1;
@@ -635,12 +658,21 @@ impl ServerStats {
                     stat.record_latency_usec(elapsed_us);
                 }
             }
-            let lat_name = self
-                .pending_latency_name
-                .take()
-                .unwrap_or_else(|| name.to_ascii_lowercase());
             if track_latency {
-                *self.latency_histos.entry(lat_name).or_insert(0) += 1;
+                match self.pending_latency_name.take() {
+                    // Subcommand-keyed latency event (e.g. "config|get"): keep
+                    // the dedicated map since its key differs from cmd_stats.
+                    Some(subname) => {
+                        *self.latency_histos.entry(subname).or_insert(0) += 1;
+                    }
+                    // Ordinary command: store the sample count on CmdStat to
+                    // skip the per-command `String` allocation on the hot path.
+                    None => {
+                        stat.latency_samples += 1;
+                    }
+                }
+            } else if self.pending_latency_name.is_some() {
+                self.pending_latency_name = None;
             }
         }
         if self.pending_latency_name.is_some() {
@@ -656,6 +688,7 @@ impl ServerStats {
         self.latency_histos.clear();
         for stat in self.cmd_stats.values_mut() {
             stat.latency_histogram = None;
+            stat.latency_samples = 0;
         }
     }
 
@@ -828,7 +861,7 @@ mod tests {
     fn command_stats_record_success_rejection_failure_and_latency_name() {
         let mut stats = ServerStats::new();
 
-        stats.begin_cmd();
+        stats.begin_cmd(true);
         stats.set_cmd_fullname("config|get");
         thread::sleep(Duration::from_micros(1));
         let duration = stats.end_cmd("CONFIG", false, true);
@@ -874,14 +907,14 @@ mod tests {
         stats.incr_expired_keys(1);
         stats.incr_evicted_keys(1);
         stats.incr_sync_full();
-        stats.begin_cmd();
+        stats.begin_cmd(true);
         stats.end_cmd("set", false, true);
         stats.incr_error_reply("ERR");
         stats.io_threaded_total_prefetch_batches = 1;
         stats.io_threaded_total_prefetch_entries = 2;
         stats.latency_histos_reset();
         assert!(stats.latency_histos.is_empty());
-        stats.begin_cmd();
+        stats.begin_cmd(true);
         stats.end_cmd("get", false, true);
 
         stats.reset();
@@ -944,18 +977,20 @@ mod tests {
     }
 
     #[test]
-    fn eventloop_event_outcomes_and_latency_accumulate() {
+    fn eventloop_event_outcomes_accumulate() {
         let mut stats = ServerStats::new();
 
         stats.record_eventloop_event_collected(3);
-        stats.record_eventloop_event_dispatch(EventLoopEventOutcome::Handled, 4);
-        stats.record_eventloop_event_dispatch(EventLoopEventOutcome::Deferred, 5);
-        stats.record_eventloop_event_dispatch(EventLoopEventOutcome::OwnerClosed, 6);
+        stats.record_eventloop_event_dispatch(EventLoopEventOutcome::Handled);
+        stats.record_eventloop_event_dispatch(EventLoopEventOutcome::Deferred);
+        stats.record_eventloop_event_dispatch(EventLoopEventOutcome::OwnerClosed);
 
         assert_eq!(stats.eventloop_events_collected, 3);
         assert_eq!(stats.eventloop_events_handled, 1);
         assert_eq!(stats.eventloop_events_deferred, 1);
         assert_eq!(stats.eventloop_events_owner_closed, 1);
-        assert_eq!(stats.eventloop_events_dispatch_latency_sum, 15);
+        // Per-event dispatch latency clock reads were removed from the hot
+        // path; the diagnostic field stays at zero for INFO compatibility.
+        assert_eq!(stats.eventloop_events_dispatch_latency_sum, 0);
     }
 }

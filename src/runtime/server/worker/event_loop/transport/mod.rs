@@ -10,6 +10,7 @@ use crate::foundation::io::transport::{
     ConnectedPeer, Interest, ListenerHandle, OwnedPollSource, ThreadIoHandle, TransportEvent,
     TransportId, TransportRuntime, TransportWakeHandle, TransportWorkerBackend, UnixBindOptions,
 };
+use crate::foundation::memory::util_hash::FxHashMap;
 use crate::framework::distributed::sentinel::io::{IoInterest, SentinelIo};
 use crate::runtime::server::worker::event_loop::sources::{RuntimeSourceRegistry, SourceOwner};
 use std::io::{self, IoSlice, Read, Write};
@@ -762,17 +763,14 @@ impl<T: TransportRuntime> Write for TransportStream<'_, T> {
 pub(crate) struct RuntimeSentinelIo<'a, T: TransportRuntime> {
     transport: &'a mut RuntimeTransport<T>,
     sources: &'a mut RuntimeSourceRegistry,
-    pending_transport_removals: &'a mut std::collections::HashMap<Token, PendingTransportRemoval>,
+    pending_transport_removals: &'a mut FxHashMap<Token, PendingTransportRemoval>,
 }
 
 impl<'a, T: TransportRuntime> RuntimeSentinelIo<'a, T> {
     pub(crate) fn new(
         transport: &'a mut RuntimeTransport<T>,
         sources: &'a mut RuntimeSourceRegistry,
-        pending_transport_removals: &'a mut std::collections::HashMap<
-            Token,
-            PendingTransportRemoval,
-        >,
+        pending_transport_removals: &'a mut FxHashMap<Token, PendingTransportRemoval>,
     ) -> Self {
         Self {
             transport,
@@ -1158,6 +1156,7 @@ mod tests {
         ConnectedPeer, Interest, ListenerHandle, OwnedPollSource, PollSourceMode, ThreadIoHandle,
         TransportEvent, TransportId, TransportWakeHandle, TransportWorkerBackend, UnixBindOptions,
     };
+    use crate::foundation::memory::util_hash::FxHashMap;
     use std::fs::File;
     use std::io::{self, IoSlice, Read, Write};
     use std::net::SocketAddr;
@@ -1673,7 +1672,7 @@ mod tests {
             .push_peer(ConnectedPeer { id, peer_addr });
         let mut sources = RuntimeSourceRegistry::default();
 
-        let mut pending = std::collections::HashMap::new();
+        let mut pending = FxHashMap::default();
         let token = SentinelIo::connect_tcp(
             &mut RuntimeSentinelIo::new(&mut transport, &mut sources, &mut pending),
             "127.0.0.1:26379",

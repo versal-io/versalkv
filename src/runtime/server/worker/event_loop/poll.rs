@@ -1,4 +1,3 @@
-#[cfg(test)]
 use crate::foundation::io::sys::time::MonotonicInstant;
 use crate::runtime::server::worker::event_loop::transport::RuntimeEvent;
 
@@ -52,7 +51,7 @@ impl ServerWorkerState {
     #[cfg(test)]
     pub(super) fn poll_ready(
         &mut self,
-    ) -> std::io::Result<Option<(std::time::Instant, Vec<RuntimeEvent>)>> {
+    ) -> std::io::Result<Option<(MonotonicInstant, Vec<RuntimeEvent>)>> {
         self.sync_module_timer_event();
         let poll_timeout = self.next_poll_timeout(MonotonicInstant::now());
         self.poll_ready_with_timeout(poll_timeout)
@@ -61,7 +60,7 @@ impl ServerWorkerState {
     pub(crate) fn poll_ready_with_timeout(
         &mut self,
         poll_timeout: Option<std::time::Duration>,
-    ) -> std::io::Result<Option<(std::time::Instant, Vec<RuntimeEvent>)>> {
+    ) -> std::io::Result<Option<(MonotonicInstant, Vec<RuntimeEvent>)>> {
         self.refresh_connection_priorities();
         self.events_buf.clear();
         #[cfg(test)]
@@ -107,7 +106,7 @@ impl ServerWorkerState {
         self.drain_io_completions();
         #[cfg(test)]
         self.trace_turn_for_test(TurnTracePoint::AfterPoll);
-        let cycle_start = std::time::Instant::now();
+        let cycle_start = MonotonicInstant::now();
         if self.exit_if_shutdown_requested() {
             self.shutdown_io_threads();
             return Ok(None);
@@ -119,7 +118,7 @@ impl ServerWorkerState {
 
     pub(super) fn collect_preemptive_priority_events(
         &mut self,
-        last_poll: &mut std::time::Instant,
+        last_poll: &mut MonotonicInstant,
     ) -> std::io::Result<()> {
         let interval_us = self
             .ctx
@@ -127,7 +126,7 @@ impl ServerWorkerState {
             .server
             .priority_preemptive_poll_interval_us;
         if interval_us == 0
-            || last_poll.elapsed() < std::time::Duration::from_micros(interval_us)
+            || MonotonicInstant::now().as_micros() < last_poll.as_micros() + interval_us
             || self.transport.poll_inflight()
             || self.transport.shutdown_started()
         {
@@ -136,7 +135,7 @@ impl ServerWorkerState {
         // Poll synchronously without moving the multiplexer to an I/O worker.
         // Enqueue all returned readiness: EventBatch preserves lane ordering,
         // coalescing, and the existing current/next-turn dispatch budgets.
-        *last_poll = std::time::Instant::now();
+        *last_poll = MonotonicInstant::now();
         let events = self
             .transport
             .poll_events(Some(std::time::Duration::ZERO))?;
@@ -146,7 +145,7 @@ impl ServerWorkerState {
 
     #[cfg(test)]
     pub(super) fn dispatch_ready_batch(&mut self, events: Vec<RuntimeEvent>) {
-        self.collect_after_poll_events(Some((std::time::Instant::now(), events)));
+        self.collect_after_poll_events(Some((MonotonicInstant::now(), events)));
         self.dispatch_ready_phase(super::DispatchContext::Normal)
             .expect("dispatch test readiness batch");
     }

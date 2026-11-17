@@ -4,6 +4,7 @@
 
 use crate::engine::extension::acl::command::AclCommand;
 use bytes::Bytes;
+use std::borrow::Cow;
 
 use super::user::{
     AclDenial, DbRequirement, ACL_ALL_PERMISSION, ACL_READ_PERMISSION, ACL_WRITE_PERMISSION,
@@ -243,7 +244,15 @@ impl AclSelector {
     }
 
     pub(crate) fn can_execute_command_with_args(&self, command: AclCommand<'_>) -> bool {
-        let cmd_lower = command.name.to_ascii_lowercase();
+        // On the dispatch hot path `command.name` is the canonical lowercase
+        // command name, so `to_ascii_lowercase()` would allocate for nothing.
+        // Only allocate when the name actually contains uppercase characters
+        // (e.g. caller-supplied names from ACL validation paths).
+        let cmd_lower: Cow<str> = if command.name.bytes().any(|b| b.is_ascii_uppercase()) {
+            Cow::Owned(command.name.to_ascii_lowercase())
+        } else {
+            Cow::Borrowed(command.name)
+        };
         let first_arg = command
             .args
             .first()

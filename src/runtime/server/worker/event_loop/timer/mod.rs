@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use crate::foundation::memory::util_hash::FxHashMap;
 use std::time::Duration;
 
 use crate::foundation::io::sys::time::MonotonicInstant;
@@ -50,7 +50,7 @@ struct TimeEvent {
 
 #[derive(Default)]
 pub(crate) struct TimeEventRegistry {
-    events: HashMap<TimeEventId, TimeEvent>,
+    events: FxHashMap<TimeEventId, TimeEvent>,
     next_id: u64,
 }
 

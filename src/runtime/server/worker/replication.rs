@@ -4,6 +4,7 @@ use crate::engine::distributed::replication::{
     protocol as replication, BacklogCursor, ReplicationOffset, SnapshotBoundary,
 };
 use crate::foundation::io::transport::{Interest, WriteOutcome};
+use crate::foundation::memory::util_hash::{FxHashMap, FxHashSet};
 use crate::framework::capabilities::connection::Connection;
 use crate::framework::capabilities::io::Token;
 use crate::framework::distributed::replication::{
@@ -16,7 +17,6 @@ use crate::runtime::server::worker::event_loop::blocked_events::BlockedOperation
 use crate::runtime::server::worker::event_loop::sources::SourceOwner;
 use crate::runtime::server::worker::replication::disk_sync_batch::DiskSyncBatch;
 use crate::runtime::server::worker::replication::diskless_child::DisklessRelay;
-use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::net::{SocketAddr, ToSocketAddrs};
 
@@ -142,11 +142,11 @@ pub(crate) fn render_unknown_replication_command_for_log(
 #[derive(Default)]
 pub(crate) struct FullSyncCoordinator {
     pub(crate) next_transfer_id: u64,
-    pub(crate) pending_dual_rdb_snapshots: HashMap<Token, (i64, Vec<u8>)>,
+    pub(crate) pending_dual_rdb_snapshots: FxHashMap<Token, (i64, Vec<u8>)>,
     /// Main-channel replies held while the pipe relay services a paused primary.
-    pub(crate) paused_dual_main_replies: HashMap<Token, Vec<Vec<u8>>>,
+    pub(crate) paused_dual_main_replies: FxHashMap<Token, Vec<Vec<u8>>>,
     /// Ordinary clients held until the paused dual-channel transfer resumes.
-    pub(crate) paused_dual_clients: HashSet<Token>,
+    pub(crate) paused_dual_clients: FxHashSet<Token>,
     /// One fork pipe streaming an RDB to a cohort of EOF-capable replicas.
     pub(crate) diskless_relay: Option<DisklessRelay>,
     /// A shared disk snapshot served to independent replica cursors.
@@ -905,6 +905,11 @@ impl ServerWorkerState {
     /// Rust equivalent is cached, hence callers must refresh the view when
     /// this returns non-zero.
     pub(crate) fn expire_grace_psync_waits(&mut self) -> usize {
+        // Fast path: no PSYNC wait owners means nothing can expire, so skip the
+        // `mstime()` syscall on the common no-replication path.
+        if !self.replication_runtime.has_psync_wait_owners() {
+            return 0;
+        }
         let now = crate::foundation::io::sys::time::mstime();
         let expired_grace = self.replication_runtime.take_expired_grace_psync_waits(now);
         for main in &expired_grace {

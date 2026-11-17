@@ -19,7 +19,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 fn offset(value: i64) -> ReplicationOffset {
     ReplicationOffset::try_from(value).expect("valid test offset")
@@ -304,7 +304,11 @@ fn listener_accept_budget_applies_once_per_event_loop_cycle() {
 #[test]
 fn before_poll_records_previous_cycle_before_due_time_events() {
     let mut backend = ServerWorkerState::new(1).expect("create runtime");
-    backend.start_event_loop_cycle(Instant::now() - Duration::from_micros(10), 0, 0);
+    backend.start_event_loop_cycle(
+        MonotonicInstant::from_micros(MonotonicInstant::now().as_micros().saturating_sub(10)),
+        0,
+        0,
+    );
     backend.create_test_time_event(|runtime| {
         assert_eq!(runtime.ctx.stats().eventloop_cycles, 1);
         assert!(runtime.ctx.stats().eventloop_duration_sum > 0);
@@ -1813,7 +1817,7 @@ fn ready_phase_counts_replication_replay_deferral_as_deferred() {
         backend.ctx.stats().eventloop_events_owner_closed,
     );
     backend.collect_after_poll_events(Some((
-        Instant::now(),
+        MonotonicInstant::now(),
         vec![
             crate::runtime::server::worker::event_loop::transport::RuntimeEvent {
                 token: peer.token,
@@ -1905,7 +1909,7 @@ fn unified_dispatch_records_ready_and_time_outcomes_once_with_latency() {
         .expect("write readiness effect");
     backend.transport.wait_readable_for_test(token);
     backend.collect_after_poll_events(Some((
-        Instant::now(),
+        MonotonicInstant::now(),
         vec![
             crate::runtime::server::worker::event_loop::transport::RuntimeEvent {
                 token,
@@ -1943,7 +1947,9 @@ fn unified_dispatch_records_ready_and_time_outcomes_once_with_latency() {
     assert_eq!(stats.eventloop_events_requeued, 0);
     assert_eq!(stats.eventloop_events_stale, 0);
     assert_eq!(stats.eventloop_events_owner_closed, 0);
-    assert!(stats.eventloop_events_dispatch_latency_sum >= 2_000);
+    // Per-event dispatch latency clock reads were removed; the field stays at
+    // zero and is still emitted by INFO STATS for output compatibility.
+    assert_eq!(stats.eventloop_events_dispatch_latency_sum, 0);
     assert_eq!(stats.cmd_stats["accounted_timer"].calls, 1);
 }
 
@@ -1957,7 +1963,7 @@ fn ready_phase_counts_io_worker_failure_as_handled_not_owner_closed() {
         backend.ctx.stats().eventloop_events_owner_closed,
     );
     backend.collect_after_poll_events(Some((
-        Instant::now(),
+        MonotonicInstant::now(),
         vec![
             crate::runtime::server::worker::event_loop::transport::RuntimeEvent {
                 token: wake_token,
@@ -2004,7 +2010,7 @@ fn ready_phase_counts_terminal_connection_failure_as_owner_closed() {
         backend.ctx.stats().eventloop_events_owner_closed,
     );
     backend.collect_after_poll_events(Some((
-        Instant::now(),
+        MonotonicInstant::now(),
         vec![
             crate::runtime::server::worker::event_loop::transport::RuntimeEvent {
                 token,

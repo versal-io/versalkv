@@ -1,5 +1,6 @@
 use crate::framework::context::ServerContext;
 use crate::foundation::io::protocol::Value;
+use crate::foundation::memory::util_time::MonotonicInstant;
 use crate::engine::command::context::CommandConn;
 use bytes::Bytes;
 
@@ -15,7 +16,7 @@ fn compute_rbs(reply_bytes_curr_cmd: usize, idle_ms: u64) -> usize {
 }
 
 pub fn client_info(conn: &mut dyn CommandConn, ctx: &mut ServerContext) -> Value {
-    let now = std::time::Instant::now();
+    let now = MonotonicInstant::now();
     let age_secs = now.duration_since(conn.create_time()).as_secs();
     let idle_ms = now.duration_since(conn.last_interaction()).as_millis() as u64;
     let idle_secs = idle_ms / 1000;

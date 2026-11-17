@@ -1,6 +1,7 @@
 use super::Server;
 use crate::engine::extension::acl::{
-    acl_users, parse_acl_declarations, parse_acl_file, replace_acl_state,
+    acl_users, parse_acl_declarations, parse_acl_file, refresh_default_user_superuser_flag,
+    replace_acl_state,
 };
 use crate::framework::commands::server::acl::validate_acl_file;
 use crate::framework::commands::server::config::{apply_config_set_one, config_registry};
@@ -168,7 +169,11 @@ impl Server {
                 state.users.insert("default".to_string(), user.clone());
             }
         }
-        replace_acl_state(state).map(|_| ()).map_err(str::to_string)
+        replace_acl_state(state)
+            .map(|_| ())
+            .map_err(str::to_string)?;
+        refresh_default_user_superuser_flag();
+        Ok(())
     }
 
     fn load_acl_file(
@@ -179,6 +184,10 @@ impl Server {
         let content = std::fs::read(path).map_err(|error| error.to_string())?;
         let state = parse_acl_file(&content, default_allchannels)?;
         validate_acl_file(&state, ctx)?;
-        replace_acl_state(state).map(|_| ()).map_err(str::to_string)
+        replace_acl_state(state)
+            .map(|_| ())
+            .map_err(str::to_string)?;
+        refresh_default_user_superuser_flag();
+        Ok(())
     }
 }

@@ -67,10 +67,6 @@ impl EffectQueue {
 pub(crate) struct CommandEffects(pub(super) EffectQueue);
 
 impl CommandEffects {
-    pub(super) fn commit(&mut self, command: Self) {
-        self.0.append(command.0);
-    }
-
     pub(crate) fn exec_sinks(&mut self) -> ExecEffectSinks<'_> {
         let EffectQueue {
             watch_dirty,

@@ -6,6 +6,7 @@ use crate::engine::command::SessionId;
 use crate::engine::distributed::cluster::ClusterState;
 use crate::engine::distributed::sentinel::SentinelState;
 use crate::engine::distributed::shutdown::ShutdownState;
+use crate::foundation::memory::util_hash::FxIndexSet;
 use crate::framework::capabilities::io::Token;
 
 impl ServerContext {
@@ -40,22 +41,22 @@ impl ServerContext {
     pub(crate) fn client_pause_mut(&mut self) -> &mut ClientPauseState {
         &mut self.client_pause
     }
-    pub fn paused_clients(&self) -> &indexmap::IndexSet<Token> {
+    pub fn paused_clients(&self) -> &FxIndexSet<Token> {
         &self.paused_clients
     }
-    pub(crate) fn paused_clients_mut(&mut self) -> &mut indexmap::IndexSet<Token> {
+    pub(crate) fn paused_clients_mut(&mut self) -> &mut FxIndexSet<Token> {
         &mut self.paused_clients
     }
-    pub(crate) fn forkless_clients_mut(&mut self) -> &mut indexmap::IndexSet<Token> {
+    pub(crate) fn forkless_clients_mut(&mut self) -> &mut FxIndexSet<Token> {
         &mut self.forkless_clients
     }
     pub(crate) fn has_forkless_waiters(&self) -> bool {
         !self.forkless_clients.is_empty()
     }
-    pub fn throttled_clients(&self) -> &indexmap::IndexSet<Token> {
+    pub fn throttled_clients(&self) -> &FxIndexSet<Token> {
         &self.throttled_clients
     }
-    pub(crate) fn throttled_clients_mut(&mut self) -> &mut indexmap::IndexSet<Token> {
+    pub(crate) fn throttled_clients_mut(&mut self) -> &mut FxIndexSet<Token> {
         &mut self.throttled_clients
     }
     pub fn pending_unpause(&self) -> bool {

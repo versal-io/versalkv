@@ -5,6 +5,9 @@ use crate::runtime::server::worker::ServerWorkerState;
 impl ServerWorkerState {
     pub(crate) fn effective_client_memory_limit(&self) -> Option<usize> {
         let configured = self.ctx.config().server.maxmemory_clients.trim();
+        if configured.is_empty() || configured == "0" {
+            return None;
+        }
         let limit = if let Some(percent) = configured.strip_suffix('%') {
             percent.parse::<usize>().ok().and_then(|value| {
                 (self.ctx.config().server.maxmemory > 0)

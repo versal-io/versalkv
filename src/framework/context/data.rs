@@ -50,8 +50,13 @@ impl ServerContext {
     ) {
         let persistence = &self.persistence;
         let is_capturing = persistence.forkless_capture_in_progress();
+        // Route the flag flip through DbSet so its aggregate count stays
+        // consistent for the `set_replica_local_expire_only_all(false)` fast
+        // path.
+        self.db
+            .dbs
+            .set_db_replica_local_expire_only(db_idx, replica_local_only);
         if let Some(db) = self.db.dbs.get_mut(db_idx) {
-            db.set_replica_local_expire_only(replica_local_only);
             crate::foundation::io::store::kv_engine::expire::active_expire_cycle_with_effort_and_filter(
                 db,
                 false,
@@ -115,15 +120,23 @@ impl ServerContext {
             .set_eviction_metadata_config(use_lfu, log_factor, decay_time);
     }
     pub fn refresh_dict_resize_budget(&mut self) {
-        let budget = (self.config().server.maxmemory > 0).then(|| {
-            let state = self.maxmemory_state();
-            if state.would_exceed(0) {
-                0
-            } else {
-                state.headroom()
+        if self.config().server.maxmemory == 0 {
+            // Fast path: a standalone server with no memory limit never needs
+            // to throttle dict resizing. The budget is initialized to
+            // unlimited at startup, so only store when a previous maxmemory
+            // value left it bounded (e.g. after `CONFIG SET maxmemory 0`).
+            if !self.db.dbs.resize_budget_is_unlimited() {
+                self.db.dbs.set_resize_budget(None);
             }
-        });
-        self.db.dbs.set_resize_budget(budget);
+            return;
+        }
+        let state = self.maxmemory_state();
+        let budget = if state.would_exceed(0) {
+            0
+        } else {
+            state.headroom()
+        };
+        self.db.dbs.set_resize_budget(Some(budget));
     }
     /// Run a closure with mutable access to a specific database.
     /// Returns `db_index_out_of_range` error if the index is invalid.
@@ -148,7 +161,9 @@ impl ServerContext {
         self.db.dbs.get_mut(idx)
     }
     /// Mutably access the client info registry.
-    pub(crate) fn client_infos_mut(&mut self) -> &mut std::collections::HashMap<usize, ClientInfo> {
+    pub(crate) fn client_infos_mut(
+        &mut self,
+    ) -> &mut crate::foundation::memory::util_hash::FxHashMap<usize, ClientInfo> {
         &mut self.db.client_infos
     }
     /// Look up a client's info by token id.

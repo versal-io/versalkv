@@ -235,12 +235,13 @@ impl CommandConn for ModuleCallConn {
     fn set_selected_db(&mut self, db: u32) {
         self.selected_db = db;
     }
-    fn last_interaction(&self) -> std::time::Instant {
-        std::time::Instant::now()
+    fn last_interaction(&self) -> crate::foundation::memory::util_time::MonotonicInstant {
+        crate::foundation::memory::util_time::MonotonicInstant::now()
     }
-    fn set_last_interaction(&mut self, _t: std::time::Instant) {}
-    fn create_time(&self) -> std::time::Instant {
-        std::time::Instant::now()
+    fn set_last_interaction(&mut self, _t: crate::foundation::memory::util_time::MonotonicInstant) {
+    }
+    fn create_time(&self) -> crate::foundation::memory::util_time::MonotonicInstant {
+        crate::foundation::memory::util_time::MonotonicInstant::now()
     }
     fn name(&self) -> Option<&Bytes> {
         None

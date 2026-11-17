@@ -2604,7 +2604,8 @@ fn stalled_import_uses_last_incoming_connection_activity() {
     let token = Token(94);
     let mut connection = Connection::new_fake();
     connection.set_token_for_test(token);
-    connection.last_interaction = std::time::Instant::now() - std::time::Duration::from_secs(3);
+    connection.last_interaction = crate::foundation::memory::util_time::MonotonicInstant::now()
+        .saturating_sub(std::time::Duration::from_secs(3));
     connection.slot_migration_role = Some(SlotMigrationConnectionRole::Import(id.clone()));
     let _connection_token = runtime.connection_registry.insert(connection);
 

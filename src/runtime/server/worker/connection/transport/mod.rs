@@ -65,22 +65,28 @@ impl ServerWorkerState {
         connection_token: usize,
         token_value: usize,
         args: &CommandArgs,
-        name_lower: &str,
+        name: &str,
         resp3: bool,
         replies: &mut Vec<Vec<u8>>,
         _pending_unblock: &mut Vec<(usize, bool)>,
     ) -> Option<bool> {
-        if !matches!(name_lower, "replconf" | "psync" | "sync") {
+        if !name.eq_ignore_ascii_case("replconf")
+            && !name.eq_ignore_ascii_case("psync")
+            && !name.eq_ignore_ascii_case("sync")
+        {
             return None;
         }
-        if let Some(reply) = self.transport_acl_denial(connection_token, args, name_lower, resp3) {
+        // Slow path: replication transport commands. Allocate the lowercased
+        // name once for ACL, stats, and routing; not on the PING hot path.
+        let name_lower = name.to_ascii_lowercase();
+        if let Some(reply) = self.transport_acl_denial(connection_token, args, &name_lower, resp3) {
             replies.push(reply);
             return Some(false);
         }
-        let allows_busy = crate::framework::generated::commands::top_level_meta(name_lower)
+        let allows_busy = crate::framework::generated::commands::top_level_meta(&name_lower)
             .is_some_and(|meta| meta.flags & crate::engine::command::CMD_ALLOW_BUSY != 0);
         if self.ctx.is_script_busy() && !self.ctx.is_loading() && !allows_busy {
-            self.ctx.end_cmd(name_lower, true);
+            self.ctx.end_cmd(&name_lower, true);
             let reply = Value::error(
                 "BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.",
             );
@@ -96,14 +102,10 @@ impl ServerWorkerState {
             });
             return Some(false);
         }
-        match name_lower {
-            "replconf" => {
-                Some(self.handle_replconf(connection_token, token_value, args, resp3, replies))
-            }
-            "psync" | "sync" => {
-                Some(self.handle_psync(connection_token, args, name_lower, replies))
-            }
-            _ => unreachable!("transport command name checked above"),
+        if name_lower == "replconf" {
+            Some(self.handle_replconf(connection_token, token_value, args, resp3, replies))
+        } else {
+            Some(self.handle_psync(connection_token, args, &name_lower, replies))
         }
     }
 }
@@ -1092,11 +1094,10 @@ mod tests {
             "ENDOFF must not create a PSYNC wait before snapshot start"
         );
         assert_eq!(
-            backend
-                .ctx
-                .client_info(rdb.0)
-                .map(|info| info.last_cmd.as_str()),
-            Some("sync"),
+            backend.connection_registry[crate::framework::capabilities::io::Token(rdb_slab)]
+                .last_cmd
+                .as_str(),
+            "sync",
             "a dual RDB channel must remain addressable through CLIENT LIST cmd=sync"
         );
         let rdb_output: Vec<u8> = backend.connection_registry
@@ -1441,11 +1442,10 @@ mod tests {
 
         assert_eq!(replies, vec![b"+CONTINUE\r\n".to_vec()]);
         assert_eq!(
-            backend
-                .ctx
-                .client_info(main.0)
-                .map(|info| info.last_cmd.as_str()),
-            Some("psync"),
+            backend.connection_registry[crate::framework::capabilities::io::Token(main_slab)]
+                .last_cmd
+                .as_str(),
+            "psync",
             "a dual main channel must remain addressable through CLIENT LIST cmd=psync"
         );
         let link = backend

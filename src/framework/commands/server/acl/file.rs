@@ -1,5 +1,6 @@
 use crate::engine::extension::acl::{
-    acl_roles, acl_users, parse_acl_file, replace_acl_state, AclFileState,
+    acl_roles, acl_users, parse_acl_file, refresh_default_user_superuser_flag, replace_acl_state,
+    AclFileState,
 };
 use crate::foundation::io::protocol::Value;
 use crate::framework::context::ServerContext;
@@ -29,6 +30,7 @@ pub fn acl_load(ctx: &mut ServerContext) -> Value {
         Ok(existing) => ctx.pending_acl_client_kills_mut().extend(existing),
         Err(error) => return Value::error(format!("ERR {error}")),
     }
+    refresh_default_user_superuser_flag();
     Value::ok()
 }
 

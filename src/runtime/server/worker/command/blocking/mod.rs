@@ -256,9 +256,10 @@ impl ServerWorkerState {
                 self.ctx.shutdown_state().blocked_clients.saturating_sub(1);
         }
         if let Some(ci) = self.ctx.client_info_mut(token.0) {
-            ci.flags.retain(|c| c != 'b');
-            if ci.flags.is_empty() {
-                ci.flags.push('N');
+            let flags = ci.flags.to_mut();
+            flags.retain(|c| c != 'b');
+            if flags.is_empty() {
+                flags.push('N');
             }
         }
         Some(DetachedBlockedCommand { completed })
@@ -744,6 +745,9 @@ impl ServerWorkerState {
 
     pub(crate) fn reject_blocked_waitaof_local_if_aof_disabled(&mut self) {
         if self.ctx.config().persistence.aof_enabled {
+            return;
+        }
+        if self.ctx.blocking_registry().count() == 0 {
             return;
         }
         let tokens: Vec<Token> = self

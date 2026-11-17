@@ -5,6 +5,7 @@ use super::{
     TlsClientConfig, TlsConfig, TransportEvent, TransportId, TransportPollMode, TransportPollState,
     TransportRuntime, TransportWakeHandle, TransportWorkerBackend, UnixBindOptions,
 };
+use crate::foundation::memory::util_hash::FxHashMap;
 #[cfg(feature = "tls")]
 use openssl::ssl::{ErrorCode, Ssl, SslStream};
 use polling::{Event, Events, PollMode, Poller};
@@ -163,6 +164,10 @@ pub(crate) struct PollingTransportRuntime {
     poller: Arc<Poller>,
     mode: TransportPollMode,
     registered: Slab<Registered>,
+    /// Cached last-set interest per transport. `reregister` skips the
+    /// `epoll_ctl` syscall when the requested interest matches the cache,
+    /// mirroring C's `want_read`/`want_write` mask short-circuit.
+    current_interests: FxHashMap<TransportId, Interest>,
     tcp_buffer_limits: Option<TcpBufferLimits>,
     tcp_backlog: i32,
     tls_contexts: super::TlsContextBatch,
@@ -212,6 +217,7 @@ impl PollingTransportRuntime {
             poller,
             mode,
             registered: Slab::new(),
+            current_interests: FxHashMap::default(),
             tcp_buffer_limits,
             tcp_backlog: 511,
             tls_contexts: super::TlsContextBatch::default(),
@@ -256,7 +262,7 @@ impl PollingTransportRuntime {
     }
 
     fn add_source_fd(
-        &self,
+        &mut self,
         fd: std::os::fd::RawFd,
         id: TransportId,
         interest: Interest,
@@ -266,38 +272,48 @@ impl PollingTransportRuntime {
             fd,
             Self::polling_event(id, interest),
             self.poll_mode(),
-        )
+        )?;
+        self.current_interests.insert(id, interest);
+        Ok(())
     }
 
     fn reregister(&mut self, id: TransportId, interest: Interest) -> io::Result<()> {
         self.ensure_poll_attached()?;
+        // Determine the effective interest: TLS streams that haven't finished
+        // the handshake always need both directions regardless of the request.
+        let effective = match self.registered.get(id.get() - 1) {
+            #[cfg(feature = "tls")]
+            Some(Registered::Stream(Stream::Tls(stream))) if !stream.ssl().is_init_finished() => {
+                Interest::ReadWritable
+            }
+            _ => interest,
+        };
+        // Short-circuit: skip the syscall when the kernel already has this mask.
+        if self.current_interests.get(&id) == Some(&effective) {
+            return Ok(());
+        }
         let poller = Arc::clone(&self.poller);
         let mode = self.poll_mode();
-        match self.registered.get_mut(id.get() - 1) {
+        let result = match self.registered.get_mut(id.get() - 1) {
             Some(Registered::TcpListener(listener)) => {
-                poller.modify_with_mode(listener, Self::polling_event(id, interest), mode)
+                poller.modify_with_mode(listener, Self::polling_event(id, effective), mode)
             }
             #[cfg(feature = "tls")]
             Some(Registered::TlsListener(listener)) => {
-                poller.modify_with_mode(listener, Self::polling_event(id, interest), mode)
+                poller.modify_with_mode(listener, Self::polling_event(id, effective), mode)
             }
             Some(Registered::UnixListener(listener)) => {
-                poller.modify_with_mode(listener, Self::polling_event(id, interest), mode)
+                poller.modify_with_mode(listener, Self::polling_event(id, effective), mode)
             }
             Some(Registered::Stream(Stream::Tcp(stream))) => {
-                poller.modify_with_mode(stream, Self::polling_event(id, interest), mode)
+                poller.modify_with_mode(stream, Self::polling_event(id, effective), mode)
             }
             #[cfg(feature = "tls")]
             Some(Registered::Stream(Stream::Tls(stream))) => {
-                let interest = if stream.ssl().is_init_finished() {
-                    interest
-                } else {
-                    Interest::ReadWritable
-                };
-                poller.modify_with_mode(stream.get_ref(), Self::polling_event(id, interest), mode)
+                poller.modify_with_mode(stream.get_ref(), Self::polling_event(id, effective), mode)
             }
             Some(Registered::Stream(Stream::Unix(stream))) => {
-                poller.modify_with_mode(stream, Self::polling_event(id, interest), mode)
+                poller.modify_with_mode(stream, Self::polling_event(id, effective), mode)
             }
             Some(Registered::OwnedSource { .. }) => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -311,7 +327,11 @@ impl PollingTransportRuntime {
                 io::ErrorKind::NotFound,
                 "transport not found",
             )),
+        };
+        if result.is_ok() {
+            self.current_interests.insert(id, effective);
         }
+        result
     }
 
     fn bind_tcp_listener(&mut self, addr: SocketAddr, tls: bool) -> io::Result<ListenerHandle> {
@@ -1054,6 +1074,7 @@ impl TransportRuntime for PollingTransportRuntime {
             }
         }
         self.registered.try_remove(id.get() - 1);
+        self.current_interests.remove(&id);
         Ok(())
     }
 
@@ -1079,6 +1100,10 @@ impl TransportRuntime for PollingTransportRuntime {
 impl super::TransportTestBackend for PollingTransportRuntime {
     fn deregister_for_test(&mut self, id: TransportId) -> io::Result<()> {
         self.ensure_poll_attached()?;
+        // The kernel registration is removed out-of-band, so the cached
+        // interest no longer reflects kernel state. Drop it so the next
+        // `set_interest` reissues the syscall (and surfaces any error).
+        self.current_interests.remove(&id);
         match self.registered.get_mut(id.get() - 1) {
             Some(Registered::TcpListener(listener)) => self.poller.delete(&*listener),
             #[cfg(feature = "tls")]
@@ -1114,7 +1139,7 @@ impl super::TransportTestBackend for PollingTransportRuntime {
     fn reregister_for_test(&mut self, id: TransportId) -> io::Result<()> {
         self.ensure_poll_attached()?;
         let mode = self.poll_mode();
-        match self.registered.get_mut(id.get() - 1) {
+        let result = match self.registered.get_mut(id.get() - 1) {
             Some(Registered::TcpListener(listener)) => {
                 crate::foundation::io::sys::polling::add_with_mode(
                     &self.poller,
@@ -1190,7 +1215,11 @@ impl super::TransportTestBackend for PollingTransportRuntime {
                 io::ErrorKind::NotFound,
                 "transport not found",
             )),
+        };
+        if result.is_ok() {
+            self.current_interests.insert(id, Interest::Readable);
         }
+        result
     }
 
     fn source_enabled_for_test(&self, id: TransportId) -> io::Result<bool> {

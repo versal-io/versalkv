@@ -112,18 +112,26 @@ pub(crate) fn effective_command_flags_for_call(
     args: &CommandArgs,
     ctx: &ServerContext,
 ) -> CmdFlags {
-    let subcommand_flags = args
-        .args
-        .first()
-        .and_then(|subcommand| std::str::from_utf8(subcommand).ok())
-        .map(|subcommand| subcommand.to_ascii_lowercase())
-        .and_then(|subcommand| {
-            crate::framework::generated::commands::SUBCOMMAND_GATE_FLAGS
-                .iter()
-                .find(|(container, candidate, _)| *container == name && *candidate == subcommand)
-                .map(|(_, _, flags)| *flags)
-        })
-        .unwrap_or_default();
+    // Fast path: only subcommand-container commands (CLUSTER, CONFIG, ...) can
+    // carry subcommand-level flag overrides. For the vast majority of commands
+    // (GET, SET, PING, ...) skip the `from_utf8` + `to_ascii_lowercase` String
+    // allocation and the linear SUBCOMMAND_GATE_FLAGS scan entirely.
+    let subcommand_flags = if crate::engine::command::is_subcommand_container(name) {
+        args.args
+            .first()
+            .and_then(|subcommand| std::str::from_utf8(subcommand).ok())
+            .and_then(|subcommand| {
+                crate::framework::generated::commands::SUBCOMMAND_GATE_FLAGS
+                    .iter()
+                    .find(|(container, candidate, _)| {
+                        *container == name && candidate.eq_ignore_ascii_case(subcommand)
+                    })
+                    .map(|(_, _, flags)| *flags)
+            })
+            .unwrap_or_default()
+    } else {
+        0
+    };
     effective_script_command_flags(name, base_flags | subcommand_flags, args, ctx)
 }
 
@@ -138,26 +146,29 @@ fn effective_script_command_flags(
         SCRIPT_ALLOW_OOM, SCRIPT_ALLOW_STALE, SCRIPT_NO_WRITES, SCRIPT_READ_ONLY,
     };
 
-    let name = name.to_ascii_lowercase();
-    let script_flags = match name.as_str() {
-        "eval" | "eval_ro" => args
-            .args
+    // Avoid `name.to_ascii_lowercase()` allocation: command spec names are
+    // already lowercase, and the script-command set is small enough that
+    // case-insensitive comparisons are cheaper than a heap allocation.
+    let script_flags = if name.eq_ignore_ascii_case("eval") || name.eq_ignore_ascii_case("eval_ro")
+    {
+        args.args
             .first()
             .and_then(|body| std::str::from_utf8(body).ok())
-            .and_then(extract_valid_shebang_flags),
-        "evalsha" | "evalsha_ro" => args
-            .args
+            .and_then(extract_valid_shebang_flags)
+    } else if name.eq_ignore_ascii_case("evalsha") || name.eq_ignore_ascii_case("evalsha_ro") {
+        args.args
             .first()
             .and_then(|sha| std::str::from_utf8(sha).ok())
             .and_then(|sha| ctx.script().script_cache.peek(sha))
-            .and_then(extract_valid_shebang_flags),
-        "fcall" | "fcall_ro" => args
-            .args
+            .and_then(extract_valid_shebang_flags)
+    } else if name.eq_ignore_ascii_case("fcall") || name.eq_ignore_ascii_case("fcall_ro") {
+        args.args
             .first()
             .and_then(|func| std::str::from_utf8(func).ok())
             .and_then(|func| ctx.script().function_registry.find_function(func))
-            .map(|func| func.flags),
-        _ => None,
+            .map(|func| func.flags)
+    } else {
+        None
     };
     let Some(script_flags) = script_flags else {
         return base_flags;

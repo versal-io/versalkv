@@ -45,6 +45,12 @@ impl ServerWorkerState {
             self.priority_subnets_generation = config.priority_subnets_generation;
             self.ctx.stats_mut().connected_priority_clients = priority_clients;
         }
+        // Fast path: with no priority clients connected, no token can resolve
+        // to a priority connection, so the per-command lookup and stat update
+        // are skipped. This covers the common standalone PING workload.
+        if self.ctx.stats().connected_priority_clients == 0 {
+            return;
+        }
         if let Some(token) = self.priority_command_token {
             let is_priority = self.is_priority_connection(token);
             self.ctx
@@ -71,6 +77,11 @@ impl ServerWorkerState {
     }
 
     pub(crate) fn is_priority_connection(&self, token: Token) -> bool {
+        // Fast path: no priority clients means no connection can be priority,
+        // so skip the `connection_registry` HashMap lookup entirely.
+        if self.ctx.stats().connected_priority_clients == 0 {
+            return false;
+        }
         self.connection_registry
             .get(token)
             .is_some_and(|connection| connection.is_priority)

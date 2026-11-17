@@ -8,10 +8,10 @@ use crate::engine::extension::script::PropagationOp;
 use crate::foundation::io::protocol::Value;
 use crate::foundation::io::store::Robj;
 use crate::foundation::io::sys::time::mstime;
+use crate::foundation::memory::util_time::MonotonicInstant;
 use crate::framework::capabilities::io::Token;
 use bytes::Bytes;
 use std::net::SocketAddr;
-use std::time::Instant;
 
 impl CommandConn for Connection {
     fn token(&self) -> Token {
@@ -85,15 +85,15 @@ impl CommandConn for Connection {
         self.selected_db = db;
     }
 
-    fn last_interaction(&self) -> Instant {
+    fn last_interaction(&self) -> MonotonicInstant {
         self.last_interaction
     }
 
-    fn set_last_interaction(&mut self, t: Instant) {
+    fn set_last_interaction(&mut self, t: MonotonicInstant) {
         self.last_interaction = t;
     }
 
-    fn create_time(&self) -> Instant {
+    fn create_time(&self) -> MonotonicInstant {
         self.create_time
     }
 

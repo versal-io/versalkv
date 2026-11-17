@@ -251,6 +251,32 @@ impl AclUser {
         self.flags == "on"
     }
 
+    /// Whether this user has unrestricted access to every command, key, channel
+    /// and database. When true, `check_command_perm` and the channel check can
+    /// be skipped entirely on the dispatch hot path. This mirrors C's
+    /// `ACL_USER_FLAG_SUPERUSER` fast path: a single root selector with
+    /// `+@all ~* &*` and no extra selectors or roles.
+    pub(crate) fn is_superuser(&self) -> bool {
+        if !self.is_on() || !self.selectors.is_empty() || !self.roles.is_empty() {
+            return false;
+        }
+        let root = &self.root_selector;
+        if root.allowed_dbs.is_some() {
+            return false;
+        }
+        if root.categories.len() != 1 || root.categories[0] != "+@all" {
+            return false;
+        }
+        if root.pubsub_patterns.len() != 1 || root.pubsub_patterns[0] != b"*".as_slice() {
+            return false;
+        }
+        if root.patterns.len() != 1 {
+            return false;
+        }
+        let pat = &root.patterns[0];
+        pat.flags == ACL_ALL_PERMISSION && pat.pattern == b"*".as_slice()
+    }
+
     fn has_nopass(&self) -> bool {
         self.nopass
     }
@@ -679,6 +705,27 @@ pub(crate) fn acl_users() -> &'static Mutex<HashMap<String, AclUser>> {
         m.insert("default".to_string(), default_user);
         Mutex::new(m)
     })
+}
+
+/// Cached superuser status of the `default` user. The vast majority of
+/// connections authenticate as `default`, and in the default configuration
+/// that user is a full superuser. Caching this flag lets `stage_acl_permissions`
+/// skip the `acl_users()` mutex + HashMap lookup on the hot path (e.g. every
+/// PING). The atomic is refreshed by `refresh_default_user_superuser_flag()`
+/// whenever ACL users are mutated.
+pub(crate) static DEFAULT_USER_IS_SUPERUSER: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// Recompute the cached default-user superuser flag after any ACL mutation.
+/// Callers must already hold the `acl_users()` lock (or have just released it)
+/// so the snapshot is consistent with the committed state.
+pub(crate) fn refresh_default_user_superuser_flag() {
+    let is_superuser = acl_users()
+        .lock()
+        .unwrap()
+        .get("default")
+        .is_some_and(|user| user.is_superuser());
+    DEFAULT_USER_IS_SUPERUSER.store(is_superuser, std::sync::atomic::Ordering::Relaxed);
 }
 
 pub(crate) fn default_user_has_nopass() -> bool {

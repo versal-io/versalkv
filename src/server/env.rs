@@ -3,6 +3,10 @@ mod args;
 use args::ServerArgPlan;
 
 pub fn run_from_env() {
+    // Install the hardware-accelerated monotonic clock (TSC/CNTVCT) before any
+    // `MonotonicInstant::now` call so latency bookkeeping avoids `Instant`
+    // syscalls on the hot path.
+    crate::foundation::io::sys::time::init_hardware_clock();
     let raw_args = std::env::args().collect();
     let executable_name = std::env::current_exe()
         .ok()

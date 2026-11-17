@@ -13,7 +13,8 @@ pub(crate) use role::{acl_roles, apply_role_rule, apply_role_rule_bytes, validat
 
 pub(crate) use user::{
     acl_users, compute_db_requirement, default_user_has_nopass, merge_acl_tokens,
-    set_default_user_requirepass, AclDenial, AclUser, ACL_READ_PERMISSION, ACL_WRITE_PERMISSION,
+    refresh_default_user_superuser_flag, set_default_user_requirepass, AclDenial, AclUser,
+    ACL_READ_PERMISSION, ACL_WRITE_PERMISSION, DEFAULT_USER_IS_SUPERUSER,
 };
 
 pub(crate) use selector::{

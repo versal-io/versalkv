@@ -61,18 +61,20 @@ pub fn client_import_source(conn: &mut dyn CommandConn, args: &CommandArgs, ctx:
             }
             conn.set_import_source(true);
             if let Some(ci) = ctx.client_info_mut(conn.token().0) {
-                ci.flags.retain(|c| c != 'N');
-                if !ci.flags.contains('I') {
-                    ci.flags.push('I');
+                let flags = ci.flags.to_mut();
+                flags.retain(|c| c != 'N');
+                if !flags.contains('I') {
+                    flags.push('I');
                 }
             }
         }
         "off" | "no" | "0" => {
             conn.set_import_source(false);
             if let Some(ci) = ctx.client_info_mut(conn.token().0) {
-                ci.flags.retain(|c| c != 'I');
-                if ci.flags.is_empty() {
-                    ci.flags.push('N');
+                let flags = ci.flags.to_mut();
+                flags.retain(|c| c != 'I');
+                if flags.is_empty() {
+                    flags.push('N');
                 }
             }
         }

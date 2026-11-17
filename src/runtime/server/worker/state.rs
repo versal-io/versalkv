@@ -1,7 +1,9 @@
 use crate::foundation::io::sys::fd::{pipe, PipeFlags};
+use crate::foundation::io::sys::time::MonotonicInstant;
 use crate::foundation::io::transport::{
     Interest, OwnedPollSource, PollingTransportRuntime, UnixBindOptions,
 };
+use crate::foundation::memory::util_hash::{FxHashMap, FxHashSet};
 use crate::framework::capabilities::io::mt_driver::IoDriverMtConfig;
 use crate::framework::capabilities::io::Token;
 use crate::framework::context::ServerContext;
@@ -35,7 +37,6 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::net::SocketAddr;
 use std::os::fd::AsRawFd;
-use std::time::Instant;
 
 pub(in crate::runtime::server) type ProductionTransport = PollingTransportRuntime;
 
@@ -53,7 +54,7 @@ pub(in crate::runtime::server) struct ActiveDefragState {
 
 #[derive(Clone, Copy, Debug)]
 pub(in crate::runtime::server) struct EventLoopCycleStart {
-    pub(in crate::runtime::server) started_at: Instant,
+    pub(in crate::runtime::server) started_at: MonotonicInstant,
     pub(in crate::runtime::server) command_time_usec: u64,
     pub(in crate::runtime::server) commands_processed: u64,
 }
@@ -88,13 +89,13 @@ pub(crate) struct ServerWorkerState {
     /// `TransportId`/`Token` reserved (ABA-safe) until a later tick completes the
     /// deregister. Nothing else in the runtime needs to inspect this map.
     pub(in crate::runtime::server) pending_transport_removals:
-        HashMap<Token, PendingTransportRemoval>,
+        FxHashMap<Token, PendingTransportRemoval>,
     /// Tokens currently executing business-state teardown. This transient guard
     /// prevents nested failure callbacks from retiring one connection twice.
-    pub(in crate::runtime::server) retiring_connections: HashSet<Token>,
-    pub(in crate::runtime::server) socket_owners: HashMap<Token, SocketIoOwner>,
+    pub(in crate::runtime::server) retiring_connections: FxHashSet<Token>,
+    pub(in crate::runtime::server) socket_owners: FxHashMap<Token, SocketIoOwner>,
     pub(in crate::runtime::server) full_sync: FullSyncCoordinator,
-    pub(in crate::runtime::server) client_hup_drains: HashSet<Token>,
+    pub(in crate::runtime::server) client_hup_drains: FxHashSet<Token>,
     pub(in crate::runtime::server) pending_replication_replay: Option<PendingReplayContinuation>,
     pub(in crate::runtime::server) writes: WriteSchedulers,
     /// Downstream socket writes update per-connection queue bytes immediately.
@@ -260,11 +261,11 @@ impl ServerWorkerState {
             listeners: ListenerSet::default(),
             tls_reload: super::tls::TlsReloadState::default(),
             connection_registry: ConnectionRegistry::default(),
-            pending_transport_removals: HashMap::new(),
-            retiring_connections: HashSet::new(),
-            socket_owners: HashMap::new(),
+            pending_transport_removals: FxHashMap::default(),
+            retiring_connections: FxHashSet::default(),
+            socket_owners: FxHashMap::default(),
             full_sync: FullSyncCoordinator::default(),
-            client_hup_drains: HashSet::new(),
+            client_hup_drains: FxHashSet::default(),
             pending_replication_replay: None,
             writes: WriteSchedulers::default(),
             replication_buffer_accounting_dirty: false,
@@ -570,7 +571,9 @@ impl ServerWorkerState {
         }
         self.connection_registry[crate::framework::capabilities::io::Token(connection_token)]
             .queue_reply(frame);
-        self.refresh_client_memory_usage(token, false);
+        if self.effective_client_memory_limit().is_some() {
+            self.refresh_client_memory_usage(token, false);
+        }
         self.reconcile_slot_export_output_allocation(token.0);
         let is_slot_export = matches!(
             self.connection_registry[crate::framework::capabilities::io::Token(connection_token)]

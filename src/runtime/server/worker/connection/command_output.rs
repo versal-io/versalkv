@@ -18,6 +18,14 @@ impl ServerWorkerState {
 
     pub(crate) fn pause_dual_relay_client_if_needed(&mut self, token: Token) -> bool {
         let has_reply_barrier = self.full_sync.paused_dual_main_replies.contains_key(&token);
+        // Cheap config/state check before the `replication_runtime.role()`
+        // HashMap lookup. On standalone deployments (no reply barriers and no
+        // diskless-relay pause) this skips the map entirely, covering the
+        // common PING workload.
+        let dual_relay_pause_pending = self.dual_relay_parent_pause_pending();
+        if !has_reply_barrier && !dual_relay_pause_pending {
+            return false;
+        }
         let is_ordinary = self
             .replication_runtime
             .role(crate::framework::distributed::replication::ConnectionId(
@@ -25,7 +33,7 @@ impl ServerWorkerState {
             ))
             .is_none();
         if !self.connection_registry.contains(token)
-            || (!has_reply_barrier && !(is_ordinary && self.dual_relay_parent_pause_pending()))
+            || (!has_reply_barrier && !(is_ordinary && dual_relay_pause_pending))
         {
             return false;
         }
@@ -99,11 +107,20 @@ impl ServerWorkerState {
                 );
             }
         }
-        self.refresh_client_memory_usage(Token(token_value), false);
+        // Skip client-memory refresh and eviction when no `maxmemory-clients`
+        // limit is configured. Both helpers parse the config string internally
+        // and return immediately in the no-limit case; guarding them here
+        // avoids two redundant config-string parses per queued reply.
+        let client_memory_limited = self.effective_client_memory_limit().is_some();
+        if client_memory_limited {
+            self.refresh_client_memory_usage(Token(token_value), false);
+        }
         if self.enforce_client_output_buffer_limit_for(token_value) {
             return false;
         }
-        self.evict_clients();
+        if client_memory_limited {
+            self.evict_clients();
+        }
         if !self
             .connection_registry
             .contains(crate::framework::capabilities::io::Token(connection_token))

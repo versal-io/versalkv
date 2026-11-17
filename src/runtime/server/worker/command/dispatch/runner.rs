@@ -10,34 +10,41 @@ use crate::foundation::io::protocol::Value;
 use crate::framework::capabilities::connection::{BlockedCmd, CommandEffectDrain, ConnectionState};
 use crate::runtime::server::worker::command::invocation::CommandInvocation;
 use crate::runtime::server::worker::command::outcome::{
-    CommandCompletion, CommandDisposition, CommandExecution, CommandExecutionStatus, CommandOutcome,
+    CommandCompletion, CommandDisposition, CommandExecution, CommandExecutionStatus,
 };
 
 impl ServerWorkerState {
     pub(super) fn execute_command_and_handle_result(
         &mut self,
         invocation: CommandInvocation<'_>,
-    ) -> CommandOutcome {
-        let mut effects = CommandEffects::default();
+        resolved_executor: Option<crate::framework::CommandExecutor>,
+        resolved_preconditions: Option<super::CmdPreconditions>,
+        fx: &mut CommandEffects,
+    ) -> CommandDisposition {
         let Ok((connection_token, client_eviction_was_enabled)) =
-            self.prepare_command_resources(invocation, &mut effects)
+            self.prepare_command_resources(invocation, fx)
         else {
-            return CommandOutcome::new(CommandDisposition::ConnectionGone, effects);
+            return CommandDisposition::ConnectionGone;
         };
         let was_blocked = self.connection_registry
             [crate::framework::capabilities::io::Token(connection_token)]
         .blocked
         .is_some();
         self.register_active_persistence_child();
-        let Ok(execution) = self.execute_invocation(invocation, connection_token) else {
-            return CommandOutcome::new(CommandDisposition::ConnectionGone, effects);
+        let Ok(execution) = self.execute_invocation(
+            invocation,
+            connection_token,
+            resolved_executor,
+            resolved_preconditions,
+        ) else {
+            return CommandDisposition::ConnectionGone;
         };
         self.finish_invocation(
             invocation,
             execution,
             was_blocked,
             client_eviction_was_enabled,
-            effects,
+            fx,
         )
     }
 
@@ -51,12 +58,21 @@ impl ServerWorkerState {
             .resolve(self)
             .ok_or(CommandDisposition::ConnectionGone)?;
         let connection_token = token.0;
-        let client_eviction_was_enabled = self.effective_client_memory_limit().is_some();
-        self.refresh_client_memory_usage_with_pending_replies(
-            invocation.target.token(),
-            invocation.pending_replies,
-        );
-        self.evict_clients();
+        // Resolve the client memory limit once. Both `refresh_client_memory_usage`
+        // and `evict_clients` independently call `effective_client_memory_limit`,
+        // which parses the `maxmemory-clients` config string on every call. On
+        // the common no-limit hot path (PING, GET, SET, ...) the limit is `None`
+        // and both helpers return immediately, so skipping them avoids two
+        // redundant config-string parses per command.
+        let client_memory_limit = self.effective_client_memory_limit();
+        let client_eviction_was_enabled = client_memory_limit.is_some();
+        if client_memory_limit.is_some() {
+            self.refresh_client_memory_usage_with_pending_replies(
+                invocation.target.token(),
+                invocation.pending_replies,
+            );
+            self.evict_clients();
+        }
         if invocation.target.resolve(self).is_none() {
             return Err(CommandDisposition::ConnectionGone);
         }
@@ -76,34 +92,43 @@ impl ServerWorkerState {
         &mut self,
         invocation: CommandInvocation<'_>,
         connection_token: usize,
+        resolved_executor: Option<crate::framework::CommandExecutor>,
+        resolved_preconditions: Option<super::CmdPreconditions>,
     ) -> Result<CommandExecution, CommandDisposition> {
-        let Some(spec) = self.registry.lookup(&invocation.args.name) else {
-            return Ok(CommandExecution::rejected(unknown_command_reply(
-                invocation.args,
-                self.connection_registry[invocation.target.token()].session_id(),
-                &self.ctx,
-            )));
-        };
-        let executor = spec.executor;
-        let preconditions = CmdPreconditions {
-            name: spec.name.clone(),
-            arity: spec.arity,
-            flags: super::subcmd_flags::effective_command_flags_for_call(
-                spec.name.as_str(),
-                spec.flags,
-                invocation.args,
-                &self.ctx,
-            ),
-            first_key: spec.first_key,
-            last_key: spec.last_key,
-            key_step: spec.key_step,
-            key_flags: spec.key_flags,
-            acl_categories: super::subcmd_flags::effective_acl_categories(
-                spec.name.as_str(),
-                spec.acl_categories,
-                invocation.args.args.first().map(|arg| arg.as_ref()),
-            ),
-            get_keys: spec.get_keys,
+        // Use the executor and preconditions resolved during admission when
+        // available, avoiding a second `registry.lookup` HashMap lookup on the
+        // hot path. Unknown commands (resolved values are `None`) fall back to
+        // the lookup below to produce the standard rejection reply.
+        let (executor, preconditions) = match (resolved_executor, resolved_preconditions) {
+            (Some(executor), Some(preconditions)) => (executor, preconditions),
+            _ => {
+                let Some(spec) = self.registry.lookup(&invocation.args.name) else {
+                    return Ok(CommandExecution::rejected(unknown_command_reply(
+                        invocation.args,
+                        self.connection_registry[invocation.target.token()].session_id(),
+                        &self.ctx,
+                    )));
+                };
+                let acl_categories = super::subcmd_flags::effective_acl_categories(
+                    spec.name.as_str(),
+                    spec.acl_categories,
+                    invocation.args.args.first().map(|arg| arg.as_ref()),
+                );
+                let preconditions = CmdPreconditions {
+                    name: spec.name.clone(),
+                    arity: spec.arity,
+                    // `invocation.flags` already carries the effective per-call
+                    // flags resolved during admission; reuse them.
+                    flags: invocation.flags,
+                    first_key: spec.first_key,
+                    last_key: spec.last_key,
+                    key_step: spec.key_step,
+                    key_flags: spec.key_flags,
+                    acl_categories,
+                    get_keys: spec.get_keys,
+                };
+                (spec.executor, preconditions)
+            }
         };
         let decision = self.pre_dispatch_exec(connection_token, preconditions, invocation.args);
         match decision.action {
@@ -144,14 +169,12 @@ impl ServerWorkerState {
                         self.ctx.script_mut().pending_internal_monitor.push(event);
                     }
                 }
-                let started = std::time::Instant::now();
                 let reply = self.execute_registered_handler(
                     invocation.dispatch_group,
                     connection_token,
                     executor,
                     invocation.args,
                 );
-                let duration_us = (started.elapsed().as_micros() as u64).max(1);
                 let connection_token = invocation
                     .target
                     .resolve(self)
@@ -159,7 +182,10 @@ impl ServerWorkerState {
                 if call_flags.client_asking && super::consumes_asking(invocation.name) {
                     self.connection_registry[connection_token].asking = false;
                 }
-                Ok(CommandExecution::executed(reply, Some(duration_us)))
+                // Duration is measured by end_cmd() from begin_cmd()'s
+                // timestamp, matching C's full-command accounting and
+                // avoiding a second clock read on the hot path.
+                Ok(CommandExecution::executed(reply))
             }
             DispatchAction::Rejected => Ok(CommandExecution::rejected(
                 decision.reject_reply.unwrap_or(Value::null()),
@@ -197,7 +223,7 @@ impl ServerWorkerState {
                             .insert(invocation.target.token());
                     }
                 }
-                Ok(CommandExecution::executed(Value::Null, None))
+                Ok(CommandExecution::executed(Value::Null))
             }
         }
     }
@@ -208,10 +234,10 @@ impl ServerWorkerState {
         execution: CommandExecution,
         was_blocked: bool,
         client_eviction_was_enabled: bool,
-        mut effects: CommandEffects,
-    ) -> CommandOutcome {
+        fx: &mut CommandEffects,
+    ) -> CommandDisposition {
         let Some(token) = invocation.target.resolve(self) else {
-            return CommandOutcome::new(CommandDisposition::ConnectionGone, effects);
+            return CommandDisposition::ConnectionGone;
         };
         let connection_token = token.0;
         let is_blocked = self.connection_registry[token].blocked.is_some();
@@ -238,14 +264,16 @@ impl ServerWorkerState {
             execution.status.is_rejected() || matches!(&reply, Value::Error(_));
         let stats_name = super::command_stats_name(invocation.name, invocation.args);
         self.refresh_connection_priorities();
-        let duration_us = if let Some(duration_us) = execution.duration_us {
-            self.ctx
-                .end_cmd_with_duration(&stats_name, execution.status.is_rejected(), duration_us)
+        let rejected = execution.status.is_rejected();
+        // Measure full-command duration from begin_cmd()'s timestamp, matching
+        // C. Only executed commands keep the priority-command flag so that
+        // record_priority_command fires for them; rejected/postponed commands
+        // must not skew priority accounting.
+        let duration_us = if execution.status == CommandExecutionStatus::Executed {
+            self.ctx.end_cmd(&stats_name, rejected)
         } else {
             let was_priority = self.ctx.stats_mut().set_priority_command(false);
-            let duration_us = self
-                .ctx
-                .end_cmd(&stats_name, execution.status.is_rejected());
+            let duration_us = self.ctx.end_cmd(&stats_name, rejected);
             self.ctx.stats_mut().set_priority_command(was_priority);
             duration_us
         };
@@ -258,16 +286,16 @@ impl ServerWorkerState {
                 was_blocked_before: was_blocked,
             },
             connection_effects.as_mut(),
-            &mut effects,
+            fx,
         );
         if disposition.stops_read_loop() {
-            return CommandOutcome::new(disposition, effects);
+            return disposition;
         }
         self.capture_direct_propagation(
             invocation,
             propagation_rejected,
             connection_effects.expect("completed command effects were drained once"),
-            effects,
+            fx,
         )
     }
 
@@ -276,14 +304,14 @@ impl ServerWorkerState {
         invocation: CommandInvocation<'_>,
         rejected: bool,
         connection_effects: crate::framework::capabilities::connection::ConnectionCommandEffects,
-        mut effects: CommandEffects,
-    ) -> CommandOutcome {
+        fx: &mut CommandEffects,
+    ) -> CommandDisposition {
         let Some(token) = invocation.target.resolve(self) else {
-            return CommandOutcome::new(CommandDisposition::ConnectionGone, effects);
+            return CommandDisposition::ConnectionGone;
         };
         let connection_token = token.0;
         let suppress_reply = connection_effects.should_suppress_reply();
-        effects.swapdb = self.build_command_propagation(
+        fx.swapdb = self.build_command_propagation(
             CommandPropagationInput {
                 connection_token,
                 token_value: invocation.target.token_value(),
@@ -293,19 +321,19 @@ impl ServerWorkerState {
                 rejected,
             },
             connection_effects,
-            &mut effects,
+            fx,
         );
         let connection = &mut self.connection_registry
             [crate::framework::capabilities::io::Token(connection_token)];
         if suppress_reply {
-            effects.clear_replies();
+            fx.clear_replies();
         }
         connection.finish_reply_cycle();
         if connection.state == ConnectionState::Closing {
-            effects.mark_closing = true;
-            CommandOutcome::new(CommandDisposition::Closing, effects)
+            fx.mark_closing = true;
+            CommandDisposition::Closing
         } else {
-            CommandOutcome::new(CommandDisposition::Completed, effects)
+            CommandDisposition::Completed
         }
     }
 }

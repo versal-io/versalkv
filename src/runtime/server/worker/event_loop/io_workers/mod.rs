@@ -5,6 +5,7 @@ mod stats;
 use crate::foundation::io::transport::{
     ReadOutcome, ThreadIoHandle, TransportWakeHandle, WriteOutcome,
 };
+use crate::foundation::memory::util_hash::FxHashMap;
 use crate::framework::capabilities::io::mt_driver::IoDriverMtConfig;
 use crate::framework::capabilities::io::Token;
 use crate::framework::context::IoThreadInfo;
@@ -13,7 +14,7 @@ use crate::runtime::server::worker::event_loop::transport::{
 };
 use crate::runtime::server::worker::maintenance::lazyfree::DataLazyfreeCompletion;
 use crate::runtime::server::worker::replication::pending_lazyfree::ReplicationLazyfreeCompletion;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 
@@ -339,7 +340,7 @@ pub(crate) enum WriteCompletionAction {
 
 pub(crate) struct IoThreadRuntime {
     pool: SharedIoPool,
-    connections: HashMap<Token, IoConnectionState>,
+    connections: FxHashMap<Token, IoConnectionState>,
     next_generation: u64,
     #[cfg(test)]
     wake_token: Token,
@@ -360,7 +361,7 @@ impl IoThreadRuntime {
         let _ = wake_token;
         Ok(Self {
             pool: SharedIoPool::new(config, wake)?,
-            connections: HashMap::new(),
+            connections: FxHashMap::default(),
             next_generation: 0,
             #[cfg(test)]
             wake_token,
@@ -381,7 +382,7 @@ impl IoThreadRuntime {
         let _ = wake_token;
         Ok(Self {
             pool: SharedIoPool::with_completion_sender(config, wake, shared_completions)?,
-            connections: HashMap::new(),
+            connections: FxHashMap::default(),
             next_generation: 0,
             #[cfg(test)]
             wake_token,
@@ -401,7 +402,7 @@ impl IoThreadRuntime {
     ) -> std::io::Result<Self> {
         Ok(Self {
             pool: SharedIoPool::new_with_queue_capacity_for_test(config, wake, queue_capacity)?,
-            connections: HashMap::new(),
+            connections: FxHashMap::default(),
             next_generation: 0,
             wake_token,
             counter_reset_generation: 0,

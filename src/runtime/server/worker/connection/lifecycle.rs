@@ -1,5 +1,6 @@
 use super::super::event_loop::transport::RuntimeConnectedPeer;
 use super::super::{PendingRemovalOwner, ServerWorkerState};
+use crate::foundation::memory::util_time::MonotonicInstant;
 use crate::framework::capabilities::connection::{Connection, ConnectionState};
 use crate::framework::capabilities::io::Token;
 use crate::framework::distributed::replication::{ConnectionId, MasterReconnectCause, ReplicaId};
@@ -69,7 +70,8 @@ impl ServerWorkerState {
         }
         let default_user_requires_auth = !crate::engine::extension::acl::default_user_has_nopass();
         let mut conn = Connection::new(client.token, client.peer_addr, default_user_requires_auth);
-        conn.is_priority = self.peer_is_priority(client.peer_addr);
+        let conn_is_priority = self.peer_is_priority(client.peer_addr);
+        conn.is_priority = conn_is_priority;
         let client_id = conn.client_id();
         let io_handles = self
             .transport
@@ -90,7 +92,7 @@ impl ServerWorkerState {
         self.connection_registry
             .register(conn)
             .expect("a newly accepted transport token and client id must be unique");
-        if self.is_priority_connection(client.token) {
+        if conn_is_priority {
             self.ctx.stats_mut().connected_priority_clients += 1;
         }
         self.refresh_client_memory_usage(client.token, true);
@@ -109,12 +111,11 @@ impl ServerWorkerState {
             }
         }
         self.ctx.incr_connection();
-        let now = std::time::Instant::now();
+        let now = MonotonicInstant::now();
         self.ctx.client_infos_mut().insert(
             client.token.0,
             crate::engine::state::db::ClientInfo {
-                last_cmd: String::new(),
-                flags: "N".to_string(),
+                flags: std::borrow::Cow::Borrowed("N"),
                 db: 0,
                 name: String::new(),
                 rbs: 16384,

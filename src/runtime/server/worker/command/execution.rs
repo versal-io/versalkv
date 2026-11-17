@@ -27,7 +27,11 @@ impl ServerWorkerState {
         let owns_priority_cycle = samples_independently
             && self.is_priority_connection(token)
             && self.begin_priority_cycle();
-        let started = std::time::Instant::now();
+        // Only sample handler duration when the connection might record a
+        // priority-command stat. For ordinary connections (the common PING
+        // workload) this skips an `Instant::now()`/`elapsed()` pair on the
+        // hot path.
+        let started = samples_independently.then(std::time::Instant::now);
         self.command_execution_depth += 1;
         let reply = match executor {
             CommandExecutor::Hosted { prepare, .. } => {
@@ -51,7 +55,9 @@ impl ServerWorkerState {
         self.kill_acl_subscribers();
         self.drain_acl_kills_for_command(Some(token));
         self.command_execution_depth -= 1;
-        let duration_us = (started.elapsed().as_micros() as u64).max(1);
+        let duration_us = started
+            .map(|s| (s.elapsed().as_micros() as u64).max(1))
+            .unwrap_or(0);
         self.refresh_connection_priorities();
         if !had_migration_role
             && self.connection_registry.get(token).is_some_and(|connection| {

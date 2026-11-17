@@ -1,8 +1,9 @@
 use std::cmp::Reverse;
 use std::collections::hash_map::Entry;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::BinaryHeap;
 
 use crate::foundation::io::sys::time::MonotonicInstant;
+use crate::foundation::memory::util_hash::FxHashMap;
 use crate::framework::capabilities::io::Token;
 use crate::runtime::server::worker::event_loop::timer::TimeEventId;
 
@@ -41,7 +42,7 @@ struct SequenceNode<T> {
 struct SequenceQueue<T> {
     head: Option<u64>,
     tail: Option<u64>,
-    nodes: HashMap<u64, SequenceNode<T>>,
+    nodes: FxHashMap<u64, SequenceNode<T>>,
     #[cfg(test)]
     removal_work: usize,
 }
@@ -51,7 +52,7 @@ impl<T> Default for SequenceQueue<T> {
         Self {
             head: None,
             tail: None,
-            nodes: HashMap::new(),
+            nodes: FxHashMap::default(),
             #[cfg(test)]
             removal_work: 0,
         }
@@ -156,14 +157,14 @@ pub(crate) struct EventBatch {
     ready: [SequenceQueue<()>; READY_LANE_COUNT],
     time: BinaryHeap<Reverse<TimeQueueKey>>,
     next_turn: SequenceQueue<QueueTarget>,
-    events: HashMap<u64, EventLoopEvent>,
-    event_targets: HashMap<u64, QueueTarget>,
-    readiness_index: HashMap<(EventPhase, Token), u64>,
-    runnable_sequences: HashMap<RunnableKey, u64>,
+    events: FxHashMap<u64, EventLoopEvent>,
+    event_targets: FxHashMap<u64, QueueTarget>,
+    readiness_index: FxHashMap<(EventPhase, Token), u64>,
+    runnable_sequences: FxHashMap<RunnableKey, u64>,
     completed_before_poll_slots: [bool; BEFORE_POLL_SLOT_COUNT],
     completed_phases: [bool; PHASE_COUNT],
     dispatched_events_by_phase: [usize; PHASE_COUNT],
-    owner_dispatches: HashMap<EventOwner, usize>,
+    owner_dispatches: FxHashMap<EventOwner, usize>,
     next_sequence: u64,
 }
 
@@ -189,14 +190,14 @@ impl EventBatch {
             ready: std::array::from_fn(|_| SequenceQueue::default()),
             time: BinaryHeap::new(),
             next_turn: SequenceQueue::default(),
-            events: HashMap::new(),
-            event_targets: HashMap::new(),
-            readiness_index: HashMap::new(),
-            runnable_sequences: HashMap::new(),
+            events: FxHashMap::default(),
+            event_targets: FxHashMap::default(),
+            readiness_index: FxHashMap::default(),
+            runnable_sequences: FxHashMap::default(),
             completed_before_poll_slots: [false; BEFORE_POLL_SLOT_COUNT],
             completed_phases: [false; PHASE_COUNT],
             dispatched_events_by_phase: [0; PHASE_COUNT],
-            owner_dispatches: HashMap::new(),
+            owner_dispatches: FxHashMap::default(),
             next_sequence: 0,
         }
     }
@@ -248,6 +249,12 @@ impl EventBatch {
     }
 
     pub(crate) fn pop_before_poll_slot(&mut self, slot: BeforePollSlot) -> Option<EventLoopEvent> {
+        // Fast path: an empty slot has nothing to dispatch, so skip the budget
+        // exhaustion and DistributedWrites fairness checks. Most before-poll
+        // slots are empty on every cycle in the common single-client workload.
+        if self.before_poll[slot.index()].is_empty() {
+            return None;
+        }
         loop {
             if self.dispatch_budget_exhausted(EventPhase::BeforePoll) {
                 self.roll_phase_to_next_turn(EventPhase::BeforePoll);
@@ -280,6 +287,11 @@ impl EventBatch {
 
     pub(crate) fn finish_before_poll_slot(&mut self, slot: BeforePollSlot) {
         self.completed_before_poll_slots[slot.index()] = true;
+        // Skip the drain loop when the slot is already empty. Most before-poll
+        // slots are empty on every cycle for single-client workloads.
+        if self.before_poll[slot.index()].is_empty() {
+            return;
+        }
         while let Some((sequence, ())) = self.before_poll[slot.index()].pop_front() {
             self.next_turn
                 .push_back(sequence, QueueTarget::BeforePoll(slot));
@@ -343,6 +355,17 @@ impl EventBatch {
     }
 
     pub(crate) fn begin_next_turn(&mut self) {
+        // Fast path: no events carried over from the previous turn, so skip
+        // the drain-and-reshuffle dance entirely. This is the common case for
+        // single-client workloads where every cycle drains its own events.
+        if self.turn_queues_empty() {
+            self.completed_before_poll_slots = [false; BEFORE_POLL_SLOT_COUNT];
+            self.completed_phases = [false; PHASE_COUNT];
+            self.dispatched_events_by_phase = [0; PHASE_COUNT];
+            self.owner_dispatches.clear();
+            return;
+        }
+
         let mut retained = SequenceQueue::default();
         self.drain_phase_into(EventPhase::BeforePoll, &mut retained);
         self.drain_phase_into(EventPhase::Ready, &mut retained);
@@ -358,6 +381,13 @@ impl EventBatch {
         while let Some((sequence, target)) = retained.pop_front() {
             self.queue_current(target, sequence);
         }
+    }
+
+    fn turn_queues_empty(&self) -> bool {
+        self.before_poll.iter().all(|q| q.is_empty())
+            && self.ready.iter().all(|q| q.is_empty())
+            && self.time.is_empty()
+            && self.next_turn.is_empty()
     }
 
     pub(crate) fn has_pending_transport_data(&self) -> bool {
@@ -442,6 +472,14 @@ impl EventBatch {
     }
 
     pub(crate) fn activate_next_turn_before_poll_slots(&mut self, slots: &[BeforePollSlot]) {
+        // Fast path: nothing deferred to the next turn, so only reset the
+        // completed-slot markers for the requested slots.
+        if self.next_turn.is_empty() {
+            for slot in slots {
+                self.completed_before_poll_slots[slot.index()] = false;
+            }
+            return;
+        }
         let mut retained = SequenceQueue::default();
         while let Some((sequence, target)) = self.next_turn.pop_front() {
             let should_activate = matches!(

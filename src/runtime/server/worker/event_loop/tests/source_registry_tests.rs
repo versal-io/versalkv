@@ -1,6 +1,7 @@
 use crate::foundation::io::transport::{
     ConnectedPeer, OwnedPollSource, PollSourceMode, TransportId,
 };
+use crate::foundation::memory::util_hash::FxHashMap;
 use crate::framework::capabilities::io::Token;
 use crate::framework::distributed::sentinel::io::SentinelIo;
 use crate::runtime::server::worker::event_loop::sources::{
@@ -17,9 +18,9 @@ use crate::runtime::server::worker::PendingRemovalOwner;
 use crate::runtime::server::worker::ServerWorkerState;
 use std::fs::File;
 use std::net::SocketAddr;
+use std::net::TcpListener;
 use std::os::fd::OwnedFd;
 use std::time::Duration;
-use std::{collections::HashMap, net::TcpListener};
 
 fn owned_pipe_source(mode: PollSourceMode) -> (OwnedPollSource, std::io::PipeWriter) {
     let (reader, writer) = std::io::pipe().expect("create pipe");
@@ -377,7 +378,7 @@ fn sentinel_adapter_connect_installs_and_remove_retires_the_route() {
     let mut sources = RuntimeSourceRegistry::default();
 
     let token = {
-        let mut pending = HashMap::new();
+        let mut pending = FxHashMap::default();
         let mut sentinel = RuntimeSentinelIo::new(&mut transport, &mut sources, &mut pending);
         sentinel
             .connect_tcp("127.0.0.1:26379")
@@ -390,7 +391,7 @@ fn sentinel_adapter_connect_installs_and_remove_retires_the_route() {
         Some(SourceOwner::Sentinel)
     );
 
-    let mut pending = HashMap::new();
+    let mut pending = FxHashMap::default();
     RuntimeSentinelIo::new(&mut transport, &mut sources, &mut pending)
         .remove(token)
         .expect("remove Sentinel transport");
@@ -409,7 +410,7 @@ fn sentinel_route_is_retired_before_failed_transport_removal() {
         .expect("Sentinel route");
     transport.inner_mut().fail_remove();
 
-    let mut pending = HashMap::new();
+    let mut pending = FxHashMap::default();
     assert!(
         RuntimeSentinelIo::new(&mut transport, &mut sources, &mut pending)
             .remove(token)
@@ -433,7 +434,7 @@ fn sentinel_retry_remove_clears_pending_after_stale_route() {
     sources
         .install(token, SourceOwner::Sentinel)
         .expect("Sentinel route");
-    let mut pending = HashMap::new();
+    let mut pending = FxHashMap::default();
 
     transport.inner_mut().fail_remove();
     assert!(
@@ -509,7 +510,7 @@ fn sentinel_connect_rolls_back_transport_when_route_install_fails() {
         .install(Token(1), SourceOwner::Listener)
         .expect("conflicting route");
 
-    let mut pending = HashMap::new();
+    let mut pending = FxHashMap::default();
     assert!(
         RuntimeSentinelIo::new(&mut transport, &mut sources, &mut pending)
             .connect_tcp("127.0.0.1:26379")
@@ -532,7 +533,7 @@ fn sentinel_connect_quarantines_transport_until_retry_when_remove_fails() {
     });
     transport.inner_mut().fail_remove();
     let mut sources = RuntimeSourceRegistry::default();
-    let mut pending = HashMap::new();
+    let mut pending = FxHashMap::default();
     sources
         .install(Token(1), SourceOwner::Listener)
         .expect("conflicting route");

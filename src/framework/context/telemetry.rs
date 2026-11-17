@@ -28,7 +28,7 @@ impl ServerContext {
         self.stats.incr_lazyfreed_objects(n);
     }
     pub fn begin_cmd(&mut self) {
-        self.stats.begin_cmd();
+        self.stats.begin_cmd(self.rconfig.server.latency_tracking);
     }
     pub fn end_cmd(&mut self, name: &str, rejected: bool) -> u64 {
         self.stats
@@ -138,13 +138,8 @@ impl ServerContext {
     pub fn record_eventloop_event_collected(&mut self, count: usize) {
         self.stats.record_eventloop_event_collected(count);
     }
-    pub fn record_eventloop_event_dispatch(
-        &mut self,
-        outcome: EventLoopEventOutcome,
-        duration_usec: u64,
-    ) {
-        self.stats
-            .record_eventloop_event_dispatch(outcome, duration_usec);
+    pub fn record_eventloop_event_dispatch(&mut self, outcome: EventLoopEventOutcome) {
+        self.stats.record_eventloop_event_dispatch(outcome);
     }
     pub fn mem_stats(&self) -> &'static MemoryCategoryTracker {
         self.mem_stats

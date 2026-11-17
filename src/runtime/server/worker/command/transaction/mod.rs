@@ -389,7 +389,7 @@ impl ServerWorkerState {
             wakeup_only: pending_wakeup_only,
             closed_publish_peers: std::collections::HashSet::new(),
         };
-        let _time_guard = crate::foundation::io::sys::time::enter_command_time_snapshot(mstime());
+        let _time_guard = crate::foundation::io::sys::time::enter_command_time_snapshot_lazy();
         for cmd_args in &cmds {
             if !self.exec_run_queued_item(&mut state, cmd_args) {
                 break;
@@ -626,16 +626,18 @@ impl ServerWorkerState {
             self.ctx.blocking_registry_mut().increment_count();
             if let Some(ci) = self.ctx.client_info_mut(token_value) {
                 if !ci.flags.contains('b') {
-                    ci.flags.retain(|c| c != 'N');
-                    ci.flags.push('b');
+                    let flags = ci.flags.to_mut();
+                    flags.retain(|c| c != 'N');
+                    flags.push('b');
                 }
             }
         } else if was_blocked && !is_blocked {
             self.ctx.blocking_registry_mut().decrement_count();
             if let Some(ci) = self.ctx.client_info_mut(token_value) {
-                ci.flags.retain(|c| c != 'b');
-                if ci.flags.is_empty() {
-                    ci.flags.push('N');
+                let flags = ci.flags.to_mut();
+                flags.retain(|c| c != 'b');
+                if flags.is_empty() {
+                    flags.push('N');
                 }
             }
         }

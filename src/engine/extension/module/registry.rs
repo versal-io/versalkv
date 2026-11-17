@@ -520,6 +520,13 @@ impl ModuleRegistry {
             .min()
     }
 
+    /// Returns true when no module timers are registered. The hot path
+    /// (`sync_module_timer_event`) uses this to skip a `MonotonicInstant::now()`
+    /// syscall when nothing can produce a timer deadline.
+    pub fn has_timers(&self) -> bool {
+        !self.timers.is_empty()
+    }
+
     pub fn subscribe_keyspace_events(
         &mut self,
         module_name: &str,

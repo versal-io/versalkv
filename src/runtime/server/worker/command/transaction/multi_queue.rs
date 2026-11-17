@@ -46,10 +46,13 @@ impl ServerWorkerState {
         resp3: bool,
         replies: &mut Vec<Vec<u8>>,
     ) -> bool {
+        // Slow path: transaction queuing. Allocate the lowercased name for
+        // stats and transaction control checks; not on the PING hot path.
+        let name_lower = name.to_ascii_lowercase();
         let input = MultiQueueInput {
             token,
             args,
-            name,
+            name: &name_lower,
             resp3,
         };
         match self.decide_multi_queue(&input) {
@@ -74,7 +77,11 @@ impl ServerWorkerState {
 
     pub(crate) fn should_queue_in_transaction(&self, token: Token, name: &str) -> bool {
         self.connection_registry[token].transaction.is_active()
-            && !matches!(name, "multi" | "discard" | "reset" | "watch" | "unwatch")
+            && !name.eq_ignore_ascii_case("multi")
+            && !name.eq_ignore_ascii_case("discard")
+            && !name.eq_ignore_ascii_case("reset")
+            && !name.eq_ignore_ascii_case("watch")
+            && !name.eq_ignore_ascii_case("unwatch")
     }
 
     fn decide_multi_queue(&mut self, input: &MultiQueueInput<'_>) -> MultiQueueDecision {
@@ -170,9 +177,10 @@ impl ServerWorkerState {
                 }
                 if let Some(info) = self.ctx.client_info_mut(input.token.0) {
                     let flag = if is_throttled { 'h' } else { 'b' };
-                    info.flags.retain(|flag| flag != 'N');
-                    if !info.flags.contains(flag) {
-                        info.flags.push(flag);
+                    let flags = info.flags.to_mut();
+                    flags.retain(|c| c != 'N');
+                    if !flags.contains(flag) {
+                        flags.push(flag);
                     }
                 }
                 conn.cmd_count = conn.cmd_count.saturating_sub(1);
@@ -204,8 +212,8 @@ impl ServerWorkerState {
             );
         }
         let selected_db = self.connection_registry[input.token].selected_db;
+        self.connection_registry[input.token].last_cmd = input.name.to_string();
         if let Some(info) = self.ctx.client_info_mut(input.token.0) {
-            info.last_cmd = input.name.to_string();
             info.db = selected_db;
         }
         let conn = &mut self.connection_registry[input.token];

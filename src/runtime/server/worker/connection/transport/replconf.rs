@@ -447,9 +447,8 @@ impl ServerWorkerState {
             if !self.ensure_rdb_candidate(connection_token) {
                 return Err("ERR connection is already assigned a replication role".to_string());
             }
-            if let Some(info) = self.ctx.client_info_mut(connection_id.0) {
-                info.last_cmd = "sync".to_string();
-            }
+            self.connection_registry[crate::framework::capabilities::io::Token(connection_token)]
+                .last_cmd = "sync".to_string();
             crate::server_log!(
                 debug,
                 "dual-rdb handshake: primary accepted rdb-channel rdb={} role={:?}",

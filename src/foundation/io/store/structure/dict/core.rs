@@ -60,6 +60,13 @@ impl ResizeBudget {
         self.0.store(bytes.unwrap_or(usize::MAX), Ordering::Release);
     }
 
+    /// Returns true when the budget is unlimited (`None` / `usize::MAX`).
+    /// Used by the per-command refresh path to skip a redundant atomic store
+    /// when `maxmemory` is zero and the budget was already left unlimited.
+    pub(crate) fn is_unlimited(&self) -> bool {
+        self.0.load(Ordering::Acquire) == usize::MAX
+    }
+
     fn reserve(&self, bytes: usize) -> bool {
         let mut available = self.0.load(Ordering::Acquire);
         loop {

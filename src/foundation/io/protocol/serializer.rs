@@ -1,5 +1,5 @@
 use super::Value;
-use bytes::{BufMut, BytesMut};
+use bytes::BufMut;
 
 pub fn format_double(v: f64) -> String {
     if v.is_nan() {
@@ -36,9 +36,9 @@ pub fn serialize_command(parts: &[&[u8]], buf: &mut impl BufMut) {
 }
 
 pub fn serialize_to_vec(value: &Value) -> Vec<u8> {
-    let mut buf = BytesMut::with_capacity(256);
+    let mut buf = Vec::with_capacity(256);
     serialize(value, &mut buf);
-    buf.to_vec()
+    buf
 }
 
 pub fn serialize_resp2(value: &Value, buf: &mut impl BufMut) {
@@ -262,15 +262,15 @@ pub fn serialize_resp3(value: &Value, buf: &mut impl BufMut) {
 }
 
 pub fn serialize_to_vec_resp2(value: &Value) -> Vec<u8> {
-    let mut buf = BytesMut::with_capacity(256);
+    let mut buf = Vec::with_capacity(64);
     serialize_resp2(value, &mut buf);
-    buf.to_vec()
+    buf
 }
 
 pub fn serialize_to_vec_resp3(value: &Value) -> Vec<u8> {
-    let mut buf = BytesMut::with_capacity(256);
+    let mut buf = Vec::with_capacity(64);
     serialize_resp3(value, &mut buf);
-    buf.to_vec()
+    buf
 }
 
 #[cfg(test)]

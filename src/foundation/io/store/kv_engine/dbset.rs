@@ -14,6 +14,11 @@ pub struct SlotEntry {
 pub struct DbSet {
     dbs: Vec<Db>,
     resize_budget: ResizeBudget,
+    /// Number of databases with `replica_local_expire_only` set. Lets
+    /// `set_replica_local_expire_only_all(false)` skip the per-DB scan on the
+    /// common standalone hot path (e.g. every PING), where no DB ever flips
+    /// the flag.
+    replica_local_expire_only_count: usize,
 }
 
 impl DbSet {
@@ -37,7 +42,11 @@ impl DbSet {
             db.db_id = db_id;
             dbs.push(db);
         }
-        Self { dbs, resize_budget }
+        Self {
+            dbs,
+            resize_budget,
+            replica_local_expire_only_count: 0,
+        }
     }
 
     pub fn num_dbs(&self) -> usize {
@@ -52,6 +61,7 @@ impl DbSet {
             None => Self {
                 dbs: Vec::new(),
                 resize_budget: ResizeBudget::new(None),
+                replica_local_expire_only_count: 0,
             },
         }
     }
@@ -140,6 +150,13 @@ impl DbSet {
 
     pub fn set_resize_budget(&mut self, budget: Option<usize>) {
         self.resize_budget.reset(budget);
+    }
+
+    /// True when the shared resize budget is already unlimited. Lets the
+    /// per-command refresh skip a redundant atomic store on the common
+    /// `maxmemory == 0` standalone path.
+    pub fn resize_budget_is_unlimited(&self) -> bool {
+        self.resize_budget.is_unlimited()
     }
 
     pub fn try_resize_all(&mut self, active_rehash: bool) {
@@ -238,8 +255,35 @@ impl DbSet {
     }
 
     pub fn set_replica_local_expire_only_all(&mut self, value: bool) {
+        if !value && self.replica_local_expire_only_count == 0 {
+            return;
+        }
         for db in &mut self.dbs {
             db.set_replica_local_expire_only(value);
+        }
+        self.replica_local_expire_only_count = if value { self.dbs.len() } else { 0 };
+    }
+
+    /// Sets the replica-local-expire flag on a single database while keeping
+    /// `DbSet`'s aggregate count consistent. Callers that previously reached
+    /// `Db::set_replica_local_expire_only` directly must route through here so
+    /// the fast path in `set_replica_local_expire_only_all(false)` stays valid.
+    pub fn set_db_replica_local_expire_only(&mut self, db_id: u32, value: bool) {
+        let Some(db) = self.dbs.get_mut(db_id as usize) else {
+            return;
+        };
+        let was_set = db.replica_local_expire_only;
+        db.set_replica_local_expire_only(value);
+        match (was_set, value) {
+            (false, true) => {
+                self.replica_local_expire_only_count =
+                    self.replica_local_expire_only_count.saturating_add(1);
+            }
+            (true, false) => {
+                self.replica_local_expire_only_count =
+                    self.replica_local_expire_only_count.saturating_sub(1);
+            }
+            _ => {}
         }
     }
 

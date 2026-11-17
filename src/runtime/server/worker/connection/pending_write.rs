@@ -1,10 +1,10 @@
+use crate::foundation::memory::util_hash::FxHashSet;
 use crate::framework::capabilities::io::Token;
 use crate::runtime::server::worker::event_loop::{BeforePollSlot, DispatchContext, RunnableKey};
-use std::collections::HashSet;
 
 #[derive(Default)]
 pub(crate) struct OrdinaryWriteScheduler {
-    serviced_this_turn: HashSet<Token>,
+    serviced_this_turn: FxHashSet<Token>,
 }
 
 impl OrdinaryWriteScheduler {

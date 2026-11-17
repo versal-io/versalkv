@@ -19,15 +19,15 @@ impl EvictionOutcome {
 
 impl ServerWorkerState {
     pub(crate) fn perform_evictions(&mut self) -> EvictionOutcome {
+        let maxmemory = self.ctx.config().server.maxmemory;
+        if maxmemory == 0 {
+            self.cancel_eviction_timer();
+            return EvictionOutcome::empty();
+        }
         if self.ctx.suppress_eviction_until_write()
             || self.ctx.is_host_task_loading()
             || self.ctx.is_loading()
         {
-            self.cancel_eviction_timer();
-            return EvictionOutcome::empty();
-        }
-        let maxmemory = self.ctx.config().server.maxmemory;
-        if maxmemory == 0 {
             self.cancel_eviction_timer();
             return EvictionOutcome::empty();
         }

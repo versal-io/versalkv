@@ -2,8 +2,10 @@ use crate::engine::command::{CommandArgs, CMD_ALL_DBS, CMD_NO_AUTH};
 use crate::engine::extension::acl::{
     add_acl_log_entry, AclCommand, AclDenial, AclUser, ACL_DENIED_CHANNEL, ACL_DENIED_CMD,
     ACL_DENIED_DB, ACL_DENIED_KEY, ACL_LOG_CTX_MULTI, ACL_LOG_CTX_TOPLEVEL,
+    DEFAULT_USER_IS_SUPERUSER,
 };
 use crate::foundation::io::protocol::Value;
+use std::sync::atomic::Ordering;
 
 use super::super::super::ServerWorkerState;
 use super::{CmdCallFlags, CmdPreconditions, CommandClientFacts, DispatchAction, DispatchOutcome};
@@ -14,6 +16,7 @@ struct AclRequest<'a> {
     args: &'a CommandArgs,
     call_flags: CmdCallFlags,
     log_context: i32,
+    username: &'a str,
 }
 
 impl<'a> AclRequest<'a> {
@@ -22,6 +25,7 @@ impl<'a> AclRequest<'a> {
         meta: &'a CmdPreconditions,
         args: &'a CommandArgs,
         call_flags: CmdCallFlags,
+        username: &'a str,
     ) -> Self {
         let log_context = if facts.transaction {
             ACL_LOG_CTX_MULTI
@@ -34,13 +38,14 @@ impl<'a> AclRequest<'a> {
             args,
             call_flags,
             log_context,
+            username,
         }
     }
 }
 
 impl ServerWorkerState {
     pub(crate) fn stage_acl_permissions(
-        &mut self,
+        &self,
         facts: &CommandClientFacts,
         meta: &CmdPreconditions,
         args: &CommandArgs,
@@ -49,10 +54,32 @@ impl ServerWorkerState {
         if (meta.flags & CMD_NO_AUTH) != 0 {
             return None;
         }
-        let request = AclRequest::new(facts, meta, args, call_flags);
-        let key_requirements = acl_key_requirements(meta, args);
+        // Borrow the username directly from the connection instead of cloning
+        // it into `CommandClientFacts`. The ACL user lookup and any denial
+        // message only need a transient borrow, so the per-command String
+        // allocation is eliminated on the hot path (e.g. every PING).
+        let username = &self.connection_registry[facts.token].username;
+        // Fast path: the `default` user is a superuser in the default
+        // configuration, and most connections authenticate as `default`. The
+        // cached atomic avoids the `acl_users()` mutex + HashMap lookup on
+        // every command. If the flag is false (default user was demoted via
+        // ACL SETUSER) or the user is not `default`, fall through to the full
+        // lookup.
+        if username == "default" && DEFAULT_USER_IS_SUPERUSER.load(Ordering::Relaxed) {
+            return None;
+        }
         let users = crate::engine::extension::acl::acl_users().lock().unwrap();
-        let user = users.get(&facts.username)?;
+        let user = users.get(username)?;
+        // Fast path: the default user (and any user configured as a full
+        // superuser) has `+@all ~* &*` on the root selector. In that case the
+        // command/db/key/channel checks are trivially satisfied, so skip the
+        // selector iteration entirely. This mirrors C's `ACL_USER_FLAG_SUPERUSER`
+        // short-circuit and avoids computing key requirements for nothing.
+        if user.is_superuser() {
+            return None;
+        }
+        let request = AclRequest::new(facts, meta, args, call_flags, username);
+        let key_requirements = acl_key_requirements(meta, args);
         if let Some(denial) = command_denial(user, &request, &key_requirements, self.ctx.num_dbs())
         {
             return Some(acl_denial_outcome(&request, denial, &key_requirements));
@@ -178,7 +205,7 @@ fn acl_denial_outcome(
                 object,
                 format!(
                     "NOPERM User {} has no permissions to access database {db}",
-                    request.facts.username
+                    request.username
                 ),
             )
         }
@@ -189,7 +216,7 @@ fn acl_denial_outcome(
             );
             let message = format!(
                 "NOPERM User {} has no permissions to run the '{}' command",
-                request.facts.username, object
+                request.username, object
             );
             (ACL_DENIED_CMD, object, message)
         }
@@ -201,7 +228,7 @@ fn acl_denial_outcome(
                 .to_string();
             let message = format!(
                 "NOPERM User {} has no permissions to access a key",
-                request.facts.username
+                request.username
             );
             (ACL_DENIED_KEY, key, message)
         }
@@ -217,7 +244,7 @@ fn acl_denial_outcome(
                 object,
                 format!(
                     "NOPERM User {} has no permissions to access a channel",
-                    request.facts.username
+                    request.username
                 ),
             )
         }
@@ -227,7 +254,7 @@ fn acl_denial_outcome(
         reason,
         request.log_context,
         object,
-        request.facts.username.clone(),
+        request.username.to_string(),
         client_info,
     );
     rejected(request.call_flags, message)
@@ -257,14 +284,14 @@ fn channel_denial_outcome(user: &AclUser, request: &AclRequest<'_>) -> Option<Di
         ACL_DENIED_CHANNEL,
         request.log_context,
         channel.to_string(),
-        request.facts.username.clone(),
+        request.username.to_string(),
         client_info,
     );
     Some(rejected(
         request.call_flags,
         format!(
             "NOPERM User {} has no permissions to access a channel",
-            request.facts.username
+            request.username
         ),
     ))
 }

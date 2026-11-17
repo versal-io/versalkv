@@ -1,12 +1,13 @@
 use super::super::ServerWorkerState;
 use crate::engine::distributed::replication::BacklogCursor;
 use crate::foundation::io::transport::{Interest, WriteOutcome};
+use crate::foundation::memory::util_hash::FxHashSet;
 use crate::framework::capabilities::connection::{Connection, ConnectionState};
 use crate::framework::capabilities::io::Token;
 use crate::runtime::server::worker::event_loop::io_workers::{
     WriteCompletion, WriteCompletionAction, WriteSubmission,
 };
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::io::{IoSlice, Write};
 
 #[cfg(test)]
@@ -242,7 +243,9 @@ impl ServerWorkerState {
                 if replication_written > 0 {
                     self.replication_buffer_accounting_dirty = true;
                 }
-                self.refresh_client_memory_usage(token, false);
+                if self.effective_client_memory_limit().is_some() {
+                    self.refresh_client_memory_usage(token, false);
+                }
                 if let WriteOutcome::Failed(error) = &outcome {
                     crate::server_log!(
                         warning,
@@ -366,7 +369,15 @@ impl ServerWorkerState {
     /// partial/WouldBlock result keeps writable interest armed through
     /// `dispatch_client_write`.
     pub(crate) fn schedule_pending_replica_writes_before_sleep(&mut self) {
-        let streaming: HashSet<Token> = self
+        // Buffer accounting has its own dirty guard; run it before the
+        // no-replicas fast path so dirty standalone state is still settled.
+        self.refresh_replication_buffer_accounting_if_dirty();
+        // Fast path: no downstream replicas, so there is nothing to schedule.
+        // This avoids the HashSet/Vec allocations on every standalone cycle.
+        if self.replication_runtime.primary_links().is_empty() {
+            return;
+        }
+        let streaming: FxHashSet<Token> = self
             .replication_runtime
             .primary_links()
             .values()
@@ -396,7 +407,6 @@ impl ServerWorkerState {
                 crate::runtime::server::worker::event_loop::RunnableKey::ClientWrite(token),
             );
         }
-        self.refresh_replication_buffer_accounting_if_dirty();
     }
 
     /// Flush the output queue for a connection synchronously, without changing
@@ -442,7 +452,9 @@ impl ServerWorkerState {
             Ok(replication_written) => replication_written,
             Err(_) => return WriteOutcome::Failed(replication_accounting_error()),
         };
-        self.refresh_client_memory_usage(Token(token_value), false);
+        if self.effective_client_memory_limit().is_some() {
+            self.refresh_client_memory_usage(Token(token_value), false);
+        }
         if is_slot_export {
             self.writes
                 .slot_exports
@@ -689,7 +701,9 @@ impl ServerWorkerState {
 
     fn record_writable_flush(&mut self, context: &WritableContext, flush: &WritableFlush) -> bool {
         self.record_replication_wire_write(context.token.0, flush.written);
-        self.refresh_client_memory_usage(context.token, false);
+        if self.effective_client_memory_limit().is_some() {
+            self.refresh_client_memory_usage(context.token, false);
+        }
         if context.is_slot_export() {
             self.writes
                 .slot_exports
@@ -968,10 +982,13 @@ impl ServerWorkerState {
     }
 
     pub(crate) fn reap_bgsave_child(&mut self) {
-        if let Some(outcome) = self
-            .ctx
-            .poll_forkless_save(crate::foundation::io::sys::time::mstime() / 1_000)
-        {
+        let forkless_outcome = if self.ctx.persistence().forkless_save_in_progress() {
+            self.ctx
+                .poll_forkless_save(crate::foundation::io::sys::time::mstime() / 1_000)
+        } else {
+            None
+        };
+        if let Some(outcome) = forkless_outcome {
             use crate::foundation::io::persistence::snapshot::background::RdbSaveOutcome;
             match outcome {
                 RdbSaveOutcome::Saved => {

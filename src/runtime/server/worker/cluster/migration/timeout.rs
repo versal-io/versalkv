@@ -2,7 +2,8 @@ use super::super::super::ServerWorkerState;
 use crate::engine::distributed::cluster::migration::{
     ExportPhase, ImportPhase, MigrationJobId, MigrationOperation, MigrationPhase,
 };
-use std::time::{Duration, Instant};
+use crate::foundation::memory::util_time::MonotonicInstant;
+use std::time::Duration;
 
 impl ServerWorkerState {
     pub(super) fn expire_stalled_slot_migrations(&mut self) {
@@ -11,7 +12,7 @@ impl ServerWorkerState {
             return;
         }
         let timeout = Duration::from_secs(timeout_sec);
-        let now = Instant::now();
+        let now = MonotonicInstant::now();
         let now_unix = crate::foundation::io::sys::time::unixtime();
         let stalled = self
             .ctx

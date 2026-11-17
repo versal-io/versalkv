@@ -293,6 +293,11 @@ pub fn crash_via_readonly_page() {
 
 /// Consume the pending signal number, if any. Clears the atomic slot.
 pub fn take_pending_signal() -> Option<i32> {
+    // Fast path: a relaxed load avoids the locked xchg on every event-loop
+    // turn. Signals are rare, so the load almost always reads 0 and returns.
+    if LAST_SIG.load(Ordering::Relaxed) == 0 {
+        return None;
+    }
     match LAST_SIG.swap(0, Ordering::Relaxed) {
         0 => None,
         s => Some(s),
@@ -301,6 +306,10 @@ pub fn take_pending_signal() -> Option<i32> {
 
 /// Whether SIGINT has fired at least twice since startup (and cleared).
 pub fn take_second_sigint() -> bool {
+    // Fast path: relaxed load before the locked swap.
+    if !SECOND_SIGINT.load(Ordering::Relaxed) {
+        return false;
+    }
     SECOND_SIGINT.swap(false, Ordering::Relaxed)
 }
 

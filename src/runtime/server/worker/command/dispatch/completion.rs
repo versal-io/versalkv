@@ -3,7 +3,7 @@
 //! linear because its order is part of the client, monitoring, and blocking
 //! contract.
 
-use super::command_exec::client_last_command_name;
+use super::command_exec::{client_last_command_name, write_client_last_command_name};
 use super::side_effects::CommandEffects;
 use super::{CmdLogEntry, ServerWorkerState};
 use crate::engine::command::context::CommandConn;
@@ -95,6 +95,12 @@ impl ServerWorkerState {
     }
 
     fn is_downstream_replica(&self, token_value: usize) -> bool {
+        // Fast path: a standalone server with no connected replicas has an
+        // empty `primary_links` map, so the per-connection `channel_records`
+        // lookup can be skipped entirely. This covers the common PING workload.
+        if self.replication_runtime.primary_links().is_empty() {
+            return false;
+        }
         self.replication_runtime
             .primary_for_connection(crate::framework::distributed::replication::ConnectionId(
                 token_value,
@@ -133,7 +139,7 @@ impl ServerWorkerState {
         super::record_error_reply(
             &mut self.ctx,
             reply,
-            (!rejected).then_some(stats_name.as_str()),
+            (!rejected).then_some(stats_name.as_ref()),
         );
         if !rejected && duration_us > 0 {
             let event_name = if invocation.flags & crate::engine::command::CMD_FAST != 0 {
@@ -145,16 +151,21 @@ impl ServerWorkerState {
                 .latency_mut()
                 .add_sample(event_name, (duration_us / 1000) as i64);
         }
-        let connection =
-            &self.connection_registry[crate::framework::capabilities::io::Token(connection_token)];
-        let selected_db = connection.selected_db;
+        let connection = &mut self.connection_registry
+            [crate::framework::capabilities::io::Token(connection_token)];
+        // Write `last_cmd` directly onto the connection instead of going
+        // through `client_info_mut`. The `db` and `flags` fields are derivable
+        // from connection state (CLIENT LIST already computes them on the fly),
+        // so only `watched_keys` is mirrored to `ClientInfo` for the low-
+        // frequency INFO `watched_client_summary` consumer.
+        write_client_last_command_name(&mut connection.last_cmd, invocation.name, invocation.args);
         let watched_keys = connection.transaction.watched_key_count();
-        let flags = connection_info_flags(connection);
+        // `watched_keys` must be mirrored to `ClientInfo` on every transition,
+        // including the 1 -> 0 case after UNWATCH/EXEC/DISCARD. Skipping the
+        // update when the count is zero would leave a stale non-zero value and
+        // inflate `INFO watching_clients`.
         if let Some(info) = self.ctx.client_info_mut(invocation.target.token_value()) {
-            info.last_cmd = client_last_command_name(invocation.name, invocation.args);
-            info.db = selected_db;
             info.watched_keys = watched_keys;
-            info.flags = flags;
         }
     }
 
@@ -175,14 +186,13 @@ impl ServerWorkerState {
         if !was_blocked_before {
             self.ctx.decr_total_commands(1);
             let stats_name = super::command_stats_name(invocation.name, invocation.args);
-            let stat = self
-                .ctx
-                .stats_mut()
-                .cmd_stats
-                .entry(stats_name)
-                .or_default();
-            stat.calls = stat.calls.saturating_sub(1);
-            stat.usec = stat.usec.saturating_sub(duration_us);
+            // The command was already recorded by `begin_cmd`/`end_cmd` before
+            // it blocked; only adjust the existing entry. A missing entry
+            // saturates to zero identically to creating one first.
+            if let Some(stat) = self.ctx.stats_mut().cmd_stats.get_mut(stats_name.as_ref()) {
+                stat.calls = stat.calls.saturating_sub(1);
+                stat.usec = stat.usec.saturating_sub(duration_us);
+            }
         }
         self.commit_blocked_stream_read_effects(connection_token, None, None, Some(effects));
         let request_wait_ack = self.register_blocked_command(connection_token);
@@ -411,8 +421,31 @@ impl ServerWorkerState {
         if completion.status.is_rejected() {
             return;
         }
+        let has_monitor = self.ctx.has_monitor_clients();
+        let req_bytes = completion
+            .connection_effects
+            .map_or(0, ConnectionCommandEffects::request_bytes);
+        // Skip the argv/CmdLogEntry allocation entirely when no observer needs
+        // it. Fast commands (e.g. PING) never cross slowlog/commandlog
+        // thresholds and no MONITOR client means argv is not needed there.
+        let needs_argv = has_monitor
+            || self.ctx.would_log_command(
+                completion.duration_us,
+                req_bytes,
+                completion.reply_bytes,
+                completion.invocation.flags,
+            );
+        if !needs_argv {
+            self.capture_completion_slot_metrics(completion);
+            return;
+        }
         let argv = redacted_argv(completion.connection_effects, completion.invocation.args);
-        self.capture_completion_monitor(completion, argv.clone(), effects);
+        // Skip the monitor path entirely when no client is subscribed to
+        // MONITOR. This avoids `peer_addr.to_string()` and an `argv` clone on
+        // the common no-monitor workload.
+        if has_monitor {
+            self.capture_completion_monitor(completion, argv.clone(), effects);
+        }
         self.capture_completion_command_log(completion, argv, effects);
         self.capture_completion_slot_metrics(completion);
     }
@@ -470,6 +503,14 @@ impl ServerWorkerState {
     }
 
     fn capture_completion_slot_metrics(&mut self, completion: ObserverCompletion<'_>) {
+        // Fast path: slot metrics are only recorded when cluster mode and
+        // slot stats are both enabled. On the common standalone deployment
+        // this skips the `dirty_keys().to_vec()` allocation entirely.
+        if !self.ctx.config().server.cluster_enabled
+            || !self.ctx.config().server.cluster_slot_stats_enabled
+        {
+            return;
+        }
         let connection_effects = completion.connection_effects;
         let observed_keys =
             connection_effects.map_or_else(Vec::new, |effects| effects.dirty_keys().to_vec());
@@ -513,50 +554,6 @@ pub(super) fn replica_command_name_for_log(
     } else {
         client_last_command_name(name, args)
     }
-}
-
-fn connection_info_flags(
-    connection: &crate::framework::capabilities::connection::Connection,
-) -> String {
-    let mut flags = String::new();
-    if let Some(role) = connection.slot_migration_role.as_ref() {
-        flags.push(match role {
-            crate::engine::distributed::cluster::migration::SlotMigrationConnectionRole::Export(
-                _,
-            ) => 'E',
-            crate::engine::distributed::cluster::migration::SlotMigrationConnectionRole::Import(
-                _,
-            ) => 'i',
-        });
-    }
-    if connection.import_source {
-        flags.push('I');
-    }
-    if connection.readonly {
-        flags.push('r');
-    }
-    if connection.monitoring {
-        flags.push('O');
-    }
-    if connection
-        .blocked
-        .as_ref()
-        .is_some_and(|blocked| matches!(blocked.cmd, BlockedCmd::Throttled))
-    {
-        flags.push('h');
-    } else if connection.blocked.is_some() {
-        flags.push('b');
-    }
-    if connection.no_touch {
-        flags.push('N');
-    }
-    if connection.is_priority {
-        flags.push('H');
-    }
-    if flags.is_empty() {
-        flags.push('N');
-    }
-    flags
 }
 
 pub(crate) fn redacted_argv(

@@ -101,10 +101,17 @@ impl ServerWorkerState {
         &mut self,
         token: crate::framework::capabilities::io::Token,
     ) {
-        let mode = &self.ctx.config().server.tls_auth_clients_user;
+        let server = &self.ctx.config().server;
+        // When no TLS listener, replication link, or cluster bus is configured,
+        // no connection can possibly carry a TLS peer identity. Skip the
+        // transport lookup entirely on the hot read path.
+        if server.tls_port == 0 && !server.tls_replication && !server.tls_cluster {
+            return;
+        }
         if self.connection_registry[token].tls_identity_checked {
             return;
         }
+        let mode = &server.tls_auth_clients_user;
         let Some(names) = self.transport.tls_peer_names(token, mode == "uri") else {
             return;
         };
