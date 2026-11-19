@@ -2302,6 +2302,12 @@ mod tests {
                 false,
             )]);
             let watcher_token = runtime.connection_registry.register_for_test(watcher);
+            // Mirror the production CLIENT TRACKING ON flow, which registers
+            // the client in the global `tracking.clients` set before any key
+            // can be tracked for it. The `collect_tracking_deliveries` fast
+            // path relies on this invariant to skip work when no client has
+            // tracking enabled.
+            runtime.ctx.tracking_mut().clients.insert(watcher_token.0);
             runtime
                 .ctx
                 .tracking_mut()

@@ -664,6 +664,15 @@ impl ServerWorkerState {
         connection_token: usize,
         args: &CommandArgs,
     ) -> (Value, bool) {
+        // A signaled blocked command is reprocessed as a fresh command attempt,
+        // so it must observe the current wall clock rather than the outer
+        // command's frozen time snapshot. Without this, a key whose TTL elapsed
+        // during the outer command (e.g. `DEBUG SLEEP` inside MULTI/EXEC) still
+        // looks alive: the reprocessed BLPOP/BZPOPMIN would pop stale data
+        // instead of recognizing the expiry and reblocking (C #13004). The
+        // guard restores the outer snapshot when it drops.
+        let _fresh_command_time =
+            crate::foundation::io::sys::time::enter_fresh_command_time_snapshot();
         match self.registry.lookup(&args.name).cloned() {
             Some(spec) => {
                 // Re-check ACL key permissions for blocked commands (permissions may have changed
@@ -1263,6 +1272,7 @@ mod tests {
 
         let mut backend = ServerWorkerState::new(2).unwrap();
         crate::framework::commands::register_all(&mut backend.registry);
+        backend.ctx.replication_mut().backlog.activate();
         for db_id in [0, 1] {
             backend
                 .ctx
@@ -1293,7 +1303,7 @@ mod tests {
             let name = String::from_utf8_lossy(&args.name).to_ascii_lowercase();
             let mut batch = ReadBatchEffects::default();
             backend.process_parsed_command(token, args, name, true, &mut batch);
-            backend.complete_client_read(token.0, token.0, batch);
+            backend.complete_client_read(token.0, token.0, &mut batch);
         };
         dispatch(
             &mut backend,
@@ -1333,6 +1343,11 @@ mod tests {
         assert!(backend.connection_registry[trigger].output.queue.is_empty());
 
         backend.connection_registry[trigger].set_tracking(true);
+        // Mirror the production CLIENT TRACKING ON flow, which registers the
+        // client in the global `tracking.clients` set before any key can be
+        // tracked for it. The `collect_tracking_deliveries` fast path relies
+        // on this invariant to skip work when no client has tracking enabled.
+        backend.ctx.tracking_mut().clients.insert(trigger.0);
         backend
             .ctx
             .tracking_mut()
@@ -1414,6 +1429,11 @@ mod tests {
             .transaction
             .watch_many(vec![WatchedKey::new(0, Bytes::from_static(b"s"), false)]);
         let observer = Token(backend.connection_registry.insert(observer));
+        // Mirror the production CLIENT TRACKING ON flow, which registers the
+        // client in the global `tracking.clients` set before any key can be
+        // tracked for it. The `collect_tracking_deliveries` fast path relies
+        // on this invariant to skip work when no client has tracking enabled.
+        backend.ctx.tracking_mut().clients.insert(observer.0);
         backend
             .ctx
             .tracking_mut()
@@ -1737,6 +1757,7 @@ mod tests {
     #[test]
     fn paused_exec_wakeup_consumes_notifications_before_clearing_transients() {
         let (mut backend, connection_token, token) = _backend_with_connection();
+        backend.ctx.replication_mut().backlog.activate();
         let channel = Bytes::from_static(b"exec-channel");
         backend.connection_registry[crate::framework::capabilities::io::Token(connection_token)]
             .set_skip_propagation(false);

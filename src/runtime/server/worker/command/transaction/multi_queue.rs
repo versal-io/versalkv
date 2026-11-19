@@ -32,7 +32,7 @@ impl ServerWorkerState {
         resp3: bool,
         replies: &mut Vec<Vec<u8>>,
     ) -> Option<bool> {
-        if !self.should_queue_in_transaction(token, name) {
+        if !self.should_queue_in_transaction(token, name.as_bytes()) {
             return None;
         }
         Some(self.handle_multi_queue(token, args, name, resp3, replies))
@@ -75,13 +75,13 @@ impl ServerWorkerState {
         }
     }
 
-    pub(crate) fn should_queue_in_transaction(&self, token: Token, name: &str) -> bool {
+    pub(crate) fn should_queue_in_transaction(&self, token: Token, name: &[u8]) -> bool {
         self.connection_registry[token].transaction.is_active()
-            && !name.eq_ignore_ascii_case("multi")
-            && !name.eq_ignore_ascii_case("discard")
-            && !name.eq_ignore_ascii_case("reset")
-            && !name.eq_ignore_ascii_case("watch")
-            && !name.eq_ignore_ascii_case("unwatch")
+            && !name.eq_ignore_ascii_case(b"multi")
+            && !name.eq_ignore_ascii_case(b"discard")
+            && !name.eq_ignore_ascii_case(b"reset")
+            && !name.eq_ignore_ascii_case(b"watch")
+            && !name.eq_ignore_ascii_case(b"unwatch")
     }
 
     fn decide_multi_queue(&mut self, input: &MultiQueueInput<'_>) -> MultiQueueDecision {

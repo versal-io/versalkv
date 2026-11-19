@@ -1,6 +1,55 @@
 use super::Value;
 use bytes::BufMut;
 
+/// Write a non-negative `usize` into `buf` without heap allocation. Returns
+/// the slice of `buf` containing the decimal digits. Used by the serializer
+/// to avoid `format!("{}", n)` String allocations on the hot reply path
+/// (e.g. every INCR integer reply and every bulk-string length prefix).
+#[inline]
+fn write_usize(buf: &mut [u8; 20], n: usize) -> &[u8] {
+    if n == 0 {
+        buf[0] = b'0';
+        return &buf[..1];
+    }
+    let mut n = n;
+    let mut pos = 20;
+    while n > 0 {
+        pos -= 1;
+        buf[pos] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    &buf[pos..]
+}
+
+/// Write a signed `i64` into `buf` without heap allocation. Returns the slice
+/// of `buf` containing the decimal digits (including a leading `-` for
+/// negatives).
+#[inline]
+fn write_i64(buf: &mut [u8; 20], n: i64) -> &[u8] {
+    if n == i64::MIN {
+        // i64::MIN cannot be negated; handle it explicitly.
+        return b"-9223372036854775808";
+    }
+    if n < 0 {
+        // Write digits of the absolute value first, then shift right and
+        // prepend the sign. Use a local copy of the digit count to avoid
+        // borrowing `buf` across the mutation.
+        let abs = (-n) as usize;
+        let digits = write_usize(buf, abs);
+        let digit_len = digits.len();
+        let start = 20 - digit_len - 1;
+        // `digits` points into `buf[start+1..]`; copy within the same array
+        // using a temporary to avoid overlapping borrow issues.
+        let mut tmp = [0u8; 20];
+        tmp[..digit_len].copy_from_slice(digits);
+        buf[start] = b'-';
+        buf[start + 1..start + 1 + digit_len].copy_from_slice(&tmp[..digit_len]);
+        &buf[start..start + 1 + digit_len]
+    } else {
+        write_usize(buf, n as usize)
+    }
+}
+
 pub fn format_double(v: f64) -> String {
     if v.is_nan() {
         return "nan".to_string();
@@ -42,6 +91,7 @@ pub fn serialize_to_vec(value: &Value) -> Vec<u8> {
 }
 
 pub fn serialize_resp2(value: &Value, buf: &mut impl BufMut) {
+    let mut num_buf = [0u8; 20];
     match value {
         Value::SimpleString(s) => {
             buf.put_u8(b'+');
@@ -55,15 +105,13 @@ pub fn serialize_resp2(value: &Value, buf: &mut impl BufMut) {
         }
         Value::Integer(n) => {
             buf.put_u8(b':');
-            let s = format!("{}", n);
-            buf.put_slice(s.as_bytes());
+            buf.put_slice(write_i64(&mut num_buf, *n));
             buf.put_slice(b"\r\n");
         }
         Value::Double(v) => {
             let s = format_double(*v);
             buf.put_u8(b'$');
-            let len = format!("{}", s.len());
-            buf.put_slice(len.as_bytes());
+            buf.put_slice(write_usize(&mut num_buf, s.len()));
             buf.put_slice(b"\r\n");
             buf.put_slice(s.as_bytes());
             buf.put_slice(b"\r\n");
@@ -73,8 +121,7 @@ pub fn serialize_resp2(value: &Value, buf: &mut impl BufMut) {
         }
         Value::Bulk(b) => {
             buf.put_u8(b'$');
-            let s = format!("{}", b.len());
-            buf.put_slice(s.as_bytes());
+            buf.put_slice(write_usize(&mut num_buf, b.len()));
             buf.put_slice(b"\r\n");
             buf.put_slice(b);
             buf.put_slice(b"\r\n");
@@ -90,16 +137,14 @@ pub fn serialize_resp2(value: &Value, buf: &mut impl BufMut) {
         }
         Value::BigNumber(b) => {
             buf.put_u8(b'$');
-            let s = format!("{}", b.len());
-            buf.put_slice(s.as_bytes());
+            buf.put_slice(write_usize(&mut num_buf, b.len()));
             buf.put_slice(b"\r\n");
             buf.put_slice(b);
             buf.put_slice(b"\r\n");
         }
         Value::Verbatim { data, .. } => {
             buf.put_u8(b'$');
-            let s = format!("{}", data.len());
-            buf.put_slice(s.as_bytes());
+            buf.put_slice(write_usize(&mut num_buf, data.len()));
             buf.put_slice(b"\r\n");
             buf.put_slice(data);
             buf.put_slice(b"\r\n");
@@ -109,8 +154,7 @@ pub fn serialize_resp2(value: &Value, buf: &mut impl BufMut) {
         }
         Value::Push(items) => {
             buf.put_u8(b'*');
-            let s = format!("{}", items.len());
-            buf.put_slice(s.as_bytes());
+            buf.put_slice(write_usize(&mut num_buf, items.len()));
             buf.put_slice(b"\r\n");
             for item in items {
                 serialize_resp2(item, buf);
@@ -118,8 +162,7 @@ pub fn serialize_resp2(value: &Value, buf: &mut impl BufMut) {
         }
         Value::Array(items) => {
             buf.put_u8(b'*');
-            let s = format!("{}", items.len());
-            buf.put_slice(s.as_bytes());
+            buf.put_slice(write_usize(&mut num_buf, items.len()));
             buf.put_slice(b"\r\n");
             for item in items {
                 serialize_resp2(item, buf);
@@ -127,9 +170,7 @@ pub fn serialize_resp2(value: &Value, buf: &mut impl BufMut) {
         }
         Value::Map(entries) => {
             buf.put_u8(b'*');
-            let n = entries.len() * 2;
-            let s = format!("{}", n);
-            buf.put_slice(s.as_bytes());
+            buf.put_slice(write_usize(&mut num_buf, entries.len() * 2));
             buf.put_slice(b"\r\n");
             for (k, v) in entries {
                 serialize_resp2(k, buf);
@@ -138,8 +179,7 @@ pub fn serialize_resp2(value: &Value, buf: &mut impl BufMut) {
         }
         Value::Set(items) => {
             buf.put_u8(b'*');
-            let s = format!("{}", items.len());
-            buf.put_slice(s.as_bytes());
+            buf.put_slice(write_usize(&mut num_buf, items.len()));
             buf.put_slice(b"\r\n");
             for item in items {
                 serialize_resp2(item, buf);
@@ -149,6 +189,7 @@ pub fn serialize_resp2(value: &Value, buf: &mut impl BufMut) {
 }
 
 pub fn serialize_resp3(value: &Value, buf: &mut impl BufMut) {
+    let mut num_buf = [0u8; 20];
     match value {
         Value::SimpleString(s) => {
             buf.put_u8(b'+');
@@ -162,8 +203,7 @@ pub fn serialize_resp3(value: &Value, buf: &mut impl BufMut) {
         }
         Value::Integer(n) => {
             buf.put_u8(b':');
-            let s = format!("{}", n);
-            buf.put_slice(s.as_bytes());
+            buf.put_slice(write_i64(&mut num_buf, *n));
             buf.put_slice(b"\r\n");
         }
         Value::Double(v) => {
@@ -179,8 +219,7 @@ pub fn serialize_resp3(value: &Value, buf: &mut impl BufMut) {
         }
         Value::Bulk(b) => {
             buf.put_u8(b'$');
-            let s = format!("{}", b.len());
-            buf.put_slice(s.as_bytes());
+            buf.put_slice(write_usize(&mut num_buf, b.len()));
             buf.put_slice(b"\r\n");
             buf.put_slice(b);
             buf.put_slice(b"\r\n");
@@ -200,9 +239,7 @@ pub fn serialize_resp3(value: &Value, buf: &mut impl BufMut) {
         }
         Value::Verbatim { format, data } => {
             buf.put_u8(b'=');
-            let total = data.len() + 4;
-            let s = format!("{}", total);
-            buf.put_slice(s.as_bytes());
+            buf.put_slice(write_usize(&mut num_buf, data.len() + 4));
             buf.put_slice(b"\r\n");
             buf.put_slice(format);
             buf.put_u8(b':');
@@ -211,9 +248,7 @@ pub fn serialize_resp3(value: &Value, buf: &mut impl BufMut) {
         }
         Value::Attribute { attrs, inner } => {
             buf.put_u8(b'|');
-            let n = attrs.len();
-            let s = format!("{}", n);
-            buf.put_slice(s.as_bytes());
+            buf.put_slice(write_usize(&mut num_buf, attrs.len()));
             buf.put_slice(b"\r\n");
             for (k, v) in attrs {
                 serialize_resp3(k, buf);
@@ -223,8 +258,7 @@ pub fn serialize_resp3(value: &Value, buf: &mut impl BufMut) {
         }
         Value::Push(items) => {
             buf.put_u8(b'>');
-            let s = format!("{}", items.len());
-            buf.put_slice(s.as_bytes());
+            buf.put_slice(write_usize(&mut num_buf, items.len()));
             buf.put_slice(b"\r\n");
             for item in items {
                 serialize_resp3(item, buf);
@@ -232,8 +266,7 @@ pub fn serialize_resp3(value: &Value, buf: &mut impl BufMut) {
         }
         Value::Array(items) => {
             buf.put_u8(b'*');
-            let s = format!("{}", items.len());
-            buf.put_slice(s.as_bytes());
+            buf.put_slice(write_usize(&mut num_buf, items.len()));
             buf.put_slice(b"\r\n");
             for item in items {
                 serialize_resp3(item, buf);
@@ -241,8 +274,7 @@ pub fn serialize_resp3(value: &Value, buf: &mut impl BufMut) {
         }
         Value::Map(entries) => {
             buf.put_u8(b'%');
-            let s = format!("{}", entries.len());
-            buf.put_slice(s.as_bytes());
+            buf.put_slice(write_usize(&mut num_buf, entries.len()));
             buf.put_slice(b"\r\n");
             for (k, v) in entries {
                 serialize_resp3(k, buf);
@@ -251,8 +283,7 @@ pub fn serialize_resp3(value: &Value, buf: &mut impl BufMut) {
         }
         Value::Set(items) => {
             buf.put_u8(b'~');
-            let s = format!("{}", items.len());
-            buf.put_slice(s.as_bytes());
+            buf.put_slice(write_usize(&mut num_buf, items.len()));
             buf.put_slice(b"\r\n");
             for item in items {
                 serialize_resp3(item, buf);

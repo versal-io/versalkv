@@ -208,8 +208,11 @@ impl RdbSaveControl {
     }
 
     pub fn set_key_delay(&self, key_delay_us: i64) {
-        self.lock().key_delay_us = key_delay_us;
-        self.changed.notify_all();
+        let mut state = self.lock();
+        if state.key_delay_us != key_delay_us {
+            state.key_delay_us = key_delay_us;
+            self.changed.notify_all();
+        }
     }
 
     /// Current per-key save delay in microseconds. Test-only helper used to

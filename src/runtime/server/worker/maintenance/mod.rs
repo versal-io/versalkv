@@ -1,7 +1,7 @@
 use super::ServerWorkerState;
 use crate::engine::distributed::replication::protocol as replication_svc;
 use crate::engine::extension::script::PropagationOp;
-use crate::foundation::io::sys::time::mstime;
+use crate::foundation::io::sys::time::{mstime, MonotonicInstant};
 use crate::framework::capabilities::io::Token;
 use crate::framework::context::PauseAction;
 use crate::framework::distributed::sentinel::timer::sentinel_cron;
@@ -137,12 +137,10 @@ impl ServerWorkerState {
     /// release any writers whose keys have just been captured.
     ///
     /// Called both from the periodic cron task and from every before-poll
-    /// phase. While a capture is active the poll timeout collapses to zero (see
-    /// `next_poll_timeout`), so the feed is refilled each event-loop turn
-    /// instead of only on the ~100 ms cron tick. This keeps a forkless save
-    /// close to a continuously running background save without holding a single
-    /// turn for the whole dataset; client commands are still serviced between
-    /// turns and writers are unblocked as soon as their keys are captured.
+    /// phase. A feed with available capacity runs again immediately; a full
+    /// feed permits a bounded poll wait until the serializer can consume it.
+    /// This keeps capture independent of the slower cron tick while allowing
+    /// socket events to wake the worker and writers to resume after capture.
     pub(crate) fn pump_forkless_capture(&mut self) {
         if self.ctx.persistence().forkless_capture_in_progress() {
             let released_forkless_key = self.ctx.drive_forkless_feed();
@@ -636,7 +634,12 @@ impl ServerWorkerState {
         if paused {
             return;
         }
-        let expire_start = mstime();
+        // Measure real wall-clock duration with the monotonic clock. The
+        // cron phase runs inside the event-loop command-time snapshot, so
+        // `mstime()` is frozen and would read the same value before and after
+        // a multi-hundred-millisecond cycle, dropping the `expire-cycle`
+        // latency sample. C measures `activeExpireCycle` with `getMonotonicUs`.
+        let expire_start = MonotonicInstant::now();
         let num_dbs = self.ctx.num_dbs();
         let replica_local_only =
             self.ctx.replication().is_replica() && !self.ctx.config().replication.replica_read_only;
@@ -645,7 +648,7 @@ impl ServerWorkerState {
             self.ctx
                 .run_active_expire_cycle(db_idx as u32, expire_effort, replica_local_only);
         }
-        let elapsed = mstime() - expire_start;
+        let elapsed = expire_start.elapsed().as_millis() as i64;
         if elapsed > 0 {
             self.ctx.latency_mut().add_sample("expire-cycle", elapsed);
         }

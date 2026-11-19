@@ -3,3 +3,4 @@ pub mod robj;
 pub mod structure;
 
 pub use robj::Robj;
+pub use structure::string::StrInt;

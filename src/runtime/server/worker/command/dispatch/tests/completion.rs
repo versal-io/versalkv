@@ -297,7 +297,7 @@ fn stream_final_initial_block_notifications_follow_prior_batch_reply() {
     assert!(backend.connection_registry[token].blocked.is_some());
     assert!(backend.connection_registry[token].output.queue.is_empty());
     assert_eq!(batch.publish.len(), 2);
-    backend.complete_client_read(token.0, token.0, batch);
+    backend.complete_client_read(token.0, token.0, &mut batch);
     let output: Vec<u8> = backend.connection_registry[token]
         .output
         .queue
@@ -318,6 +318,7 @@ fn stream_final_initial_block_notifications_follow_prior_batch_reply() {
 fn stream_final_reblock_notifications_follow_triggering_batch_reply() {
     let mut backend = ServerWorkerState::new(1).unwrap();
     crate::framework::commands::register_all(&mut backend.registry);
+    backend.ctx.replication_mut().backlog.activate();
     let reader = Token(add_fake_connection(&mut backend));
     backend.connection_registry[reader].set_custom_reply_enabled(false);
     backend.connection_registry[reader].set_skip_propagation(false);
@@ -348,7 +349,7 @@ fn stream_final_reblock_notifications_follow_triggering_batch_reply() {
         let name = String::from_utf8_lossy(&args.name).to_ascii_lowercase();
         backend.process_parsed_command(reader, args, name, false, &mut initial);
     }
-    backend.complete_client_read(reader.0, reader.0, initial);
+    backend.complete_client_read(reader.0, reader.0, &mut initial);
     let mut connection = Connection::new_fake();
     connection.set_token_for_test(Token(44));
     connection.resp_version = 3;
@@ -373,7 +374,7 @@ fn stream_final_reblock_notifications_follow_triggering_batch_reply() {
         "frames: {:?}",
         batch.replication_only
     );
-    backend.complete_client_read(trigger.0, trigger.0, batch);
+    backend.complete_client_read(trigger.0, trigger.0, &mut batch);
     let output: Vec<u8> = backend.connection_registry[trigger]
         .output
         .queue
@@ -535,6 +536,7 @@ fn may_replicate_command_builds_propagation_without_dirty_write() {
     crate::framework::commands::register_all(&mut backend.registry);
     let connection_token = add_fake_connection(&mut backend);
     backend.connection_registry[Token(connection_token)].set_skip_propagation(false);
+    backend.ctx.replication_mut().backlog.activate();
     let args = make_args(&[b"SPUBLISH", b"channel", b"message"]);
     let flags = backend.registry.lookup(b"spublish").unwrap().flags;
     let mut effects = DispatchSideEffects::default();
@@ -659,7 +661,8 @@ fn postloop_preserves_blocked_command_input_until_unblock() {
         orig_wrapped: None,
     });
 
-    backend.complete_client_read(connection_token, 42, ReadBatchEffects::default());
+    let mut empty_fx = ReadBatchEffects::default();
+    backend.complete_client_read(connection_token, 42, &mut empty_fx);
 
     assert_eq!(
         backend.connection_registry[crate::framework::capabilities::io::Token(connection_token)]
@@ -727,7 +730,7 @@ fn replica_link_reply_is_dropped_and_marks_the_connection_closing() {
         &mut effects,
     );
     assert_eq!(disposition, CommandDisposition::Closing);
-    batch.commit(effects);
+    batch.commit(&mut effects);
 
     assert_eq!(batch.replies, vec![fullresync]);
     assert!(batch.mark_closing);
@@ -775,7 +778,7 @@ fn pre_psync_replica_link_allows_an_ordinary_reply() {
     );
     assert_eq!(disposition, CommandDisposition::Completed);
     let mut batch = ReadBatchEffects::default();
-    batch.commit(effects);
+    batch.commit(&mut effects);
     assert_eq!(batch.replies, vec![b"+PONG\r\n".to_vec()]);
     assert!(!batch.mark_closing);
     assert_eq!(

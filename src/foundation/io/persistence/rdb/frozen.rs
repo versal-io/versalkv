@@ -497,6 +497,10 @@ impl ForklessFeed {
     pub(crate) fn is_finished(&self) -> bool {
         self.is_finished
     }
+
+    pub(crate) fn is_backpressured(&self) -> bool {
+        self.pending.is_some()
+    }
 }
 
 fn capture_forkless_entry(

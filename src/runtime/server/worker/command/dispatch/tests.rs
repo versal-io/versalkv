@@ -960,7 +960,7 @@ fn finalization_schedules_replication_and_defers_origin_reply_to_pending_writes(
     effects.replies.push(client_reply.clone());
 
     backend.writes.ordinary.begin_turn();
-    backend.complete_client_read(client_slab, client_token.0, effects);
+    backend.complete_client_read(client_slab, client_token.0, &mut effects);
 
     replica
         .set_nonblocking(true)
@@ -1058,7 +1058,7 @@ fn close_after_reply_preserves_output_after_ordinary_write_service() {
     let mut effects = ReadBatchEffects::default();
     effects.replies.push(b"+LATE\r\n".to_vec());
 
-    backend.complete_client_read(connection_token, token.0, effects);
+    backend.complete_client_read(connection_token, token.0, &mut effects);
 
     assert!(backend.connection_registry.contains(token));
     assert_eq!(
@@ -1153,6 +1153,124 @@ fn registered_handler_uses_one_command_time_snapshot() {
     };
     assert_eq!(samples.len(), 2);
     assert_eq!(samples[0], samples[1]);
+}
+
+#[test]
+fn hosted_script_completion_refreshes_time_for_the_next_cycle_command() {
+    let mut backend = ServerWorkerState::new(1).unwrap();
+    crate::framework::commands::register_all(&mut backend.registry);
+    backend.ctx.set_command_registry_snapshot(&backend.registry);
+    let connection_token = add_fake_connection(&mut backend);
+    backend.cycle_time_guard =
+        Some(crate::foundation::io::sys::time::enter_command_time_snapshot(1_000));
+    let args = make_args(&[
+        b"EVAL",
+        b"redis.call('SET','clock-key','value','PX',1);return redis.call('EXISTS','clock-key')",
+        b"0",
+    ]);
+    let executor = backend.registry.lookup(b"eval").unwrap().executor;
+
+    let reply = backend.execute_registered_handler(
+        DispatchGroup::Default,
+        connection_token,
+        executor,
+        &args,
+    );
+
+    assert_eq!(
+        reply,
+        Value::integer(1),
+        "time must remain frozen within the script"
+    );
+    let exists_executor = backend.registry.lookup(b"exists").unwrap().executor;
+    let reply = backend.execute_registered_handler(
+        DispatchGroup::Default,
+        connection_token,
+        exists_executor,
+        &make_args(&[b"EXISTS", b"clock-key"]),
+    );
+    assert_eq!(
+        reply,
+        Value::integer(0),
+        "the next command must observe expired keys"
+    );
+}
+
+#[test]
+fn nested_hosted_script_preserves_the_outer_execution_time() {
+    let mut backend = ServerWorkerState::new(1).unwrap();
+    crate::framework::commands::register_all(&mut backend.registry);
+    backend.ctx.set_command_registry_snapshot(&backend.registry);
+    let connection_token = add_fake_connection(&mut backend);
+    backend.cycle_time_guard =
+        Some(crate::foundation::io::sys::time::enter_command_time_snapshot(1_000));
+    backend.command_execution_depth = 1;
+    let executor = backend.registry.lookup(b"eval").unwrap().executor;
+
+    let reply = backend.execute_registered_handler(
+        DispatchGroup::Default,
+        connection_token,
+        executor,
+        &make_args(&[b"EVAL", b"return redis.call('TIME')[1]", b"0"]),
+    );
+
+    assert_eq!(reply, Value::bulk(b"1".to_vec()));
+    assert_eq!(crate::foundation::io::sys::time::mstime(), 1_000);
+}
+
+#[test]
+fn exec_script_keeps_transaction_time_and_refreshes_the_next_command() {
+    let mut backend = ServerWorkerState::new(1).unwrap();
+    crate::framework::commands::register_all(&mut backend.registry);
+    backend.ctx.set_command_registry_snapshot(&backend.registry);
+    let (mut peer, _connection_token, token) = add_socket_connection(&mut backend);
+    backend.cycle_time_guard =
+        Some(crate::foundation::io::sys::time::enter_command_time_snapshot(1_000));
+    let script =
+        b"redis.call('SET','clock-key','value','PX',1);return redis.call('EXISTS','clock-key')";
+    let mut request = Vec::new();
+    for parts in [
+        vec![b"MULTI".as_slice()],
+        vec![b"EVAL".as_slice(), script.as_slice(), b"0"],
+        vec![b"EXISTS".as_slice(), b"clock-key"],
+        vec![b"EXEC".as_slice()],
+        vec![b"EXISTS".as_slice(), b"clock-key"],
+    ] {
+        let command = Value::Array(
+            parts
+                .into_iter()
+                .map(|part| Value::bulk(part.to_vec()))
+                .collect(),
+        );
+        request
+            .extend(crate::foundation::io::protocol::serializer::serialize_to_vec_resp2(&command));
+    }
+
+    backend.process_client_read_result(token, ClientReadMode::Fair, request, false, false);
+    backend.writes.ordinary.begin_turn();
+    backend.drive_pending_ordinary_writes();
+
+    let expected = b"+OK\r\n+QUEUED\r\n+QUEUED\r\n*2\r\n:1\r\n:1\r\n:0\r\n";
+    let mut reply = vec![0; expected.len()];
+    peer.read_exact(&mut reply).unwrap();
+    assert_eq!(reply, expected);
+}
+
+#[test]
+fn ordinary_pipeline_commands_reuse_the_cycle_time_snapshot() {
+    let mut backend = ServerWorkerState::new(1).unwrap();
+    let connection_token = add_fake_connection(&mut backend);
+    backend.cycle_time_guard =
+        Some(crate::foundation::io::sys::time::enter_command_time_snapshot(1_000));
+    for _ in 0..2 {
+        let reply = backend.execute_registered_handler(
+            DispatchGroup::Default,
+            connection_token,
+            crate::framework::CommandExecutor::Immediate(command_time_observing_handler),
+            &make_args(&[b"TIME-SNAPSHOT"]),
+        );
+        assert_eq!(reply, Value::Array(vec![Value::integer(1_000); 2]));
+    }
 }
 
 #[test]
@@ -1347,7 +1465,7 @@ fn generic_export_reply_reconciles_two_export_aggregate_through_teardown() {
         ),
         LoopAction::Continue
     );
-    backend.complete_client_read(export_a_slab, export_a_token.0, effects);
+    backend.complete_client_read(export_a_slab, export_a_token.0, &mut effects);
 
     let expected_after_reply = backend.connection_registry[Token(export_a_slab)]
         .output_buffer_allocation_bytes()
@@ -1399,7 +1517,7 @@ fn generic_export_reply_waits_for_pending_write_phase() {
     let mut effects = ReadBatchEffects::default();
     effects.replies.push(reply.clone());
 
-    backend.complete_client_read(connection_token, token.0, effects);
+    backend.complete_client_read(connection_token, token.0, &mut effects);
 
     assert_eq!(
         backend.connection_registry[Token(connection_token)].pending_reply_bytes(),
@@ -2013,6 +2131,7 @@ fn direct_set_builds_compatible_frames_for_both_sinks() {
         .primary_link_mut(replica_id)
         .unwrap()
         .set_state(PrimaryLinkState::Streaming);
+    backend.ctx.replication_mut().backlog.activate();
     let connection_token = add_fake_connection(&mut backend);
     backend.connection_registry[Token(connection_token)].set_skip_propagation(false);
     backend.ctx.set_repl_seldb(0);
@@ -2078,7 +2197,7 @@ fn writable_replica_local_write_does_not_append_to_replication_history() {
         ),
         LoopAction::Continue
     );
-    backend.complete_client_read(connection_token, token, effects);
+    backend.complete_client_read(connection_token, token, &mut effects);
 
     assert_eq!(backend.ctx.replication().backlog.history_len(), 0);
     assert_eq!(
@@ -2097,6 +2216,7 @@ fn rewrite_force_select_resets_only_the_aof_cursor() {
     crate::framework::commands::register_all(&mut backend.registry);
     let connection_token = add_fake_connection(&mut backend);
     backend.connection_registry[Token(connection_token)].set_skip_propagation(false);
+    backend.ctx.config_mut().persistence.aof_enabled = true;
     backend.ctx.set_repl_seldb(0);
     backend.ctx.persistence_mut().set_aof_selected_db(0);
     backend.ctx.aof_mut().rewrite.force_select = true;
@@ -2290,6 +2410,7 @@ fn lazy_expiry_precedes_the_write_inside_propagated_transaction() {
     crate::framework::commands::register_all(&mut backend.registry);
     let connection_token = add_fake_connection(&mut backend);
     backend.connection_registry[Token(connection_token)].set_skip_propagation(false);
+    backend.ctx.replication_mut().backlog.activate();
     backend.ctx.set_repl_seldb(0);
     backend.ctx.persistence_mut().set_aof_selected_db(0);
     backend

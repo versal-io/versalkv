@@ -1,4 +1,4 @@
-use indexmap::IndexSet;
+use indexmap::{IndexMap, IndexSet};
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hasher};
 
@@ -64,3 +64,7 @@ pub type FxHashSet<T> = HashSet<T, BuildHasherDefault<FxHasher>>;
 /// An `IndexSet` using [`FxHasher`]. Drop-in replacement for
 /// `indexmap::IndexSet` on hot paths with internal-only keys.
 pub type FxIndexSet<T> = IndexSet<T, BuildHasherDefault<FxHasher>>;
+
+/// An `IndexMap` using [`FxHasher`]. Drop-in replacement for
+/// `indexmap::IndexMap` on hot paths with internal-only keys.
+pub type FxIndexMap<K, V> = IndexMap<K, V, BuildHasherDefault<FxHasher>>;

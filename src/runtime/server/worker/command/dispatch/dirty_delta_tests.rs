@@ -55,3 +55,35 @@ fn generic_dirty_counter_replaces_default_and_drains_nonpropagating_effects() {
         assert_eq!(effects.take_dirty_delta(), None);
     }
 }
+
+#[test]
+fn active_slot_export_counts_as_propagation_consumer_without_replica_or_aof() {
+    let mut backend = ServerWorkerState::new(1).unwrap();
+    // Standalone baseline: inactive backlog, AOF disabled, no cluster state.
+    assert!(!backend.has_propagation_consumers());
+
+    let mut state =
+        crate::engine::distributed::cluster::ClusterState::new("127.0.0.1", 6379, 16_379);
+    let id = crate::engine::distributed::cluster::migration::MigrationJobId::parse(
+        b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    )
+    .unwrap();
+    let job = crate::engine::distributed::cluster::migration::MigrationJob::new(
+        id,
+        crate::engine::distributed::cluster::NodeId::parse(state.myself.name.as_bytes()).unwrap(),
+        crate::engine::distributed::cluster::NodeId::parse(&[b'b'; 40]).unwrap(),
+        crate::engine::distributed::cluster::migration::SlotRanges::new(vec![
+            crate::engine::distributed::cluster::SlotRange::new(16383, 16383).unwrap(),
+        ])
+        .unwrap(),
+        crate::engine::distributed::cluster::migration::MigrationOperation::Export,
+        1,
+    );
+    state.migrations.start(job).unwrap();
+    *backend.ctx.cluster_state_mut() = Some(Box::new(state));
+
+    // An in-progress export streams every source write to the import target,
+    // so propagation frames must still be encoded with zero replicas and AOF
+    // disabled instead of being dropped by the standalone fast path.
+    assert!(backend.has_propagation_consumers());
+}

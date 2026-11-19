@@ -50,11 +50,21 @@ pub fn score_value(v: f64, resp3: bool) -> Value {
 
 pub fn parse_score(b: &[u8]) -> Option<f64> {
     let s = std::str::from_utf8(b).ok()?.trim();
-    match s.to_ascii_lowercase().as_str() {
-        "inf" | "+inf" | "infinity" | "+infinity" => Some(f64::INFINITY),
-        "-inf" | "-infinity" => Some(f64::NEG_INFINITY),
-        _ => s.parse::<f64>().ok().filter(|f| !f.is_nan()),
+    // Compare against the finite set of infinity spellings case-insensitively
+    // on the byte slice, avoiding the `to_ascii_lowercase()` String allocation
+    // that the previous implementation incurred for every score parse.
+    let bytes = s.as_bytes();
+    if bytes.eq_ignore_ascii_case(b"inf")
+        || bytes.eq_ignore_ascii_case(b"+inf")
+        || bytes.eq_ignore_ascii_case(b"infinity")
+        || bytes.eq_ignore_ascii_case(b"+infinity")
+    {
+        return Some(f64::INFINITY);
     }
+    if bytes.eq_ignore_ascii_case(b"-inf") || bytes.eq_ignore_ascii_case(b"-infinity") {
+        return Some(f64::NEG_INFINITY);
+    }
+    s.parse::<f64>().ok().filter(|f| !f.is_nan())
 }
 
 pub fn parse_score_range(b: &[u8]) -> Option<(f64, bool)> {

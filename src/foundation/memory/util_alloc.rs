@@ -1,54 +1,42 @@
 pub use super::external::ExternalMemoryError;
 use super::external::MODULE_EXTERNAL_MEMORY;
-use std::alloc::{GlobalAlloc, Layout, System};
+#[cfg(target_family = "wasm")]
+use std::alloc::System as AllocatorBackend;
+use std::alloc::{GlobalAlloc, Layout};
 use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(not(target_family = "wasm"))]
+use tikv_jemallocator::Jemalloc as AllocatorBackend;
 
 thread_local! {
     static THREAD_ALLOCATED: Cell<usize> = const { Cell::new(0) };
 }
 
-#[cfg(target_os = "macos")]
-extern "C" {
-    fn malloc_size(ptr: *const std::ffi::c_void) -> usize;
-}
-
-#[cfg(target_os = "linux")]
-extern "C" {
-    fn malloc_usable_size(ptr: *mut std::ffi::c_void) -> usize;
-}
-
+/// Return the accounted size for an allocation.
+///
+/// Uses `Layout::size()` rather than querying the allocator for the real
+/// usable size. Jemalloc does not expose a Rust-reachable `malloc_usable_size`
+/// that is guaranteed to resolve to jemalloc's implementation (the system
+/// libc's symbol takes precedence and crashes on jemalloc-owned pointers).
+/// The slight under-count (allocator size-class slack) is acceptable for
+/// maxmemory/INFO accounting.
 #[inline]
-fn malloc_real_size(ptr: *mut u8, layout: Layout) -> usize {
-    if layout.size() == 0 {
-        return 0;
-    }
-    #[cfg(target_os = "macos")]
-    // SAFETY: malloc_size is a macOS libc function that reads the allocation size; ptr comes from a valid allocator allocation.
-    unsafe {
-        malloc_size(ptr as *const std::ffi::c_void)
-    }
-    #[cfg(target_os = "linux")]
-    // SAFETY: malloc_usable_size is a Linux libc function that reads the allocation size; ptr comes from a valid allocator allocation.
-    unsafe {
-        malloc_usable_size(ptr as *mut std::ffi::c_void)
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn malloc_real_size(_ptr: *mut u8, layout: Layout) -> usize {
     layout.size()
 }
 
 pub struct LibcAllocator;
 
-// SAFETY: LibcAllocator delegates raw memory operations to System, preserving
+// SAFETY: LibcAllocator delegates raw memory operations to the backend, preserving
 // the complete Layout contract, and only adds allocation-size accounting.
 unsafe impl GlobalAlloc for LibcAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         if layout.size() == 0 {
             return std::ptr::NonNull::dangling().as_ptr();
         }
-        // SAFETY: System accepts this non-zero valid Layout and returns a block
+        // SAFETY: The backend accepts this non-zero valid Layout and returns a block
         // satisfying its size and alignment requirements.
-        let ptr = unsafe { System.alloc(layout) };
+        let ptr = unsafe { AllocatorBackend.alloc(layout) };
         if ptr.is_null() {
             std::alloc::handle_alloc_error(layout);
         }
@@ -61,15 +49,15 @@ unsafe impl GlobalAlloc for LibcAllocator {
         ptr
     }
 
-    // SAFETY: System preserves the requested alignment and initializes the
+    // SAFETY: The backend preserves the requested alignment and initializes the
     // complete allocation to zero.
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         if layout.size() == 0 {
             return std::ptr::NonNull::dangling().as_ptr();
         }
-        // SAFETY: System accepts this non-zero valid Layout and returns a
+        // SAFETY: The backend accepts this non-zero valid Layout and returns a
         // zero-initialized block satisfying its size and alignment requirements.
-        let ptr = unsafe { System.alloc_zeroed(layout) };
+        let ptr = unsafe { AllocatorBackend.alloc_zeroed(layout) };
         if ptr.is_null() {
             std::alloc::handle_alloc_error(layout);
         }
@@ -92,13 +80,13 @@ unsafe impl GlobalAlloc for LibcAllocator {
             ALLOCATED.fetch_sub(real, Ordering::Relaxed);
             decrease_thread_allocated(real);
         }
-        // SAFETY: ptr was allocated by System with this exact layout and has not
+        // SAFETY: ptr was allocated by the backend with this exact layout and has not
         // been deallocated yet, as required by the GlobalAlloc caller contract.
-        unsafe { System.dealloc(ptr, layout) };
+        unsafe { AllocatorBackend.dealloc(ptr, layout) };
     }
 
     // SAFETY: ptr and layout came from a previous allocation by this allocator;
-    // System preserves layout alignment while growing or shrinking the block.
+    // The backend preserves layout alignment while growing or shrinking the block.
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         if new_size == 0 {
             let old_real = malloc_real_size(ptr, layout);
@@ -106,17 +94,17 @@ unsafe impl GlobalAlloc for LibcAllocator {
                 ALLOCATED.fetch_sub(old_real, Ordering::Relaxed);
                 decrease_thread_allocated(old_real);
             }
-            // SAFETY: ptr was allocated by System with this exact layout and is
+            // SAFETY: ptr was allocated by the backend with this exact layout and is
             // consumed here instead of being passed to realloc with size zero.
-            unsafe { System.dealloc(ptr, layout) };
+            unsafe { AllocatorBackend.dealloc(ptr, layout) };
             return std::ptr::NonNull::dangling().as_ptr();
         }
         let old_real = malloc_real_size(ptr, layout);
         let new_layout =
             Layout::from_size_align(new_size, layout.align()).expect("valid realloc layout");
-        // SAFETY: ptr is live and was allocated by System with layout; new_size
-        // is non-zero, and System preserves the original alignment.
-        let new_ptr = unsafe { System.realloc(ptr, layout, new_size) };
+        // SAFETY: ptr is live and was allocated by the backend with layout; new_size
+        // is non-zero, and the backend preserves the original alignment.
+        let new_ptr = unsafe { AllocatorBackend.realloc(ptr, layout, new_size) };
         if new_ptr.is_null() {
             std::alloc::handle_alloc_error(new_layout);
         }
@@ -217,6 +205,24 @@ pub fn vec_allocation_bytes<T>(value: &Vec<T>) -> usize {
     #[cfg(not(miri))]
     {
         malloc_real_size(value.as_ptr().cast_mut().cast::<u8>(), layout)
+    }
+}
+
+/// Return the allocator-owned usable bytes for a `BytesMut` (or `Bytes`)
+/// backing allocation. Mirrors [`vec_allocation_bytes`] for byte buffers whose
+/// storage is not a `Vec`.
+pub fn bytes_allocation_bytes(ptr: *const u8, capacity: usize) -> usize {
+    if capacity == 0 {
+        return 0;
+    }
+    let layout = Layout::array::<u8>(capacity).expect("live buffer capacity has valid layout");
+    #[cfg(miri)]
+    {
+        layout.size()
+    }
+    #[cfg(not(miri))]
+    {
+        malloc_real_size(ptr.cast_mut().cast::<u8>(), layout)
     }
 }
 

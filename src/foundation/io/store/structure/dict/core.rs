@@ -527,6 +527,35 @@ impl<K: Eq + Hash, V> Dict<K, V> {
         None
     }
 
+    /// Byte-slice lookup that skips the `Hash` trait collection step. Keys
+    /// stored as `StoredKey` hash only their raw bytes (no length prefix), so
+    /// `hash_bytes` produces the same hash as `hash_value::<StoredKey>`.
+    pub fn get_bytes(&self, key: &[u8]) -> Option<&V>
+    where
+        K: Borrow<[u8]>,
+    {
+        if self.is_empty() {
+            return None;
+        }
+        let hash = super::super::configurable_hash::hash_bytes(key);
+        for t in 0..2 {
+            if self.tables[t].bucket_count() == 0 {
+                continue;
+            }
+            let bc = self.tables[t].bucket_count() as u64;
+            let idx = (hash & (bc - 1)) as usize;
+            for entry in self.tables[t].bucket_slice(idx) {
+                if entry.key.borrow() == key {
+                    return Some(&entry.value);
+                }
+            }
+            if !self.is_rehashing() {
+                break;
+            }
+        }
+        None
+    }
+
     pub fn get_key_value<Q: Hash + Eq + ?Sized>(&self, key: &Q) -> Option<(&K, &V)>
     where
         K: Borrow<Q>,
@@ -595,11 +624,63 @@ impl<K: Eq + Hash, V> Dict<K, V> {
         None
     }
 
+    /// Byte-slice mutable lookup that skips the `Hash` trait collection step.
+    /// See `get_bytes` for the hash-consistency contract.
+    pub fn get_mut_bytes(&mut self, key: &[u8]) -> Option<&mut V>
+    where
+        K: Borrow<[u8]>,
+    {
+        if self.is_empty() {
+            return None;
+        }
+        self.rehash_step_if_needed();
+        let hash = super::super::configurable_hash::hash_bytes(key);
+        let rehashing = self.is_rehashing();
+        let (t0, t1_rest) = self.tables.split_at_mut(1);
+        let t0 = &mut t0[0];
+        let t1 = &mut t1_rest[0];
+        {
+            let bc0 = t0.bucket_count() as u64;
+            if bc0 > 0 {
+                let idx = (hash & (bc0 - 1)) as usize;
+                if let Some(bucket) = t0.bucket_entries_mut(idx) {
+                    for entry in bucket {
+                        if entry.key.borrow() == key {
+                            return Some(&mut entry.value);
+                        }
+                    }
+                }
+            }
+        }
+        if rehashing {
+            let bc1 = t1.bucket_count() as u64;
+            if bc1 > 0 {
+                let idx = (hash & (bc1 - 1)) as usize;
+                if let Some(bucket) = t1.bucket_entries_mut(idx) {
+                    for entry in bucket {
+                        if entry.key.borrow() == key {
+                            return Some(&mut entry.value);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
     pub fn contains_key<Q: Hash + Eq + ?Sized>(&self, key: &Q) -> bool
     where
         K: Borrow<Q>,
     {
         self.get(key).is_some()
+    }
+
+    /// Byte-slice membership check that skips the `Hash` trait collection step.
+    pub fn contains_key_bytes(&self, key: &[u8]) -> bool
+    where
+        K: Borrow<[u8]>,
+    {
+        self.get_bytes(key).is_some()
     }
 
     pub fn insert(&mut self, key: K, value: V) -> Option<V> {
@@ -656,7 +737,7 @@ impl<K: Eq + Hash, V> Dict<K, V> {
         None
     }
 
-    fn remove_entry_inner<Q: Hash + Eq + ?Sized>(&mut self, key: &Q) -> Option<Entry<K, V>>
+    fn remove_entry_inner<Q: Eq + ?Sized>(&mut self, key: &Q, hash: u64) -> Option<Entry<K, V>>
     where
         K: Borrow<Q>,
     {
@@ -664,7 +745,6 @@ impl<K: Eq + Hash, V> Dict<K, V> {
             return None;
         }
         self.rehash_step_if_needed();
-        let hash = Self::hash_key(key);
         for t in [0usize, 1] {
             let bc = if t == 0 {
                 self.tables[0].bucket_count()
@@ -701,14 +781,25 @@ impl<K: Eq + Hash, V> Dict<K, V> {
     where
         K: Borrow<Q>,
     {
-        self.remove_entry_inner(key).map(|e| e.value)
+        let hash = Self::hash_key(key);
+        self.remove_entry_inner(key, hash).map(|e| e.value)
     }
 
     pub fn remove_entry<Q: Hash + Eq + ?Sized>(&mut self, key: &Q) -> Option<(K, V)>
     where
         K: Borrow<Q>,
     {
-        self.remove_entry_inner(key).map(|e| (e.key, e.value))
+        let hash = Self::hash_key(key);
+        self.remove_entry_inner(key, hash).map(|e| (e.key, e.value))
+    }
+
+    /// Byte-slice removal that skips the `Hash` trait collection step.
+    pub fn remove_bytes(&mut self, key: &[u8]) -> Option<V>
+    where
+        K: Borrow<[u8]>,
+    {
+        let hash = super::super::configurable_hash::hash_bytes(key);
+        self.remove_entry_inner(key, hash).map(|e| e.value)
     }
 
     pub fn keys(&self) -> impl Iterator<Item = &K> {

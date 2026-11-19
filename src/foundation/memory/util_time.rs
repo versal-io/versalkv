@@ -4,10 +4,10 @@
 //! (e.g. command latency bookkeeping) can use it without creating a
 //! `memory -> io` dependency. The hot-path clock source is injected at
 //! startup by `io::sys::time` via [`install_monotonic_clock`]; until then a
-//! portable fallback based on `std::time::Instant` (or an atomic counter on
-//! `wasm32`) is used.
+//! portable fallback based on `clock_gettime(CLOCK_MONOTONIC)` (or an atomic
+//! counter on `wasm32`) is used.
 
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicPtr, Ordering};
 use std::time::Duration;
 
 /// A monotonic microsecond timestamp.
@@ -18,32 +18,43 @@ use std::time::Duration;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct MonotonicInstant(u64);
 
-static MONOTONIC_US_FN: OnceLock<fn() -> u64> = OnceLock::new();
+/// Installed clock function, stored as a raw pointer so the hot path avoids
+/// the `OnceLock` state-machine overhead. A null pointer means "not
+/// installed, use the portable fallback". Set once at process startup via
+/// [`install_monotonic_clock`] before any [`MonotonicInstant::now`] call.
+static MONOTONIC_US_FN: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
 
 /// Install a hardware-accelerated monotonic clock implementation.
 ///
 /// Must be invoked before the first [`MonotonicInstant::now`] to take
-/// effect. Returns `false` if a clock was already installed or the fallback
-/// has already been initialised. Intended to be called once at process
-/// startup by the `io` layer.
+/// effect. Returns `false` if a clock was already installed. Intended to be
+/// called once at process startup by the `io` layer.
 pub fn install_monotonic_clock(f: fn() -> u64) -> bool {
-    MONOTONIC_US_FN.set(f).is_ok()
+    let ptr = f as *mut ();
+    MONOTONIC_US_FN
+        .compare_exchange(
+            std::ptr::null_mut(),
+            ptr,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_ok()
 }
 
 /// Portable fallback used when no hardware counter has been installed.
 ///
-/// Uses `SystemTime` (UNIX epoch microseconds) so the returned value is a
-/// large absolute timestamp; this keeps `saturating_sub` semantics working in
-/// tests and early-startup code paths that predate the hardware clock install.
-/// `SystemTime` is not strictly monotonic (NTP can step it), but the fallback
-/// only runs before `install_monotonic_clock` takes effect.
+/// Calls `clock_gettime(CLOCK_MONOTONIC)` directly via libc, matching C
+/// Valkey's `getMonotonicUs_posix`. This avoids the `SystemTime` abstraction
+/// (epoch subtraction, `as_micros` u128 conversion) that adds measurable
+/// overhead on the `latency_tracking` hot path when TSC/CNTVCT is unavailable.
 #[cfg(not(target_arch = "wasm32"))]
 fn fallback_monotonic_us() -> u64 {
-    use std::time::SystemTime;
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_micros() as u64
+    // SAFETY: `timespec` is plain-old-data with no Drop invariants, so a
+    // zero-initialized value is a valid bit pattern.
+    let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
+    // SAFETY: `ts` is a valid stack-allocated timespec pointer.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    ts.tv_sec as u64 * 1_000_000 + ts.tv_nsec as u64 / 1_000
 }
 
 /// `wasm32` has no working monotonic clock (`Instant::now` panics); use an
@@ -57,7 +68,16 @@ fn fallback_monotonic_us() -> u64 {
 
 impl MonotonicInstant {
     pub fn now() -> Self {
-        let f = MONOTONIC_US_FN.get_or_init(|| fallback_monotonic_us);
+        let ptr = MONOTONIC_US_FN.load(Ordering::Acquire);
+        let f = if ptr.is_null() {
+            fallback_monotonic_us
+        } else {
+            // SAFETY: `ptr` was stored from a valid `fn() -> u64` by
+            // `install_monotonic_clock`, which is called once at startup
+            // before any `now` invocation. Function pointers and `*mut ()`
+            // have the same representation on all supported 64-bit targets.
+            unsafe { std::mem::transmute::<*mut (), fn() -> u64>(ptr) }
+        };
         Self(f())
     }
 

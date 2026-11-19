@@ -611,6 +611,13 @@ impl ServerWorkerState {
                 self.ctx.unregister_monitor_client(conn.client_id());
             }
             self.ctx.decr_connection();
+            // Keep the global watched-key client count consistent when a
+            // connection holding WATCHed keys is torn down. The connection's
+            // own `synced_watched_keys` is the source of truth because EXEC
+            // and direct teardown may bypass `record_completion_metadata`.
+            if conn.synced_watched_keys > 0 {
+                self.watched_key_clients = self.watched_key_clients.saturating_sub(1);
+            }
         }
         self.ctx.client_infos_mut().remove(&plan.token_value);
         self.ctx.pubsub_mut().remove_client(plan.token_value);

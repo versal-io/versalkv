@@ -404,7 +404,8 @@ fn blocked_readiness_matrix_pending_replay_main_readable_waits_for_fifo() {
         crate::runtime::server::worker::event_loop::blocked_events::PendingReplayContinuation::new_for_test(
             main,
             replay_session_id,
-            crate::foundation::io::sys::time::mstime().saturating_sub(101),
+            (crate::foundation::io::sys::time::MonotonicInstant::now().as_millis() as i64)
+                .saturating_sub(101),
         ),
     );
     backend.transport.queue_test_transport_event_batch(&[(
@@ -538,7 +539,8 @@ fn blocked_readiness_matrix_pending_replay_hup_only_aborts_without_resurrection(
         crate::runtime::server::worker::event_loop::blocked_events::PendingReplayContinuation::new_for_test(
             main,
             replay_session_id,
-            crate::foundation::io::sys::time::mstime().saturating_sub(101),
+            (crate::foundation::io::sys::time::MonotonicInstant::now().as_millis() as i64)
+                .saturating_sub(101),
         ),
     );
     backend.transport.queue_test_transport_event_batch(&[(
@@ -614,7 +616,8 @@ fn pending_replay_does_not_resurrect_cancelled_session() {
         crate::runtime::server::worker::event_loop::blocked_events::PendingReplayContinuation::new_for_test(
             main,
             replay_session_id,
-            crate::foundation::io::sys::time::mstime().saturating_sub(101),
+            (crate::foundation::io::sys::time::MonotonicInstant::now().as_millis() as i64)
+                .saturating_sub(101),
         ),
     );
 

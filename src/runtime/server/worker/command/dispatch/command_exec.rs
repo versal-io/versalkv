@@ -343,7 +343,7 @@ impl ServerWorkerState {
         // observing real time. The snapshot is resolved lazily on first
         // clock access so commands that never consult time (e.g. PING)
         // avoid the wall-clock syscall entirely.
-        let _time_guard = crate::foundation::io::sys::time::enter_command_time_snapshot_lazy();
+        let time_guard = crate::foundation::io::sys::time::enter_command_time_snapshot_lazy();
         let reply = self.invoke_command_executor(
             crate::framework::capabilities::io::Token(connection_token),
             executor,
@@ -351,6 +351,10 @@ impl ServerWorkerState {
         );
         // CLIENT UNPAUSE and save handlers can change DB-local guards.
         self.ctx.set_forkless_capture_expiration_paused(false);
+        drop(time_guard);
+        if matches!(executor, CommandExecutor::Hosted { .. }) {
+            self.refresh_event_loop_cycle_time_after_execution();
+        }
         reply
     }
 
@@ -457,12 +461,24 @@ impl ServerWorkerState {
             }
         }
         let mut operations = connection_effects.take_script_propagation();
-        let generated_command = operations.is_empty().then(|| {
-            let (direct, generated) =
-                Self::take_direct_propagation_ops(connection_effects, plan, state.selected_db);
-            operations = direct;
-            generated
-        });
+        // Fast path: with no connected replicas and AOF disabled, the encoded
+        // propagation frame is discarded by `queue_command_propagation`. Skip
+        // the `encode_command_args` heap allocation and serialization on the
+        // common standalone write workload. Script ops and custom propagation
+        // still run because callers may rely on their side effects.
+        let generated_command = if operations.is_empty()
+            && !state.force_propagate
+            && !self.has_propagation_consumers()
+        {
+            Some(false)
+        } else {
+            operations.is_empty().then(|| {
+                let (direct, generated) =
+                    Self::take_direct_propagation_ops(connection_effects, plan, state.selected_db);
+                operations = direct;
+                generated
+            })
+        };
         if mode == PropagationCaptureMode::Direct
             && generated_command == Some(true)
             && (plan.is_write || plan.may_replicate)
@@ -475,6 +491,23 @@ impl ServerWorkerState {
             );
         }
         operations
+    }
+
+    /// Returns true when at least one consumer exists for encoded propagation
+    /// frames: a connected replica (active backlog), AOF persistence, or an
+    /// in-progress slot export. An export job streams every source write to the
+    /// import target through the migration queue, so it must keep generating
+    /// propagation frames even on a zero-replica, AOF-disabled cluster;
+    /// otherwise the snapshot bulk load is the only data that reaches the
+    /// target and the trailing live mutations are silently dropped.
+    fn has_propagation_consumers(&self) -> bool {
+        self.ctx.replication().backlog.is_active()
+            || self.ctx.config().persistence.aof_enabled
+            || self
+                .ctx
+                .cluster_state()
+                .as_deref()
+                .is_some_and(|state| state.migrations.has_active_exports())
     }
 
     fn take_direct_propagation_ops(
@@ -500,8 +533,22 @@ impl ServerWorkerState {
     }
 
     fn collect_expired_propagation(&mut self, fx: &mut CommandEffects) -> Vec<PropagationOp> {
-        let now = crate::foundation::io::sys::time::mstime();
-        if self.ctx.client_pause().is_paused(now) != PauseAction::None {
+        // Steady-state fast path: a read-only command on a healthy dataset
+        // (the common GET/INCR workload) produces no lazy-expiry deletions.
+        // Return before touching the client-pause clock, config or allocating
+        // the operations Vec. When any expiry queue is non-empty, fall through
+        // to the full drain/propagation path unchanged.
+        if !self.ctx.dbs().has_pending_expirations() {
+            return Vec::new();
+        }
+        // Fast path: only read the clock when a client pause might be active.
+        // `is_paused` returns None immediately when `end_time_ms == 0`, so the
+        // common no-pause hot path avoids a `mstime()` syscall per command.
+        let client_pause = self.ctx.client_pause();
+        if client_pause.end_time_ms != 0
+            && client_pause.is_paused(crate::foundation::io::sys::time::mstime())
+                != PauseAction::None
+        {
             return Vec::new();
         }
         let delete_command: &[u8] = if self.ctx.config().server.lazyfree_lazy_expire {

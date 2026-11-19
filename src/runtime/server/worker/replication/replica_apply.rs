@@ -5,6 +5,7 @@ use crate::engine::distributed::replication::{
 };
 use crate::engine::extension::script::{PropagationOp, PropagationTargets};
 use crate::foundation::io::store::Robj;
+use crate::foundation::io::sys::time::MonotonicInstant;
 use crate::framework::capabilities::connection::{CommandEffectDrain, TransactionEnd};
 use crate::framework::capabilities::io::Token;
 use crate::framework::distributed::replication::{
@@ -720,7 +721,7 @@ impl ServerWorkerState {
                 self.set_pending_replication_replay(PendingReplayContinuation::new(
                     link.connection_id(),
                     link.session_id(),
-                    crate::foundation::io::sys::time::mstime(),
+                    MonotonicInstant::now().as_millis() as i64,
                 ));
             }
             return Ok(());
@@ -859,7 +860,7 @@ impl ServerWorkerState {
                 self.set_pending_replication_replay(PendingReplayContinuation::new(
                     main,
                     replacement_session_id,
-                    crate::foundation::io::sys::time::mstime(),
+                    MonotonicInstant::now().as_millis() as i64,
                 ));
             } else if self.replication_runtime.replica_main_read_paused() {
                 if replacement.is_some() {
@@ -995,7 +996,7 @@ impl ServerWorkerState {
             if continuation.progress.record(
                 storage_bytes,
                 interval,
-                crate::foundation::io::sys::time::mstime(),
+                MonotonicInstant::now().as_millis() as i64,
             ) {
                 break;
             }
@@ -1783,7 +1784,7 @@ mod boundary_tests {
         let mut continuation = PendingReplayContinuation::new(
             ConnectionId(40),
             link.session_id(),
-            crate::foundation::io::sys::time::mstime(),
+            crate::foundation::io::sys::time::MonotonicInstant::now().as_millis() as i64,
         );
 
         runtime

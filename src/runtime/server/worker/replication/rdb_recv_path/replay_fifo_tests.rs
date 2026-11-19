@@ -530,6 +530,49 @@ fn disk_backed_local_frames_precede_socket_frames_with_aof() {
 }
 
 #[test]
+fn pending_replay_yields_while_command_time_is_frozen() {
+    let mut fixture = ReplayFixture::new(false, "frozen-command-clock");
+    let mut position = SNAPSHOT_OFFSET;
+    let (prefix, _) = batch(
+        &[&[b"SET", b"shared", b"prefix"], &[b"INCR", b"counter"]],
+        &mut position,
+    );
+    let _guard = crate::foundation::io::sys::time::enter_command_time_snapshot(1_000);
+    fixture.publish_prefix(&prefix);
+    fixture.load_first_turn();
+    fixture.finish_decode_with_local(&[]);
+    fixture
+        .runtime
+        .ctx
+        .config_mut()
+        .persistence
+        .loading_process_events_interval_bytes = 1;
+    std::thread::sleep(std::time::Duration::from_millis(120));
+
+    fixture.runtime.drive_one_pending_replication_replay();
+
+    assert!(
+        fixture.runtime.pending_replication_replay.is_some(),
+        "real elapsed time must yield replay before the next buffered command"
+    );
+    assert!(fixture.runtime.ctx.is_loading());
+    fixture.runtime.drive_one_pending_replication_replay();
+    assert!(fixture.runtime.pending_replication_replay.is_none());
+    assert!(!fixture.runtime.ctx.is_loading());
+    assert_eq!(
+        fixture
+            .runtime
+            .ctx
+            .db(0)
+            .unwrap()
+            .get_no_expire(b"counter")
+            .unwrap()
+            .as_bytes(),
+        b"1"
+    );
+}
+
+#[test]
 fn existing_replay_handoff_preserves_progress_and_paused_socket() {
     let mut fixture = ReplayFixture::new(false, "existing");
     let mut position = SNAPSHOT_OFFSET;
@@ -551,7 +594,9 @@ fn existing_replay_handoff_preserves_progress_and_paused_socket() {
         .pending_replication_replay
         .as_mut()
         .unwrap()
-        .progress = ReplayProgress::new(crate::foundation::io::sys::time::mstime() - 101);
+        .progress = ReplayProgress::new(
+        crate::foundation::io::sys::time::MonotonicInstant::now().as_millis() as i64 - 101,
+    );
     fixture.runtime.drive_one_pending_replication_replay();
     let continuation = fixture.runtime.pending_replication_replay.as_ref().unwrap();
     assert!(continuation.selected_db_applied);

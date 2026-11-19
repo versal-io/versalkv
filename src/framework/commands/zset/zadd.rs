@@ -49,14 +49,31 @@ pub fn zadd(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> CommandOutc
     if (incr && remaining != 2) || (!incr && (remaining == 0 || !remaining.is_multiple_of(2))) {
         return CommandOutcome::reply(CommandError::syntax_error());
     }
-    let pairs = args.args[index..]
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|pair| parse_score(&pair[0]).map(|score| (score, pair[1].clone())))
-        .collect::<Option<Vec<_>>>();
-    let Some(pairs) = pairs else {
-        return CommandOutcome::reply(Value::error("ERR value is not a valid float"));
+    let pair_count = remaining / 2;
+    // The benchmark and the common case send a single (score, member) pair.
+    // Keep that path on the stack to avoid a one-element heap `Vec`; only
+    // multi-pair ZADD collects into a `Vec`. Error semantics are unchanged:
+    // an invalid float is rejected before any database access.
+    let stack_pair;
+    let heap_pairs;
+    let pairs: &[(f64, &[u8])] = if pair_count == 1 {
+        let Some(score) = parse_score(&args.args[index]) else {
+            return CommandOutcome::reply(Value::error("ERR value is not a valid float"));
+        };
+        stack_pair = [(score, args.args[index + 1].as_ref())];
+        &stack_pair
+    } else {
+        let collected = args.args[index..]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| parse_score(&pair[0]).map(|score| (score, pair[1].as_ref())))
+            .collect::<Option<Vec<_>>>();
+        let Some(collected) = collected else {
+            return CommandOutcome::reply(Value::error("ERR value is not a valid float"));
+        };
+        heap_pairs = collected;
+        &heap_pairs
     };
     let db_index = runtime.selected_db();
     let resp3 = runtime.resp3();
@@ -118,43 +135,19 @@ pub fn zadd(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> CommandOutc
             }
         }
     }
-    let mut added = 0i64;
-    let mut updated = 0i64;
-    for (score, member) in pairs {
-        let current = match db.get_zset_object(&key) {
-            Ok(Some(zset)) => zset.zset_score(&member),
-            Ok(None) => None,
-            Err(_) => return CommandOutcome::reply(CommandError::wrong_type()),
-        };
-        match current {
-            Some(old_score) => {
-                if nx || (gt && score <= old_score) || (lt && score >= old_score) {
-                    continue;
-                }
-                if score != old_score {
-                    if db
-                        .zset_add_with_limits(&key, &member, score, max_entries, max_value_size)
-                        .is_err()
-                    {
-                        return CommandOutcome::reply(CommandError::wrong_type());
-                    }
-                    updated += 1;
-                }
-            }
-            None => {
-                if xx {
-                    continue;
-                }
-                if db
-                    .zset_add_with_limits(&key, &member, score, max_entries, max_value_size)
-                    .is_err()
-                {
-                    return CommandOutcome::reply(CommandError::wrong_type());
-                }
-                added += 1;
-            }
-        }
-    }
+    let (added, updated) = match db.zset_add_batch_with_limits(
+        &key,
+        pairs,
+        max_entries,
+        max_value_size,
+        nx,
+        xx,
+        gt,
+        lt,
+    ) {
+        Ok(result) => result,
+        Err(_) => return CommandOutcome::reply(CommandError::wrong_type()),
+    };
     CommandOutcome {
         reply: Value::integer(if ch { added + updated } else { added }),
         effects: event(),

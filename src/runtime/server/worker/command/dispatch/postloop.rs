@@ -129,15 +129,21 @@ impl ServerWorkerState {
     }
 
     fn process_watch_and_wakeup(&mut self, effects: &ReadBatchEffects) {
-        for (db_id, key) in &effects.watch_dirty {
-            let exists_after = self
-                .ctx
-                .db(*db_id)
-                .is_some_and(|db| db.exists_no_expire(key));
-            for (_, connection) in self.connection_registry.iter_mut() {
-                connection
-                    .transaction
-                    .touch_watched_key(*db_id, key, exists_after);
+        // Fast path: skip the per-connection watched-key scan when no client
+        // holds WATCHed keys. The counter is kept consistent by
+        // `record_completion_metadata`, the EXEC accounting path, and
+        // connection teardown.
+        if self.watched_key_clients > 0 {
+            for (db_id, key) in &effects.watch_dirty {
+                let exists_after = self
+                    .ctx
+                    .db(*db_id)
+                    .is_some_and(|db| db.exists_no_expire(key));
+                for (_, connection) in self.connection_registry.iter_mut() {
+                    connection
+                        .transaction
+                        .touch_watched_key(*db_id, key, exists_after);
+                }
             }
         }
         if !effects.watch_dirty.is_empty() {
@@ -157,7 +163,7 @@ impl ServerWorkerState {
         &mut self,
         connection_token: usize,
         token_value: usize,
-        mut fx: ReadBatchEffects,
+        fx: &mut ReadBatchEffects,
     ) {
         // Match C REPLICAOF/SLAVEOF: tear down the old primary before +OK.
         self.apply_pending_replicaof_request();
@@ -166,16 +172,16 @@ impl ServerWorkerState {
         }
         self.promote_default_user_authentication();
         self.evict_tracking_table_if_needed(&mut fx.tracking);
-        self.queue_command_propagation(&mut fx);
+        self.queue_command_propagation(fx);
 
         let is_slot_export =
             self.queue_origin_replies(connection_token, token_value, &mut fx.replies);
 
-        self.deliver_observer_effects(&mut fx);
+        self.deliver_observer_effects(fx);
         for (client_id, is_error) in std::mem::take(&mut fx.unblock) {
             self.process_pending_unblock(client_id, is_error);
         }
-        self.process_watch_and_wakeup(&fx);
+        self.process_watch_and_wakeup(fx);
         // C's beforeSleep broadcasts a locally finalized imported slot before
         // the next heartbeat can reintroduce the source's older ownership.
         // The engine only records this intent; L5 owns the bus write buffers.

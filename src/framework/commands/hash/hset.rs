@@ -13,35 +13,25 @@ pub fn hset(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> CommandOutc
     let (max_entries, max_value_size) = runtime.hash_encoding_limits();
     let read_expired_values = runtime.read_expired_values();
     let key = args.args[0].clone();
-    let pairs = args.args[1..]
+    // Borrow field/value `Bytes` handles directly from the parsed argument
+    // buffer instead of cloning every argument into a Vec<(Bytes, Bytes)>.
+    // The batch store method performs a single key lookup for the whole set
+    // of pairs and clones the Bytes (refcount bump) only when inserting into
+    // the hashtable, avoiding a per-field heap allocation + memcpy.
+    let pairs: Vec<(&Bytes, &Bytes)> = args.args[1..]
         .as_chunks::<2>()
         .0
         .iter()
-        .map(|pair| (pair[0].clone(), pair[1].clone()))
-        .collect::<Vec<_>>();
+        .map(|pair| (&pair[0], &pair[1]))
+        .collect();
     let Some(db) = runtime.db_mut() else {
         return CommandOutcome::reply(CommandError::db_index_out_of_range());
     };
-    if db.hash_prepare_pairs_with_limits(&key, &pairs, max_entries, max_value_size).is_err() {
-        return CommandOutcome::reply(CommandError::wrong_type());
-    }
-    let mut added = 0i64;
-    let mut expired_overwritten = 0u64;
-    for (field, value) in &pairs {
-        let expired = !read_expired_values && db.clear_expired_hash_field_ttl(&key, field);
-        let was_new = match db.hash_set_with_limits(&key, field, value, max_entries, max_value_size)
-        {
-            Ok(added) => added,
+    let (added, expired_overwritten) =
+        match db.hash_set_batch_with_limits(&key, &pairs, max_entries, max_value_size, read_expired_values) {
+            Ok(result) => result,
             Err(_) => return CommandOutcome::reply(CommandError::wrong_type()),
         };
-        if expired || was_new {
-            added += 1;
-        }
-        expired_overwritten += u64::from(expired);
-    }
-    for (field, _) in &pairs {
-        db.remove_hash_field_expire(&key, field);
-    }
     let mut effects = CommandEffects::default();
     effects.changed_keys.push((db_index, key.clone()));
     effects.events.push(CoreEvent {
@@ -55,8 +45,8 @@ pub fn hset(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> CommandOutc
         propagation.push(Bytes::from_static(b"HSET"));
         propagation.push(key.clone());
         for (field, value) in &pairs {
-            propagation.push(field.clone());
-            propagation.push(value.clone());
+            propagation.push((*field).clone());
+            propagation.push((*value).clone());
         }
         effects.custom_propagations.push(propagation);
         effects.events.insert(

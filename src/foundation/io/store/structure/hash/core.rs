@@ -1,19 +1,19 @@
 use bytes::Bytes;
-use indexmap::IndexMap;
 use std::ops::{Deref, DerefMut};
 
+use crate::foundation::memory::util_hash::FxIndexMap;
 use crate::foundation::memory::value::{Encoding, EncodingChange, HashOps};
 
 /// Hashtable-backed hash encoding.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HashHt {
-    pub data: Box<IndexMap<Bytes, Bytes>>,
+    pub data: Box<FxIndexMap<Bytes, Bytes>>,
 }
 
 impl HashHt {
     pub fn new() -> Self {
         Self {
-            data: Box::new(IndexMap::new()),
+            data: Box::new(FxIndexMap::default()),
         }
     }
 }
@@ -25,7 +25,7 @@ impl Default for HashHt {
 }
 
 impl Deref for HashHt {
-    type Target = IndexMap<Bytes, Bytes>;
+    type Target = FxIndexMap<Bytes, Bytes>;
     fn deref(&self) -> &Self::Target {
         &self.data
     }
@@ -70,7 +70,7 @@ impl HashOps for HashHt {
 }
 
 pub fn infer_hash_encoding(
-    data: &IndexMap<Bytes, Bytes>,
+    data: &FxIndexMap<Bytes, Bytes>,
     max_entries: usize,
     max_value_size: usize,
 ) -> &'static str {
@@ -89,7 +89,7 @@ pub fn infer_hash_encoding(
 }
 
 pub fn check_hash_encoding_upgrade(
-    data: &IndexMap<Bytes, Bytes>,
+    data: &FxIndexMap<Bytes, Bytes>,
     new_key: &[u8],
     new_val: &[u8],
     max_entries: usize,
@@ -118,7 +118,7 @@ mod tests {
 
     #[test]
     fn infer_hash_encoding_honors_entry_and_value_thresholds() {
-        let mut data = IndexMap::new();
+        let mut data = FxIndexMap::default();
         data.insert(bytes(4), bytes(4));
         data.insert(bytes(8), bytes(8));
 
@@ -126,18 +126,18 @@ mod tests {
         assert_eq!(infer_hash_encoding(&data, 2, 8), "listpack");
         assert_eq!(infer_hash_encoding(&data, 1, 8), "hashtable");
 
-        let mut long_key = IndexMap::new();
+        let mut long_key = FxIndexMap::default();
         long_key.insert(bytes(9), bytes(1));
         assert_eq!(infer_hash_encoding(&long_key, 2, 8), "hashtable");
 
-        let mut long_value = IndexMap::new();
+        let mut long_value = FxIndexMap::default();
         long_value.insert(bytes(1), bytes(9));
         assert_eq!(infer_hash_encoding(&long_value, 2, 8), "hashtable");
     }
 
     #[test]
     fn check_hash_encoding_upgrade_reports_only_actual_threshold_crossings() {
-        let mut data = IndexMap::new();
+        let mut data = FxIndexMap::default();
         data.insert(bytes(1), bytes(1));
         data.insert(bytes(2), bytes(2));
 

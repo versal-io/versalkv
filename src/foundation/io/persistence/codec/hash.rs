@@ -7,9 +7,10 @@ use crate::foundation::io::persistence::codec::types::{
 use crate::foundation::io::persistence::codec::RdbWriter;
 use crate::foundation::io::store::structure::hash::{HashHt, HashLp};
 use crate::foundation::io::store::Robj;
+use crate::foundation::memory::util_hash::FxIndexMap;
 use bytes::Bytes;
-use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
+use std::hash::BuildHasherDefault;
 
 pub struct HashCodec;
 
@@ -30,7 +31,8 @@ fn validate_hash_listpack(data: &[u8]) -> Option<()> {
     if !items.len().is_multiple_of(2) {
         return None;
     }
-    let mut fields = IndexMap::with_capacity(items.len() / 2);
+    let mut fields =
+        FxIndexMap::with_capacity_and_hasher(items.len() / 2, BuildHasherDefault::default());
     let mut it = items.into_iter();
     while let (Some(field), Some(_value)) = (it.next(), it.next()) {
         if fields.insert(field, ()).is_some() {
@@ -73,7 +75,10 @@ impl HashCodec {
                 if encoded {
                     return None;
                 }
-                let mut map = IndexMap::with_capacity(len as usize);
+                let mut map = FxIndexMap::with_capacity_and_hasher(
+                    len as usize,
+                    BuildHasherDefault::default(),
+                );
                 for _ in 0..len {
                     let field = Bytes::from(decoder::load_string(buf, pos)?);
                     let value = Bytes::from(decoder::load_string(buf, pos)?);
@@ -95,7 +100,10 @@ impl HashCodec {
                 if !items.len().is_multiple_of(2) {
                     return None;
                 }
-                let mut map = IndexMap::with_capacity(items.len() / 2);
+                let mut map = FxIndexMap::with_capacity_and_hasher(
+                    items.len() / 2,
+                    BuildHasherDefault::default(),
+                );
                 let mut it = items.into_iter();
                 while let (Some(field), Some(value)) = (it.next(), it.next()) {
                     if map.insert(Bytes::from(field), Bytes::from(value)).is_some() {
@@ -151,7 +159,8 @@ impl HashCodec {
         }
         let mut is_listpack = declared_len <= max_entries;
         let mut seen = HashSet::new();
-        let mut map = IndexMap::with_capacity(declared_len);
+        let mut map =
+            FxIndexMap::with_capacity_and_hasher(declared_len, BuildHasherDefault::default());
         let mut expires = HashMap::new();
         let mut skipped_expired_fields = Vec::new();
         for _ in 0..len {

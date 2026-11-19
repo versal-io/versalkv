@@ -322,6 +322,11 @@ mod tests {
             .transaction
             .watch_many(vec![WatchedKey::new(0, key.clone(), false)]);
         let token = Token(backend.connection_registry.insert(watcher));
+        // Mirror the production CLIENT TRACKING ON flow, which registers the
+        // client in the global `tracking.clients` set before any key can be
+        // tracked for it. The `collect_tracking_deliveries` fast path relies
+        // on this invariant to skip work when no client has tracking enabled.
+        backend.ctx.tracking_mut().clients.insert(token.0);
         backend.ctx.tracking_mut().remember_key(token.0, &key);
         backend
             .ctx

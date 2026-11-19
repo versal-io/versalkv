@@ -99,6 +99,11 @@ impl Node {
     }
 
     pub fn insert(&mut self, entry: Entry) -> Option<Self> {
+        // Common single-entry mutations maintain `count`, `minimum`, and branch
+        // separators incrementally. The generic `refresh()` rebuilds every
+        // separator (a `Bytes` clone per child) at every tree level on each
+        // operation, which dominates write cost for large sorted sets, so it is
+        // reserved for structural changes (leaf/node splits).
         match &mut self.data {
             NodeData::Leaf(entries) => {
                 let position =
@@ -107,6 +112,15 @@ impl Node {
                         Err(position) => position,
                     };
                 entries.insert(position, entry);
+                self.count = entries.len();
+                // The minimum only moves when the new entry lands at the head.
+                if position == 0 {
+                    self.minimum = entries.first().cloned();
+                }
+                if entries.len() <= MAX_ITEMS {
+                    return None;
+                }
+                // Leaf overflow: fall through to the shared split below.
             }
             NodeData::Branch {
                 children,
@@ -114,14 +128,34 @@ impl Node {
             } => {
                 let position = separators
                     .partition_point(|key| key.compare(entry.score, &entry.member).is_le());
-                if let Some(right) = children[position].insert(entry) {
-                    children.insert(position + 1, right);
+                match children[position].insert(entry) {
+                    Some(right) => {
+                        children.insert(position + 1, right);
+                        // Adding a child changes the separator layout: rebuild.
+                        self.refresh();
+                        if self.occupancy() <= MAX_ITEMS {
+                            return None;
+                        }
+                        // Branch overflow: fall through to the shared split.
+                    }
+                    None => {
+                        // `None` covers both a real insert and a duplicate
+                        // no-op (a leaf returns early without mutating), so
+                        // recompute the count from children instead of
+                        // assuming a delta. This is an integer-only sum; the
+                        // expensive part of `refresh()` is the separator
+                        // rebuild, which we still avoid by touching only the
+                        // single affected entry below.
+                        self.count = children.iter().map(|child| child.count).sum();
+                        if position == 0 {
+                            self.minimum = children.first().and_then(|child| child.minimum.clone());
+                        } else if let Some(minimum) = children[position].minimum.clone() {
+                            separators[position - 1] = minimum;
+                        }
+                        return None;
+                    }
                 }
             }
-        }
-        self.refresh();
-        if self.occupancy() <= MAX_ITEMS {
-            return None;
         }
         let midpoint = self.occupancy() / 2;
         let right = match &mut self.data {
@@ -140,6 +174,14 @@ impl Node {
                     return false;
                 };
                 entries.remove(position);
+                // Only a head removal can change the minimum, so non-head
+                // deletes keep the cached `Bytes` instead of cloning in
+                // `refresh()`.
+                self.count = entries.len();
+                if position == 0 {
+                    self.minimum = entries.first().cloned();
+                }
+                true
             }
             NodeData::Branch {
                 children,
@@ -150,12 +192,20 @@ impl Node {
                     return false;
                 }
                 if children[position].occupancy() < MIN_ITEMS {
+                    // Rebalance may borrow or merge children, so rebuild.
                     Self::rebalance(children, position);
+                    self.refresh();
+                    return true;
                 }
+                self.count = children.iter().map(|child| child.count).sum();
+                if position == 0 {
+                    self.minimum = children.first().and_then(|child| child.minimum.clone());
+                } else if let Some(minimum) = children[position].minimum.clone() {
+                    separators[position - 1] = minimum;
+                }
+                true
             }
         }
-        self.refresh();
-        true
     }
 
     fn rebalance(children: &mut Vec<Self>, position: usize) {

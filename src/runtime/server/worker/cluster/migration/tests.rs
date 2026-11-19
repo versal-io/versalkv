@@ -1522,7 +1522,7 @@ fn import_commands_preserve_pending_read_batch_propagation_order() {
         let name = String::from_utf8_lossy(&args.name).to_ascii_lowercase();
         runtime.process_parsed_command(token, args, name, false, &mut effects);
     }
-    runtime.complete_client_read(token.0, token.0, effects);
+    runtime.complete_client_read(token.0, token.0, &mut effects);
 
     let expected = [
         select_one,

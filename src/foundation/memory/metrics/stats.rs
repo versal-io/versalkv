@@ -73,7 +73,7 @@ impl InstantaneousMetric {
 /// average-derived pseudo-percentiles.
 #[derive(Debug, Clone, PartialEq)]
 struct LatencyHistogram {
-    exact_usec: Box<[u64; LATENCY_EXACT_USEC_LIMIT]>,
+    exact_usec: [u64; LATENCY_EXACT_USEC_LIMIT],
     logarithmic_usec: [u64; LATENCY_LOG_BUCKETS],
     count: u64,
 }
@@ -133,7 +133,7 @@ impl LatencyHistogram {
 impl Default for LatencyHistogram {
     fn default() -> Self {
         Self {
-            exact_usec: Box::new([0; LATENCY_EXACT_USEC_LIMIT]),
+            exact_usec: [0; LATENCY_EXACT_USEC_LIMIT],
             logarithmic_usec: [0; LATENCY_LOG_BUCKETS],
             count: 0,
         }

@@ -37,11 +37,28 @@ impl ServerWorkerState {
             self.cancel_eviction_timer();
             return EvictionOutcome::empty();
         }
-        if self.ctx.client_pause().is_paused(mstime()) != PauseAction::None {
+        // Fast path: no client pause is scheduled, so skip the `mstime()`
+        // syscall. `ClientPauseState::is_paused` returns None immediately when
+        // `end_time_ms == 0`, so this covers the common no-pause workload.
+        let client_pause = self.ctx.client_pause();
+        if client_pause.end_time_ms != 0 && client_pause.is_paused(mstime()) != PauseAction::None {
             self.cancel_eviction_timer();
             return EvictionOutcome::empty();
         }
         let state = self.ctx.maxmemory_state();
+        if !state.is_over_limit() {
+            self.cancel_eviction_timer();
+            return EvictionOutcome::empty();
+        }
+        // Sent tracking invalidations can fill the idle reply pool. Reclaim
+        // those reusable allocations before deleting more keys, otherwise
+        // each eviction leaves new retained buffers behind after output drains.
+        let state = if self.reply_buffer_pool.is_empty() {
+            state
+        } else {
+            self.reply_buffer_pool.clear();
+            self.ctx.maxmemory_state()
+        };
         if !state.is_over_limit() {
             self.cancel_eviction_timer();
             return EvictionOutcome::empty();
@@ -141,6 +158,56 @@ mod tests {
     use bytes::Bytes;
 
     const ISOLATION_MARKER: &str = "VALKEY_TEST_MAXMEMORY_EVICTION_CYCLE";
+
+    #[test]
+    fn importing_only_dataset_does_not_stall_eviction_sampling() {
+        let mut runtime =
+            crate::runtime::server::worker::ServerWorkerState::new_with_slot_router(16, 14, |_| {
+                16_383
+            })
+            .unwrap();
+        runtime.ctx.db_mut(0).unwrap().set(
+            b"imported".to_vec(),
+            Robj::string_raw(Bytes::from(vec![b'x'; 1_024])),
+        );
+        runtime
+            .ctx
+            .db_mut(0)
+            .unwrap()
+            .set_slot_importing(16_383, true);
+        assert_eq!(runtime.ctx.db(0).unwrap().dbsize(), 0);
+        runtime.ctx.config_mut().server.maxmemory = 1;
+        runtime.ctx.config_mut().server.maxmemory_policy = "allkeys-random".to_string();
+
+        let started = std::time::Instant::now();
+        let outcome = runtime.perform_evictions();
+        let elapsed = started.elapsed();
+        eprintln!("importing-only eviction sampling elapsed: {elapsed:?}");
+
+        assert!(outcome.evicted.is_empty());
+        assert!(runtime
+            .ctx
+            .db(0)
+            .unwrap()
+            .get_allow_expired(b"imported")
+            .is_some());
+        assert!(
+            // Leave ample headroom for loaded test hosts while catching the
+            // multi-second full-directory scans that trigger cluster failover.
+            elapsed < std::time::Duration::from_secs(4),
+            "sampling an importing-only dataset stalled the event loop for {elapsed:?}"
+        );
+        runtime
+            .ctx
+            .db_mut(0)
+            .unwrap()
+            .set_slot_importing(16_383, false);
+        assert_eq!(
+            runtime.ctx.db(0).unwrap().random_eviction_key(),
+            Some(b"imported".to_vec()),
+            "completed import must make its keys eligible again"
+        );
+    }
 
     fn enter_isolated_test() -> bool {
         if std::env::var_os(ISOLATION_MARKER).is_some() {
@@ -261,6 +328,51 @@ mod tests {
         assert!(outcome.evicted.len() > 1);
         drop(outcome);
         assert!(!runtime.ctx.maxmemory_state().is_over_limit());
+        std::process::exit(86);
+    }
+
+    #[test]
+    fn memory_pressure_releases_idle_reply_buffers_before_evicting_keys() {
+        const MARKER: &str = "VALKEY_TEST_REPLY_POOL_PRESSURE";
+        if std::env::var_os(MARKER).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "runtime::server::worker::maintenance::eviction::tests::memory_pressure_releases_idle_reply_buffers_before_evicting_keys",
+                ])
+                .env(MARKER, "1")
+                .status()
+                .expect("run reply buffer pressure test in isolation");
+            assert_eq!(status.code(), Some(86));
+            return;
+        }
+        for policy in ["allkeys-random", "noeviction"] {
+            let mut runtime = crate::runtime::server::worker::ServerWorkerState::new(1).unwrap();
+            runtime.ctx.config_mut().server.maxmemory_policy = policy.to_string();
+            runtime.ctx.config_mut().server.maxmemory_eviction_tenacity = 100;
+            for index in 0..64 {
+                runtime.ctx.db_mut(0).unwrap().set(
+                    format!("key-{index}").into_bytes(),
+                    Robj::string_raw(Bytes::from(vec![b'x'; 1_024])),
+                );
+                runtime.reply_buffer_pool.push(Vec::with_capacity(1_024));
+            }
+            let unlimited = runtime.perform_evictions();
+            assert!(unlimited.evicted.is_empty());
+            assert_eq!(runtime.reply_buffer_pool.len(), 64);
+
+            let before = runtime.ctx.maxmemory_state().logical;
+            runtime.ctx.config_mut().server.maxmemory = before.saturating_sub(40 * 1_024) as u64;
+            let outcome = runtime.perform_evictions();
+
+            assert!(
+                outcome.evicted.is_empty(),
+                "idle reply allocations must be released before deleting dataset keys"
+            );
+            assert_eq!(runtime.ctx.db(0).unwrap().dbsize(), 64);
+            assert!(runtime.reply_buffer_pool.is_empty());
+            assert!(!runtime.ctx.maxmemory_state().is_over_limit());
+        }
         std::process::exit(86);
     }
 

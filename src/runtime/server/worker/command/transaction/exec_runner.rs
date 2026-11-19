@@ -123,6 +123,7 @@ impl ServerWorkerState {
         self.command_execution_depth += 1;
         let execution = self.apply_exec_decision(context, decision, effects);
         self.command_execution_depth -= 1;
+        self.refresh_event_loop_cycle_time_after_execution();
         self.finish_exec(context, execution, effects)
     }
 
@@ -395,7 +396,9 @@ impl ServerWorkerState {
         };
         let offset_after = self.ctx.replication().primary_repl_offset();
         if offset_after != offset_before {
-            self.connection_registry[context.target.token()].set_last_write_offset(offset_after);
+            if let Some(connection) = self.connection_registry.get_mut(context.target.token()) {
+                connection.set_last_write_offset(offset_after);
+            }
         }
         effects.publish.extend(publish);
         effects.publish_shard.extend(publish_shard);
@@ -481,6 +484,18 @@ impl ServerWorkerState {
         let connection = &mut self.connection_registry[token];
         let selected_db = connection.selected_db;
         let watched_keys = connection.transaction.watched_key_count();
+        // EXEC clears transaction state (including watched keys) but does not
+        // go through `record_completion_metadata`. Keep `synced_watched_keys`
+        // and the global `watched_key_clients` counter in sync here so the
+        // `process_dirty_keys_in_loop` fast path stays correct.
+        let had_watched = connection.synced_watched_keys > 0;
+        let has_watched = watched_keys > 0;
+        match (had_watched, has_watched) {
+            (false, true) => self.watched_key_clients += 1,
+            (true, false) => self.watched_key_clients -= 1,
+            _ => {}
+        }
+        connection.synced_watched_keys = watched_keys;
         connection.last_cmd = context.name.to_string();
         if let Some(info) = self.ctx.client_info_mut(token.0) {
             info.db = selected_db;

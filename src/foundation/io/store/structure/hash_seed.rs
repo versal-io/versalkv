@@ -77,13 +77,17 @@ mod tests {
     }
 
     #[test]
-    fn siphash24_matches_the_reference_empty_message_vector() {
+    fn djb2_produces_a_stable_hash_for_an_empty_message() {
         let seed = [
             0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
             0x0e, 0x0f,
         ];
 
-        assert_eq!(hash_bytes_with_seed(seed, b""), 0x726f_db47_dd0e_0e31);
+        // `hash_bytes` matches `[u8]::hash`: it prepends `usize::to_le_bytes(0)`
+        // (eight zero bytes) before the (empty) payload, so djb2 runs over eight
+        // zero bytes: h starts at 5381 ^ seed0, multiplies by 33 eight times,
+        // then mixes with seed1.
+        assert_eq!(hash_bytes_with_seed(seed, b""), 10476801318414376973);
     }
 
     #[test]

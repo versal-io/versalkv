@@ -108,6 +108,9 @@ impl super::Db {
     }
 
     pub(super) fn clear_hash_field_expires(&mut self, key: &[u8]) {
+        if self.hash_field_expires.is_empty() {
+            return;
+        }
         if self.hash_field_expires.remove(key).is_some() {
             self.keys_with_volatile_items = self.keys_with_volatile_items.saturating_sub(1);
         }

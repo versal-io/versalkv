@@ -205,19 +205,17 @@ fn choose_poll_timeout(
 impl ServerWorkerState {
     pub(crate) fn next_poll_timeout<C: EventClock>(&self, now: C) -> Option<Duration> {
         let now_ms = now.wall_ms();
+        let capture_deadline = self.ctx.persistence().forkless_capture_poll_delay();
         let has_immediate_work = self.transport.has_pending_data()
             || self.event_batch.has_pending_transport_data()
             || self.event_batch.has_due_time_events()
-            // Keep the loop spinning while a forkless capture is active so the
-            // before-poll phase can refill the feed every turn instead of
-            // blocking for the full cron interval.
-            || self.ctx.persistence().forkless_capture_in_progress();
+            || capture_deadline.is_some_and(|delay| delay.is_zero());
         let blocked_deadline = (self.ctx.blocking_registry().count() > 0)
             .then(|| self.next_blocked_timeout(now_ms))
             .flatten();
         choose_poll_timeout(
             has_immediate_work,
-            self.time_events.next_timeout(now),
+            min_poll_deadline(self.time_events.next_timeout(now), capture_deadline),
             blocked_deadline,
         )
     }

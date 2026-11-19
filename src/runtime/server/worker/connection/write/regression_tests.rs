@@ -3,6 +3,40 @@ use std::io::Read;
 use std::os::fd::AsRawFd;
 
 #[test]
+fn reply_buffer_pool_stays_bounded_when_replication_frames_are_drained() {
+    let mut pool = Vec::new();
+    let mut writer = std::io::sink();
+    for _ in 0..8 {
+        let mut reply = pool.pop().unwrap_or_else(Vec::new);
+        reply.clear();
+        reply.extend_from_slice(b"+OK\r\n");
+        let mut queue = VecDeque::from([reply]);
+        queue.extend((0..32).map(|_| vec![b'x'; 1024]));
+        let expected_released = queue
+            .iter()
+            .map(crate::foundation::memory::util_alloc::vec_allocation_bytes)
+            .sum::<usize>();
+
+        let (outcome, released) =
+            flush_queue_vectored(&mut writer, &mut queue, None, Some(&mut pool));
+
+        assert!(matches!(outcome, WriteOutcome::Complete));
+        assert!(queue.is_empty());
+        assert_eq!(released, expected_released);
+        assert!(
+            pool.len() <= 64,
+            "drained replication frames must not grow the reply pool without bound"
+        );
+        assert!(pool.iter().all(|frame| frame.is_empty()));
+    }
+    assert!(!pool.is_empty(), "small reply buffers must remain reusable");
+    assert!(
+        pool.iter().map(Vec::capacity).sum::<usize>() <= 64 * REPLY_BUFFER_POOL_MAX_CAP,
+        "the retained allocation must remain bounded as well as the frame count"
+    );
+}
+
+#[test]
 fn completed_write_releases_the_recorded_allocator_usable_size() {
     let mut connection = Connection::new_fake();
     let mut frame = Vec::with_capacity(144);
@@ -15,7 +49,7 @@ fn completed_write_releases_the_recorded_allocator_usable_size() {
     let mut queue = std::mem::take(&mut connection.output.queue);
     let mut writer = Vec::new();
 
-    let (_, released_allocation_bytes) = flush_queue_vectored(&mut writer, &mut queue, None);
+    let (_, released_allocation_bytes) = flush_queue_vectored(&mut writer, &mut queue, None, None);
     connection.consume_written_bytes(144, 144).unwrap();
     connection.release_output_frame_allocations(released_allocation_bytes);
 

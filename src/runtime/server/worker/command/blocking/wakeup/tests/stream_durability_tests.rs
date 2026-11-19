@@ -137,9 +137,13 @@ fn sync_aof(backend: &mut ServerWorkerState) {
         .unwrap();
 }
 
-fn finish_without_fsync(backend: &mut ServerWorkerState, reader: Token, batch: ReadBatchEffects) {
+fn finish_without_fsync(
+    backend: &mut ServerWorkerState,
+    reader: Token,
+    mut batch: ReadBatchEffects,
+) {
     backend.ctx.config_mut().persistence.aof_fsync = AofFsync::No;
-    backend.complete_client_read(reader.0, reader.0, batch);
+    backend.complete_client_read(reader.0, reader.0, &mut batch);
     backend.flush_aof_if_needed();
     backend.ctx.config_mut().persistence.aof_fsync = AofFsync::EverySec;
 }

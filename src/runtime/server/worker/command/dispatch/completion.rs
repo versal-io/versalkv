@@ -8,7 +8,7 @@ use super::side_effects::CommandEffects;
 use super::{CmdLogEntry, ServerWorkerState};
 use crate::engine::command::context::CommandConn;
 use crate::engine::command::CMD_READONLY;
-use crate::foundation::io::protocol::serializer::{serialize_to_vec_resp2, serialize_to_vec_resp3};
+use crate::foundation::io::protocol::serializer::{serialize_resp2, serialize_resp3};
 use crate::foundation::io::protocol::Value;
 use crate::framework::capabilities::connection::BlockedCmd;
 use crate::framework::capabilities::connection::ConnectionCommandEffects;
@@ -164,8 +164,25 @@ impl ServerWorkerState {
         // including the 1 -> 0 case after UNWATCH/EXEC/DISCARD. Skipping the
         // update when the count is zero would leave a stale non-zero value and
         // inflate `INFO watching_clients`.
-        if let Some(info) = self.ctx.client_info_mut(invocation.target.token_value()) {
-            info.watched_keys = watched_keys;
+        //
+        // Fast path: only pay for the `client_info_mut` HashMap lookup when the
+        // count actually changed since the last sync. On a pure SET/GET/INCR
+        // workload the count is always 0, so the lookup is skipped entirely.
+        // The `watched_key_clients` counter is kept in sync so
+        // `process_dirty_keys_in_loop` can skip the per-connection scan when
+        // no client holds watched keys.
+        if watched_keys != connection.synced_watched_keys {
+            let had_watched = connection.synced_watched_keys > 0;
+            let has_watched = watched_keys > 0;
+            match (had_watched, has_watched) {
+                (false, true) => self.watched_key_clients += 1,
+                (true, false) => self.watched_key_clients -= 1,
+                _ => {}
+            }
+            if let Some(info) = self.ctx.client_info_mut(invocation.target.token_value()) {
+                info.watched_keys = watched_keys;
+            }
+            connection.synced_watched_keys = watched_keys;
         }
     }
 
@@ -282,27 +299,41 @@ impl ServerWorkerState {
         connection_effects: Option<&mut ConnectionCommandEffects>,
         effects: &mut CommandEffects,
     ) -> usize {
-        let connection = &mut self.connection_registry
-            [crate::framework::capabilities::io::Token(connection_token)];
+        let token = crate::framework::capabilities::io::Token(connection_token);
+        // Read the small connection fields we need up front so the connection
+        // borrow does not span `acquire_reply_buffer`, which needs `&mut self`.
+        let (output_before, resp_version, has_custom_reply) = {
+            let connection = &self.connection_registry[token];
+            (
+                connection.output_before_current_command(),
+                connection.resp_version,
+                connection_effects
+                    .as_deref()
+                    .is_some_and(ConnectionCommandEffects::has_custom_reply),
+            )
+        };
         debug_assert_eq!(
             connection_effects
                 .as_deref()
                 .map(ConnectionCommandEffects::output_before),
-            Some(connection.output_before_current_command())
+            Some(output_before)
         );
-        let reply_bytes = if connection_effects
-            .as_deref()
-            .is_some_and(ConnectionCommandEffects::has_custom_reply)
-        {
+        let reply_bytes = if has_custom_reply {
             connection_effects
                 .as_deref()
                 .map_or(0, ConnectionCommandEffects::reply_bytes)
         } else {
-            let frame = if connection.resp_version >= 3 {
-                serialize_to_vec_resp3(reply)
+            // Reuse a pooled reply buffer instead of allocating a fresh
+            // `Vec<u8>` for every command reply. `acquire_reply_buffer` pops
+            // a recycled buffer (empty but with surviving heap capacity) or
+            // falls back to a default-allocated one; the write path returns
+            // fully-consumed frames to the pool.
+            let mut frame = self.acquire_reply_buffer();
+            if resp_version >= 3 {
+                serialize_resp3(reply, &mut frame);
             } else {
-                serialize_to_vec_resp2(reply)
-            };
+                serialize_resp2(reply, &mut frame);
+            }
             let reply_bytes = frame.len();
             if let Some(connection_effects) = connection_effects {
                 connection_effects.set_reply_bytes(reply_bytes);
@@ -310,7 +341,7 @@ impl ServerWorkerState {
             effects.push_command_reply(frame);
             reply_bytes
         };
-        connection.set_custom_reply_enabled(false);
+        self.connection_registry[token].set_custom_reply_enabled(false);
         reply_bytes
     }
 

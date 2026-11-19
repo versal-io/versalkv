@@ -11,7 +11,6 @@ pub fn get(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> CommandOutco
     let read_expired_values = runtime.read_expired_values();
     let suppress_lazy_expire = runtime.suppress_lazy_expire();
     let should_touch = runtime.should_touch_read_keys();
-    let now_ms = runtime.now_ms();
     let Some(db) = runtime.db_mut() else {
         return CommandOutcome::reply(CommandError::db_index_out_of_range());
     };
@@ -19,7 +18,9 @@ pub fn get(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> CommandOutco
     let value = if read_expired_values {
         db.get_allow_expired(key).cloned()
     } else {
-        db.get_at(key, now_ms).cloned()
+        // Resolve command time lazily inside the lookup: keys without a TTL
+        // never trigger a clock read, matching C's `expireIfNeeded`.
+        db.get_at_lazy(key).cloned()
     };
     if should_touch && value.is_some() {
         db.touch_access_time(key);
@@ -27,7 +28,7 @@ pub fn get(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> CommandOutco
     db.set_no_lazy_expire(false);
     match value {
         Some(value) if value.is_string() => {
-            CommandOutcome::reply(Value::bulk(value.as_bytes().to_vec()))
+            CommandOutcome::reply(Value::bulk(value.string_bytes()))
         }
         Some(_) => CommandOutcome::reply(CommandError::wrong_type()),
         None => CommandOutcome {

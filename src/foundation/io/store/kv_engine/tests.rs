@@ -343,6 +343,45 @@ fn zset_object_accessor_reads_a_listpack_without_upgrading_it() {
 }
 
 #[test]
+fn zset_batch_xx_on_missing_key_is_a_noop_and_creates_nothing() {
+    let mut db = Db::new();
+
+    // XX against a missing key must report no change and leave the key absent,
+    // matching C `ZADD XX` (TYPE stays `none` instead of an empty zset).
+    let (added, updated) = db
+        .zset_add_batch_with_limits(
+            b"ztmp",
+            &[(10.0, b"x".as_slice())],
+            128,
+            256,
+            false,
+            true,
+            false,
+            false,
+        )
+        .unwrap();
+    assert_eq!((added, updated), (0, 0));
+    assert!(db.get(b"ztmp").is_none());
+
+    // The guard must not suppress creation for a plain ZADD or NX on the same
+    // missing key.
+    let (added, updated) = db
+        .zset_add_batch_with_limits(
+            b"ztmp",
+            &[(10.0, b"x".as_slice())],
+            128,
+            256,
+            false,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+    assert_eq!((added, updated), (1, 0));
+    assert!(matches!(db.get(b"ztmp"), Some(Robj::ZSetListpack(_))));
+}
+
+#[test]
 fn hash_object_accessor_reads_a_listpack_without_upgrading_it() {
     let mut db = Db::new();
     db.hash_set_with_limits(b"hash", b"field", b"value", 4, 64)
@@ -405,6 +444,34 @@ fn lazy_expiration_deletes_key_and_records_propagation_once() {
     assert_eq!(db.expired_deletions, vec![b"k".to_vec()]);
     assert!(db.get(b"k").is_none());
     assert_eq!(db.expired_deletions, vec![b"k".to_vec()]);
+}
+
+#[test]
+fn get_at_lazy_matches_get_at_across_ttl_states() {
+    // Key without a TTL: served from the data table without resolving time.
+    let mut db = Db::new();
+    db.set(b"persistent".to_vec(), Robj::string("p"));
+    assert_eq!(db.get_at_lazy(b"persistent").unwrap().as_bytes(), b"p");
+    assert!(db.expired_deletions.is_empty());
+
+    // Key with a future TTL: the clock is consulted but the key is retained.
+    db.set(b"live".to_vec(), Robj::string("l"));
+    let live_expire = future_ms();
+    db.set_expire(b"live", live_expire);
+    assert_eq!(db.get_at_lazy(b"live").unwrap().as_bytes(), b"l");
+    assert_eq!(db.get_expire(b"live"), Some(live_expire));
+    assert!(db.expired_deletions.is_empty());
+
+    // Key with a past TTL: lazily expired exactly like the eager variant.
+    db.set(b"dead".to_vec(), Robj::string("d"));
+    db.set_expire(b"dead", past_ms());
+    assert!(db.get_at_lazy(b"dead").is_none());
+    assert_eq!(db.dbsize(), 2);
+    assert_eq!(db.expired_deletions, vec![b"dead".to_vec()]);
+    assert!(db.get_allow_expired(b"dead").is_none());
+
+    // Missing key resolves to None without touching the expires table.
+    assert!(db.get_at_lazy(b"missing").is_none());
 }
 
 #[test]

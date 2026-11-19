@@ -1517,7 +1517,7 @@ fn normal_dispatch_defers_replica_main_read_while_pending_replay_exists() {
     backend.pending_replication_replay = Some(PendingReplayContinuation::new_for_test(
         main,
         session_id,
-        crate::foundation::io::sys::time::mstime(),
+        MonotonicInstant::now().as_millis() as i64,
     ));
     primary
         .write_all(b"*1\r\n$4\r\nPING\r\n")
@@ -1809,7 +1809,7 @@ fn ready_phase_counts_replication_replay_deferral_as_deferred() {
     backend.pending_replication_replay = Some(PendingReplayContinuation::new_for_test(
         main,
         session_id,
-        crate::foundation::io::sys::time::mstime(),
+        MonotonicInstant::now().as_millis() as i64,
     ));
     let before = (
         backend.ctx.stats().eventloop_events_handled,
@@ -1886,7 +1886,7 @@ fn blocked_dispatch_reports_replication_replay_readiness_as_deferred() {
     backend.pending_replication_replay = Some(PendingReplayContinuation::new_for_test(
         main,
         session_id,
-        crate::foundation::io::sys::time::mstime(),
+        MonotonicInstant::now().as_millis() as i64,
     ));
 
     backend.transport.queue_test_pending_data_event(peer.token);

@@ -71,13 +71,17 @@ impl Server {
     fn wait_ready(mut self) -> Self {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            if TcpStream::connect(("127.0.0.1", self.port)).is_ok() {
+            let log = std::fs::read_to_string(self.dir.join("server.log")).unwrap();
+            // Parallel spawns can briefly retain a reserved listener before
+            // exec. Require this child's readiness before probing its port.
+            if log.contains("Ready to accept connections")
+                && TcpStream::connect(("127.0.0.1", self.port)).is_ok()
+            {
                 break;
             }
             assert!(
                 self.child.try_wait().unwrap().is_none() && Instant::now() < deadline,
-                "server did not start: {}",
-                std::fs::read_to_string(self.dir.join("server.log")).unwrap()
+                "server did not start: {log}"
             );
             std::thread::sleep(Duration::from_millis(10));
         }

@@ -55,6 +55,7 @@ impl RdbLoadProgress {
 
 pub(crate) struct ReplayProgress {
     processed_bytes: u64,
+    // This measures service time, independently of the command wall-clock snapshot.
     last_service_ms: i64,
 }
 

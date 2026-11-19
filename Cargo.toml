@@ -43,6 +43,9 @@ serde = { version = "1", features = ["derive"], optional = true }
 serde-wasm-bindgen = { version = "0.6", optional = true }
 wasm-bindgen = { version = "0.2", optional = true }
 
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+tikv-jemallocator = "0.6"
+
 [dev-dependencies]
 criterion = { version = "6", package = "codspeed-criterion-compat", features = ["html_reports"] }
 proptest = "1"

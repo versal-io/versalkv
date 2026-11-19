@@ -132,13 +132,11 @@ impl CommandRegistry {
 
     /// Look up a command by name in the active table only.
     pub fn lookup(&self, name: &[u8]) -> Option<&CommandSpec> {
-        let name = std::str::from_utf8(name).ok()?;
-        self.lookup_entry(name).map(|command| &command.spec)
+        self.lookup_entry_bytes(name).map(|command| &command.spec)
     }
 
     pub(crate) fn resolve(&self, name: &[u8]) -> Option<ResolvedCommand> {
-        let name = std::str::from_utf8(name).ok()?;
-        let command = self.lookup_entry(name)?;
+        let command = self.lookup_entry_bytes(name)?;
         Some(ResolvedCommand::new(
             command.spec.descriptor(),
             self.registry_id,
@@ -210,27 +208,30 @@ impl CommandRegistry {
         self.commands.len()
     }
 
-    fn lookup_entry(&self, name: &str) -> Option<&RegisteredCommand> {
-        // Fast path: already lowercase, no allocation.
-        if name.bytes().all(|byte| !byte.is_ascii_uppercase()) {
-            return self.commands.get(name);
+    /// Byte-slice lookup that folds ASCII case once and performs at most one
+    /// UTF-8 validation. The two-step `from_utf8` + per-entry lookup path paid
+    /// that validation twice per command (once on the raw name, again on the
+    /// lowercased buffer); non-UTF-8 names simply resolve to no command.
+    fn lookup_entry_bytes(&self, name: &[u8]) -> Option<&RegisteredCommand> {
+        // Fast path: already lowercase, no allocation. A single checked
+        // conversion produces the `&str` key required by the String map.
+        if name.iter().all(|byte| !byte.is_ascii_uppercase()) {
+            let key = std::str::from_utf8(name).ok()?;
+            return self.commands.get(key);
         }
-        // Slow path: uppercase bytes present. Use a stack buffer for short
-        // command names to avoid a heap allocation on the hot path (e.g.
-        // PING, SET, GET sent in uppercase by benchmarks and clients).
-        let bytes = name.as_bytes();
-        if bytes.len() <= 32 {
+        // Slow path: uppercase bytes present. Lowercase into a stack buffer
+        // for short command names to avoid a heap allocation on the hot path.
+        if name.len() <= 32 {
             let mut buf = [0u8; 32];
-            for (i, &b) in bytes.iter().enumerate() {
+            for (i, &b) in name.iter().enumerate() {
                 buf[i] = b.to_ascii_lowercase();
             }
-            // SAFETY: input is valid UTF-8; ASCII lowercase mapping preserves
-            // UTF-8 validity because uppercase ASCII bytes (0x41..=0x5A) map
-            // one-to-one to lowercase ASCII bytes (0x61..=0x7A).
-            let lower = std::str::from_utf8(&buf[..bytes.len()]).unwrap();
+            let lower = std::str::from_utf8(&buf[..name.len()]).ok()?;
             self.commands.get(lower)
         } else {
-            self.commands.get(&name.to_ascii_lowercase())
+            let lower = name.to_ascii_lowercase();
+            let key = std::str::from_utf8(&lower).ok()?;
+            self.commands.get(key)
         }
     }
 }

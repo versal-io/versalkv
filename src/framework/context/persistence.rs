@@ -65,12 +65,18 @@ impl ServerContext {
         self.set_forkless_capture_expiration_paused(false);
     }
     pub(crate) fn set_forkless_capture_expiration_paused(&mut self, is_paused: bool) {
-        let should_skip_expire = is_paused
-            || self.persistence.forkless_capture_in_progress()
-            || self
+        // Fast path: only read the clock when a client pause is actually
+        // scheduled. `ClientPauseState::is_paused` returns None immediately
+        // when `end_time_ms == 0`, so the common no-pause hot path avoids a
+        // `mstime()` syscall on every command.
+        let client_pause_active = self.client_pause.end_time_ms != 0
+            && self
                 .client_pause
                 .is_paused(crate::foundation::io::sys::time::mstime())
-                != super::PauseAction::None
+                != super::PauseAction::None;
+        let should_skip_expire = is_paused
+            || self.persistence.forkless_capture_in_progress()
+            || client_pause_active
             || (self.replication.is_replica() && self.rconfig.replication.replica_read_only);
         self.db.dbs.set_pause_skip_expire_all(should_skip_expire);
         for dataset in self.slot_imports.values_mut() {

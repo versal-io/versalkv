@@ -31,7 +31,7 @@ pub fn getdel(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> CommandOu
         db.del(key);
     }
     CommandOutcome {
-        reply: Value::bulk(obj.as_bytes().to_vec()),
+        reply: Value::bulk(obj.string_bytes()),
         effects: CommandEffects {
             changed_keys: vec![(db_idx, key.clone())],
             events: vec![CoreEvent {

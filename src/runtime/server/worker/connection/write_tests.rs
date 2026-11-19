@@ -211,7 +211,8 @@ fn partial_slot_export_write_retains_unaccepted_replication_bytes() {
     };
 
     let allocation_before = connection.output_buffer_allocation_bytes();
-    let (result, released_allocation_bytes) = flush_queue_vectored(&mut writer, &mut queue, None);
+    let (result, released_allocation_bytes) =
+        flush_queue_vectored(&mut writer, &mut queue, None, None);
     let queued_after = queue.iter().map(Vec::len).sum::<usize>();
     connection
         .consume_written_bytes(queued_before - queued_after, queued_before)
@@ -490,7 +491,7 @@ fn c_shaped_export_partial_then_eagain_closes_on_second_limit_check() {
             .queue,
     );
     let queued_before = queue.iter().map(Vec::len).sum::<usize>();
-    let (partial, released_on_partial) = flush_queue_vectored(&mut writer, &mut queue, None);
+    let (partial, released_on_partial) = flush_queue_vectored(&mut writer, &mut queue, None, None);
     let queued_after = queue.iter().map(Vec::len).sum::<usize>();
     let written = queued_before - queued_after;
     backend.connection_registry[Token(connection_token)]
@@ -535,7 +536,7 @@ fn c_shaped_export_partial_then_eagain_closes_on_second_limit_check() {
             .queue,
     );
     let queued_before_eagain = queue.iter().map(Vec::len).sum::<usize>();
-    let (blocked, released_on_eagain) = flush_queue_vectored(&mut writer, &mut queue, None);
+    let (blocked, released_on_eagain) = flush_queue_vectored(&mut writer, &mut queue, None, None);
     let queued_after_eagain = queue.iter().map(Vec::len).sum::<usize>();
     backend.connection_registry[Token(connection_token)]
         .consume_written_bytes(
@@ -771,7 +772,7 @@ fn zero_budget_queue_flush_is_budget_exhausted_without_writing() {
     let mut writer = Vec::new();
 
     let (result, released_allocation_bytes) =
-        flush_queue_vectored(&mut writer, &mut queue, Some(0));
+        flush_queue_vectored(&mut writer, &mut queue, Some(0), None);
 
     assert!(matches!(result, WriteOutcome::BudgetExhausted));
     assert_eq!(released_allocation_bytes, 0);
@@ -790,7 +791,7 @@ fn short_write_before_configured_budget_is_backpressured() {
         calls: 0,
     };
 
-    let (result, _) = flush_queue_vectored(&mut writer, &mut queue, Some(8));
+    let (result, _) = flush_queue_vectored(&mut writer, &mut queue, Some(8), None);
 
     assert!(matches!(result, WriteOutcome::Backpressured));
     assert_eq!(writer.calls, 1);
@@ -802,7 +803,8 @@ fn progress_then_would_block_is_backpressured_before_budget() {
     let mut queue = std::collections::VecDeque::from(vec![vec![b'x']; MAX_IOV_PER_WRITE + 1]);
     let mut writer = ProgressThenBlock { calls: 0 };
 
-    let (result, _) = flush_queue_vectored(&mut writer, &mut queue, Some(MAX_IOV_PER_WRITE + 1));
+    let (result, _) =
+        flush_queue_vectored(&mut writer, &mut queue, Some(MAX_IOV_PER_WRITE + 1), None);
 
     assert!(matches!(result, WriteOutcome::Backpressured));
     assert_eq!(writer.calls, 2);
@@ -818,7 +820,8 @@ fn interrupted_vectored_write_retries_and_completes() {
         written: Vec::new(),
     };
 
-    let (result, released_allocation_bytes) = flush_queue_vectored(&mut writer, &mut queue, None);
+    let (result, released_allocation_bytes) =
+        flush_queue_vectored(&mut writer, &mut queue, None, None);
 
     assert!(matches!(result, WriteOutcome::Complete));
     assert_eq!(writer.calls, 2);
@@ -836,7 +839,8 @@ fn interrupted_vectored_write_retries_then_reports_backpressure() {
         written: Vec::new(),
     };
 
-    let (result, released_allocation_bytes) = flush_queue_vectored(&mut writer, &mut queue, None);
+    let (result, released_allocation_bytes) =
+        flush_queue_vectored(&mut writer, &mut queue, None, None);
 
     assert!(matches!(result, WriteOutcome::Backpressured));
     assert_eq!(writer.calls, 2);
@@ -852,7 +856,8 @@ fn drained_queue_flush_reports_complete_exactly() {
     let mut queue = std::collections::VecDeque::from([b"complete".to_vec()]);
     let mut writer = Vec::new();
 
-    let (result, released_allocation_bytes) = flush_queue_vectored(&mut writer, &mut queue, None);
+    let (result, released_allocation_bytes) =
+        flush_queue_vectored(&mut writer, &mut queue, None, None);
 
     assert!(matches!(result, WriteOutcome::Complete));
     assert_eq!(writer, b"complete");
@@ -865,7 +870,7 @@ fn write_zero_is_preserved_as_failed_outcome() {
     let mut queue = std::collections::VecDeque::from([b"pending".to_vec()]);
 
     let (result, released_allocation_bytes) =
-        flush_queue_vectored(&mut WriteZero, &mut queue, None);
+        flush_queue_vectored(&mut WriteZero, &mut queue, None, None);
 
     assert!(matches!(
         result,
@@ -883,7 +888,8 @@ fn hard_write_error_is_preserved_as_failed_outcome() {
     let mut queue = std::collections::VecDeque::from([b"pending".to_vec()]);
     let mut writer = FailingWriter(std::io::ErrorKind::BrokenPipe);
 
-    let (result, released_allocation_bytes) = flush_queue_vectored(&mut writer, &mut queue, None);
+    let (result, released_allocation_bytes) =
+        flush_queue_vectored(&mut writer, &mut queue, None, None);
 
     assert!(matches!(
         result,
@@ -1121,7 +1127,7 @@ fn bounded_queue_flush_stops_after_budget_on_always_writable_stream() {
         std::collections::VecDeque::from([vec![b'a'; 48 * 1024], vec![b'b'; 48 * 1024]]);
     let mut writer = Vec::new();
 
-    let (result, _) = flush_queue_vectored(&mut writer, &mut queue, Some(64 * 1024));
+    let (result, _) = flush_queue_vectored(&mut writer, &mut queue, Some(64 * 1024), None);
 
     assert!(matches!(result, WriteOutcome::BudgetExhausted));
     assert_eq!(writer.len(), 64 * 1024);
@@ -1250,7 +1256,7 @@ fn ordinary_large_write_turn_stops_after_first_frame_crossing_c_budget() {
     let budget = c_client_write_budget(&queue);
     let mut writer = Vec::new();
 
-    let (result, _) = flush_queue_vectored(&mut writer, &mut queue, Some(budget));
+    let (result, _) = flush_queue_vectored(&mut writer, &mut queue, Some(budget), None);
 
     assert!(matches!(result, WriteOutcome::BudgetExhausted));
     assert_eq!(writer.len(), frame_len);

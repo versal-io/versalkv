@@ -89,27 +89,40 @@ pub fn socket_read_closed_raw(fd: std::os::fd::RawFd) -> io::Result<bool> {
     if descriptor.revents() & closed_events != 0 {
         return Ok(true);
     }
-    let mut byte = [0u8; 1];
-    // SAFETY: fd is borrowed for this nonblocking peek, and byte is a valid
-    // writable buffer for one byte. MSG_PEEK leaves application data queued.
-    let result = unsafe {
-        libc::recv(
-            fd,
-            byte.as_mut_ptr().cast::<libc::c_void>(),
-            byte.len(),
-            libc::MSG_PEEK | libc::MSG_DONTWAIT,
-        )
-    };
-    if result == 0 {
-        return Ok(true);
+    // On Linux, `POLLRDHUP` is the authoritative orderly-shutdown signal and is
+    // asserted the moment the peer shuts its write side (together with
+    // `POLLIN` while buffered data remains). A negative poll therefore means
+    // the read side is still open, and a `MSG_PEEK` fallback could only return
+    // `WouldBlock`; skip that second syscall on the hot readiness path. Ports
+    // without `POLLRDHUP` keep the peek-based fallback below.
+    #[cfg(target_os = "linux")]
+    {
+        Ok(false)
     }
-    if result > 0 {
-        return Ok(false);
-    }
-    let error = io::Error::last_os_error();
-    match error.kind() {
-        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted => Ok(false),
-        _ => Err(error),
+    #[cfg(not(target_os = "linux"))]
+    {
+        let mut byte = [0u8; 1];
+        // SAFETY: fd is borrowed for this nonblocking peek, and byte is a valid
+        // writable buffer for one byte. MSG_PEEK leaves application data queued.
+        let result = unsafe {
+            libc::recv(
+                fd,
+                byte.as_mut_ptr().cast::<libc::c_void>(),
+                byte.len(),
+                libc::MSG_PEEK | libc::MSG_DONTWAIT,
+            )
+        };
+        if result == 0 {
+            return Ok(true);
+        }
+        if result > 0 {
+            return Ok(false);
+        }
+        let error = io::Error::last_os_error();
+        match error.kind() {
+            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted => Ok(false),
+            _ => Err(error),
+        }
     }
 }
 

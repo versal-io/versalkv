@@ -477,8 +477,16 @@ impl ServerWorkerState {
         }
         let in_transaction = facts.transaction;
         if !in_transaction {
-            let now = mstime();
-            let pause = self.ctx.client_pause().is_paused(now);
+            let client_pause = self.ctx.client_pause();
+            // Fast path: no client pause is scheduled, so skip the `mstime()`
+            // syscall and the write/readonly classification entirely.
+            // `ClientPauseState::is_paused` returns `None` immediately when
+            // `end_time_ms == 0`, so this covers the common standalone
+            // SET/GET/INCR workload where CLIENT PAUSE was never issued.
+            if client_pause.end_time_ms == 0 {
+                return None;
+            }
+            let pause = client_pause.is_paused(mstime());
             let has_write_flag = (meta.flags & (CMD_WRITE | CMD_MAY_REPLICATE)) != 0;
             let is_ro = if has_write_flag {
                 is_ro_script(meta.name.as_str(), args, &self.ctx)
@@ -543,6 +551,17 @@ impl ServerWorkerState {
                 call_flags,
                 reject_reply: None,
             });
+        }
+        // The key targets only feed forkless snapshot coordination: the
+        // capture barrier returns immediately unless a capture is active and
+        // the per-key block check is inert while no save owns any forkless
+        // keys. Resolve both flags before `forkless_key_targets`, which would
+        // otherwise allocate a key `Vec` (a `to_vec` per key) on every
+        // standalone write and immediately discard it.
+        if !self.ctx.persistence().forkless_save_in_progress()
+            && !self.ctx.persistence().forkless_capture_in_progress()
+        {
+            return None;
         }
         let key_targets = Self::forkless_key_targets(meta, args, facts.selected_db);
         if key_targets
@@ -647,13 +666,17 @@ impl ServerWorkerState {
         if !call_flags.is_write || facts.transaction {
             return None;
         }
+        // Slot migrations only exist while a cluster is active. On standalone
+        // deployments `cluster_state` is always absent, so resolve it before
+        // extracting the key list: `cluster_redirect_keys` heap-allocates a
+        // fresh `Vec` plus a `to_vec` per key on every write, and without a
+        // cluster that result would be discarded by the `?` below anyway.
+        let state = self.ctx.cluster_state().as_deref()?;
         let keys = Self::cluster_redirect_keys(meta, args);
-        let job_id = self.ctx.cluster_state().as_deref().and_then(|state| {
-            keys.iter().find_map(|key| {
-                state.migrations.paused_export_for_slot(
-                    crate::engine::distributed::cluster::node::key_hash_slot(key),
-                )
-            })
+        let job_id = keys.iter().find_map(|key| {
+            state.migrations.paused_export_for_slot(
+                crate::engine::distributed::cluster::node::key_hash_slot(key),
+            )
         })?;
         Some(DispatchOutcome {
             action: DispatchAction::Postpone(PostponeReason::SlotMigration(job_id)),

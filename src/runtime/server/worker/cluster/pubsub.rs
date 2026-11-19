@@ -15,16 +15,16 @@ mod cluster_bus;
 mod shard;
 
 impl ServerWorkerState {
-    pub(crate) fn is_subscribe_mode_allowed(name: &str) -> bool {
-        name.eq_ignore_ascii_case("subscribe")
-            || name.eq_ignore_ascii_case("unsubscribe")
-            || name.eq_ignore_ascii_case("psubscribe")
-            || name.eq_ignore_ascii_case("punsubscribe")
-            || name.eq_ignore_ascii_case("ssubscribe")
-            || name.eq_ignore_ascii_case("sunsubscribe")
-            || name.eq_ignore_ascii_case("ping")
-            || name.eq_ignore_ascii_case("quit")
-            || name.eq_ignore_ascii_case("reset")
+    pub(crate) fn is_subscribe_mode_allowed(name: &[u8]) -> bool {
+        name.eq_ignore_ascii_case(b"subscribe")
+            || name.eq_ignore_ascii_case(b"unsubscribe")
+            || name.eq_ignore_ascii_case(b"psubscribe")
+            || name.eq_ignore_ascii_case(b"punsubscribe")
+            || name.eq_ignore_ascii_case(b"ssubscribe")
+            || name.eq_ignore_ascii_case(b"sunsubscribe")
+            || name.eq_ignore_ascii_case(b"ping")
+            || name.eq_ignore_ascii_case(b"quit")
+            || name.eq_ignore_ascii_case(b"reset")
     }
 
     pub(crate) fn deliver_published(
@@ -499,21 +499,21 @@ mod tests {
     #[test]
     fn subscribe_mode_allows_only_pubsub_control_commands() {
         for name in [
-            "subscribe",
-            "unsubscribe",
-            "psubscribe",
-            "punsubscribe",
-            "ssubscribe",
-            "sunsubscribe",
-            "ping",
-            "quit",
-            "reset",
+            b"subscribe".as_slice(),
+            b"unsubscribe",
+            b"psubscribe",
+            b"punsubscribe",
+            b"ssubscribe",
+            b"sunsubscribe",
+            b"ping",
+            b"quit",
+            b"reset",
         ] {
             assert!(ServerWorkerState::is_subscribe_mode_allowed(name));
         }
 
-        assert!(!ServerWorkerState::is_subscribe_mode_allowed("get"));
-        assert!(!ServerWorkerState::is_subscribe_mode_allowed("publish"));
+        assert!(!ServerWorkerState::is_subscribe_mode_allowed(b"get"));
+        assert!(!ServerWorkerState::is_subscribe_mode_allowed(b"publish"));
     }
 
     #[test]

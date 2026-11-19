@@ -201,6 +201,18 @@ impl<K: Eq + Hash, V> KVStore<K, V> {
             .and_then(|dict| dict.get(key))
     }
 
+    /// Byte-slice variant of `get_in_slot` for `K: Borrow<[u8]>` stores.
+    /// Skips the `Hash` trait collection step; see `Dict::get_bytes`.
+    pub fn get_in_slot_bytes(&self, slot: usize, key: &[u8]) -> Option<&V>
+    where
+        K: Borrow<[u8]>,
+    {
+        self.slots
+            .get(slot)
+            .and_then(|s| s.as_ref())
+            .and_then(|dict| dict.get_bytes(key))
+    }
+
     pub(crate) fn get_key_value_in_slot<Q: Hash + Eq + ?Sized>(
         &self,
         slot: usize,
@@ -233,6 +245,18 @@ impl<K: Eq + Hash, V> KVStore<K, V> {
             .and_then(|dict| dict.get_mut(key))
     }
 
+    /// Byte-slice mutable lookup variant of `get_mut_in_slot` for
+    /// `K: Borrow<[u8]>` stores. Skips the `Hash` trait collection step.
+    pub fn get_mut_in_slot_bytes(&mut self, slot: usize, key: &[u8]) -> Option<&mut V>
+    where
+        K: Borrow<[u8]>,
+    {
+        self.slots
+            .get_mut(slot)
+            .and_then(|s| s.as_mut())
+            .and_then(|dict| dict.get_mut_bytes(key))
+    }
+
     pub fn contains_key<Q: Hash + Eq + ?Sized>(&self, key: &Q) -> bool
     where
         K: Borrow<Q>,
@@ -245,6 +269,15 @@ impl<K: Eq + Hash, V> KVStore<K, V> {
         K: Borrow<Q>,
     {
         self.get_in_slot(slot, key).is_some()
+    }
+
+    /// Byte-slice membership variant of `contains_key_in_slot` for
+    /// `K: Borrow<[u8]>` stores.
+    pub fn contains_key_in_slot_bytes(&self, slot: usize, key: &[u8]) -> bool
+    where
+        K: Borrow<[u8]>,
+    {
+        self.get_in_slot_bytes(slot, key).is_some()
     }
 
     pub fn insert(&mut self, key: K, value: V) -> Option<V> {
@@ -291,6 +324,28 @@ impl<K: Eq + Hash, V> KVStore<K, V> {
         removed
     }
 
+    /// Byte-slice removal variant of `remove_in_slot` for `K: Borrow<[u8]>`
+    /// stores. Skips the `Hash` trait collection step.
+    pub fn remove_in_slot_bytes(&mut self, slot: usize, key: &[u8]) -> Option<V>
+    where
+        K: Borrow<[u8]>,
+    {
+        let slot_entry = self.slots.get_mut(slot)?;
+        let dict = slot_entry.as_mut()?;
+        let removed = dict.remove_bytes(key);
+        if removed.is_some() {
+            self.total_len -= 1;
+            if self.importing_slots.contains(&slot) {
+                self.importing_len = self.importing_len.saturating_sub(1);
+            }
+            if self.slot_bits > 0 && dict.is_empty() {
+                *slot_entry = None;
+                self.allocated_slots.remove(&slot);
+            }
+        }
+        removed
+    }
+
     pub fn keys(&self) -> impl Iterator<Item = &K> {
         self.iter().map(|(k, _)| k)
     }
@@ -300,7 +355,9 @@ impl<K: Eq + Hash, V> KVStore<K, V> {
     /// blocked by `keys().collect()` on large datasets (mirrors C's
     /// `kvstoreGetFairRandomHashtableIndex` + `kvstoreHashtableRandomEntry`).
     pub fn random_entry(&self) -> Option<(&K, &V)> {
-        if self.is_empty() {
+        // Importing keys are invisible to sampling even though the raw store
+        // is nonempty. Avoid a full slot-directory scan when none are eligible.
+        if self.total_len <= self.importing_len {
             return None;
         }
         let n = self.slots.len();

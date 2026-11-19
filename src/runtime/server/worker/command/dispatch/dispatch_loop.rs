@@ -125,12 +125,19 @@ impl ServerWorkerState {
             name,
             resp3,
         };
-        let mut effects = CommandEffects::default();
+        // Reuse the worker-level effect scratch instead of default-constructing
+        // a twelve-`Vec` `CommandEffects` on every command. `Option::take` is
+        // a pointer-swap; the first call falls back to `Default`, and every
+        // subsequent call reuses the struct whose `Vec` capacities survived
+        // the prior `commit`. After dispatch, `commit` drains every field, so
+        // the scratch is empty when stored back.
+        let mut effects = self.command_effects_scratch.take().unwrap_or_default();
         let token = input.token;
         let action = self.dispatch_parsed_command(input, &batch.replies, &mut effects);
         self.refresh_connection_priorities();
         self.account_command_reply_effects(token, &mut effects);
-        batch.commit(effects);
+        batch.commit(&mut effects);
+        self.command_effects_scratch = Some(effects);
         if let Some(state) = priority_state {
             self.finish_priority_cycle(state.owns_priority_cycle);
             self.priority_command_token = state.previous_token;
@@ -234,7 +241,7 @@ impl ServerWorkerState {
         if let Some(action) = self.reject_unauthenticated_command(&input, fx) {
             return action;
         }
-        self.apply_client_test_tcp_buffer_policy(input.token, input.name_str(), &input.args);
+        self.apply_client_test_tcp_buffer_policy(input.token, &input.name, &input.args);
         self.ctx.begin_cmd();
         self.connection_registry[input.token].begin_admitted_command(diagnostic_command);
         self.dispatch_admitted_command(
@@ -437,7 +444,7 @@ impl ServerWorkerState {
     fn apply_client_test_tcp_buffer_policy(
         &mut self,
         token: Token,
-        name: &str,
+        name: &[u8],
         args: &CommandArgs,
     ) {
         // Replicas negotiate on an unclassified accepted socket. Keep their
@@ -449,12 +456,12 @@ impl ServerWorkerState {
         // the map entirely. The role lookup is only needed for commands that
         // could legitimately trigger buffer-limit application.
         if self.connection_registry[token].is_test_tcp_buffer_policy_applied
-            || (name.eq_ignore_ascii_case("ping") && args.args.is_empty())
-            || name.eq_ignore_ascii_case("auth")
-            || name.eq_ignore_ascii_case("hello")
-            || name.eq_ignore_ascii_case("replconf")
-            || name.eq_ignore_ascii_case("psync")
-            || name.eq_ignore_ascii_case("sync")
+            || (name.eq_ignore_ascii_case(b"ping") && args.args.is_empty())
+            || name.eq_ignore_ascii_case(b"auth")
+            || name.eq_ignore_ascii_case(b"hello")
+            || name.eq_ignore_ascii_case(b"replconf")
+            || name.eq_ignore_ascii_case(b"psync")
+            || name.eq_ignore_ascii_case(b"sync")
             || self
                 .replication_runtime
                 .role(crate::framework::distributed::replication::ConnectionId(
@@ -516,11 +523,14 @@ impl ServerWorkerState {
             if self.should_reject_subscribe_mode(input) {
                 return SpecialCommandRoute::RejectSubscribeMode;
             }
-            if input.name_str().eq_ignore_ascii_case("exec") {
+            // Byte-wise ASCII case folding avoids a per-command UTF-8
+            // validation (`from_utf8`); command names only need to match ASCII
+            // literals here, and `[u8]::eq_ignore_ascii_case` is equivalent.
+            if input.name.eq_ignore_ascii_case(b"exec") {
                 return SpecialCommandRoute::Exec;
             }
         }
-        if self.should_queue_in_transaction(input.token, input.name_str()) {
+        if self.should_queue_in_transaction(input.token, &input.name) {
             return SpecialCommandRoute::MultiQueue;
         }
         match group {
@@ -531,8 +541,8 @@ impl ServerWorkerState {
             | DispatchGroup::Transaction
             | DispatchGroup::Auth
             | DispatchGroup::Shutdown => {
-                if input.name_str().eq_ignore_ascii_case("publish")
-                    || input.name_str().eq_ignore_ascii_case("spublish")
+                if input.name.eq_ignore_ascii_case(b"publish")
+                    || input.name.eq_ignore_ascii_case(b"spublish")
                 {
                     SpecialCommandRoute::PubSub
                 } else {
@@ -645,7 +655,7 @@ impl ServerWorkerState {
         let is_subscribed = conn.sub_channel_count > 0
             || conn.psub_channel_count > 0
             || conn.ssub_channel_count > 0;
-        is_subscribed && !input.resp3 && !Self::is_subscribe_mode_allowed(input.name_str())
+        is_subscribed && !input.resp3 && !Self::is_subscribe_mode_allowed(&input.name)
     }
 
     pub(crate) fn process_dirty_keys_in_loop(
@@ -662,17 +672,23 @@ impl ServerWorkerState {
             Some(Token(token_value)),
             &mut effects.tracking,
         );
-        for (db_id, key) in &effects.watch_dirty {
-            let exists_after = self
-                .ctx
-                .db(*db_id)
-                .is_some_and(|db| db.exists_no_expire(key));
-            for (_, conn) in self.connection_registry.iter_mut() {
-                if conn.transaction.watched_keys().is_empty() {
-                    continue;
+        // Fast path: when no connection holds WATCHed keys, the per-connection
+        // scan below is pure overhead. The `watched_key_clients` counter is
+        // maintained by `record_completion_metadata`, the EXEC accounting
+        // path, and connection teardown, so it stays accurate without a scan.
+        if self.watched_key_clients > 0 {
+            for (db_id, key) in &effects.watch_dirty {
+                let exists_after = self
+                    .ctx
+                    .db(*db_id)
+                    .is_some_and(|db| db.exists_no_expire(key));
+                for (_, conn) in self.connection_registry.iter_mut() {
+                    if conn.transaction.watched_keys().is_empty() {
+                        continue;
+                    }
+                    conn.transaction
+                        .touch_watched_key(*db_id, key, exists_after);
                 }
-                conn.transaction
-                    .touch_watched_key(*db_id, key, exists_after);
             }
         }
         let dirty_keys = std::mem::take(&mut effects.watch_dirty);

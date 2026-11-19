@@ -29,7 +29,7 @@ pub fn getset(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> CommandOu
         db.set(key.to_vec(), val);
     }
     let reply = match old_obj {
-        Some(obj) => Value::bulk(obj.as_bytes().to_vec()),
+        Some(obj) => Value::bulk(obj.string_bytes()),
         None => Value::null(),
     };
     CommandOutcome {

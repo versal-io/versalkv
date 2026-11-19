@@ -74,6 +74,13 @@ pub(in crate::runtime::server) enum SocketIoOwner {
     },
 }
 
+/// Maximum capacity (in bytes) of a reply buffer retained in
+/// `reply_buffer_pool`. Larger frames are dropped after being written.
+pub(crate) const REPLY_BUFFER_POOL_MAX_CAP: usize = 4 * 1024;
+/// Bound retained allocations even when replication produces more reusable
+/// frames than ordinary replies consume. Payload capacity is at most 256 KiB.
+pub(crate) const REPLY_BUFFER_POOL_MAX_LEN: usize = 64;
+
 pub(crate) struct ServerWorkerState {
     pub(in crate::runtime::server) transport: RuntimeTransport<ProductionTransport>,
     pub(in crate::runtime::server) runtime_sources: RuntimeSourceRegistry,
@@ -140,6 +147,14 @@ pub(crate) struct ServerWorkerState {
     pub(in crate::runtime::server) pending_due_time_events: HashMap<TimeEventId, DueTimeEvent>,
     pub(in crate::runtime::server) module_timer_event: Option<TimeEventId>,
     pub(in crate::runtime::server) event_loop_cycle_start: Option<EventLoopCycleStart>,
+    /// Wall-clock snapshot shared by every command admitted during the current
+    /// event-loop cycle. C Valkey updates `server.mstime` once per iteration
+    /// (in `beforeSleep`) and all commands in a pipeline observe the same
+    /// value. This guard installs that snapshot at cycle start and restores
+    /// the previous cell state when the cycle completes, so a pipeline of N
+    /// commands pays for a single `SystemTime::now` instead of N.
+    pub(in crate::runtime::server) cycle_time_guard:
+        Option<crate::foundation::io::sys::time::CommandTimeSnapshotGuard>,
     /// Set when the command path performs key eviction during the current
     /// event-loop turn. The timer-driven eviction continuation defers to the
     /// next turn when this is set, so every eviction cycle is separated by a
@@ -174,6 +189,28 @@ pub(crate) struct ServerWorkerState {
     /// signalKeyAsReady → beforeSleep batching).
     pub(in crate::runtime::server) ready_keys: Vec<(u32, Bytes)>,
     pub(in crate::runtime::server) ready_keys_set: HashSet<(u32, Bytes)>,
+    /// Number of connections currently holding at least one WATCHed key.
+    /// Lets `process_dirty_keys_in_loop` skip the per-connection scan when no
+    /// client is watching anything, which is the common standalone
+    /// SET/GET/INCR workload. Maintained alongside `Connection.synced_watched_keys`.
+    pub(in crate::runtime::server) watched_key_clients: usize,
+    /// Reusable per-command effect scratch space. `process_parsed_command`
+    /// takes this `Option` (a pointer-swap, no `Default` call), dispatches
+    /// into it, commits it to the read batch, and stores it back. Reusing the
+    /// struct avoids re-initialising the twelve `Vec` fields on every command
+    /// and lets their heap capacities survive across commands, eliminating
+    /// per-command `Vec` allocations for the common reply/`watch_dirty` paths.
+    pub(in crate::runtime::server) command_effects_scratch:
+        Option<super::command::dispatch::CommandEffects>,
+    /// Free-list of reply `Vec<u8>` buffers recycled after they are fully
+    /// written to the socket. `acquire_reply_buffer` pops one (reusing its
+    /// heap capacity) or allocates a fresh one; the write path pushes
+    /// fully-consumed frames back here. This eliminates the per-reply
+    /// `malloc`/`free` pair that every command reply would otherwise pay on
+    /// the common PING/SET/GET/INCR hot path. Buffers larger than
+    /// `REPLY_BUFFER_POOL_MAX_CAP` or exceeding `REPLY_BUFFER_POOL_MAX_LEN`
+    /// are dropped so replication traffic cannot grow the free-list forever.
+    pub(in crate::runtime::server) reply_buffer_pool: Vec<Vec<u8>>,
 }
 
 impl ServerWorkerState {
@@ -203,6 +240,14 @@ impl ServerWorkerState {
         if !keys.is_empty() {
             self.wakeup_blocked_on_keys(&keys, None, None);
         }
+    }
+
+    /// Acquire a reply buffer from the pool, reusing a previously-recycled
+    /// `Vec<u8>` allocation when one is available. The returned buffer is
+    /// empty but may carry heap capacity from a prior reply, so the
+    /// serializer avoids a fresh `malloc` on the common hot path.
+    pub(in crate::runtime::server) fn acquire_reply_buffer(&mut self) -> Vec<u8> {
+        self.reply_buffer_pool.pop().unwrap_or_default()
     }
 
     pub fn new(num_dbs: u32) -> std::io::Result<Self> {
@@ -299,6 +344,7 @@ impl ServerWorkerState {
             pending_due_time_events: HashMap::new(),
             module_timer_event: None,
             event_loop_cycle_start: None,
+            cycle_time_guard: None,
             command_eviction_ran_this_turn: false,
             priority_subnets_generation: 0,
             priority_command_token: None,
@@ -317,6 +363,9 @@ impl ServerWorkerState {
             active_defrag: ActiveDefragState::default(),
             ready_keys: Vec::new(),
             ready_keys_set: HashSet::new(),
+            watched_key_clients: 0,
+            command_effects_scratch: None,
+            reply_buffer_pool: Vec::new(),
         })
     }
 

@@ -39,12 +39,20 @@ pub(crate) struct EffectQueue {
 }
 
 impl EffectQueue {
-    fn append(&mut self, mut other: Self) {
+    /// Merge `other` into `self`, draining every field of `other`. Taking
+    /// `other` by `&mut` (instead of by value) avoids moving the ~384-byte
+    /// `EffectQueue` struct on the per-command hot path. `std::mem::take`
+    /// leaves each field in its default (empty) state so the caller can drop
+    /// or reuse `other` without double-freeing any heap storage.
+    fn append(&mut self, other: &mut Self) {
         self.replies.append(&mut other.replies);
         self.command_reply_bytes = self
             .command_reply_bytes
-            .saturating_add(other.command_reply_bytes);
-        self.deferred_slot_metric = other.deferred_slot_metric.or(self.deferred_slot_metric);
+            .saturating_add(std::mem::take(&mut other.command_reply_bytes));
+        self.deferred_slot_metric = other
+            .deferred_slot_metric
+            .take()
+            .or(self.deferred_slot_metric);
         self.cmd_logs.append(&mut other.cmd_logs);
         self.monitor.append(&mut other.monitor);
         self.watch_dirty.append(&mut other.watch_dirty);
@@ -58,8 +66,9 @@ impl EffectQueue {
             .append(&mut other.cluster_publish_shard);
         self.unblock.append(&mut other.unblock);
         self.tracking.append(&mut other.tracking);
-        self.swapdb = other.swapdb.or(self.swapdb);
+        self.swapdb = other.swapdb.take().or(self.swapdb);
         self.mark_closing |= other.mark_closing;
+        other.mark_closing = false;
     }
 }
 
@@ -176,8 +185,8 @@ impl DerefMut for CommandEffects {
 pub(crate) struct ReadBatchEffects(pub(super) EffectQueue);
 
 impl ReadBatchEffects {
-    pub(super) fn commit(&mut self, command: CommandEffects) {
-        self.0.append(command.0);
+    pub(super) fn commit(&mut self, command: &mut CommandEffects) {
+        self.0.append(&mut command.0);
     }
 }
 
@@ -210,8 +219,8 @@ mod tests {
         second.replication_only.push(b"repl-second".to_vec());
         second.mark_closing = true;
 
-        batch.commit(first);
-        batch.commit(second);
+        batch.commit(&mut first);
+        batch.commit(&mut second);
 
         assert_eq!(batch.replies, [b"first".to_vec(), b"second".to_vec()]);
         assert_eq!(

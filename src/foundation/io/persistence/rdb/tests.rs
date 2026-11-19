@@ -5,8 +5,8 @@ use crate::foundation::io::store::structure::list::ListValue;
 use crate::foundation::io::store::structure::set::ValkeySet;
 use crate::foundation::io::store::structure::zset::ZSetSl;
 use crate::foundation::io::store::Robj;
+use crate::foundation::memory::util_hash::FxIndexMap;
 use bytes::Bytes;
-use indexmap::IndexMap;
 use std::collections::{HashSet, VecDeque};
 
 #[test]
@@ -484,7 +484,7 @@ fn load_rdb_rebuilds_all_types() {
             b"st".to_vec(),
             Robj::SetHashtable(ValkeySet::from_hashset(set)),
         );
-        let mut h = IndexMap::new();
+        let mut h = FxIndexMap::default();
         h.insert(Bytes::from_static(b"f"), Bytes::from_static(b"v"));
         db.set(
             b"h".to_vec(),

@@ -7,6 +7,7 @@ use crate::framework::capabilities::io::Token;
 use crate::runtime::server::worker::event_loop::io_workers::{
     WriteCompletion, WriteCompletionAction, WriteSubmission,
 };
+use crate::runtime::server::worker::state::{REPLY_BUFFER_POOL_MAX_CAP, REPLY_BUFFER_POOL_MAX_LEN};
 use std::collections::VecDeque;
 use std::io::{IoSlice, Write};
 
@@ -66,6 +67,7 @@ fn flush_queue_vectored(
     stream: &mut impl Write,
     queue: &mut VecDeque<Vec<u8>>,
     byte_budget: Option<usize>,
+    mut reply_buffer_pool: Option<&mut Vec<Vec<u8>>>,
 ) -> (WriteOutcome, usize) {
     let mut total_written = 0usize;
     let mut released_allocation_bytes = 0usize;
@@ -133,6 +135,20 @@ fn flush_queue_vectored(
                 released_allocation_bytes = released_allocation_bytes.saturating_add(
                     crate::foundation::memory::util_alloc::vec_allocation_bytes(&frame),
                 );
+                // Recycle fully-consumed reply frames back into the pool so
+                // the next command reply can reuse the heap allocation
+                // instead of paying for a fresh `malloc`. Large frames
+                // (bulk strings, replication payloads) are dropped to keep
+                // the pool bounded.
+                if let Some(pool) = reply_buffer_pool.as_deref_mut() {
+                    if frame.capacity() <= REPLY_BUFFER_POOL_MAX_CAP
+                        && pool.len() < REPLY_BUFFER_POOL_MAX_LEN
+                    {
+                        let mut frame = frame;
+                        frame.clear();
+                        pool.push(frame);
+                    }
+                }
                 n -= flen;
             } else {
                 queue.front_mut().unwrap().drain(..n);
@@ -439,8 +455,12 @@ impl ServerWorkerState {
             };
             let mut queue = std::mem::take(&mut conn.output.queue);
             let queued_before: usize = queue.iter().map(Vec::len).sum();
-            let (result, released_allocation_bytes) =
-                flush_queue_vectored(&mut stream, &mut queue, write_budget);
+            let (result, released_allocation_bytes) = flush_queue_vectored(
+                &mut stream,
+                &mut queue,
+                write_budget,
+                Some(&mut self.reply_buffer_pool),
+            );
             let written = queued_before.saturating_sub(queue.iter().map(Vec::len).sum::<usize>());
             let replication_written = conn.consume_written_bytes(written, queued_before);
             conn.release_output_frame_allocations(released_allocation_bytes);
@@ -675,7 +695,12 @@ impl ServerWorkerState {
             && queue.iter().any(|frame| {
                 frame == crate::engine::distributed::replication::protocol::DUAL_CHANNEL_SYNC_REPLY
             });
-        let (result, released) = flush_queue_vectored(&mut stream, &mut queue, write_budget);
+        let (result, released) = flush_queue_vectored(
+            &mut stream,
+            &mut queue,
+            write_budget,
+            Some(&mut self.reply_buffer_pool),
+        );
         let written = queued_before.saturating_sub(queue.iter().map(Vec::len).sum::<usize>());
         let replication_written = conn.consume_written_bytes(written, queued_before);
         conn.release_output_frame_allocations(released);

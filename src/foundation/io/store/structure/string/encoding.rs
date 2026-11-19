@@ -1,4 +1,9 @@
 pub fn int_encodable(b: &[u8]) -> Option<i64> {
+    // i64::MIN text is "-9223372036854775808" (20 bytes). Anything longer
+    // cannot be a valid i64, so skip the UTF-8 validation and parse entirely.
+    if b.len() > 20 {
+        return None;
+    }
     let s = std::str::from_utf8(b).ok()?;
     let n: i64 = s.parse().ok()?;
     if n.to_string().as_bytes() == b {

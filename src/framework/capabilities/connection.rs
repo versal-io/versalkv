@@ -117,6 +117,11 @@ pub struct Connection {
     reply: ReplyPolicy,
     pub psub_channel_count: usize,
     pub(crate) transaction: TransactionState,
+    /// Last `watched_keys` count mirrored to `ClientInfo`. Lets
+    /// `record_completion_metadata` skip the `client_info_mut` HashMap lookup
+    /// on the common hot path where the count never changes (e.g. a pure
+    /// SET/GET/INCR workload never issues WATCH).
+    pub(crate) synced_watched_keys: usize,
     pub blocked: Option<BlockedState>,
     pub name: Option<Bytes>,
     pub lib_name: String,
@@ -213,6 +218,7 @@ impl Connection {
             reply: ReplyPolicy::default(),
             psub_channel_count: 0,
             transaction: TransactionState::default(),
+            synced_watched_keys: 0,
             blocked: None,
             name: None,
             lib_name: String::new(),
@@ -767,16 +773,12 @@ impl Connection {
 
     pub fn remember_query_bytes(&mut self, bytes: &[u8]) {
         // C logs only a bounded query-buffer excerpt for protocol/crash
-        // diagnostics. Retaining a megabyte copy for every normal client
-        // read makes CLIENT REPLY OFF pipelines consume memory unrelated to
-        // the keyspace.
+        // diagnostics. Retaining a megabyte copy for every normal client read
+        // makes CLIENT REPLY OFF pipelines consume memory unrelated to the
+        // keyspace.
         const MAX_SNAPSHOT: usize = 64;
         if let Some(debug_at) = (!self.last_query_snapshot.is_empty())
-            .then(|| {
-                bytes
-                    .windows(5)
-                    .position(|window| window.eq_ignore_ascii_case(b"DEBUG"))
-            })
+            .then(|| find_debug_ignore_case(bytes))
             .flatten()
         {
             let remaining = MAX_SNAPSHOT.saturating_sub(self.last_query_snapshot.len());
@@ -928,6 +930,7 @@ impl Connection {
             reply: ReplyPolicy::default(),
             psub_channel_count: 0,
             transaction: TransactionState::default(),
+            synced_watched_keys: 0,
             blocked: None,
             name: None,
             lib_name: String::new(),
@@ -960,3 +963,24 @@ impl Connection {
 
 #[cfg(test)]
 mod tests;
+
+/// Find the byte offset of an ASCII, case-insensitive `DEBUG` token.
+///
+/// Equivalent to `bytes.windows(5).position(|w| w.eq_ignore_ascii_case(b"DEBUG"))`
+/// but uses a SIMD `memchr` to jump over runs that lack a leading `d`/`D`
+/// instead of doing five comparisons at every window. This runs on every
+/// admitted read batch, so the hot no-`DEBUG` path must stay linear and cheap.
+fn find_debug_ignore_case(bytes: &[u8]) -> Option<usize> {
+    let mut start = 0;
+    while let Some(relative) = memchr::memchr2(b'd', b'D', &bytes[start..]) {
+        let index = start + relative;
+        if bytes
+            .get(index..index + 5)
+            .is_some_and(|window| window.eq_ignore_ascii_case(b"DEBUG"))
+        {
+            return Some(index);
+        }
+        start = index + 1;
+    }
+    None
+}

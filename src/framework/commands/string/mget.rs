@@ -16,7 +16,7 @@ pub fn mget(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> CommandOutc
     let mut events = Vec::new();
     for key in &args.args {
         match db.get_at(key, now_ms) {
-            Some(value) if value.is_string() => values.push(Value::bulk(value.as_bytes().to_vec())),
+            Some(value) if value.is_string() => values.push(Value::bulk(value.string_bytes())),
             Some(_) => values.push(Value::null()),
             None => {
                 values.push(Value::null());

@@ -8,7 +8,7 @@ use crate::foundation::io::store::structure::zset::ZSetSl;
 use crate::foundation::io::store::kv_engine::{now_ms, DbSet};
 use crate::foundation::io::store::Robj;
 use bytes::Bytes;
-use indexmap::IndexMap;
+use crate::foundation::memory::util_hash::FxIndexMap;
 use std::collections::HashSet;
 use std::io::{self, Write};
 
@@ -35,7 +35,7 @@ fn disk_sync_streaming_fixture() -> DbSet {
     list.push_back(Bytes::from_static(b"b"));
     let mut set = HashSet::new();
     set.insert(Bytes::from_static(b"member"));
-    let mut hash = IndexMap::new();
+    let mut hash = FxIndexMap::default();
     hash.insert(Bytes::from_static(b"field"), Bytes::from_static(b"value"));
     let mut zset = HashTable::new();
     zset.insert(Bytes::from_static(b"member"), 1.5);
@@ -495,7 +495,7 @@ fn rdb_container_types_roundtrip() {
     set.insert(Bytes::from_static(b"x"));
     set.insert(Bytes::from_static(b"y"));
 
-    let mut hash = IndexMap::new();
+    let mut hash = FxIndexMap::default();
     hash.insert(Bytes::from_static(b"f1"), Bytes::from_static(b"v1"));
     hash.insert(Bytes::from_static(b"f2"), Bytes::from_static(b"v2"));
 

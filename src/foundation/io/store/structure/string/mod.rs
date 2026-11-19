@@ -133,6 +133,29 @@ impl StrInt {
             raw: InlineStr::new(&raw),
         }
     }
+
+    /// Build a `StrInt` directly from an `i64` without going through a heap
+    /// `String` or `Bytes` allocation. The canonical decimal text is rendered
+    /// into a fixed-size stack buffer and copied into the inline storage.
+    pub fn from_i64(value: i64) -> Self {
+        let mut buf = [0u8; 20];
+        let text = format_i64(value, &mut buf);
+        Self {
+            value,
+            raw: InlineStr::new(text),
+        }
+    }
+
+    /// Update both the stored integer and its inline text representation in
+    /// place. Used by increment/decrement commands to avoid a dict remove +
+    /// insert round-trip for integer-encoded values.
+    pub fn set_value(&mut self, value: i64) {
+        let mut buf = [0u8; 20];
+        let text = format_i64(value, &mut buf);
+        self.value = value;
+        self.raw = InlineStr::new(text);
+    }
+
     pub fn encoding(&self) -> Encoding {
         Encoding::Int
     }
@@ -206,6 +229,33 @@ impl StrRaw {
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
+}
+
+/// Render `value` as canonical ASCII decimal into `buf` and return the
+/// populated slice. `buf` must be at least 20 bytes long (i64::MIN text).
+#[inline]
+fn format_i64(value: i64, buf: &mut [u8; 20]) -> &[u8] {
+    if value == i64::MIN {
+        let s = b"-9223372036854775808";
+        buf[..s.len()].copy_from_slice(s);
+        return &buf[..s.len()];
+    }
+    let negative = value < 0;
+    let mut n = if negative { -value } else { value } as u64;
+    let mut pos = buf.len();
+    loop {
+        pos -= 1;
+        buf[pos] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    if negative {
+        pos -= 1;
+        buf[pos] = b'-';
+    }
+    &buf[pos..]
 }
 
 const _: () = assert!(std::mem::size_of::<InlineStr>() == 24);

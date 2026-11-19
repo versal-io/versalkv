@@ -26,6 +26,42 @@ pub fn set(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> CommandOutco
     };
     let key = key.clone();
     let value = Robj::string(value.clone());
+
+    // Fast path: plain SET with no conditions, no GET, no expiry. Skip the
+    // pre-lookup of the old value (which does a full dict read + Robj clone)
+    // and let `set_slice` report whether the key was new. C Valkey's
+    // `setGenericCommand` similarly avoids `lookupKeyWrite` for the default
+    // SET case when no GET/NX/XX/expire options are present.
+    if !opts.get
+        && matches!(opts.condition, ConditionOption::None)
+        && matches!(opts.expire, ExpireOption::None)
+    {
+        let Some(db) = runtime.db_mut() else {
+            return CommandOutcome::reply(CommandError::db_index_out_of_range());
+        };
+        db.set_no_lazy_expire(should_suppress_expire);
+        let is_new = db.set_slice(&key, value);
+        db.set_no_lazy_expire(false);
+        let mut effects = CommandEffects {
+            changed_keys: vec![(db_index, key.clone())],
+            events: vec![CoreEvent {
+                kind: "set",
+                key: key.clone(),
+            }],
+            ..CommandEffects::default()
+        };
+        if is_new {
+            effects.events.push(CoreEvent {
+                kind: "new",
+                key: key.clone(),
+            });
+        }
+        return CommandOutcome {
+            reply: Value::ok(),
+            effects,
+        };
+    }
+
     let old_value = {
         let Some(db) = runtime.db_mut() else {
             return CommandOutcome::reply(CommandError::db_index_out_of_range());
@@ -116,10 +152,14 @@ pub fn set(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> CommandOutco
             return CommandOutcome::reply(CommandError::db_index_out_of_range());
         };
         match opts.expire {
-            ExpireOption::None => db.set(key.clone().to_vec(), value),
-            ExpireOption::KeepTtl => db.set_keep_ttl(key.clone().to_vec(), value),
+            ExpireOption::None => {
+                let _ = db.set_slice(&key, value);
+            }
+            ExpireOption::KeepTtl => {
+                let _ = db.set_keep_ttl_slice(&key, value);
+            }
             ExpireOption::At(deadline_ms) => {
-                db.set(key.clone().to_vec(), value);
+                let _ = db.set_slice(&key, value);
                 db.set_expire(&key, deadline_ms as u64);
                 if should_mark_replica_local_expire {
                     db.mark_replica_local_expire(&key);
@@ -251,7 +291,7 @@ fn get_set_reply(get: bool, old_value: Option<Robj>) -> Value {
         return Value::ok();
     }
     match old_value {
-        Some(value) => Value::bulk(value.as_bytes().to_vec()),
+        Some(value) => Value::bulk(value.string_bytes()),
         None => Value::null(),
     }
 }

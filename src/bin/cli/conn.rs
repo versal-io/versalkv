@@ -264,6 +264,10 @@ impl Connection {
         &mut self,
         writer: &mut W,
     ) -> Result<ReplicationRdbTransfer, String> {
+        // RDB preparation and transfer can exceed the normal command read timeout.
+        self.stream
+            .set_read_timeout(None)
+            .map_err(|error| format!("Could not clear replication read timeout: {}", error))?;
         let mut header = self.read_replication_line()?;
         if header.starts_with(b"+FULLRESYNC") {
             header = self.read_replication_line()?;
@@ -434,6 +438,81 @@ mod tests {
         let connection = Connection::connect_with_defaults("127.0.0.1", port).unwrap();
         let server = listener.accept().unwrap().0;
         (connection, server)
+    }
+
+    #[test]
+    fn command_requests_preserve_read_and_write_timeouts() {
+        let (mut connection, mut server) = tcp_pair();
+        server.write_all(b"+PONG\r\n").unwrap();
+        assert!(matches!(
+            connection.send_command(&[b"PING"]).unwrap(),
+            super::RespValue::SimpleString(reply) if reply == "PONG"
+        ));
+
+        let StreamType::Tcp(stream) = &connection.stream else {
+            panic!("expected TCP connection");
+        };
+        assert_eq!(
+            stream.read_timeout().unwrap(),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(
+            stream.write_timeout().unwrap(),
+            Some(Duration::from_secs(30))
+        );
+    }
+
+    #[test]
+    fn replication_rdb_clears_read_timeout_only() {
+        for (payload, expected_transfer, expected_rdb) in [
+            (
+                &b"$3\r\nRDB"[..],
+                ReplicationRdbTransfer::FullLength,
+                &b"RDB"[..],
+            ),
+            (
+                &b"+FULLRESYNC 0123456789012345678901234567890123456789 0\r\n\
+$EOF:0123456789012345678901234567890123456789\r\n\
+RDB0123456789012345678901234567890123456789"[..],
+                ReplicationRdbTransfer::FullEof,
+                &b"RDB"[..],
+            ),
+            (
+                &b"+CONTINUE\r\n"[..],
+                ReplicationRdbTransfer::Partial,
+                &b""[..],
+            ),
+        ] {
+            let (mut connection, mut server) = tcp_pair();
+            let StreamType::Tcp(stream) = &connection.stream else {
+                panic!("expected TCP connection");
+            };
+            assert_eq!(
+                stream.read_timeout().unwrap(),
+                Some(Duration::from_secs(30))
+            );
+            server.write_all(payload).unwrap();
+
+            let mut rdb = Vec::new();
+            assert_eq!(
+                connection.read_replication_rdb(&mut rdb).unwrap(),
+                expected_transfer
+            );
+            assert_eq!(rdb, expected_rdb);
+
+            let StreamType::Tcp(stream) = &connection.stream else {
+                panic!("expected TCP connection");
+            };
+            assert_eq!(
+                stream.read_timeout().unwrap(),
+                None,
+                "{expected_transfer:?}"
+            );
+            assert_eq!(
+                stream.write_timeout().unwrap(),
+                Some(Duration::from_secs(30))
+            );
+        }
     }
 
     #[test]

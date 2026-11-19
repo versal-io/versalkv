@@ -254,13 +254,35 @@ impl ServerWorkerState {
             command_time_usec: cycle_cmd_start,
             commands_processed: cycle_processed_start,
         });
+        // Ordinary commands in a pipeline share one snapshot. Hosted commands
+        // and transactions invalidate it on completion so a long execution
+        // cannot leave subsequent commands observing stale expiry deadlines.
+        // Sharing the cycle clock avoids resolving a separate lazy snapshot
+        // through `SystemTime::now` for each ordinary command. The guard
+        // restores the prior cell state when the cycle is recorded complete.
+        let cycle_ms = crate::foundation::io::sys::time::mstime();
+        self.cycle_time_guard =
+            Some(crate::foundation::io::sys::time::enter_command_time_snapshot(cycle_ms));
         self.command_eviction_ran_this_turn = false;
+    }
+
+    pub(crate) fn refresh_event_loop_cycle_time_after_execution(&mut self) {
+        if self.command_execution_depth == 0 && self.cycle_time_guard.is_some() {
+            // Command-local guards must already be gone. Nested execution
+            // retains the outer command's frozen time until that unit ends.
+            self.cycle_time_guard = None;
+            self.cycle_time_guard =
+                Some(crate::foundation::io::sys::time::enter_command_time_snapshot_lazy());
+        }
     }
 
     pub(super) fn record_completed_event_loop_cycle(&mut self) {
         let Some(cycle) = self.event_loop_cycle_start.take() else {
             return;
         };
+        // Drop the cycle-level wall-clock snapshot so commands running outside
+        // a recorded cycle (e.g. wakeup servicing) observe real time again.
+        self.cycle_time_guard = None;
         let cycle_duration_usec = MonotonicInstant::now()
             .as_micros()
             .saturating_sub(cycle.started_at.as_micros());

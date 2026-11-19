@@ -153,6 +153,14 @@ fn collect_tracking_deliveries(
     dirty_keys: &[(u32, Bytes)],
     source: Option<Token>,
 ) -> Vec<TrackingDelivery> {
+    // Fast path: no client has tracking enabled, so there is nothing to
+    // invalidate. Skip the dirty-count HashMap allocation, the per-key
+    // tracking-table lookup, and the broadcast scan over every connection.
+    // This covers the common standalone SET/GET/INCR workload where CLIENT
+    // TRACKING was never invoked.
+    if tracking.clients.is_empty() {
+        return Vec::new();
+    }
     if dirty_keys.iter().any(|(_, key)| key.is_empty()) {
         return tracking
             .invalidate_all_keys()
@@ -500,6 +508,11 @@ mod tests {
         let key = Bytes::from(vec![b'x'; 1_000]);
         runtime.connection_registry[peer.token].resp_version = 3;
         runtime.connection_registry[peer.token].set_tracking(true);
+        // Mirror the production CLIENT TRACKING ON flow, which registers the
+        // client in the global `tracking.clients` set before any key can be
+        // tracked for it. The `collect_tracking_deliveries` fast path relies
+        // on this invariant to skip work when no client has tracking enabled.
+        runtime.ctx.tracking_mut().clients.insert(peer.token.0);
         runtime.ctx.tracking_mut().remember_key(peer.token.0, &key);
         runtime.event_batch.finish_phase(EventPhase::BeforePoll);
         let mut effects = super::CommandEffects::default();
@@ -577,6 +590,10 @@ mod tests {
     fn no_loop_suppresses_only_the_single_client_write() {
         let key = Bytes::from_static(b"key");
         let mut tracking = TrackingState::new();
+        // Mirror the production CLIENT TRACKING ON flow: a client must be
+        // registered in `tracking.clients` before `remember_key` can track
+        // keys for it. The fast-path check relies on this invariant.
+        tracking.clients.insert(7);
         tracking.remember_key(7, &key);
         let mut connections = ConnectionRegistry::default();
         let mut connection = Connection::new_fake();

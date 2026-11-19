@@ -15,6 +15,11 @@ struct ActiveObserver {
 thread_local! {
     static ACTIVE: RefCell<Option<ActiveObserver>> = const { RefCell::new(None) };
     static SUPPRESSED: Cell<u32> = const { Cell::new(0) };
+    /// Fast-path flag set true only while a `KeyAccessScope` with an observer
+    /// is active. Lets `record_lookup`/`record_delete` skip the
+    /// `RefCell::borrow()` + `Option` chain on the common no-observer path
+    /// (every ordinary GET/SET/INCR key access).
+    static HAS_ACTIVE: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Restores the enclosing command's observer when nested execution finishes.
@@ -28,15 +33,24 @@ impl KeyAccessScope {
             observer,
             record_deletions,
         });
+        let has_active = active.is_some();
         Self {
             previous: ACTIVE.with(|slot| slot.replace(active)),
         }
+        .with_has_active(has_active)
+    }
+
+    fn with_has_active(self, has_active: bool) -> Self {
+        HAS_ACTIVE.with(|flag| flag.set(has_active));
+        self
     }
 }
 
 impl Drop for KeyAccessScope {
     fn drop(&mut self) {
-        ACTIVE.with(|slot| slot.replace(self.previous.take()));
+        let previous = self.previous.take();
+        HAS_ACTIVE.with(|flag| flag.set(previous.is_some()));
+        ACTIVE.with(|slot| slot.replace(previous));
     }
 }
 
@@ -68,6 +82,13 @@ pub fn record_delete(db_id: u32, key: &[u8]) {
 
 fn record(db_id: u32, key: &[u8], is_deletion: bool) {
     if SUPPRESSED.with(Cell::get) != 0 {
+        return;
+    }
+    // Fast path: no observer is registered for this thread, so skip the
+    // `RefCell::borrow()` and `Option` chain. This covers every ordinary
+    // key access (GET/SET/INCR) where no KEYSPACE-notification or tracking
+    // observer is installed.
+    if !HAS_ACTIVE.with(Cell::get) {
         return;
     }
     let observer = ACTIVE.with(|slot| {

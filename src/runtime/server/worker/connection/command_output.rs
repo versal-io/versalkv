@@ -193,7 +193,16 @@ impl ServerWorkerState {
         if is_replication {
             return !self.enforce_client_output_buffer_limit_for(token_value);
         }
-        let _ = self.schedule_ordinary_write(token_value);
+        // Schedule the deferred write. The OrdinaryWrites before-poll slot
+        // drains it before the next `epoll_wait`, mirroring C's
+        // `handleClientsWithPendingWrites` running in `beforeSleep`. We do not
+        // arm `EPOLLOUT` here: the client fd stays registered for `EPOLLIN`
+        // only, eliminating the redundant epoll_ctl MOD pair that the old
+        // ReadWritable/Readable toggle incurred per command. If the socket
+        // buffer cannot absorb the reply, `finish_partial_writable` arms
+        // `EPOLLOUT` exactly like C does on `EAGAIN`.
+        let scheduled = self.schedule_ordinary_write(token_value);
+        let _ = scheduled;
         false
     }
 
@@ -299,12 +308,30 @@ impl ServerWorkerState {
             return;
         }
         if has_output {
-            let token = self.connection_registry
-                [crate::framework::capabilities::io::Token(connection_token)]
-            .token();
-            self.transport
-                .set_interest(token, Interest::ReadWritable)
-                .ok();
+            // Ordinary client replies are drained by the OrdinaryWrites
+            // before-poll slot via the scheduled ClientWrite runnable. Keep
+            // the fd registered for `EPOLLIN` only and skip the
+            // `ReadWritable` arm: toggling interest here and back to
+            // `Readable` after the write was the source of two redundant
+            // `epoll_ctl(MOD)` syscalls per command. Slot-export and
+            // replication connections still rely on `EPOLLOUT` because their
+            // writes are driven by the DistributedWrites slot and may span
+            // multiple turns.
+            let is_ordinary = !is_slot_export
+                && self
+                    .replication_runtime
+                    .role(crate::framework::distributed::replication::ConnectionId(
+                        token_value,
+                    ))
+                    .is_none();
+            if !is_ordinary {
+                let token = self.connection_registry
+                    [crate::framework::capabilities::io::Token(connection_token)]
+                .token();
+                self.transport
+                    .set_interest(token, Interest::ReadWritable)
+                    .ok();
+            }
         } else if mark_closing {
             self.remove_connection(token_value);
             return;

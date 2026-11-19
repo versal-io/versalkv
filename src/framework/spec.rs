@@ -200,6 +200,13 @@ pub(crate) fn effective_acl_categories(
     base_categories: &'static [&'static str],
     subcommand: Option<&[u8]>,
 ) -> &'static [&'static str] {
+    // Fast path: only subcommand-container commands (CONFIG, CLIENT, ...) can
+    // carry subcommand-level ACL category overrides. For the vast majority of
+    // commands (GET, SET, INCR, ...) skip the `from_utf8` conversion and the
+    // linear `subcommand_meta` scan over ALL_COMMAND_META entirely.
+    if !crate::engine::command::is_subcommand_container(name) {
+        return base_categories;
+    }
     let Some(subcommand) = subcommand.and_then(|value| std::str::from_utf8(value).ok()) else {
         return base_categories;
     };

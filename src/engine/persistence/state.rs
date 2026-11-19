@@ -6,7 +6,7 @@ use crate::foundation::io::persistence::snapshot::background::{
 };
 use crate::foundation::io::store::kv_engine::DbSet;
 use std::collections::{HashMap, HashSet};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OperationStatus {
@@ -433,7 +433,19 @@ impl PersistenceState {
     ) -> bool {
         let db_id = self.forkless_original_db(db_id);
         if let Some(feed) = self.forkless_feed.as_mut() {
-            return feed.prioritize_keys(db_id, keys);
+            // Captured keys may still block writers until serialization ends.
+            // They must wait for completion without being written a second time.
+            let captured = &self.forkless_captured_keys;
+            return feed.prioritize_keys(
+                db_id,
+                keys.into_iter().filter(|key| {
+                    !captured.contains(&ForklessItemId {
+                        dataset_id: None,
+                        db_id,
+                        key: key.clone(),
+                    })
+                }),
+            );
         }
         false
     }
@@ -492,6 +504,17 @@ impl PersistenceState {
         if let Some((task, _)) = &self.forkless {
             task.control().set_key_delay(delay_us);
         }
+    }
+
+    pub(crate) fn forkless_capture_poll_delay(&self) -> Option<Duration> {
+        let feed = self.forkless_feed.as_ref()?;
+        Some(if feed.is_backpressured() {
+            // Retry a full feed promptly without spinning while its consumer
+            // waits for a configured per-key delay or storage I/O.
+            Duration::from_millis(1)
+        } else {
+            Duration::ZERO
+        })
     }
 
     /// Current per-key save delay of the in-flight forkless save, if any.

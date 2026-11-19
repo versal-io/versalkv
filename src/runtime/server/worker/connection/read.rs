@@ -209,7 +209,7 @@ impl ServerWorkerState {
         let mut fx = ReadBatchEffects::default();
         let pipeline_yielded = self.run_client_pipeline(token, mode, &mut fx);
         let yielded = yielded || pipeline_yielded;
-        self.complete_client_read(token.0, token.0, fx);
+        self.complete_client_read(token.0, token.0, &mut fx);
         self.schedule_client_read_continuation(token, yielded);
     }
 
@@ -240,7 +240,17 @@ impl ServerWorkerState {
         self.refresh_replication_buffer_accounting_if_dirty();
         {
             let conn = &mut self.connection_registry[token];
-            conn.last_interaction = MonotonicInstant::now();
+            // Reuse the event-loop cycle's monotonic timestamp for idle
+            // bookkeeping. C updates `lastinteraction` from the per-cycle
+            // `server.mstime` cache, so a cycle-start snapshot is accurate
+            // enough and avoids a hardware clock read (TSC/CNTVCT) on every
+            // admitted command. Fall back to a fresh read when processing
+            // happens outside a recorded cycle (e.g. wakeup paths).
+            conn.last_interaction = self
+                .event_loop_cycle_start
+                .as_ref()
+                .map(|cycle| cycle.started_at)
+                .unwrap_or_else(MonotonicInstant::now);
             if !read_data.is_empty() {
                 conn.parser.feed(read_data);
                 conn.remember_query_bytes(read_data);
@@ -336,7 +346,7 @@ impl ServerWorkerState {
         );
         match conn.parser.try_parse_limited(max_mbulk, max_bulk) {
             Ok(Some(parts)) => {
-                let args = CommandArgs::from_parts(parts);
+                let args = CommandArgs::from_parts_reusing(parts);
                 // Keep the original-case command name as Bytes (cheap refcount
                 // clone). Command lookup is case-insensitive and the canonical
                 // lowercased name comes from the resolved CommandSpec, so no

@@ -606,7 +606,7 @@ fn pending_replay_continuation_transfers_to_same_token_replacement() {
     backend.pending_replication_replay = Some(PendingReplayContinuation::new_for_test(
         main,
         original_session_id,
-        crate::foundation::io::sys::time::mstime(),
+        MonotonicInstant::now().as_millis() as i64,
     ));
     backend.pause_replica_main_reads(connection_token).unwrap();
     backend.transport.clear_interest_requests_for_test();
@@ -697,7 +697,7 @@ fn pending_replay_abort_preserves_replacement_after_nested_service() {
     backend.pending_replication_replay = Some(PendingReplayContinuation::new_for_test(
         main,
         original_session_id,
-        crate::foundation::io::sys::time::mstime(),
+        MonotonicInstant::now().as_millis() as i64,
     ));
 
     let replacement = loaded_replay_link(main, 201);
@@ -830,7 +830,7 @@ fn pending_replay_readable_error_aborts_immediately() {
     backend.pending_replication_replay = Some(PendingReplayContinuation::new_for_test(
         main,
         session_id,
-        crate::foundation::io::sys::time::mstime(),
+        MonotonicInstant::now().as_millis() as i64,
     ));
     backend.transport.queue_test_transport_event_batch(&[(
         Token(main.0),
@@ -891,7 +891,7 @@ fn pending_replay_newline_failure_does_not_poll_events() {
     backend.pending_replication_replay = Some(PendingReplayContinuation::new_for_test(
         main,
         session_id,
-        crate::foundation::io::sys::time::mstime().saturating_sub(101),
+        (MonotonicInstant::now().as_millis() as i64).saturating_sub(101),
     ));
     backend
         .transport

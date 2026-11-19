@@ -28,7 +28,7 @@ pub fn getex(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> CommandOut
         db.get_at(key, now_ms)
     };
     let reply = match object {
-        Some(object) if object.is_string() => Value::bulk(object.as_bytes().to_vec()),
+        Some(object) if object.is_string() => Value::bulk(object.string_bytes()),
         Some(_) => CommandError::wrong_type(),
         None => Value::null(),
     };

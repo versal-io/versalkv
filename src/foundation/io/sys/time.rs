@@ -322,6 +322,19 @@ pub fn sleep_debug_delay_interruptible(delay_us: i64, cancelled: impl Fn() -> bo
     } else {
         debug_delay_sleep_us(delay_us, 0)
     };
+    #[cfg(not(target_family = "wasm"))]
+    if (1..=50).contains(&sleep_us) {
+        // Debug key delays need microsecond precision. Kernel wakeup latency
+        // can amplify tiny sleeps by orders of magnitude, turning a bounded
+        // RDB pause into minutes. Spin only for these short, explicit delays;
+        // zero-delay workloads and longer interruptible sleeps keep their path.
+        let started = std::time::Instant::now();
+        let delay = std::time::Duration::from_micros(sleep_us);
+        while !cancelled() && started.elapsed() < delay {
+            std::hint::spin_loop();
+        }
+        return;
+    }
     sleep_interruptible(sleep_us, cancelled);
 }
 
@@ -437,5 +450,33 @@ mod tests {
         assert_eq!(debug_delay_sleep_us(25, 17), 25);
         assert_eq!(debug_delay_sleep_us(-10, 0), 1);
         assert_eq!(debug_delay_sleep_us(-10, 1), 0);
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn short_debug_delays_do_not_accumulate_kernel_wakeup_latency() {
+        let started = std::time::Instant::now();
+        for _ in 0..10_000 {
+            sleep_debug_delay_interruptible(10, || false);
+        }
+        let elapsed = started.elapsed();
+        eprintln!("ten thousand short debug delays elapsed: {elapsed:?}");
+        assert!(elapsed >= std::time::Duration::from_millis(100));
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "short debug delays accumulated excessive wakeup latency: {elapsed:?}"
+        );
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn short_debug_delay_observes_cancellation_before_waiting() {
+        let calls = Cell::new(0);
+        sleep_debug_delay_interruptible(50, || {
+            calls.set(calls.get() + 1);
+            true
+        });
+        assert_eq!(calls.get(), 1);
+        sleep_debug_delay_interruptible(0, || panic!("zero delay must not wait"));
     }
 }

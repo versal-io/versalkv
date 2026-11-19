@@ -204,6 +204,12 @@ impl Robj {
         Robj::StrRaw(StrRaw(data.into()))
     }
 
+    /// Construct a `StrInt` directly from an `i64`, skipping the heap `String`
+    /// allocation and `int_encodable` re-parse that `Robj::string` performs.
+    pub fn from_i64(value: i64) -> Self {
+        Robj::StrInt(StrInt::from_i64(value))
+    }
+
     pub fn type_(&self) -> Type {
         match self {
             Robj::StrInt(_) | Robj::StrEmbstr(_) | Robj::StrRaw(_) => Type::String,
@@ -242,6 +248,20 @@ impl Robj {
             Robj::StrEmbstr(s) => s.as_bytes(),
             Robj::StrRaw(s) => s.as_bytes(),
             _ => b"",
+        }
+    }
+
+    /// Returns the string payload as a `Bytes` handle.
+    ///
+    /// For `StrRaw` this is a refcount bump (no copy). For inline encodings
+    /// (`StrInt`, `StrEmbstr`) the bytes are copied into a fresh allocation
+    /// because inline storage cannot be shared.
+    pub fn string_bytes(&self) -> Bytes {
+        match self {
+            Robj::StrRaw(s) => s.0.clone(),
+            Robj::StrInt(s) => Bytes::copy_from_slice(s.as_bytes()),
+            Robj::StrEmbstr(s) => Bytes::copy_from_slice(s.as_bytes()),
+            _ => Bytes::new(),
         }
     }
 

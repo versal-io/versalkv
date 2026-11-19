@@ -439,6 +439,7 @@ fn postponed_hosted_exec_commits_prior_item_effects_before_connection_gone() {
     backend.ctx.set_command_registry_snapshot(&backend.registry);
     backend.ctx.config_mut().server.lua_time_limit = 1;
     backend.ctx.config_mut().server.notify_keyspace_events = "KEA".to_string();
+    backend.ctx.replication_mut().backlog.activate();
     let key = Bytes::from_static(b"effects-before-gone");
     let channel = Bytes::from_static(b"__keyspace@0__:effects-before-gone");
     let subscriber = _add_subscriber(&mut backend, channel);

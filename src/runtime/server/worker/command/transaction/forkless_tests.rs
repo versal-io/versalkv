@@ -165,6 +165,84 @@ fn exec_resumes_after_target_capture_and_preserves_snapshot_values() {
 }
 
 #[test]
+fn exec_waiting_for_serialization_does_not_recapture_a_queued_key() {
+    let mut fixture = CaptureFixture::new("forkless-exec-queued-key", Vec::new());
+    let backend = &mut fixture.backend;
+    backend.ctx.persistence().set_forkless_key_delay(10_000_000);
+    let original = (0..256)
+        .map(|index| format!("capture-{index}").into_bytes())
+        .find(|key| {
+            backend.ctx.persistence().forkless_key_captured(0, key)
+                && backend.ctx.persistence().forkless_key_blocked(0, key)
+        })
+        .expect("startup queued a key that still awaits serialization");
+    assert!(backend.connection_registry[Token(7)]
+        .transaction
+        .queue(1, command(&[b"SET", &original, b"updated"])));
+    let mut effects = CommandEffects::default();
+    assert_eq!(
+        backend.handle_exec(CommandTarget::new(Token(7)), "exec", false, &mut effects),
+        CommandDisposition::Blocked
+    );
+    backend.ctx.persistence().set_forkless_key_delay(0);
+    while backend.ctx.persistence().forkless_capture_in_progress() {
+        backend.ctx.drive_forkless_feed();
+        std::thread::yield_now();
+    }
+    assert!(matches!(
+        backend.ctx.finish_primary_forkless_save_for_test(),
+        Some(RdbSaveOutcome::Saved)
+    ));
+    let bytes = std::fs::read(fixture.dir.join("dump.rdb")).unwrap();
+    let mut restored = DbSet::new(3);
+    let mut decoder = RdbDecoder::new(true);
+    decoder.feed(&bytes);
+    loop {
+        match decoder
+            .step(&mut restored)
+            .expect("a queued transaction key must occur only once in the RDB")
+        {
+            RdbStep::RecordApplied => {}
+            RdbStep::Finished(_) => break,
+            RdbStep::NeedInput => panic!("complete snapshot requested more input"),
+        }
+    }
+    assert_eq!(restored.get(0).unwrap().dbsize(), 257);
+    assert_eq!(
+        restored
+            .get(0)
+            .unwrap()
+            .get_no_expire(&original)
+            .unwrap()
+            .as_bytes(),
+        b"value"
+    );
+}
+
+#[test]
+fn full_forkless_feed_queue_allows_a_bounded_poll_wait() {
+    let mut fixture = CaptureFixture::new("forkless-feed-backpressure", Vec::new());
+    fixture
+        .backend
+        .ctx
+        .persistence()
+        .set_forkless_key_delay(10_000_000);
+    fixture.backend.ctx.drive_forkless_feed();
+    assert!(fixture
+        .backend
+        .ctx
+        .persistence()
+        .forkless_capture_in_progress());
+    assert_eq!(
+        fixture
+            .backend
+            .next_poll_timeout(crate::foundation::io::sys::time::MonotonicInstant::now()),
+        Some(std::time::Duration::from_millis(1)),
+        "a full background feed must not keep an idle event loop spinning"
+    );
+}
+
+#[test]
 fn forkless_exec_tracks_valid_select_and_cross_database_targets() {
     use crate::framework::capabilities::connection::TransactionEnd;
 

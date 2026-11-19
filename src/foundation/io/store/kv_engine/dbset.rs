@@ -19,6 +19,11 @@ pub struct DbSet {
     /// common standalone hot path (e.g. every PING), where no DB ever flips
     /// the flag.
     replica_local_expire_only_count: usize,
+    /// Number of databases with `pause_skip_expire` set. Lets
+    /// `set_pause_skip_expire_all(false)` skip the per-DB scan on the common
+    /// standalone hot path, where forkless capture and client pause are both
+    /// inactive so the flag is never raised.
+    pause_skip_expire_count: usize,
 }
 
 impl DbSet {
@@ -46,6 +51,7 @@ impl DbSet {
             dbs,
             resize_budget,
             replica_local_expire_only_count: 0,
+            pause_skip_expire_count: 0,
         }
     }
 
@@ -62,6 +68,7 @@ impl DbSet {
                 dbs: Vec::new(),
                 resize_budget: ResizeBudget::new(None),
                 replica_local_expire_only_count: 0,
+                pause_skip_expire_count: 0,
             },
         }
     }
@@ -243,9 +250,13 @@ impl DbSet {
     }
 
     pub fn set_pause_skip_expire_all(&mut self, value: bool) {
+        if !value && self.pause_skip_expire_count == 0 {
+            return;
+        }
         for db in &mut self.dbs {
             db.set_pause_skip_expire(value);
         }
+        self.pause_skip_expire_count = if value { self.dbs.len() } else { 0 };
     }
 
     pub fn set_no_lazy_expire_all(&mut self, value: bool) {
@@ -310,6 +321,17 @@ impl DbSet {
             }
         }
         result
+    }
+
+    /// Non-destructive check for any lazy-expiry work waiting to be propagated.
+    /// Lets read-only commands on a healthy (non-expiring) dataset skip the
+    /// entire expired-propagation collection without draining any queue.
+    pub fn has_pending_expirations(&self) -> bool {
+        self.dbs.iter().any(|db| {
+            !db.expired_deletions.is_empty()
+                || db.lazy_expired_hash_fields != 0
+                || !db.pending_hexpired.is_empty()
+        })
     }
 
     pub fn drain_active_expired_deletions(&mut self) -> Vec<(u32, Vec<u8>)> {

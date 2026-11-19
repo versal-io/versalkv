@@ -491,11 +491,35 @@ pub(crate) fn apply_server_command_effects(
     if effects.close_connection {
         conn.mark_closing();
     }
-    let mut changed_keys_seen: std::collections::HashSet<_> =
-        conn.dirty_keys().iter().cloned().collect();
-    for changed_key in effects.changed_keys.drain(..) {
-        if changed_keys_seen.insert(changed_key.clone()) {
-            conn.record_dirty_key(changed_key);
+    // Read-only commands still skip all dirty-key bookkeeping.
+    if !effects.changed_keys.is_empty() {
+        let dirty_key_count = conn
+            .dirty_keys()
+            .len()
+            .saturating_add(effects.changed_keys.len());
+        if dirty_key_count > 64 {
+            // Bulk commands such as FLUSHALL can produce an entire database of
+            // changed keys. Keep their deduplication linear while preserving the
+            // first-seen order and keys already recorded by nested commands.
+            let mut seen = std::collections::HashSet::with_capacity(dirty_key_count);
+            seen.extend(conn.dirty_keys().iter().cloned());
+            for changed_key in effects.changed_keys.drain(..) {
+                if seen.insert(changed_key.clone()) {
+                    conn.record_dirty_key(changed_key);
+                }
+            }
+        } else {
+            // Small commands keep the allocation-free containment check. Newly
+            // recorded keys participate in deduplication within this batch too.
+            for changed_key in effects.changed_keys.drain(..) {
+                let already_dirty = conn
+                    .dirty_keys()
+                    .iter()
+                    .any(|existing| existing == &changed_key);
+                if !already_dirty {
+                    conn.record_dirty_key(changed_key);
+                }
+            }
         }
     }
     if effects.expired_hash_fields > 0 {
@@ -651,6 +675,65 @@ mod tests {
             &[(1, Bytes::from_static(b"destination"))]
         );
         assert!(effects.changed_keys.is_empty());
+    }
+
+    #[test]
+    fn bulk_changed_keys_do_not_stall_command_completion() {
+        let mut conn = Connection::new_fake();
+        let mut ctx = ServerContext::new(2);
+        let expected: Vec<_> = (0..100_000)
+            .map(|index| {
+                (
+                    index % 2,
+                    Bytes::from(format!("bulk-command-key-with-shared-prefix-{index:08}")),
+                )
+            })
+            .collect();
+        let mut effects = CommandEffects {
+            changed_keys: expected.clone(),
+            ..CommandEffects::default()
+        };
+        let started = std::time::Instant::now();
+
+        apply_server_command_effects(&mut conn, &mut ctx, 0, &mut effects);
+
+        let elapsed = started.elapsed();
+        eprintln!("Bulk changed-key completion elapsed: {elapsed:?}");
+        assert_eq!(conn.dirty_keys(), expected);
+        assert!(effects.changed_keys.is_empty());
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "bulk changed-key completion stalled: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn changed_key_dedup_preserves_database_and_first_seen_order() {
+        for count in [1, 16, 64, 65, 256] {
+            let mut conn = Connection::new_fake();
+            let mut ctx = ServerContext::new(2);
+            let existing = (0, Bytes::from_static(b"existing"));
+            conn.record_dirty_key(existing.clone());
+            let mut expected = vec![existing.clone()];
+            let mut changed_keys = vec![existing];
+            for index in 0..count {
+                let key = Bytes::from(format!("key-{index}"));
+                for db_idx in [1, 0] {
+                    let changed = (db_idx, key.clone());
+                    expected.push(changed.clone());
+                    changed_keys.extend([changed.clone(), changed]);
+                }
+            }
+            let mut effects = CommandEffects {
+                changed_keys,
+                ..CommandEffects::default()
+            };
+
+            apply_server_command_effects(&mut conn, &mut ctx, 0, &mut effects);
+
+            assert_eq!(conn.dirty_keys(), expected);
+            assert!(effects.changed_keys.is_empty());
+        }
     }
 
     #[test]

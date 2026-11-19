@@ -430,6 +430,13 @@ impl ServerWorkerState {
         mut pending_aof: Option<&mut Vec<Vec<u8>>>,
         mut pending_effects: Option<&mut EffectQueue>,
     ) {
+        // Fast path: no client is blocked on any key, so there is nobody to
+        // wake. Skip the ready-queue Vec, the seen-set HashSet, and the
+        // per-key registry lookups. This covers the common standalone
+        // SET/GET/INCR workload where no blocking command is in flight.
+        if self.ctx.blocking_registry().count() == 0 {
+            return;
+        }
         if self.processing_blocked_clients {
             return;
         }
@@ -901,6 +908,11 @@ impl ServerWorkerState {
     /// Collect subscribers whose ACL channel permissions were revoked.
     /// Invoked before the next command can observe the changed permissions.
     pub(crate) fn kill_acl_subscribers(&mut self) {
+        // The kill list is empty on the common hot path (no ACL channel
+        // revocations); avoid the per-command `mem::take` write entirely.
+        if self.ctx.pending_acl_client_kills_mut().is_empty() {
+            return;
+        }
         let usernames: Vec<String> = std::mem::take(self.ctx.pending_acl_client_kills_mut());
         if usernames.is_empty() {
             return;
@@ -938,6 +950,10 @@ impl ServerWorkerState {
     }
 
     pub(crate) fn drain_acl_kills_for_command(&mut self, current: Option<Token>) {
+        // Empty on the common hot path; skip the per-command `mem::take`.
+        if self.ctx.pending_acl_tokens_to_kill_mut().is_empty() {
+            return;
+        }
         let tokens: Vec<Token> = std::mem::take(self.ctx.pending_acl_tokens_to_kill_mut());
         for token in tokens {
             // Skip protected clients
