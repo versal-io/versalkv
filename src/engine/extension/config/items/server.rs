@@ -53,13 +53,13 @@ fn normalize_notify_keyspace_events(value: &str) -> Result<String, String> {
     if value.contains('A') {
         out.push('A');
     } else {
-        for flag in ['g', '$', 'l', 's', 'h', 'z', 'x', 'e', 't', 'd', 'p', 'n'] {
+        for flag in ['g', '$', 'l', 's', 'h', 'z', 'x', 'e', 't', 'd', 'p'] {
             if value.contains(flag) {
                 out.push(flag);
             }
         }
     }
-    for flag in ['K', 'E', 'm'] {
+    for flag in ['n', 'K', 'E', 'm'] {
         if value.contains(flag) {
             out.push(flag);
         }

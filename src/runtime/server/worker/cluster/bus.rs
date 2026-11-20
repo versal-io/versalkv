@@ -1747,83 +1747,98 @@ mod tests {
     }
 
     #[test]
-    fn outbound_pong_retires_other_handshake_owned_links() {
+    fn outbound_pong_handles_handshake_identity_confirmation_and_duplicates() {
         use crate::engine::distributed::cluster::msg::{
             ClusterBusBody, ClusterBusMessage, ClusterMsgType,
         };
 
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let mut backend = ServerWorkerState::new(1).unwrap();
-        let outgoing = backend.transport.connect_tcp(addr).unwrap();
-        let (mut outgoing_peer, _) = listener.accept().unwrap();
-        let incoming = backend.transport.connect_tcp(addr).unwrap();
-        let (_incoming_peer, _) = listener.accept().unwrap();
-        for token in [outgoing.token, incoming.token] {
-            backend
+        for is_known_sender in [false, true] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let mut backend = ServerWorkerState::new(1).unwrap();
+            let outgoing = backend.transport.connect_tcp(addr).unwrap();
+            let (mut outgoing_peer, _) = listener.accept().unwrap();
+            let incoming = backend.transport.connect_tcp(addr).unwrap();
+            let (_incoming_peer, _) = listener.accept().unwrap();
+            for token in [outgoing.token, incoming.token] {
+                backend
                 .route_runtime_source(
                     token,
                     crate::runtime::server::worker::event_loop::sources::SourceOwner::ClusterBus,
                 )
                 .unwrap();
-        }
-        let node_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let mut node = ClusterNode::new(
-            node_id.to_string(),
-            addr.ip().to_string(),
-            addr.port(),
-            addr.port(),
-            true,
-        );
-        node.flags &= !CLUSTER_NODE_MYSELF;
-        let packet = ClusterBusMessage::from_node(
-            ClusterMsgType::Pong,
-            &node,
-            1,
-            ClusterBusBody::Gossip(Vec::new()),
-        )
-        .encode()
-        .unwrap();
-        let mut state = ClusterState::new("127.0.0.1", 6379, 16_379);
-        let handshake_id = state.ensure_handshake_node(
-            &addr.ip().to_string(),
-            addr.port(),
-            addr.port(),
-            crate::foundation::io::sys::time::mstime(),
-        );
-        state.nodes.insert(node_id.to_string(), node);
-        *backend.ctx.cluster_state_mut() = Some(Box::new(state));
-        backend.cluster_bus.register_outgoing_for_handshake(
-            outgoing.token,
-            addr,
-            handshake_id.clone(),
-        );
-        backend.cluster_bus.register_incoming(incoming.token, addr);
-        backend
-            .cluster_bus
-            .connections
-            .get_mut(&incoming.token.0)
-            .unwrap()
-            .handshake_node_name = handshake_id.clone();
-        backend.refresh_cluster_link_views();
-        outgoing_peer.write_all(&packet).unwrap();
-        backend.transport.wait_readable_for_test(outgoing.token);
-
-        backend.handle_cluster_bus_readable(outgoing.token);
-
-        assert!(
-            !backend
+            }
+            let node_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+            let mut node = ClusterNode::new(
+                node_id.to_string(),
+                addr.ip().to_string(),
+                addr.port(),
+                addr.port(),
+                true,
+            );
+            node.flags &= !CLUSTER_NODE_MYSELF;
+            let packet = ClusterBusMessage::from_node(
+                ClusterMsgType::Pong,
+                &node,
+                1,
+                ClusterBusBody::Gossip(Vec::new()),
+            )
+            .encode()
+            .unwrap();
+            let mut state = ClusterState::new("127.0.0.1", 6379, 16_379);
+            let handshake_id = state.ensure_handshake_node(
+                &addr.ip().to_string(),
+                addr.port(),
+                addr.port(),
+                crate::foundation::io::sys::time::mstime(),
+            );
+            state.replicate(handshake_id.as_bytes()).unwrap();
+            if is_known_sender {
+                state.nodes.insert(node_id.to_string(), node);
+            }
+            *backend.ctx.cluster_state_mut() = Some(Box::new(state));
+            backend.cluster_bus.register_outgoing_for_handshake(
+                outgoing.token,
+                addr,
+                handshake_id.clone(),
+            );
+            backend.cluster_bus.register_incoming(incoming.token, addr);
+            backend
                 .cluster_bus
                 .connections
-                .contains_key(&incoming.token.0),
-            "removing a handshake identity must retire its other socket owners"
-        );
-        let confirmed = &backend.cluster_bus.connections[&outgoing.token.0];
-        assert_eq!(confirmed.node_name, node_id);
-        assert!(confirmed.handshake_node_name.is_empty());
-        let state = backend.ctx.cluster_state().as_deref().unwrap();
-        assert!(!state.nodes.contains_key(&handshake_id));
-        assert!(state.pending_link_closes.is_empty());
+                .get_mut(&incoming.token.0)
+                .unwrap()
+                .handshake_node_name = handshake_id.clone();
+            backend.refresh_cluster_link_views();
+            outgoing_peer.write_all(&packet).unwrap();
+            backend.transport.wait_readable_for_test(outgoing.token);
+
+            backend.handle_cluster_bus_readable(outgoing.token);
+
+            if is_known_sender {
+                for token in [outgoing.token, incoming.token] {
+                    assert!(
+                        !backend.cluster_bus.connections.contains_key(&token.0),
+                        "deleting a duplicate handshake must retire all its socket owners"
+                    );
+                }
+            } else {
+                for token in [outgoing.token, incoming.token] {
+                    let confirmed = &backend.cluster_bus.connections[&token.0];
+                    assert_eq!(confirmed.node_name, node_id);
+                    assert!(confirmed.handshake_node_name.is_empty());
+                    assert_eq!(confirmed.projected_node_name, node_id);
+                    assert!(backend.runtime_sources.resolve_token(token).is_some());
+                }
+            }
+            let state = backend.ctx.cluster_state().as_deref().unwrap();
+            assert!(!state.nodes.contains_key(&handshake_id));
+            assert!(state.pending_link_closes.is_empty());
+            assert_eq!(
+                state.myself.replicaof,
+                if is_known_sender { "" } else { node_id }
+            );
+        }
     }
 
     #[test]

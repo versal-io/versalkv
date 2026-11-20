@@ -104,6 +104,10 @@ impl ImportDataset {
         self.player.selected_db()
     }
 
+    pub(crate) fn set_selected_db(&mut self, selected_db: u32) {
+        self.player.set_selected_db(selected_db);
+    }
+
     pub fn dbs_mut(&mut self) -> &mut DbSet {
         self.preserve_expired_keys();
         self.context.dbs_mut()

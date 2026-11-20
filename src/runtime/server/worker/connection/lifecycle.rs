@@ -71,7 +71,11 @@ impl ServerWorkerState {
         let default_user_requires_auth = !crate::engine::extension::acl::default_user_has_nopass();
         let mut conn = Connection::new(client.token, client.peer_addr, default_user_requires_auth);
         let conn_is_priority = self.peer_is_priority(client.peer_addr);
-        conn.is_priority = conn_is_priority;
+        conn.priority = if conn_is_priority {
+            crate::framework::capabilities::connection::ConnectionPriority::Subnet
+        } else {
+            crate::framework::capabilities::connection::ConnectionPriority::Normal
+        };
         let client_id = conn.client_id();
         let io_handles = self
             .transport
@@ -94,6 +98,7 @@ impl ServerWorkerState {
             .expect("a newly accepted transport token and client id must be unique");
         if conn_is_priority {
             self.ctx.stats_mut().connected_priority_clients += 1;
+            self.priority_connections += 1;
         }
         self.refresh_client_memory_usage(client.token, true);
         match io_handles {
@@ -599,7 +604,12 @@ impl ServerWorkerState {
                 .connection_registry
                 .remove(token)
                 .expect("connection presence was checked before removal");
-            if conn.is_priority {
+            if conn.priority.is_priority() {
+                self.priority_connections = self.priority_connections.saturating_sub(1);
+            }
+            if conn.priority
+                == crate::framework::capabilities::connection::ConnectionPriority::Subnet
+            {
                 let stats = self.ctx.stats_mut();
                 stats.connected_priority_clients =
                     stats.connected_priority_clients.saturating_sub(1);

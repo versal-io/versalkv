@@ -135,6 +135,10 @@ pub(super) fn setup_redis_table(lua: &Lua) -> Result<(), ScriptError> {
         .create_function(|_lua, _args: LuaMultiValue| Ok(LuaValue::Boolean(true)))
         .map_err(|e| ScriptError::Runtime(e.to_string()))?;
 
+    let breakpoint_fn = lua
+        .create_function(|_, _: LuaMultiValue| Ok(super::timeout::request_debugger_breakpoint()))
+        .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+
     let acl_check_cmd_fn = lua
         .create_function(|lua, args: LuaMultiValue| dispatch_scoped_host(lua, 4, args))
         .map_err(|e| ScriptError::Runtime(e.to_string()))?;
@@ -189,18 +193,23 @@ pub(super) fn setup_redis_table(lua: &Lua) -> Result<(), ScriptError> {
                 };
 
                 let known_keys = ["function_name", "callback", "description", "flags"];
-                for (k, _) in table.pairs::<LuaValue, LuaValue>().flatten() {
-                    if let LuaValue::String(key) = k {
-                        if let Ok(key_str) = key.to_str() {
-                            if known_keys.iter().any(|known| key_str == *known) {
-                                continue;
-                            }
-                            return Err(LuaError::RuntimeError(
-                                "unknown argument given to server.register_function".into(),
-                            ));
-                        }
-                    }
+                let normalized = lua.create_table()?;
+                for pair in table.pairs::<LuaValue, LuaValue>() {
+                    let (key, value) = pair?;
+                    let key = lua.coerce_string(key)?.ok_or_else(|| LuaError::RuntimeError(
+                        "named argument key given to server.register_function is not a string".into(),
+                    ))?;
+                    let key_bytes = key.as_bytes();
+                    let key_bytes = &key_bytes[..key_bytes.iter().position(|byte| *byte == 0).unwrap_or(key_bytes.len())];
+                    let known = known_keys.iter().find(|known| key_bytes.eq_ignore_ascii_case(known.as_bytes()))
+                        .ok_or_else(|| LuaError::RuntimeError(
+                            "unknown argument given to server.register_function".into(),
+                        ))?;
+                    // Retain only the last visited spelling without mutating
+                    // the caller's table or retaining superseded values.
+                    normalized.raw_set(*known, value)?;
                 }
+                let table = normalized;
 
                 let name_val: LuaValue = table.get("function_name")?;
                 let name = match name_val {
@@ -356,6 +365,7 @@ pub(super) fn setup_redis_table(lua: &Lua) -> Result<(), ScriptError> {
     let _ = redis_table.set("setresp", setresp_fn);
     let _ = redis_table.set("set_repl", set_repl_fn);
     let _ = redis_table.set("replicate_commands", replicate_commands_fn);
+    let _ = redis_table.set("breakpoint", breakpoint_fn);
     let _ = redis_table.set("acl_check_cmd", acl_check_cmd_fn);
 
     let version_num = (7_i64 << 16) | (2 << 8); // 7.2.0
@@ -379,14 +389,19 @@ fn render_lua_log_message(
     values: impl IntoIterator<Item = LuaValue>,
 ) -> LuaResult<String> {
     let mut message = String::new();
-    for value in values {
+    for (index, value) in values.into_iter().enumerate() {
         let Some(value) = lua.coerce_string(value)? else {
             continue;
         };
-        if !message.is_empty() {
+        if index != 0 {
             message.push(' ');
         }
-        message.push_str(&String::from_utf8_lossy(value.as_bytes().as_ref()));
+        let bytes = value.as_bytes();
+        let end = bytes
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(bytes.len());
+        message.push_str(&String::from_utf8_lossy(&bytes[..end]));
     }
     Ok(message.replace(['\r', '\n'], " "))
 }
@@ -417,6 +432,37 @@ mod tests {
         assert_eq!(
             render_lua_log_message(&lua, values).unwrap(),
             "before  after 42 tail"
+        );
+    }
+
+    #[test]
+    fn lua_log_message_preserves_argument_position_separators() {
+        let lua = Lua::new();
+        for first in [
+            LuaValue::Table(lua.create_table().unwrap()),
+            LuaValue::String(lua.create_string("").unwrap()),
+        ] {
+            let values = [
+                first,
+                LuaValue::String(lua.create_string("after-skipped-arg").unwrap()),
+            ];
+            assert_eq!(
+                render_lua_log_message(&lua, values).unwrap(),
+                " after-skipped-arg"
+            );
+        }
+    }
+
+    #[test]
+    fn lua_log_message_stops_each_argument_at_a_nul() {
+        let lua = Lua::new();
+        let values = [
+            LuaValue::String(lua.create_string("before\0hidden").unwrap()),
+            LuaValue::String(lua.create_string("after").unwrap()),
+        ];
+        assert_eq!(
+            render_lua_log_message(&lua, values).unwrap(),
+            "before after"
         );
     }
 }

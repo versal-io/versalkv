@@ -1,7 +1,8 @@
 use crate::engine::core::{CommandEffects, CommandOutcome, Value};
 use crate::framework::commands::command_runtime::CommandRuntime;
 use crate::framework::commands::hyperloglog::common::{
-    error_value, parse_hll, serialize_hll_as, HllEncoding, HLL_REGISTERS,
+    c_format, error_value, hll_format, parse_hll, serialize_hll_as, HllEncoding, HllFormat,
+    HLL_REGISTERS,
 };
 use crate::framework::{CommandArgs, CommandError};
 use command_macros::command;
@@ -42,11 +43,20 @@ fn pfdebug_reply(
             };
             match db.get_string(key) {
                 Err(_) => CommandError::wrong_type(),
-                Ok(Some(data)) => match parse_hll(data) {
-                    Ok(state) if state.encoding == HllEncoding::Sparse => Value::bulk("sparse"),
-                    Ok(_) => Value::bulk("dense"),
-                    Err(err) => error_value(err),
-                },
+                Ok(Some(data)) => {
+                    if hll_format(data) == Ok(HllFormat::Standard) {
+                        return Value::SimpleString(bytes::Bytes::from_static(if data[4] == 1 {
+                            b"sparse"
+                        } else {
+                            b"dense"
+                        }));
+                    }
+                    match parse_hll(data) {
+                        Ok(state) if state.encoding == HllEncoding::Sparse => Value::bulk("sparse"),
+                        Ok(_) => Value::bulk("dense"),
+                        Err(err) => error_value(err),
+                    }
+                }
                 Ok(None) => Value::error("ERR key does not exist"),
             }
         }
@@ -55,14 +65,32 @@ fn pfdebug_reply(
                 return Value::error("ERR wrong number of arguments for 'pfdebug|getreg' command");
             }
             let key = &args.args[1];
+            let db_idx = runtime.selected_db();
             let db = match runtime.db_mut() {
                 Some(d) => d,
                 None => return CommandError::db_index_out_of_range(),
             };
             match db.get_string(key) {
                 Err(_) => CommandError::wrong_type(),
-                Ok(Some(data)) => match parse_hll(data) {
-                    Ok(state) => Value::Array(
+                Ok(Some(data)) => {
+                    let state = match parse_hll(data) {
+                        Ok(state) => state,
+                        Err(err) => return error_value(err),
+                    };
+                    if state.format == HllFormat::Standard && state.encoding == HllEncoding::Sparse
+                    {
+                        let dense = match c_format::to_dense(data) {
+                            Ok(dense) => dense,
+                            Err(err) => return error_value(err),
+                        };
+                        db.set_keep_ttl(
+                            key.to_vec(),
+                            crate::foundation::io::store::Robj::string_raw(dense),
+                        );
+                        effects.changed_keys.push((db_idx, key.clone()));
+                        effects.dirty_delta = Some(1);
+                    }
+                    Value::Array(
                         state
                             .registers()
                             .iter()
@@ -70,10 +98,30 @@ fn pfdebug_reply(
                             .chain(std::iter::repeat(Value::integer(0)))
                             .take(HLL_REGISTERS)
                             .collect(),
-                    ),
+                    )
+                }
+                Ok(None) => Value::error("ERR key does not exist"),
+            }
+        }
+        "DECODE" => {
+            if args.args.len() != 2 {
+                return Value::error("ERR wrong number of arguments for 'pfdebug|decode' command");
+            }
+            let db = match runtime.db_mut() {
+                Some(db) => db,
+                None => return CommandError::db_index_out_of_range(),
+            };
+            match db.get_string(&args.args[1]) {
+                Err(_) => CommandError::wrong_type(),
+                Ok(None) => Value::error("ERR key does not exist"),
+                Ok(Some(data)) => match hll_format(data) {
+                    Ok(HllFormat::Standard) if data[4] == 1 => match c_format::decode_text(data) {
+                        Ok(text) => Value::bulk(text),
+                        Err(err) => error_value(err),
+                    },
+                    Ok(_) => Value::error("ERR HLL encoding is not sparse"),
                     Err(err) => error_value(err),
                 },
-                Ok(None) => Value::error("ERR key does not exist"),
             }
         }
         "TODENSE" => {
@@ -91,20 +139,38 @@ fn pfdebug_reply(
                 Ok(Some(data)) => data,
                 Ok(None) => return Value::error("ERR key does not exist"),
             };
+            if hll_format(data) == Ok(HllFormat::Standard) {
+                if data[4] == 0 {
+                    return Value::integer(0);
+                }
+                let dense = match c_format::to_dense(data) {
+                    Ok(dense) => dense,
+                    Err(err) => return error_value(err),
+                };
+                db.set_keep_ttl(
+                    key.to_vec(),
+                    crate::foundation::io::store::Robj::string_raw(dense),
+                );
+                effects.changed_keys.push((db_idx, key.clone()));
+                effects.dirty_delta = Some(1);
+                return Value::integer(1);
+            }
             let state = match parse_hll(data) {
                 Ok(state) => state,
                 Err(err) => return error_value(err),
             };
             db.set(
                 key.to_vec(),
-                crate::foundation::io::store::Robj::string_raw(serialize_hll_as(&state, HllEncoding::Dense, true)),
+                crate::foundation::io::store::Robj::string_raw(serialize_hll_as(
+                    &state,
+                    HllEncoding::Dense,
+                    true,
+                )),
             );
             effects.changed_keys.push((db_idx, key.clone()));
             Value::ok()
         }
-        "SIMD" => {
-            Value::ok()
-        }
+        "SIMD" => Value::ok(),
         _ => Value::error(format!(
             "ERR Unknown subcommand or wrong number of arguments for '{}' command",
             subcmd_str

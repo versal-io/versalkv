@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 
 use bytes::Bytes;
+use std::cell::Cell;
 use std::fmt;
 use std::mem::size_of;
 
@@ -16,7 +17,7 @@ mod query;
 #[path = "ordered_index/range.rs"]
 mod range;
 
-use node::{Entry, Node, NodeData};
+use node::{DeletionPolicy, Entry, Node, NodeData};
 pub use range::OrderedIndexIter;
 
 #[cfg(test)]
@@ -54,6 +55,15 @@ pub struct OrderedIndex {
     root: Node,
 }
 
+thread_local! {
+    static LEAF_COMPACTION_ALLOWED: Cell<bool> = const { Cell::new(true) };
+}
+
+/// Set the owning event thread's fork-aware policy for all sorted-set trees.
+pub fn set_leaf_compaction_allowed(is_allowed: bool) {
+    LEAF_COMPACTION_ALLOWED.set(is_allowed);
+}
+
 impl OrderedIndex {
     pub fn new() -> Self {
         Self {
@@ -81,7 +91,21 @@ impl OrderedIndex {
     }
 
     pub fn delete(&mut self, score: f64, member: &[u8]) -> bool {
-        if score.is_nan() || !self.root.delete(normalize_score(score), member) {
+        self.delete_with_policy(score, member, DeletionPolicy::Rebalance)
+    }
+
+    /// Delete without moving surviving leaves while a fork child shares pages.
+    /// Otherwise, compact sparse leaves locally with fill hysteresis.
+    pub fn delete_with_leaf_compaction(&mut self, score: f64, member: &[u8]) -> bool {
+        self.delete_with_policy(
+            score,
+            member,
+            DeletionPolicy::CompactLeaves(LEAF_COMPACTION_ALLOWED.get()),
+        )
+    }
+
+    fn delete_with_policy(&mut self, score: f64, member: &[u8], policy: DeletionPolicy) -> bool {
+        if score.is_nan() || !self.root.delete(normalize_score(score), member, policy) {
             return false;
         }
         loop {
@@ -118,19 +142,40 @@ impl OrderedIndex {
     }
 
     pub fn pop_min(&mut self, count: usize) -> Vec<(Bytes, f64)> {
-        self.pop_entries(count, false)
+        self.pop_entries(count, false, DeletionPolicy::Rebalance)
     }
 
     pub fn pop_max(&mut self, count: usize) -> Vec<(Bytes, f64)> {
-        self.pop_entries(count, true)
+        self.pop_entries(count, true, DeletionPolicy::Rebalance)
     }
 
-    fn pop_entries(&mut self, count: usize, is_reverse: bool) -> Vec<(Bytes, f64)> {
+    pub fn pop_min_with_leaf_compaction(&mut self, count: usize) -> Vec<(Bytes, f64)> {
+        self.pop_entries(
+            count,
+            false,
+            DeletionPolicy::CompactLeaves(LEAF_COMPACTION_ALLOWED.get()),
+        )
+    }
+
+    pub fn pop_max_with_leaf_compaction(&mut self, count: usize) -> Vec<(Bytes, f64)> {
+        self.pop_entries(
+            count,
+            true,
+            DeletionPolicy::CompactLeaves(LEAF_COMPACTION_ALLOWED.get()),
+        )
+    }
+
+    fn pop_entries(
+        &mut self,
+        count: usize,
+        is_reverse: bool,
+        policy: DeletionPolicy,
+    ) -> Vec<(Bytes, f64)> {
         let count = count.min(self.len());
         let start = if is_reverse { self.len() - count } else { 0 };
         let entries = self.collect_ranks(start, start + count, is_reverse);
         for (member, score) in &entries {
-            self.delete(*score, member);
+            self.delete_with_policy(*score, member, policy);
         }
         entries
     }

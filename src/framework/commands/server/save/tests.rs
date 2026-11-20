@@ -2,6 +2,41 @@ use crate::foundation::io::persistence as persistence;
 use bytes::Bytes;
 
 #[test]
+fn active_slot_import_selects_real_fork_without_starting_incremental_capture() {
+    use crate::engine::distributed::cluster::migration::{
+        MigrationJobId, SlotRanges,
+    };
+    use crate::engine::distributed::cluster::SlotRange;
+    use crate::engine::extension::config::persistence::BgsaveMethod;
+    use crate::foundation::io::sys::process::{wait_blocking, WaitOutcome};
+    use crate::framework::context::ServerContext;
+
+    let _fork_guard = super::diskless_fork_test_guard();
+    let mut ctx = ServerContext::new(1);
+    let id = MigrationJobId::parse(b"abababababababababababababababababababab").unwrap();
+    let ranges = SlotRanges::new(vec![SlotRange::new(1, 1).unwrap()]).unwrap();
+    ctx.create_slot_import(id, &ranges);
+    let directory = std::env::temp_dir().join(format!(
+        "versal-import-fork-policy-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    ctx.config_mut().persistence.dir = directory.to_string_lossy().into_owned();
+    ctx.config_mut().persistence.bgsave_default_method = BgsaveMethod::Forkless;
+    super::start_bgsave(&mut ctx).unwrap();
+    assert_eq!(ctx.stats().forkless_fallbacks_slot_import, 1);
+    assert_eq!(ctx.stats().total_forks, 1);
+    assert!(!ctx.persistence().forkless_save_in_progress());
+    let pid = ctx.persistence().rdb_child_pid().expect("a real RDB child");
+    assert_eq!(wait_blocking(pid).unwrap(), WaitOutcome::Exited(0));
+    let bytes = std::fs::read(directory.join("dump.rdb")).unwrap();
+    let mut restored = crate::foundation::io::store::kv_engine::DbSet::new(1);
+    persistence::load_rdb_bytes_checked(&bytes, &mut restored, true).unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn close_listener_fds_closes_all_and_ignores_invalid() {
     use std::io::Read;
     use std::os::unix::io::AsRawFd;

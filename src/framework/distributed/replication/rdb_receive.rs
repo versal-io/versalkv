@@ -35,6 +35,9 @@ pub struct RdbCommit {
     pub function_codes: Vec<Vec<u8>>,
     pub aux_fields: Vec<(Vec<u8>, Vec<u8>)>,
     pub repl_stream_db: u32,
+    pub repl_id: Option<String>,
+    pub repl_offset: Option<i64>,
+    pub functions_applied: bool,
     pub diskless: bool,
     pub disk_backed: bool,
     /// `Some` only for the AOF-preamble-reuse path; otherwise `None`.
@@ -59,6 +62,7 @@ pub struct RdbReceive {
     payload_bytes: u64,
     compression_logged: bool,
     input_complete: bool,
+    functions_applied: bool,
 }
 
 impl RdbReceive {
@@ -85,6 +89,7 @@ impl RdbReceive {
             payload_bytes: 0,
             compression_logged: false,
             input_complete: false,
+            functions_applied: false,
         }
     }
 
@@ -246,6 +251,27 @@ impl RdbReceive {
         self.target = RdbTarget::Direct;
     }
 
+    pub fn take_inline_function_codes(&mut self) -> Option<Vec<Vec<u8>>> {
+        if self.functions_applied {
+            return None;
+        }
+        self.functions_applied = true;
+        Some(self.decoder.take_function_codes())
+    }
+
+    pub fn replication_metadata(&self) -> (Option<&str>, Option<i64>) {
+        (
+            self.decoder.replication_id(),
+            self.decoder.replication_offset(),
+        )
+    }
+
+    pub fn swap_inline_dataset(&mut self, serving: &mut DbSet) {
+        if let RdbTarget::Swap(temp) = &mut self.target {
+            std::mem::swap(serving, temp);
+        }
+    }
+
     pub fn set_zset_limits(&mut self, max_entries: usize, max_value_size: usize) {
         self.decoder.set_zset_limits(max_entries, max_value_size);
     }
@@ -263,6 +289,13 @@ impl RdbReceive {
                 RdbTarget::Direct => self.decoder.step(serving),
                 RdbTarget::Uninit => return Ok(RdbStep::NeedInput),
             }?;
+            if matches!(step, RdbStep::InlineCommand { .. }) && self.load_mode == RdbLoadMode::Swap
+            {
+                return Err(LoadError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Inline RDB commands are not supported with swapdb loading",
+                )));
+            }
             if matches!(step, RdbStep::Finished(_)) && self.compression.is_compressed() {
                 if self.decoder.unconsumed_bytes() != 0 {
                     return Err(LoadError::Io(std::io::Error::new(
@@ -311,6 +344,9 @@ impl RdbReceive {
             match self.step(serving, key_load_delay_us)? {
                 RdbStep::NeedInput => return Ok(StreamStep::NeedMore),
                 RdbStep::RecordApplied => {}
+                RdbStep::InlineCommand { db, args } => {
+                    return Ok(StreamStep::InlineCommand { db, args });
+                }
                 RdbStep::Finished(_) => return Ok(StreamStep::Finished),
             }
         }
@@ -327,6 +363,8 @@ impl RdbReceive {
         let function_codes = decoder.take_function_codes();
         let aux_fields = decoder.take_aux_fields();
         let repl_stream_db = decoder.repl_stream_db().unwrap_or(0);
+        let repl_id = decoder.replication_id().map(str::to_owned);
+        let repl_offset = decoder.replication_offset();
         let swapped = match self.target {
             RdbTarget::Swap(temp) => Some(temp),
             RdbTarget::Uninit | RdbTarget::Direct => None,
@@ -335,6 +373,9 @@ impl RdbReceive {
             function_codes,
             aux_fields,
             repl_stream_db,
+            repl_id,
+            repl_offset,
+            functions_applied: self.functions_applied,
             diskless: self.diskless,
             disk_backed: self.load_mode == RdbLoadMode::DiskBacked,
             raw: self.raw,

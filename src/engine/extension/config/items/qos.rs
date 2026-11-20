@@ -54,8 +54,6 @@ pub fn register_qos_configs(registry: &mut ConfigRegistry) {
                 let subnets = parse_priority_subnets(value)?;
                 config.server.priority_subnets = value.clone();
                 config.server.compiled_priority_subnets = subnets;
-                config.server.priority_subnets_generation =
-                    config.server.priority_subnets_generation.wrapping_add(1);
             }
             Ok(())
         },

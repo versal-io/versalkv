@@ -221,6 +221,7 @@ pub fn load_rdb_bytes_with_policy(
         match decoder.step(dbs)? {
             RdbStep::NeedInput => return Err(LoadError::Corrupt),
             RdbStep::RecordApplied => {}
+            RdbStep::InlineCommand { .. } => return Err(LoadError::Corrupt),
             RdbStep::Finished(mut metadata) => {
                 if let Some(decoded) = &decoded {
                     if metadata.consumed != decoded.bytes.len() {

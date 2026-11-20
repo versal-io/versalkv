@@ -98,7 +98,7 @@ fn check_import_write(parts: &[&str], expected: Value, dirty: i64) {
                 );
             }
             "PHDEL" => assert!(tree(db).get(b"p").is_none()),
-            "PHDELPREFIX" => {
+            "PHPATHDEL" => {
                 assert!(tree(db).get(b"branch/a").is_none());
                 assert!(tree(db).get(b"branch/b").is_none());
                 assert_eq!(
@@ -148,8 +148,12 @@ fn phdel_expired_import_preserves_tree_ttl_and_snapshot() {
 }
 
 #[test]
-fn phdelprefix_expired_import_preserves_tree_ttl_and_snapshot() {
-    check_import_write(&["PHDELPREFIX", "h", "branch/"], Value::integer(2), 2);
+fn phpathdel_expired_import_preserves_tree_ttl_and_snapshot() {
+    check_import_write(
+        &["PHPATHDEL", "h", "branch/", "WITHSUBPATHS"],
+        Value::integer(2),
+        2,
+    );
 }
 
 #[test]
@@ -234,7 +238,7 @@ fn pathhash_import_wrongtype_preserves_physical_value_and_ttl() {
         vec!["PHSET", "h", "p", "FXX", "FIELDS", "1", "f", "v"],
         vec!["PHMSET", "h", "p", "FIELDS", "1", "f", "v"],
         vec!["PHDEL", "h", "p"],
-        vec!["PHDELPREFIX", "h", ""],
+        vec!["PHPATHDEL", "h", "", "WITHSUBPATHS"],
     ] {
         for should_suppress_lazy_expire in [false, true] {
             let mut runtime = TestCommandRuntime::new(1, 100);
@@ -271,7 +275,12 @@ fn pathhash_ordinary_writes_hide_and_expire_old_objects() {
             true,
         ),
         (vec!["PHDEL", "h", "p"], Value::integer(0), 0, false),
-        (vec!["PHDELPREFIX", "h", ""], Value::integer(0), 0, false),
+        (
+            vec!["PHPATHDEL", "h", "", "WITHSUBPATHS"],
+            Value::integer(0),
+            0,
+            false,
+        ),
         (
             vec!["PHSET", "h", "p", "FXX", "FIELDS", "1", "f", "new"],
             Value::null(),
@@ -307,7 +316,7 @@ fn pathhash_ordinary_no_lazy_expire_does_not_read_physical_values() {
     for parts in [
         vec!["PHSET", "h", "p", "FXX", "FIELDS", "1", "f", "new"],
         vec!["PHDEL", "h", "p"],
-        vec!["PHDELPREFIX", "h", ""],
+        vec!["PHPATHDEL", "h", "", "WITHSUBPATHS"],
     ] {
         let mut runtime = TestCommandRuntime::new(1, 100);
         let db = runtime.dbs.get_mut(0).unwrap();
@@ -333,7 +342,7 @@ fn pathhash_ordinary_no_lazy_expire_does_not_read_physical_values() {
 fn pathhash_mutation_accounts_cached_growth_and_shrink() {
     use crate::foundation::memory::metrics::memory_stats::{self, MemoryCategory};
 
-    let (observations, is_empty) = {
+    let (observations, is_missing) = {
         let _guard = memory_stats::lock_global_for_test();
         let mut runtime = TestCommandRuntime::new(1, 100);
         runtime.read_expired_values = true;
@@ -353,13 +362,22 @@ fn pathhash_mutation_accounts_cached_growth_and_shrink() {
                 "PHMSET", "h", "q", "FIELDS", "1", "g", "x", "r", "FIELDS", "1", "x", "v",
             ],
             vec!["PHDEL", "h", "q"],
-            vec!["PHDELPREFIX", "h", ""],
+            vec!["PHPATHDEL", "h", "", "WITHSUBPATHS"],
         ] {
-            let old_size = tree(runtime.dbs.get(0).unwrap()).memory_usage();
+            let old_size = runtime
+                .dbs
+                .get(0)
+                .unwrap()
+                .get_allow_expired(KEY)
+                .unwrap()
+                .estimated_size()
+                + KEY.len();
             let before = memory_stats::get_tracker().get(MemoryCategory::Dataset);
             let outcome = execute(&mut runtime, &command(&parts));
             let db = runtime.dbs.get(0).unwrap();
-            let new_size = tree(db).memory_usage();
+            let new_size = db
+                .get_allow_expired(KEY)
+                .map_or(0, |value| value.estimated_size() + KEY.len());
             observations.push((
                 parts,
                 outcome.reply,
@@ -368,14 +386,24 @@ fn pathhash_mutation_accounts_cached_growth_and_shrink() {
                 db.get_expire(KEY),
             ));
         }
-        (observations, tree(runtime.dbs.get(0).unwrap()).is_empty())
+        (
+            observations,
+            runtime.dbs.get(0).unwrap().get_allow_expired(KEY).is_none(),
+        )
     };
     for (parts, reply, tracked_delta, expected_delta, deadline) in observations {
         assert!(!matches!(reply, Value::Error(_)));
         assert_eq!(tracked_delta, expected_delta, "{parts:?}");
-        assert_eq!(deadline, Some(1));
+        assert_eq!(
+            deadline,
+            if parts[0] == "PHPATHDEL" {
+                None
+            } else {
+                Some(1)
+            }
+        );
     }
-    assert!(is_empty);
+    assert!(is_missing);
 }
 
 #[cfg(not(feature = "wasm"))]
@@ -406,7 +434,7 @@ fn pathhash_import_dataset_applies_writes_and_preserves_commit_deadline() {
         ],
         vec!["PHSET", "h", "branch/b", "FIELDS", "1", "f", "b"],
         vec!["PHDEL", "h", "branch/a"],
-        vec!["PHDELPREFIX", "h", "branch/"],
+        vec!["PHPATHDEL", "h", "branch/", "WITHSUBPATHS"],
     ] {
         importing.apply(command(&parts), &registry).unwrap();
     }
@@ -451,7 +479,7 @@ fn pathhash_aof_loading_replays_physical_writes_and_deadline() {
         ],
         vec!["PHSET", "h", "branch/b", "FIELDS", "1", "f", "b"],
         vec!["PHDEL", "h", "branch/a"],
-        vec!["PHDELPREFIX", "h", "branch/"],
+        vec!["PHPATHDEL", "h", "branch/", "WITHSUBPATHS"],
         vec!["EXEC"],
     ] {
         crate::foundation::io::protocol::serializer::serialize_command(

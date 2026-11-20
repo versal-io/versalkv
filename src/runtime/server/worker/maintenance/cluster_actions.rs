@@ -146,6 +146,11 @@ impl ServerWorkerState {
             return;
         }
         let previous_primary = state.myself.replicaof.clone();
+        let migration_actions = state.fail_import_migrations(
+            "The replica detached from its primary during slot import",
+            crate::foundation::io::sys::time::unixtime(),
+        );
+        state.queue_migration_actions(migration_actions);
         self.abort_replica_session_for_role_change();
         self.replication_runtime.clear_replica_resume();
         self.ctx.flush_all_dbs();
@@ -289,7 +294,7 @@ impl ServerWorkerState {
             .nodes
             .get(target.node_id.as_str())
             .is_some_and(|node| {
-                node.is_primary() && node.ip() == target.host && node.port() == target.port
+                !node.is_replica() && node.ip() == target.host && node.port() == target.port
             })
     }
 
@@ -717,6 +722,96 @@ mod tests {
             .all(|view| view.health != ClusterReplicaHealth::Online));
         assert!(state.take_config_save_request());
         assert!(state.take_topology_broadcast_request());
+    }
+
+    #[test]
+    fn detach_replica_releases_swap_tracking_import_ownership() {
+        use crate::engine::distributed::cluster::migration::{
+            MigrationJob, MigrationJobId, SlotRanges,
+        };
+        use crate::engine::distributed::cluster::{node::key_hash_slot, SlotRange};
+        use crate::framework::CommandArgs;
+        use bytes::Bytes;
+
+        let mut runtime =
+            ServerWorkerState::new_with_slot_router(1, 14, |key| key_hash_slot(key) as usize)
+                .unwrap();
+        crate::framework::commands::register_all(&mut runtime.registry);
+        runtime.ctx.replication_mut().switch_to_replica();
+        let mut state = replica_state();
+        let id = MigrationJobId::parse(b"cccccccccccccccccccccccccccccccccccccccc").unwrap();
+        let key = b"{atomic}detach";
+        let slot = key_hash_slot(key);
+        let ranges = SlotRanges::new(vec![SlotRange::new(slot, slot).unwrap()]).unwrap();
+        state
+            .migrations
+            .start(MigrationJob::new_tracking_import(
+                id.clone(),
+                NodeId::parse(PRIMARY_ID.as_bytes()).unwrap(),
+                NodeId::parse(REPLICA_ID.as_bytes()).unwrap(),
+                ranges.clone(),
+                1,
+            ))
+            .unwrap();
+        runtime.ctx.create_slot_import(id.clone(), &ranges);
+        runtime
+            .ctx
+            .apply_slot_import(
+                &id,
+                CommandArgs::from_parts(vec![
+                    Bytes::from_static(b"SET"),
+                    Bytes::from_static(key),
+                    Bytes::from_static(b"7"),
+                ]),
+                &runtime.registry,
+            )
+            .unwrap();
+        state
+            .migrations
+            .fail_tracking_imports_after_swap("full sync", 2);
+        assert_eq!(runtime.ctx.slot_import_key_count(0, slot as usize), 1);
+
+        *runtime.ctx.cluster_state_mut() = Some(Box::new(state));
+        let mut conn = crate::framework::capabilities::connection::Connection::new_fake();
+        let detach = CommandArgs::from_parts(vec![
+            Bytes::from_static(b"CLUSTER"),
+            Bytes::from_static(b"REPLICATE"),
+            Bytes::from_static(b"NO"),
+            Bytes::from_static(b"ONE"),
+        ]);
+        assert_eq!(
+            crate::framework::commands::cluster::cluster::cluster(
+                &mut conn,
+                &detach,
+                &mut runtime.ctx,
+            ),
+            crate::foundation::io::protocol::Value::ok()
+        );
+        runtime.apply_pending_cluster_role_actions();
+
+        let state = runtime.ctx.cluster_state_mut().as_deref_mut().unwrap();
+        assert!(state.myself.is_primary());
+        assert!(state.migrations.tracking_import_views().is_empty());
+        assert!(state.migrations.import_snapshot_views().is_empty());
+        state.trim_migration_history(0);
+        assert!(state.migrations.views().is_empty());
+        assert!(runtime.ctx.slot_import_dbs().is_empty());
+        assert!(runtime.ctx.rdb_replication_info().aux_fields.is_empty());
+        assert!(runtime.ctx.slot_import_aof_snapshot().unwrap().is_empty());
+        runtime
+            .ctx
+            .cluster_state_mut()
+            .as_deref_mut()
+            .unwrap()
+            .migrations
+            .start(MigrationJob::new_tracking_import(
+                id,
+                NodeId::parse(PRIMARY_ID.as_bytes()).unwrap(),
+                NodeId::parse(REPLICA_ID.as_bytes()).unwrap(),
+                ranges,
+                3,
+            ))
+            .unwrap();
     }
 
     #[test]

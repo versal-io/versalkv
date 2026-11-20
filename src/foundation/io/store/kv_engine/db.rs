@@ -26,6 +26,7 @@ fn standalone_slot(_key: &[u8]) -> usize {
 }
 
 pub struct Db {
+    pub(super) watch_epochs: super::watch::WatchEpochs,
     pub(super) data: KVStore<StoredKey, DbValue>,
     pub(super) expires: KVStore<StoredKey, u64>,
     pub(super) expiry_cursor: u64,
@@ -263,6 +264,7 @@ impl Db {
         resize_budget: ResizeBudget,
     ) -> Self {
         Self {
+            watch_epochs: super::watch::WatchEpochs::default(),
             data: KVStore::with_resize_budget(slot_bits, resize_budget.clone()),
             expires: KVStore::with_resize_budget(slot_bits, resize_budget),
             expiry_cursor: 0,
@@ -328,6 +330,10 @@ impl Db {
             Some(&t) => now >= t,
             None => false,
         }
+    }
+
+    pub fn watch_key(&mut self, key: &[u8]) -> super::WatchSnapshot {
+        self.watch_epochs.watch(key)
     }
 
     pub fn get(&mut self, key: &[u8]) -> Option<&Robj> {
@@ -591,7 +597,7 @@ impl Db {
         }
     }
 
-    /// Mutate a path hash in place while preserving TTL and object metadata.
+    /// Preserve metadata while populated; remove the key when its last path is deleted.
     pub fn mutate_path_hash<T>(
         &mut self,
         key: &[u8],
@@ -619,12 +625,12 @@ impl Db {
         } else {
             self.get_mut(key)
         };
-        let (result, old_size, new_size) = match value {
+        let (result, old_size, new_size, is_empty) = match value {
             Some(Robj::PathHash(value)) => {
                 // Both reads use cached sizes; only the mutation touches entries.
                 let old_size = value.memory_usage();
                 let result = operation(value);
-                (result, old_size, value.memory_usage())
+                (result, old_size, value.memory_usage(), value.is_empty())
             }
             _ => return Err(()),
         };
@@ -632,6 +638,9 @@ impl Db {
             memory_stats::track_add(MemoryCategory::Dataset, new_size - old_size);
         } else {
             memory_stats::track_sub(MemoryCategory::Dataset, old_size - new_size);
+        }
+        if is_empty {
+            self.del(key);
         }
         Ok(Some(result))
     }
@@ -1396,7 +1405,7 @@ impl Db {
         }
         self.clear_hash_field_expires(key);
 
-        if let Some(entry) = self.data.get_mut_in_slot_bytes(slot, key) {
+        let is_new = if let Some(entry) = self.data.get_mut_in_slot_bytes(slot, key) {
             Self::overwrite_entry(entry, val, self.use_lfu, val_size);
             false
         } else {
@@ -1404,7 +1413,9 @@ impl Db {
                 .insert_in_slot(slot, StoredKey::from(key), DbValue::new(val, self.use_lfu));
             memory_stats::track_add(MemoryCategory::Dataset, key_len + val_size);
             true
-        }
+        };
+        self.watch_epochs.written(key);
+        is_new
     }
 
     pub fn set_keep_ttl(&mut self, key: Vec<u8>, val: Robj) {
@@ -1420,7 +1431,7 @@ impl Db {
 
         self.clear_hash_field_expires(key);
 
-        if let Some(entry) = self.data.get_mut_in_slot_bytes(slot, key) {
+        let is_new = if let Some(entry) = self.data.get_mut_in_slot_bytes(slot, key) {
             Self::overwrite_entry(entry, val, self.use_lfu, val_size);
             false
         } else {
@@ -1428,7 +1439,9 @@ impl Db {
                 .insert_in_slot(slot, StoredKey::from(key), DbValue::new(val, self.use_lfu));
             memory_stats::track_add(MemoryCategory::Dataset, key_len + val_size);
             true
-        }
+        };
+        self.watch_epochs.written(key);
+        is_new
     }
 
     pub fn load_entry(&mut self, key: Vec<u8>, val: Robj, expire: Option<u64>) {
@@ -1450,6 +1463,7 @@ impl Db {
             StoredKey::from(key.clone()),
             DbValue::new(val, self.use_lfu),
         );
+        self.watch_epochs.written(&key);
         self.set_hash_field_expires_map(key.clone(), hash_field_expires);
         let val_size = self
             .data
@@ -1618,6 +1632,7 @@ impl Db {
             .drain()
             .into_iter()
             .filter_map(|(key, val)| {
+                self.watch_epochs.deleted(key.as_bytes());
                 let key_total = key.len() + val.value.estimated_size();
                 memory_stats::track_sub(MemoryCategory::Dataset, key_total);
                 val.value.into_deferred_flush_value()
@@ -1650,6 +1665,7 @@ impl Db {
         self.module_values.remove(key);
         let removed = self.data.remove_in_slot_bytes(slot, key);
         if let Some(val) = removed {
+            self.watch_epochs.deleted(key);
             crate::foundation::memory::key_access::record_delete(self.db_id, key);
             let key_total = key.len() + val.value.estimated_size();
             memory_stats::track_sub(MemoryCategory::Dataset, key_total);
@@ -1663,13 +1679,16 @@ impl Db {
         let slot = self.key_slot(key);
         self.expires
             .insert_in_slot(slot, StoredKey::from(key), abs_ms);
+        self.watch_epochs.written(key);
     }
 
     /// Remove the TTL for `key`. Used by write commands that reset expiry
     /// (e.g. INCR without KEEPTTL) when the value is updated in place.
     pub fn remove_expire(&mut self, key: &[u8]) {
         let slot = self.key_slot(key);
-        self.expires.remove_in_slot_bytes(slot, key);
+        if self.expires.remove_in_slot_bytes(slot, key).is_some() {
+            self.watch_epochs.written(key);
+        }
         self.replica_local_expire_keys.remove(key);
     }
 
@@ -1862,6 +1881,7 @@ impl Db {
             return None;
         }
         let val = self.data.remove_in_slot_bytes(slot, key)?;
+        self.watch_epochs.deleted(key);
         crate::foundation::memory::key_access::record_delete(self.db_id, key);
         let expire = self.expires.remove_in_slot_bytes(slot, key);
         self.replica_local_expire_keys.remove(key);

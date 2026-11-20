@@ -62,7 +62,7 @@ fn object_reply(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> Value {
                 };
                 let obj = match db.get(&args.args[1]) {
                     Some(o) => o.clone(),
-                    None => return Value::error("ERR no such key"),
+                    None => return Value::Null,
                 };
                 let requires_hashtable = matches!(obj, Robj::HashHashtable(_))
                     && (db.hash_key_has_volatile_fields(&args.args[1])
@@ -79,7 +79,7 @@ fn object_reply(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> Value {
             };
             match db.get(&args.args[1]) {
                 Some(_) => Value::integer(1),
-                None => Value::error("ERR no such key"),
+                None => Value::Null,
             }
         }
         "freq" | "idletime" => {
@@ -90,7 +90,7 @@ fn object_reply(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> Value {
             let key = args.args[1].clone();
             let exists = db.exists(&key);
             if !exists {
-                return Value::error("ERR no such key");
+                return Value::Null;
             }
             let val = if sub == "freq" {
                 db.get_lfu_freq(&key) as i64
@@ -113,6 +113,16 @@ fn object_reply(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> Value {
 mod tests {
     use super::*;
     use crate::framework::commands::command_runtime::TestCommandRuntime;
+
+    #[test]
+    fn object_introspection_returns_null_for_missing_keys() {
+        let mut runtime = TestCommandRuntime::new(1, 100);
+        for subcommand in ["ENCODING", "REFCOUNT", "IDLETIME", "FREQ"] {
+            let args =
+                CommandArgs::from_parts(vec!["OBJECT".into(), subcommand.into(), "missing".into()]);
+            assert_eq!(object_reply(&mut runtime, &args), Value::Null);
+        }
+    }
 
     #[test]
     fn stringref_hash_encoding_reports_hashtable_without_field_ttl() {

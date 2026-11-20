@@ -1,5 +1,5 @@
-
 use super::{child_after_fork, prepare_bgsave_cpu_affinity, ServerContext};
+use crate::foundation::io::persistence::rdb::compression::{RdbCompression, RdbSnapshotOptions};
 use crate::foundation::io::sys::fd::{pipe, PipeFlags};
 use crate::foundation::io::sys::process::{
     exit_immediately, send_signal, wait_blocking, wait_nonblocking, ProcessSignal, WaitOutcome,
@@ -9,7 +9,6 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
-use crate::foundation::io::persistence::rdb::compression::{RdbCompression, RdbSnapshotOptions};
 
 const DISK_RDB_FILE_BUFFER_BYTES: usize = 128 * 1024;
 
@@ -169,6 +168,8 @@ fn fork_rdb_pipe_child(
     function_codes: &[Vec<u8>],
     frame_as_bulk: bool,
     snapshot: RdbSnapshotOptions,
+    include_data: bool,
+    replication: &crate::foundation::io::persistence::RdbReplicationInfo,
 ) -> Option<(i32, File, Option<File>)> {
     let data_pipe = match pipe(PipeFlags::CLOEXEC) {
         Ok(pipe) => pipe,
@@ -196,7 +197,6 @@ fn fork_rdb_pipe_child(
     };
 
     let listener_fds = ctx.listener_fds().to_vec();
-    let replication = ctx.rdb_full_sync_replication_info();
     let slot_imports = ctx.slot_import_dbs();
     // Snapshot the debug key-save delay before forking so the child can throttle
     // its RDB stream (default 0 = no delay). Mirrors the in-process full-resync
@@ -234,7 +234,7 @@ fn fork_rdb_pipe_child(
             exit_child_if_parent_is_gone(parent_pid);
             if !frame_as_bulk {
                 let ok = crate::foundation::io::persistence::rdb::serialize::serialize_replication_snapshot_streaming(
-                    ctx.dbs(), key_delay_us, function_codes, true, Some(&replication), &slot_imports,
+                    ctx.dbs(), key_delay_us, function_codes, include_data, Some(replication), &slot_imports,
                     snapshot,
                     |chunk| child_write_all(write_fd, chunk),
                 );
@@ -244,18 +244,19 @@ fn fork_rdb_pipe_child(
                 );
                 exit_immediately(if ok { 0 } else { 1 });
             }
-            let bytes = crate::foundation::io::persistence::rdb::serialize::serialize_replication_snapshot(
-                ctx.dbs(),
-                key_delay_us,
-                function_codes,
-                true,
-                Some(&replication),
-                &slot_imports,
-                snapshot,
-            );
+            let bytes =
+                crate::foundation::io::persistence::rdb::serialize::serialize_replication_snapshot(
+                    ctx.dbs(),
+                    key_delay_us,
+                    function_codes,
+                    include_data,
+                    Some(replication),
+                    &slot_imports,
+                    snapshot,
+                );
             let header = format!("${}\r\n", bytes.len());
-            let ok = child_write_all(write_fd, header.as_bytes())
-                && child_write_all(write_fd, &bytes);
+            let ok =
+                child_write_all(write_fd, header.as_bytes()) && child_write_all(write_fd, &bytes);
             drop(data_write_end);
             exit_immediately(if ok { 0 } else { 1 });
         }
@@ -299,13 +300,31 @@ pub fn fork_diskless_rdb_child(
     fork_diskless_rdb_child_with_options(ctx, function_codes, snapshot)
 }
 
+#[cfg(test)]
 pub fn fork_diskless_rdb_child_with_options(
     ctx: &mut ServerContext,
     function_codes: &[Vec<u8>],
     snapshot: RdbSnapshotOptions,
 ) -> Option<DisklessPipeChild> {
-    let (pid, data_read_end, child_release_write_end) =
-        fork_rdb_pipe_child(ctx, function_codes, false, snapshot)?;
+    let replication = ctx.rdb_full_sync_replication_info();
+    fork_diskless_rdb_child_with_filter(ctx, function_codes, snapshot, true, &replication)
+}
+
+pub fn fork_diskless_rdb_child_with_filter(
+    ctx: &mut ServerContext,
+    function_codes: &[Vec<u8>],
+    snapshot: RdbSnapshotOptions,
+    include_data: bool,
+    replication: &crate::foundation::io::persistence::RdbReplicationInfo,
+) -> Option<DisklessPipeChild> {
+    let (pid, data_read_end, child_release_write_end) = fork_rdb_pipe_child(
+        ctx,
+        function_codes,
+        false,
+        snapshot,
+        include_data,
+        replication,
+    )?;
     Some(DisklessPipeChild {
         pid,
         data_read_end,
@@ -328,7 +347,8 @@ pub fn fork_disk_rdb_file_child(
         compression: ctx.config().persistence.rdbcompression,
         checksum: ctx.config().persistence.rdbchecksum,
     };
-    fork_disk_rdb_file_child_with_options(ctx, function_codes, path, snapshot)
+    let replication = ctx.rdb_full_sync_replication_info();
+    fork_disk_rdb_file_child_with_options(ctx, function_codes, path, snapshot, &replication)
 }
 
 pub fn fork_disk_rdb_file_child_with_options(
@@ -336,9 +356,9 @@ pub fn fork_disk_rdb_file_child_with_options(
     function_codes: &[Vec<u8>],
     path: &Path,
     snapshot: RdbSnapshotOptions,
+    replication: &crate::foundation::io::persistence::RdbReplicationInfo,
 ) -> Option<i32> {
     let listener_fds = ctx.listener_fds().to_vec();
-    let replication = ctx.rdb_full_sync_replication_info();
     let slot_imports = ctx.slot_import_dbs();
     let key_delay_us = ctx.config().persistence.rdb_key_save_delay;
     let serialization = crate::foundation::io::persistence::RdbSerializeOptions {
@@ -372,9 +392,10 @@ pub fn fork_disk_rdb_file_child_with_options(
                         key_delay_us,
                         serialization,
                         function_codes,
-                        &replication,
+                        replication,
                         &slot_imports,
-                    ).with_snapshot(snapshot),
+                    )
+                    .with_snapshot(snapshot),
                     &mut writer,
                 )?;
                 writer.flush()?;

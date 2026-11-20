@@ -217,7 +217,9 @@ fn setup_forkless_import(
     runtime.ctx.config_mut().persistence.dbfilename = "dump.rdb".to_string();
     runtime.ctx.config_mut().persistence.bgsave_default_method =
         crate::engine::extension::config::persistence::BgsaveMethod::Forkless;
-    crate::framework::commands::server::save::start_bgsave(&mut runtime.ctx).unwrap();
+    // Exercise the incremental capture mechanism independently of the public
+    // policy, which now selects a fork when an import is already active.
+    crate::framework::commands::server::save::start_forkless_bgsave(&mut runtime.ctx).unwrap();
     assert!(runtime.ctx.persistence().forkless_capture_in_progress());
     (runtime, id, ranges, slot, dir)
 }
@@ -227,6 +229,111 @@ fn stop_forkless_import_capture(runtime: &mut ServerWorkerState, dir: std::path:
         .ctx
         .abort_forkless_save(crate::foundation::io::sys::time::mstime() / 1_000);
     let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn cancelled_forkless_sync_resumes_import_snapshot_and_peer_close() {
+    use crate::engine::distributed::cluster::migration::ImportPhase;
+    use crate::engine::extension::config::persistence::BgsaveMethod;
+    use crate::foundation::io::persistence::rdb::compression::RdbSnapshotOptions;
+    use crate::foundation::io::store::Robj;
+    use crate::runtime::server::worker::connection::ClientReadMode;
+
+    let (mut runtime, mut peer, id) = setup_registered_import_runtime();
+    crate::framework::commands::register_all(&mut runtime.registry);
+    let token = runtime.connection_registry.iter().next().unwrap().1.token();
+    runtime.ctx.config_mut().persistence.bgsave_default_method = BgsaveMethod::Forkless;
+    runtime.ctx.config_mut().persistence.rdb_key_save_delay = 1_000_000;
+    runtime
+        .ctx
+        .db_mut(0)
+        .unwrap()
+        .set(b"seed".to_vec(), Robj::string("value"));
+    let snapshot = RdbSnapshotOptions {
+        compression: crate::foundation::io::persistence::rdb::compression::RdbCompression::No,
+        checksum: true,
+    };
+    let output = runtime.try_begin_diskless_sync(&[], &[], snapshot).unwrap();
+    assert_eq!(output.method, BgsaveMethod::Forkless);
+    assert!(runtime.ctx.persistence().forkless_save_in_progress());
+    assert!(!runtime.ctx.persistence().forkless_capture_in_progress());
+    let ranges = runtime
+        .ctx
+        .cluster_state()
+        .as_deref()
+        .unwrap()
+        .migrations
+        .get(&id)
+        .unwrap()
+        .ranges
+        .clone();
+    runtime.ctx.create_slot_import(id.clone(), &ranges);
+    runtime
+        .ctx
+        .cluster_state_mut()
+        .as_deref_mut()
+        .unwrap()
+        .migrations
+        .record_ack(&id, 1)
+        .unwrap();
+    peer.write_all(
+        &crate::engine::distributed::replication::protocol::encode_command(&[
+            b"CLUSTER",
+            b"SYNCSLOTS",
+            b"SNAPSHOT-EOF",
+        ]),
+    )
+    .unwrap();
+    runtime.dispatch_client_read(token.0, ClientReadMode::Fair);
+    assert!(matches!(
+        runtime.connection_registry[token]
+            .blocked
+            .as_ref()
+            .map(|blocked| &blocked.cmd),
+        Some(BlockedCmd::Forkless)
+    ));
+    assert!(runtime.ctx.has_forkless_waiters());
+
+    runtime.abort_diskless_relay_for_dataset_flush();
+    assert!(!runtime.ctx.persistence().forkless_save_in_progress());
+    runtime.pump_forkless_capture();
+
+    assert!(
+        runtime.connection_registry[token].blocked.is_none(),
+        "the next maintenance turn must resume a cancelled sync's snapshot waiter"
+    );
+    assert!(!runtime.ctx.has_forkless_waiters());
+    assert_eq!(
+        runtime
+            .ctx
+            .cluster_state()
+            .as_deref()
+            .unwrap()
+            .migrations
+            .get(&id)
+            .unwrap()
+            .phase,
+        MigrationPhase::Import(ImportPhase::WaitingForPaused)
+    );
+    peer.shutdown(Shutdown::Both).unwrap();
+    runtime.dispatch_client_read(token.0, ClientReadMode::Fair);
+    assert!(!runtime.connection_registry.contains(token));
+    assert!(matches!(
+        runtime
+            .ctx
+            .cluster_state()
+            .as_deref()
+            .unwrap()
+            .migrations
+            .get(&id)
+            .unwrap()
+            .phase,
+        MigrationPhase::Terminal(
+            crate::engine::distributed::cluster::migration::TerminalPhase::Failed
+        )
+    ));
+    assert!(!runtime.ctx.has_slot_import(&id));
+    drop(output);
 }
 
 fn install_slot_snapshot_source_for_test(
@@ -920,6 +1027,83 @@ fn slot_snapshot_source_registration_failure_clears_child_state() {
     assert!(runtime.slot_migration_snapshot.is_none());
     assert!(!runtime.ctx.persistence().has_active_child());
     assert_eq!(runtime.collect_child_completion_events(), 0);
+}
+
+#[test]
+fn forkless_bgsave_fails_slot_snapshot_and_allows_a_later_retry() {
+    use crate::engine::distributed::cluster::migration::TerminalPhase;
+
+    let build_export_job =
+        |id_bytes: &[u8], slot: u16, state: &ClusterState| -> (MigrationJobId, MigrationJob) {
+            let id = MigrationJobId::parse(id_bytes).unwrap();
+            let mut job = MigrationJob::new(
+                id.clone(),
+                NodeId::parse(state.myself.name.as_bytes()).unwrap(),
+                NodeId::parse(b"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap(),
+                SlotRanges::new(vec![SlotRange::new(slot, slot).unwrap()]).unwrap(),
+                MigrationOperation::Export,
+                1,
+            );
+            job.phase = MigrationPhase::Export(ExportPhase::WaitingToSnapshot);
+            (id, job)
+        };
+
+    let mut runtime = ServerWorkerState::new(1).unwrap();
+    let mut state = ClusterState::new("127.0.0.1", 6379, 16_379);
+    let (id, job) = build_export_job(b"1111111111111111111111111111111111111111", 1, &state);
+    state.migrations.start(job).unwrap();
+    state.queue_migration_actions([MigrationAction::StartSnapshot(id.clone())]);
+    *runtime.ctx.cluster_state_mut() = Some(Box::new(state));
+
+    let dir = std::env::temp_dir().join(format!(
+        "versal-forkless-snapshot-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    runtime.ctx.config_mut().persistence.dir = dir.to_string_lossy().into_owned();
+    runtime.ctx.config_mut().persistence.dbfilename = "dump.rdb".to_string();
+    runtime.ctx.config_mut().persistence.bgsave_default_method =
+        crate::engine::extension::config::persistence::BgsaveMethod::Forkless;
+    crate::framework::commands::server::save::start_forkless_bgsave(&mut runtime.ctx).unwrap();
+    assert!(runtime.ctx.persistence().forkless_save_in_progress());
+
+    runtime.drive_slot_migration_actions();
+
+    let phase = runtime
+        .ctx
+        .cluster_state()
+        .as_deref()
+        .unwrap()
+        .migrations
+        .get(&id)
+        .unwrap()
+        .phase;
+    assert_eq!(phase, MigrationPhase::Terminal(TerminalPhase::Failed));
+    assert!(runtime.slot_migration_snapshot.is_none());
+    assert!(runtime.ctx.persistence().child().is_none());
+    assert!(runtime.ctx.persistence().forkless_save_in_progress());
+
+    // Once the forkless save ends, a fresh export must snapshot successfully.
+    runtime
+        .ctx
+        .abort_forkless_save(crate::foundation::io::sys::time::mstime() / 1000);
+    let (second_id, second_job) = {
+        let state = runtime.ctx.cluster_state().as_deref().unwrap();
+        build_export_job(b"2222222222222222222222222222222222222222", 2, state)
+    };
+    if let Some(state) = runtime.ctx.cluster_state_mut().as_deref_mut() {
+        state.migrations.start(second_job).unwrap();
+        state.queue_migration_actions([MigrationAction::StartSnapshot(second_id.clone())]);
+    }
+    runtime.drive_slot_migration_actions();
+    assert!(
+        runtime.slot_migration_snapshot.is_some(),
+        "a later export must start its snapshot after the forkless save ends"
+    );
+    runtime.abort_slot_snapshot(&second_id);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -2026,7 +2210,7 @@ fn forkless_capture_postpones_live_import_write_before_hidden_dataset_mutation()
     runtime.ctx.config_mut().persistence.bgsave_default_method =
         crate::engine::extension::config::persistence::BgsaveMethod::Forkless;
     runtime.ctx.config_mut().persistence.rdb_key_save_delay = 10_000;
-    crate::framework::commands::server::save::start_bgsave(&mut runtime.ctx).unwrap();
+    crate::framework::commands::server::save::start_forkless_bgsave(&mut runtime.ctx).unwrap();
     assert!(runtime.ctx.persistence().forkless_capture_in_progress());
 
     let token = Token(93);
@@ -2148,7 +2332,7 @@ fn forkless_capture_postpones_live_import_xgroup_create() {
     runtime.ctx.config_mut().persistence.bgsave_default_method =
         crate::engine::extension::config::persistence::BgsaveMethod::Forkless;
     runtime.ctx.config_mut().persistence.rdb_key_save_delay = 10_000;
-    crate::framework::commands::server::save::start_bgsave(&mut runtime.ctx).unwrap();
+    crate::framework::commands::server::save::start_forkless_bgsave(&mut runtime.ctx).unwrap();
     assert!(runtime.ctx.persistence().forkless_capture_in_progress());
 
     let token = Token(94);
@@ -2238,7 +2422,7 @@ fn forkless_capture_reblocks_live_import_write_after_generic_unpause_wakeup() {
     runtime.ctx.config_mut().persistence.bgsave_default_method =
         crate::engine::extension::config::persistence::BgsaveMethod::Forkless;
     runtime.ctx.config_mut().persistence.rdb_key_save_delay = 10_000;
-    crate::framework::commands::server::save::start_bgsave(&mut runtime.ctx).unwrap();
+    crate::framework::commands::server::save::start_forkless_bgsave(&mut runtime.ctx).unwrap();
     assert!(runtime.ctx.persistence().forkless_capture_in_progress());
 
     let token = Token(95);
@@ -2346,7 +2530,7 @@ fn forkless_capture_keeps_import_write_blocked_after_serving_key_resolution() {
     runtime.ctx.config_mut().persistence.bgsave_default_method =
         crate::engine::extension::config::persistence::BgsaveMethod::Forkless;
     runtime.ctx.config_mut().persistence.rdb_key_save_delay = 0;
-    crate::framework::commands::server::save::start_bgsave(&mut runtime.ctx).unwrap();
+    crate::framework::commands::server::save::start_forkless_bgsave(&mut runtime.ctx).unwrap();
     assert!(runtime.ctx.persistence().forkless_capture_in_progress());
     assert!(runtime
         .ctx

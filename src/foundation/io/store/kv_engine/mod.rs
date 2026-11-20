@@ -5,12 +5,14 @@ pub mod expire;
 mod hash_field_expires;
 mod module_values;
 pub mod scan;
+mod watch;
 
 pub use crate::foundation::io::store::Robj;
 pub(crate) use db::SnapshotValue;
 pub use db::{Db, KeyMeta};
 pub use dbset::{DbSet, SlotEntry};
 pub use eviction::{EvictionCandidate, EvictionPolicy};
+pub use watch::WatchSnapshot;
 
 use crate::foundation::io::sys::time;
 

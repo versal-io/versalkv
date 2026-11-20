@@ -55,6 +55,10 @@ rand = "0.10"
 serde_json = "1"
 cc = "1"
 
+[patch.crates-io]
+# Use Valkey's coroutine hook transfer without changing the Lua binding.
+lua-src = { path = "scripts/lua-src" }
+
 [profile.release]
 lto = "fat"
 codegen-units = 1

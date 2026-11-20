@@ -3,6 +3,7 @@ use crate::engine::command::{
     CMD_NO_AUTH, CMD_PUBSUB, CMD_READONLY, CMD_SKIP_SLOWLOG, CMD_SLOW, CMD_STALE, CMD_WRITE,
 };
 use crate::engine::core::Value;
+use crate::framework::generated::commands::catalog::CommandArgMeta;
 use crate::framework::CommandMeta;
 use bytes::Bytes;
 
@@ -17,12 +18,57 @@ pub(super) fn builtin_doc(name: &str) -> Value {
         ("since", metadata.map_or("", |metadata| metadata.since)),
         ("group", metadata.map_or("", |metadata| metadata.group)),
     ];
-    Value::Map(fields.into_iter().map(|(name, value)| {
-        (
-            Value::bulk(Bytes::from_static(name.as_bytes())),
-            Value::bulk(Bytes::from_static(value.as_bytes())),
-        )
-    }).collect())
+    let mut fields = fields
+        .into_iter()
+        .map(|(name, value)| (bulk(name), bulk(value)))
+        .collect::<Vec<_>>();
+    if let Some(metadata) = metadata.filter(|metadata| !metadata.arguments.is_empty()) {
+        fields.push((bulk("arguments"), argument_docs(metadata.arguments)));
+    }
+    Value::Map(fields)
+}
+
+fn argument_docs(arguments: &[CommandArgMeta]) -> Value {
+    Value::Array(arguments.iter().map(argument_doc).collect())
+}
+
+fn argument_doc(argument: &CommandArgMeta) -> Value {
+    let mut fields = vec![
+        (bulk("name"), bulk(argument.name)),
+        (bulk("type"), bulk(argument.arg_type)),
+    ];
+    if let Some(display_text) = argument.display_text {
+        fields.push((bulk("display_text"), bulk(display_text)));
+    }
+    if let Some(index) = argument.key_spec_index {
+        fields.push((bulk("key_spec_index"), Value::integer(index)));
+    }
+    for (name, value) in [
+        ("token", argument.token),
+        ("summary", argument.summary),
+        ("since", argument.since),
+        ("deprecated_since", argument.deprecated_since),
+    ] {
+        if let Some(value) = value {
+            fields.push((bulk(name), bulk(value)));
+        }
+    }
+    if !argument.flags.is_empty() {
+        fields.push((
+            bulk("flags"),
+            Value::set(
+                argument
+                    .flags
+                    .iter()
+                    .map(|flag| Value::SimpleString(Bytes::from_static(flag.as_bytes())))
+                    .collect(),
+            ),
+        ));
+    }
+    if matches!(argument.arg_type, "oneof" | "block") {
+        fields.push((bulk("arguments"), argument_docs(argument.arguments)));
+    }
+    Value::Map(fields)
 }
 
 pub(crate) fn flags_to_strings(flags: u64) -> Vec<&'static str> {
@@ -169,7 +215,10 @@ pub(crate) fn geo_key_specs(name: &str) -> Option<Vec<Value>> {
     };
     let source = single_key_spec(
         &["RO", "access"],
-        typed_spec("index", Value::Map(vec![(bulk("index"), Value::integer(1))])),
+        typed_spec(
+            "index",
+            Value::Map(vec![(bulk("index"), Value::integer(1))]),
+        ),
     );
     let mut specs = vec![source];
     for keyword in ["STORE", "STOREDIST"] {

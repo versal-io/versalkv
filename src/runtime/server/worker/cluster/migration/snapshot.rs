@@ -60,7 +60,19 @@ impl SlotSnapshotCompletionState {
 
 impl ServerWorkerState {
     pub(super) fn try_start_slot_snapshot(&mut self, id: &MigrationJobId) {
-        if self.slot_migration_snapshot.is_some() || self.ctx.persistence().has_active_child() {
+        if self.slot_migration_snapshot.is_some() || self.ctx.persistence().has_child_process() {
+            return;
+        }
+        // Match C serverFork(CHILD_TYPE_SLOT_MIGRATION): a forkless save holds
+        // the save-or-child exclusion even though it has no child process, so
+        // the snapshot fork fails with EALREADY instead of racing the
+        // background keyspace iteration. No pipe or child state is created.
+        if self.ctx.persistence().forkless_save_in_progress() {
+            crate::server_log!(
+                warning,
+                "Can't begin slot migration snapshot in background: fork: Operation already in progress"
+            );
+            self.fail_slot_migration(id, "Failed to start snapshot");
             return;
         }
         let ranges = self

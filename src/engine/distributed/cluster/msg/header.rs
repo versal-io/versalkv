@@ -8,8 +8,51 @@ use crate::engine::distributed::cluster::node::ClusterNode;
 
 pub const CLUSTER_BUS_HEADER_LEN: usize = 2256;
 pub const NET_IP_STR_LEN: usize = 46;
+pub(crate) const CLUSTER_BUS_PREFIX_LEN: usize = 14;
+const CLUSTER_BUS_LIGHT_HEADER_LEN: usize = 16;
+const CLUSTER_BUS_MAX_CONTROL_LEN: usize = 16 * 1024 * 1024;
+const CLUSTER_MSG_LIGHT: u16 = 1 << 15;
 const CLUSTER_PROTOCOL_VERSION: u16 = 1;
 const SIGNATURE: &[u8; 4] = b"RCmb";
+
+pub(crate) fn validate_packet_prefix(data: &[u8]) -> Result<usize, ClusterProtocolError> {
+    if data.len() < CLUSTER_BUS_PREFIX_LEN {
+        return Err(ClusterProtocolError::Incomplete {
+            available: data.len(),
+            needed: CLUSTER_BUS_PREFIX_LEN,
+        });
+    }
+    if &data[..4] != SIGNATURE {
+        return Err(ClusterProtocolError::InvalidSignature);
+    }
+    let total_len = read_u32(data, 4)? as usize;
+    let wire_type = read_u16(data, 12)?;
+    let minimum_len = if wire_type & CLUSTER_MSG_LIGHT != 0 {
+        CLUSTER_BUS_LIGHT_HEADER_LEN
+    } else {
+        CLUSTER_BUS_HEADER_LEN
+    };
+    if total_len < minimum_len {
+        return Err(ClusterProtocolError::InvalidLength {
+            declared: total_len,
+            expected: minimum_len,
+            field: "cluster packet".to_string(),
+        });
+    }
+    // Client-originated Pub/Sub and module payloads are not control packets.
+    let is_payload_type = matches!(
+        ClusterMsgType::from_u16(wire_type & !CLUSTER_MSG_LIGHT),
+        Some(ClusterMsgType::Publish | ClusterMsgType::PublishShard | ClusterMsgType::Module)
+    );
+    if !is_payload_type && total_len > CLUSTER_BUS_MAX_CONTROL_LEN {
+        return Err(ClusterProtocolError::InvalidLength {
+            declared: total_len,
+            expected: CLUSTER_BUS_MAX_CONTROL_LEN,
+            field: "cluster control packet maximum".to_string(),
+        });
+    }
+    Ok(total_len)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
@@ -263,16 +306,7 @@ impl ClusterBusMessage {
     }
 
     pub fn decode(data: &[u8]) -> Result<(Self, usize), ClusterProtocolError> {
-        if data.len() < 8 {
-            return Err(ClusterProtocolError::Incomplete {
-                available: data.len(),
-                needed: 8,
-            });
-        }
-        if &data[..4] != SIGNATURE {
-            return Err(ClusterProtocolError::InvalidSignature);
-        }
-        let total_len = read_u32(data, 4)? as usize;
+        let total_len = validate_packet_prefix(data)?;
         if total_len < CLUSTER_BUS_HEADER_LEN {
             return Err(ClusterProtocolError::InvalidLength {
                 declared: total_len,

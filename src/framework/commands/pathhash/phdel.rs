@@ -28,11 +28,19 @@ pub fn phdel(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> CommandOut
         Ok(deleted) => deleted.unwrap_or(0),
         Err(_) => return CommandOutcome::reply(CommandError::wrong_type()),
     };
-    write_outcome(
+    let is_key_removed = deleted > 0 && db.get_allow_expired(key).is_none();
+    let mut outcome = write_outcome(
         db_index,
         key,
         "phdel",
         deleted,
         Value::integer(deleted as i64),
-    )
+    );
+    if is_key_removed {
+        outcome.effects.events.push(crate::engine::core::CoreEvent {
+            kind: "del",
+            key: key.clone(),
+        });
+    }
+    outcome
 }

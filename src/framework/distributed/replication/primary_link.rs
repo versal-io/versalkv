@@ -270,6 +270,7 @@ impl PrimaryLink {
     /// Start a length-framed full sync. Unlike EOF-framed socket transfers,
     /// the replica knows the exact RDB boundary and can receive command bytes
     /// immediately after the final payload byte.
+    #[cfg(test)]
     pub fn begin_length_framed_full_resync(
         &mut self,
         bytes: Vec<u8>,

@@ -5,7 +5,7 @@ use crate::framework::{CmdFlags, CommandMeta, DispatchGroup};
 
 pub const PHSCAN_META: CommandMeta = CommandMeta {
     name: "phscan",
-    arity: -3,
+    arity: -4,
     flags: (CMD_READONLY) as CmdFlags,
     dispatch_group: DispatchGroup::Default,
     first_key: 1,

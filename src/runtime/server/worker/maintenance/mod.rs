@@ -149,6 +149,11 @@ impl ServerWorkerState {
                 self.release_forkless_clients();
             }
         }
+        if !self.ctx.persistence().forkless_save_in_progress() && self.ctx.has_forkless_waiters() {
+            // A replication producer can finish or be cancelled without a
+            // capture feed. Resume its barriers on the next maintenance turn.
+            self.release_forkless_clients();
+        }
         // Keep the serializer synchronized with the configured pace after
         // waiters resolve, including the final background serialization phase.
         if self.ctx.persistence().forkless_save_in_progress() && !self.ctx.has_forkless_waiters() {
@@ -315,10 +320,18 @@ impl ServerWorkerState {
             let Some((connection_token, token_value, memory)) = candidates.pop() else {
                 break;
             };
-            if self
+            if let Some(connection) = self
                 .connection_registry
-                .contains(crate::framework::capabilities::io::Token(connection_token))
+                .get(crate::framework::capabilities::io::Token(connection_token))
             {
+                if self
+                    .blocked_events
+                    .protects_command_owner(connection.session_id())
+                {
+                    // C counts outer command owners as pending, without closing them.
+                    total = total.saturating_sub(memory);
+                    continue;
+                }
                 self.remove_connection(token_value);
                 total = total.saturating_sub(memory);
                 self.ctx.incr_evicted_clients(1);
@@ -1361,6 +1374,7 @@ mod tests {
                 RdbStep::RecordApplied => {}
                 RdbStep::Finished(_) => break,
                 RdbStep::NeedInput => panic!("complete snapshot requested more input"),
+                RdbStep::InlineCommand { .. } => panic!("snapshot has no inline commands"),
             }
         }
         assert_eq!(decoder.consumed_bytes(), bytes.len());
@@ -1826,6 +1840,33 @@ mod tests {
             .contains(crate::framework::capabilities::io::Token(large_token.0)));
         assert_eq!(runtime.ctx.normal_client_memory(), expected_remaining);
         assert_eq!(runtime.ctx.stats().evicted_clients, 1);
+    }
+
+    #[test]
+    fn client_eviction_counts_command_owner_only_when_selected() {
+        use crate::framework::capabilities::connection::Connection;
+        use crate::framework::capabilities::io::Token;
+
+        let mut runtime = ServerWorkerState::new(1).unwrap();
+        runtime.ctx.config_mut().server.maxmemory_clients = "400kb".to_string();
+        let caller = Token(44);
+        let larger = Token(45);
+        for (token, size) in [(caller, 200 * 1024), (larger, 300 * 1024)] {
+            let mut connection = Connection::new(token, ([127, 0, 0, 1], 6379).into(), false);
+            connection.queue_reply(vec![b'x'; size]);
+            runtime.connection_registry.insert(connection);
+        }
+        runtime.refresh_all_client_memory_usage();
+        let session = runtime.connection_registry[caller].session_id();
+        runtime.blocked_events.push_command_owner(session);
+
+        runtime.evict_clients();
+
+        assert!(runtime.connection_registry.contains(caller));
+        assert!(!runtime.connection_registry.contains(larger));
+        assert!(!runtime.connection_registry[caller].is_async_close_pending);
+        assert_eq!(runtime.ctx.stats().evicted_clients, 1);
+        assert_eq!(runtime.blocked_events.pop_command_owner(), Some(session));
     }
 
     #[test]
@@ -2752,7 +2793,8 @@ mod tests {
         connection.queue_replication_reply(vec![b'm'; EVICTION_EXPORT_KEY_BYTES]);
         let connection_token = backend.connection_registry.insert(connection);
         backend.track_slot_export_connection_output(connection_token);
-        let before = backend.memory_used_for_eviction(0);
+        let before = backend.ctx.maxmemory_state();
+        assert!(before.not_counted >= EVICTION_EXPORT_KEY_BYTES);
         let queued_before = backend.connection_registry
             [crate::framework::capabilities::io::Token(connection_token)]
         .output
@@ -2770,7 +2812,14 @@ mod tests {
             .consume_written_bytes(64 * 1024, queued_before)
             .unwrap();
 
-        assert_eq!(backend.memory_used_for_eviction(0), before);
+        // Process-wide allocations may change on the libtest coordinator thread.
+        // A partial drain must retain the exact full-buffer memory exclusion.
+        let after = backend.ctx.maxmemory_state();
+        assert_eq!(after.not_counted, before.not_counted);
+        assert_eq!(
+            after.reported.saturating_sub(after.logical),
+            before.not_counted
+        );
         finish_allocator_sensitive_test(MARKER);
     }
 }

@@ -1211,10 +1211,18 @@ fn nested_hosted_script_preserves_the_outer_execution_time() {
         DispatchGroup::Default,
         connection_token,
         executor,
-        &make_args(&[b"EVAL", b"return redis.call('TIME')[1]", b"0"]),
+        &make_args(&[
+            b"EVAL",
+            b"redis.call('SET','clock-key','value','PX',1000);return redis.call('PTTL','clock-key')",
+            b"0",
+        ]),
     );
 
-    assert_eq!(reply, Value::bulk(b"1".to_vec()));
+    assert_eq!(reply, Value::integer(1_000));
+    assert_eq!(
+        backend.ctx.db(0).unwrap().get_expire(b"clock-key"),
+        Some(2_000)
+    );
     assert_eq!(crate::foundation::io::sys::time::mstime(), 1_000);
 }
 

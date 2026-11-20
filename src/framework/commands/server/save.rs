@@ -1,25 +1,26 @@
-
 use crate::engine::command::context::CommandConn;
 use crate::engine::persistence::RdbSaveOptions;
-use crate::framework::context::ServerContext;
-use crate::framework::context::RuntimeConfig;
-use crate::framework::{CommandArgs, CommandError};
-use crate::foundation::io::store::kv_engine::now_ms;
 use crate::foundation::io::protocol::Value;
+use crate::foundation::io::store::kv_engine::now_ms;
+use crate::framework::context::RuntimeConfig;
+use crate::framework::context::ServerContext;
+use crate::framework::{CommandArgs, CommandError};
 use command_macros::command;
 use std::sync::atomic::{AtomicI32, Ordering};
 
 static CLUSTER_CONFIG_LOCK_FD: AtomicI32 = AtomicI32::new(-1);
 
 mod fullsync_fork;
-pub use fullsync_fork::{
-    fork_disk_rdb_file_child_with_options, fork_diskless_rdb_child_with_options,
-    pause_parent_after_replication_fork, DiskSyncChildExit,
-};
-#[cfg(test)]
-pub use fullsync_fork::{fork_diskless_rdb_child, fork_disk_rdb_file_child};
 #[cfg(test)]
 pub use fullsync_fork::reap_disk_sync_file_child;
+#[cfg(test)]
+pub use fullsync_fork::{
+    fork_disk_rdb_file_child, fork_diskless_rdb_child, fork_diskless_rdb_child_with_options,
+};
+pub use fullsync_fork::{
+    fork_disk_rdb_file_child_with_options, fork_diskless_rdb_child_with_filter,
+    pause_parent_after_replication_fork, DiskSyncChildExit,
+};
 
 #[cfg(test)]
 static DISKLESS_FORK_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -89,16 +90,18 @@ pub fn bgsave(conn: &mut dyn CommandConn, args: &CommandArgs, ctx: &mut ServerCo
         }
     }
 
-    if ctx.persistence().rdb_child_pid().is_some()
-        || ctx.persistence().forkless_save_in_progress()
+    if ctx.persistence().rdb_child_pid().is_some() || ctx.persistence().forkless_save_in_progress()
     {
         return Value::error("ERR Background save already in progress");
     }
     if ctx.persistence().has_active_child() || conn.in_transaction() {
         if conn.in_transaction()
-            || args.args.first().is_some_and(|arg| arg.eq_ignore_ascii_case(b"SCHEDULE"))
+            || args
+                .args
+                .first()
+                .is_some_and(|arg| arg.eq_ignore_ascii_case(b"SCHEDULE"))
         {
-            let method = resolve_bgsave_method(ctx, ctx.config().persistence.bgsave_default_method);
+            let method = ctx.config().persistence.bgsave_default_method;
             ctx.persistence_mut().schedule_bgsave(method);
             return Value::SimpleString("Background saving scheduled".into());
         }
@@ -157,15 +160,26 @@ pub fn start_bgsave(ctx: &mut ServerContext) -> Result<(), ()> {
 }
 
 fn resolve_bgsave_method(
-    ctx: &ServerContext,
+    ctx: &mut ServerContext,
     requested: crate::engine::extension::config::persistence::BgsaveMethod,
 ) -> crate::engine::extension::config::persistence::BgsaveMethod {
     use crate::engine::extension::config::persistence::BgsaveMethod;
     if requested == BgsaveMethod::Forkless
-        && !ctx.module_registry().list().all(|module| module.options.get() & (1 << 6) != 0)
+        && !ctx
+            .module_registry()
+            .list()
+            .all(|module| module.options.get() & (1 << 6) != 0)
     {
+        ctx.stats_mut().forkless_fallbacks_module += 1;
         crate::server_log!(warning,
             "Falling back to fork-based save: a loaded module has not declared VALKEYMODULE_OPTIONS_HANDLE_FORKLESS"
+        );
+        BgsaveMethod::Fork
+    } else if requested == BgsaveMethod::Forkless && !ctx.slot_import_dbs().is_empty() {
+        ctx.stats_mut().forkless_fallbacks_slot_import += 1;
+        crate::server_log!(
+            notice,
+            "Falling back to fork-based save: an active slot import is in progress"
         );
         BgsaveMethod::Fork
     } else {
@@ -201,10 +215,8 @@ fn start_bgsave_with_method(
         .collect();
     let replication = ctx.rdb_replication_info();
     let slot_imports = ctx.slot_import_dbs();
-    let bgsave_affinity = prepare_bgsave_cpu_affinity(
-        &ctx.config().server.bgsave_cpulist,
-    )
-    .map_err(|_| ())?;
+    let bgsave_affinity =
+        prepare_bgsave_cpu_affinity(&ctx.config().server.bgsave_cpulist).map_err(|_| ())?;
     let fork_started = std::time::Instant::now();
     let pid = match crate::framework::capabilities::process::fork_process() {
         Ok(crate::framework::capabilities::process::ForkBranch::Parent(child)) => child.into_pid(),
@@ -238,7 +250,7 @@ fn start_bgsave_with_method(
         .map_err(|_| ())
 }
 
-fn start_forkless_bgsave(ctx: &mut ServerContext) -> Result<(), ()> {
+pub(crate) fn start_forkless_bgsave(ctx: &mut ServerContext) -> Result<(), ()> {
     use crate::foundation::io::persistence::rdb::{
         compression::{RdbCompression, RdbSnapshotOptions},
         frozen::FrozenRdb,
@@ -247,8 +259,13 @@ fn start_forkless_bgsave(ctx: &mut ServerContext) -> Result<(), ()> {
     use crate::foundation::io::persistence::snapshot::background::BackgroundRdbSave;
 
     let options = RdbSaveOptions::from_config(&ctx.config().persistence);
-    let function_codes: Vec<Vec<u8>> = ctx.script().function_registry.list_libraries()
-        .into_iter().map(|lib| lib.code.as_bytes().to_vec()).collect();
+    let function_codes: Vec<Vec<u8>> = ctx
+        .script()
+        .function_registry
+        .list_libraries()
+        .into_iter()
+        .map(|lib| lib.code.as_bytes().to_vec())
+        .collect();
     let replication = ctx.rdb_replication_info();
     let capture_ms = now_ms();
     let preserve_expired = !ctx.config().server.active_expire_enabled
@@ -282,7 +299,11 @@ fn start_forkless_bgsave(ctx: &mut ServerContext) -> Result<(), ()> {
         save_options,
     )
     .map_err(|error| {
-        crate::server_log!(warning, "Failed to start forkless background saving: {}", error);
+        crate::server_log!(
+            warning,
+            "Failed to start forkless background saving: {}",
+            error
+        );
     })?;
     let feed = frozen.into_incremental_feed(feeder, capture_ms, preserve_expired);
     ctx.set_forkless_capture_expiration_paused(true);
@@ -322,12 +343,7 @@ pub(crate) fn register_cluster_config_lock_fd(fd: i32) {
 }
 
 pub(crate) fn unregister_cluster_config_lock_fd(fd: i32) {
-    let _ = CLUSTER_CONFIG_LOCK_FD.compare_exchange(
-        fd,
-        -1,
-        Ordering::AcqRel,
-        Ordering::Acquire,
-    );
+    let _ = CLUSTER_CONFIG_LOCK_FD.compare_exchange(fd, -1, Ordering::AcqRel, Ordering::Acquire);
 }
 
 fn close_cluster_config_lock_in_child() -> bool {
@@ -364,15 +380,13 @@ pub fn apply_bgsave_child_completion(
 
 ///   2. dirty >= saveparam.changes；
 pub fn check_auto_bgsave(ctx: &mut ServerContext) {
-    if let Some(method) = ctx.persistence().scheduled_bgsave_method() {
+    if ctx.persistence().bgsave_scheduled() {
         let now_sec = (now_ms() / 1000) as i64;
         let should_retry = ctx.persistence().rdb().last_bgsave_status
             == crate::engine::persistence::OperationStatus::Ok
             || now_sec - ctx.persistence().rdb().last_bgsave_try_sec
                 > crate::engine::extension::config::persistence::BGSAVE_RETRY_DELAY_SEC;
-        if should_retry && !ctx.persistence().has_active_child()
-            && start_bgsave_with_method(ctx, method).is_ok()
-        {
+        if should_retry && !ctx.persistence().has_active_child() && start_bgsave(ctx).is_ok() {
             ctx.persistence_mut().set_bgsave_scheduled(false);
             ctx.update_dict_resize_policy();
         }
@@ -401,9 +415,11 @@ fn write_rdb<W: std::io::Write>(
     writer: &mut W,
     key_delay_us: i64,
 ) -> std::io::Result<()> {
-    writer.write_all(&crate::foundation::io::persistence::serialize_all(dbs, key_delay_us))
+    writer.write_all(&crate::foundation::io::persistence::serialize_all(
+        dbs,
+        key_delay_us,
+    ))
 }
-
 
 #[cfg(test)]
 #[path = "save/tests.rs"]

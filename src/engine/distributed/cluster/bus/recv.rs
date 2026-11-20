@@ -99,10 +99,15 @@ impl ClusterBusManager {
         let mut processed = 0;
         let mut should_close = false;
         loop {
-            if buf.len() < processed + msg::CLUSTER_BUS_HEADER_LEN {
+            let remaining = &buf[processed..];
+            if remaining.len() < msg::CLUSTER_BUS_PREFIX_LEN {
                 break;
             }
-            let remaining = &buf[processed..];
+            if let Err(error) = msg::validate_packet_prefix(remaining) {
+                crate::server_log!(warning, "Invalid cluster packet header: {}", error);
+                should_close = true;
+                break;
+            }
             if remaining.len() < msg::CLUSTER_BUS_HEADER_LEN {
                 break;
             }
@@ -148,6 +153,10 @@ impl ClusterBusManager {
                         }
                     }
 
+                    if self.confirm_handshake_identity(state, &cluster_msg, token_value, now) {
+                        should_close = true;
+                        break;
+                    }
                     self.handle_message(state, &cluster_msg, token_value, now);
                     self.propagate_gossip_failure_quorum(state, &cluster_msg, now);
                     if let Some(sender) = state.nodes.get_mut(&cluster_msg.sender_id) {
@@ -185,6 +194,126 @@ impl ClusterBusManager {
             }
         }
         should_close
+    }
+
+    /// Return true only when the current handshake link must be retired.
+    fn confirm_handshake_identity(
+        &mut self,
+        state: &mut ClusterState,
+        message: &ClusterMsg,
+        token_value: usize,
+        now_ms: i64,
+    ) -> bool {
+        if !matches!(
+            message.msg_type,
+            ClusterMsgType::Ping | ClusterMsgType::Pong | ClusterMsgType::Meet
+        ) {
+            return false;
+        }
+        let Some(connection) = self.connections.get(&token_value) else {
+            return false;
+        };
+        let linked_handshake = connection.is_outgoing
+            && state
+                .nodes
+                .get(&connection.handshake_node_name)
+                .is_some_and(|node| node.has_flag(CLUSTER_NODE_HANDSHAKE));
+        let handshake_id = if linked_handshake {
+            Some(connection.handshake_node_name.clone())
+        } else if connection.handshake_node_name.is_empty()
+            && !state.nodes.contains_key(&message.sender_id)
+        {
+            // Keep the existing separate-link endpoint confirmation paths,
+            // but never resolve the same anonymous inbound link's identity.
+            // An inbound PING cannot acknowledge our outstanding explicit
+            // MEET; only a response on its outbound handshake link can.
+            state
+                .nodes
+                .values()
+                .find(|node| {
+                    node.has_flag(CLUSTER_NODE_HANDSHAKE)
+                        && (message.msg_type != ClusterMsgType::Ping || !node.meet_pending)
+                        && node.ip == message.sender_ip
+                        && node.port == message.port
+                        && node.cport == message.bus_port
+                })
+                .map(|node| node.name.clone())
+        } else {
+            None
+        };
+        let Some(handshake_id) = handshake_id else {
+            return false;
+        };
+        if state.nodes.contains_key(&message.sender_id) {
+            // C deletes a duplicate node and its link; it does not transfer
+            // replicas to the separately known sender or process this packet.
+            Self::observe_known_sender_header(state, message, now_ms);
+            state.complete_node_meet(&message.sender_id);
+            let address_changed = if let Some(sender) = state.nodes.get_mut(&message.sender_id) {
+                let changed = sender.ip() != message.sender_ip
+                    || sender.port() != message.port
+                    || sender.cport() != message.bus_port
+                    || sender.endpoints.tls_port() != message.tls_port;
+                sender.endpoints.update_bus_address(
+                    message.sender_ip.clone(),
+                    message.port,
+                    message.bus_port,
+                );
+                sender.endpoints.set_tls_port(message.tls_port);
+                if changed {
+                    sender.flags &= !crate::engine::distributed::cluster::node::CLUSTER_NODE_NOADDR;
+                }
+                changed
+            } else {
+                false
+            };
+            if address_changed {
+                state.queue_link_close_once((
+                    message.sender_id.clone(),
+                    crate::engine::distributed::cluster::ClusterLinkDirection::To,
+                ));
+                if state.myself.is_replica() && state.myself.replicaof == message.sender_id {
+                    state.set_pending_replication_switch(
+                        crate::engine::distributed::cluster::state::PendingReplicationSwitch {
+                            node_id: message.sender_id.clone(),
+                            mode: crate::engine::distributed::cluster::action::ReplicationSwitchMode::TryPartial,
+                        },
+                    );
+                }
+            }
+            state.queue_link_close_once((
+                handshake_id.clone(),
+                crate::engine::distributed::cluster::ClusterLinkDirection::All,
+            ));
+            state.remove_handshake_node(&handshake_id);
+            state.request_config_save();
+            return true;
+        }
+        if !state.rename_handshake_node(&handshake_id, &message.sender_id) {
+            return true;
+        }
+        // Temporary records can own both directional sockets. Preserve these
+        // owners, buffers and pending PONGs just as C preserves node links.
+        for connection in self.connections.values_mut() {
+            if connection.handshake_node_name == handshake_id {
+                connection.node_name = message.sender_id.clone();
+                connection.handshake_node_name.clear();
+            }
+            if connection.projected_node_name == handshake_id {
+                connection.projected_node_name = message.sender_id.clone();
+            }
+        }
+        if let Some(connection) = self.connections.get_mut(&token_value) {
+            connection.node_name = message.sender_id.clone();
+            connection.handshake_node_name.clear();
+        }
+        if let Some(sender) = state.nodes.get_mut(&message.sender_id) {
+            sender.flags &= !CLUSTER_NODE_HANDSHAKE;
+            sender.flags |= message.flags
+                & (crate::engine::distributed::cluster::node::CLUSTER_NODE_PRIMARY
+                    | crate::engine::distributed::cluster::node::CLUSTER_NODE_REPLICA);
+        }
+        false
     }
 
     fn propagate_gossip_failure_quorum(
@@ -354,6 +483,7 @@ impl ClusterBusManager {
                                 && connection.handshake_node_name.is_empty()
                                 && state.nodes.values().any(|node| {
                                     node.has_flag(CLUSTER_NODE_HANDSHAKE)
+                                        && !node.meet_pending
                                         && node.ip == msg.sender_ip
                                         && node.port == msg.port
                                         && node.cport == msg.bus_port

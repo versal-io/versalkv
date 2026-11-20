@@ -515,7 +515,8 @@ impl ClusterState {
             .get(&master_id_str)
             .ok_or_else(|| format!("Unknown node {}", master_id_str))?;
 
-        if !master.is_primary() {
+        // A handshake or noflags node has not declared a replica role yet.
+        if master.is_replica() {
             return Err("The specified node is not a master".to_string());
         }
 
@@ -612,7 +613,7 @@ impl ClusterState {
             .nodes
             .get(&primary_id)
             .ok_or_else(|| format!("Unknown node {primary_id}"))?;
-        if !primary.is_primary() {
+        if primary.is_replica() {
             return Err("The specified node is not a master".to_string());
         }
         self.pending_replication_switch = Some(super::PendingReplicationSwitch {

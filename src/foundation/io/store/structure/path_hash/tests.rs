@@ -5,6 +5,53 @@ use std::collections::BTreeMap;
 type Reference = BTreeMap<Vec<u8>, BTreeMap<Vec<u8>, Vec<u8>>>;
 
 #[test]
+fn path_hash_scan_rehash_clone_and_mutation_keep_cached_accounting() {
+    let mut hash = PathHash::new();
+    let empty_size = hash.memory_usage();
+    for index in 0..113 {
+        hash.set_pairs(
+            b"path",
+            &[(Bytes::from(format!("f{index}")), Bytes::from_static(b"v"))],
+            0,
+            64,
+        );
+        hash.view.paths.assert_accounting();
+        hash.get(b"path").unwrap().assert_accounting();
+    }
+    let cloned = hash.clone();
+    assert_eq!(hash.memory_usage(), cloned.memory_usage());
+    let payload = hash.get(b"path").unwrap();
+    let (cursor, _) = payload.scan(0, 1);
+    assert_ne!(cursor, 0);
+    assert_eq!(
+        payload.scan(cursor, 1),
+        cloned.get(b"path").unwrap().scan(cursor, 1)
+    );
+    let before = hash.memory_usage();
+    hash.set_pairs(
+        b"path",
+        &[(Bytes::from_static(b"f0"), Bytes::from(vec![b'x'; 4096]))],
+        0,
+        64,
+    );
+    assert_eq!(hash.memory_usage(), before + 4095);
+    hash.view.paths.assert_accounting();
+    for index in 1..113 {
+        assert_eq!(
+            hash.delete_fields(b"path", &[Bytes::from(format!("f{index}"))]),
+            1
+        );
+        hash.view.paths.assert_accounting();
+        hash.get(b"path").unwrap().assert_accounting();
+    }
+    assert_eq!(cloned.get(b"path").unwrap().len(), 113);
+    assert_eq!(cloned.get(b"path").unwrap().get(b"f0"), Some(b"v".to_vec()));
+    cloned.view.paths.assert_accounting();
+    assert_eq!(hash.delete_fields(b"path", &[Bytes::from_static(b"f0")]), 1);
+    assert_eq!(hash.memory_usage(), empty_size);
+}
+
+#[test]
 fn path_hash_db_mutation_tracks_deltas_and_preserves_metadata() {
     use crate::foundation::io::store::kv_engine::{now_ms, Db};
     use crate::foundation::io::store::Robj;
@@ -28,7 +75,7 @@ fn path_hash_db_mutation_tracks_deltas_and_preserves_metadata() {
         let lru = db.get_lru_raw(b"h");
         let lfu = db.get_lfu_freq(b"h");
         let address = std::ptr::from_ref(db.get_path_hash(b"h").unwrap().unwrap());
-        for operation in 0..5 {
+        for operation in 0..4 {
             let old_size = db.get_path_hash(b"h").unwrap().unwrap().memory_usage();
             let old_dataset = tracker.get(MemoryCategory::Dataset);
             let result = db
@@ -41,12 +88,11 @@ fn path_hash_db_mutation_tracks_deltas_and_preserves_metadata() {
                     }
                     1 => usize::from(hash.delete_path(b"missing")),
                     2 => hash.delete_fields(b"p0", &[Bytes::from_static(b"f")]),
-                    3 => hash.delete_prefix(b"p"),
-                    _ => usize::from(hash.delete_path(b"")),
+                    _ => hash.delete_prefix(b"p"),
                 })
                 .unwrap()
                 .unwrap();
-            assert_eq!(result, [600, 0, 1, 599, 1][operation]);
+            assert_eq!(result, [600, 0, 1, 599][operation]);
             let hash = db.get_path_hash(b"h").unwrap().unwrap();
             assert_eq!(std::ptr::from_ref(hash), address);
             let new_size = hash.memory_usage();
@@ -63,11 +109,26 @@ fn path_hash_db_mutation_tracks_deltas_and_preserves_metadata() {
         let (copy, expiry, _) = db.clone_entry(b"h").unwrap();
         assert_eq!(expiry, Some(expiry_ms));
         db.load_entry(b"copy".to_vec(), copy, expiry);
-        db.mutate_path_hash(b"h", false, false, |hash| {
+        let old_size = db.get_allow_expired(b"h").unwrap().estimated_size() + b"h".len();
+        let old_dataset = tracker.get(MemoryCategory::Dataset);
+        assert_eq!(
+            db.mutate_path_hash(b"h", false, false, |hash| {
+                usize::from(hash.delete_path(b""))
+            })
+            .unwrap(),
+            Some(1)
+        );
+        assert!(db.get_allow_expired(b"h").is_none());
+        assert_eq!(db.get_expire(b"h"), None);
+        assert_eq!(tracker.get(MemoryCategory::Dataset), old_dataset - old_size);
+        db.mutate_path_hash(b"h", true, false, |hash| {
             hash.set_pairs(b"new", &pairs, 0, 0)
         })
         .unwrap();
-        assert!(db.get_path_hash(b"copy").unwrap().unwrap().is_empty());
+        let copy = db.get_path_hash(b"copy").unwrap().unwrap();
+        assert_eq!(copy.len(), 1);
+        assert!(copy.contains_path(b""));
+        assert!(!copy.contains_path(b"new"));
         assert_eq!(
             db.mutate_path_hash(b"missing", false, false, |_| 1)
                 .unwrap(),

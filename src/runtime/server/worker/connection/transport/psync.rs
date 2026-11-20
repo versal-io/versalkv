@@ -103,13 +103,13 @@ struct FullSyncOptions {
     diskless: bool,
     delay_seconds: i64,
     max_replicas: usize,
-    key_delay_us: i64,
     supports_eof: bool,
     filter_mode: RdbFilterMode,
     now_ms: i64,
 }
 
 impl FullSyncOptions {
+    #[cfg(test)]
     fn uses_eof_transport(self) -> bool {
         self.supports_eof && (self.diskless || self.filter_mode != RdbFilterMode::All)
     }
@@ -127,6 +127,7 @@ impl FullSyncOptions {
 enum FullSyncProgress {
     Started,
     WaitingForChild,
+    Failed,
 }
 
 impl ServerWorkerState {
@@ -748,7 +749,7 @@ impl ServerWorkerState {
             PrimarySyncPlan::FullResync { boundary } => {
                 let progress = self.start_full_resync(request, boundary, replies);
                 self.record_full_resync_request(request.is_partial());
-                if progress == FullSyncProgress::WaitingForChild {
+                if progress != FullSyncProgress::Started {
                     self.ctx.end_cmd(request.command.name(), false);
                     self.refresh_replication_view();
                     return true;
@@ -862,26 +863,32 @@ impl ServerWorkerState {
         let function_codes = self.full_sync_function_codes(options.filter_mode);
         let batch_boundary = self.try_join_disk_sync_batch(request, options, &function_codes);
         let fullsync_boundary = batch_boundary.unwrap_or(boundary);
+        if batch_boundary.is_some() {
+            self.push_full_resync_header(
+                request.command,
+                fullsync_boundary.reported_offset().get(),
+                replies,
+            );
+            return FullSyncProgress::Started;
+        }
+        if self.try_start_diskless_child(request, options, &function_codes, replies) {
+            return FullSyncProgress::Started;
+        }
         self.push_full_resync_header(
             request.command,
             fullsync_boundary.reported_offset().get(),
             replies,
         );
-        if batch_boundary.is_some()
-            || self.try_start_diskless_child(
-                request.connection_id,
-                options,
-                &function_codes,
-                replies,
-            )
-        {
-            return FullSyncProgress::Started;
-        }
         if self.defer_for_active_child(request, options, replies) {
             return FullSyncProgress::WaitingForChild;
         }
-        self.start_inline_full_resync(request.connection_id, options, &function_codes, replies);
-        FullSyncProgress::Started
+        replies.clear();
+        crate::server_log!(
+            warning,
+            "BGSAVE for replication failed: no full-sync producer was started"
+        );
+        self.remove_connection(request.connection_id.0);
+        FullSyncProgress::Failed
     }
 
     fn full_sync_options(&self, connection_id: ConnectionId) -> FullSyncOptions {
@@ -890,12 +897,17 @@ impl ServerWorkerState {
             .replication_runtime
             .replica_sync_preferences(connection_id);
         FullSyncOptions {
-            diskless: config.repl_diskless_sync || self.replication_snapshot_options(connection_id)
-                .is_some_and(|options| (options.compression == crate::foundation::io::persistence::rdb::compression::RdbCompression::Lz4)
-                    != (self.ctx.config().persistence.rdbcompression == crate::foundation::io::persistence::rdb::compression::RdbCompression::Lz4)),
-            delay_seconds: config.repl_diskless_sync_delay,
+            diskless: self.replication_snapshot_options(connection_id)
+                .is_some_and(|snapshot| self.full_sync_target(connection_id, snapshot)
+                    == crate::runtime::server::worker::replication::full_sync_plan::FullSyncTarget::Socket),
+            // A filtered/versioned cohort can require socket output even when
+            // the configured diskless batching window is disabled.
+            delay_seconds: if config.repl_diskless_sync {
+                config.repl_diskless_sync_delay
+            } else {
+                0
+            },
             max_replicas: config.repl_diskless_sync_max_replicas as usize,
-            key_delay_us: self.ctx.config().persistence.rdb_key_save_delay,
             supports_eof,
             filter_mode,
             now_ms: mstime(),
@@ -967,14 +979,15 @@ impl ServerWorkerState {
 
     fn try_start_diskless_child(
         &mut self,
-        connection_id: ConnectionId,
+        request: PsyncRequest<'_>,
         options: FullSyncOptions,
         function_codes: &[Vec<u8>],
         replies: &mut Vec<Vec<u8>>,
     ) -> bool {
-        if !options.diskless || !options.supports_eof || options.filter_mode != RdbFilterMode::All {
+        if !options.diskless || !options.supports_eof {
             return false;
         }
+        let connection_id = request.connection_id;
         let Some(primary_id) = self.replication_runtime.primary_id(connection_id) else {
             return false;
         };
@@ -983,19 +996,32 @@ impl ServerWorkerState {
         };
         self.replication_runtime
             .freeze_full_sync_snapshot_options(connection_id, snapshot);
-        let Some((read_end, marker, release)) = self.try_begin_diskless_fork_with_options(
-            function_codes,
-            snapshot,
-            "normal sync",
-            true,
-        ) else {
+        let Some(output) = self.try_begin_diskless_sync(&[connection_id], function_codes, snapshot)
+        else {
             return false;
         };
+        let offset = if output.method
+            == crate::engine::extension::config::persistence::BgsaveMethod::Forkless
+        {
+            -1
+        } else {
+            self.ctx
+                .replication()
+                .backlog
+                .snapshot_boundary()
+                .reported_offset()
+                .get()
+        };
+        self.push_full_resync_header(request.command, offset, replies);
         let mut header = b"$EOF:".to_vec();
-        header.extend_from_slice(&marker);
+        header.extend_from_slice(&output.marker);
         header.extend_from_slice(b"\r\n");
         replies.push(header);
-        self.store_diskless_relay(read_end, release, marker, vec![primary_id], true, 0);
+        self.store_diskless_producer_relay(
+            output.read, output.release, output.marker,
+            vec![crate::runtime::server::worker::replication::diskless_child::DisklessTarget::Replica(primary_id)],
+            true, 0,
+        );
         true
     }
 
@@ -1022,70 +1048,6 @@ impl ServerWorkerState {
             link.defer_diskless_sync(0, options.now_ms, request.command.is_psync());
         }
         true
-    }
-
-    fn start_inline_full_resync(
-        &mut self,
-        connection_id: ConnectionId,
-        options: FullSyncOptions,
-        function_codes: &[Vec<u8>],
-        replies: &mut Vec<Vec<u8>>,
-    ) {
-        let snapshot = self
-            .replication_snapshot_options(connection_id)
-            .expect("full-sync compression capability was validated");
-        self.replication_runtime
-            .freeze_full_sync_snapshot_options(connection_id, snapshot);
-        let (bulk, total_keys) =
-            self.build_inline_full_resync_with_snapshot(options, function_codes, snapshot);
-        let link = self
-            .replication_runtime
-            .primary_for_connection_mut(connection_id)
-            .expect("primary link exists while starting full resync");
-        if options.uses_eof_transport() {
-            link.begin_full_resync(bulk, total_keys.max(1), options.now_ms);
-        } else {
-            link.begin_length_framed_full_resync(bulk, total_keys.max(1), options.now_ms);
-        }
-        let (first_chunk, _) = link.pump_full_resync(options.now_ms);
-        if !first_chunk.is_empty() {
-            replies.push(first_chunk);
-        }
-    }
-
-    fn build_inline_full_resync_with_snapshot(
-        &self,
-        options: FullSyncOptions,
-        function_codes: &[Vec<u8>],
-        snapshot: crate::foundation::io::persistence::rdb::compression::RdbSnapshotOptions,
-    ) -> (Vec<u8>, usize) {
-        let replication = self.ctx.rdb_full_sync_replication_info();
-        let slot_imports = self.ctx.slot_import_dbs();
-        let rdb =
-            crate::foundation::io::persistence::rdb::serialize::serialize_replication_snapshot(
-                self.ctx.dbs(),
-                options.key_delay_us,
-                function_codes,
-                options.filter_mode == RdbFilterMode::All,
-                Some(&replication),
-                &slot_imports,
-                snapshot,
-            );
-        let total_keys = (0..self.ctx.num_dbs() as u32)
-            .map(|db| self.ctx.db_size(db))
-            .sum::<usize>();
-        let bulk = if options.uses_eof_transport() {
-            let marker = crate::engine::distributed::replication::protocol::generate_replid();
-            let mut bulk = format!("$EOF:{}\r\n", marker).into_bytes();
-            bulk.extend_from_slice(&rdb);
-            bulk.extend_from_slice(marker.as_bytes());
-            bulk
-        } else {
-            let mut bulk = format!("${}\r\n", rdb.len()).into_bytes();
-            bulk.extend_from_slice(&rdb);
-            bulk
-        };
-        (bulk, total_keys)
     }
 
     pub(super) fn ensure_rdb_candidate(&mut self, connection_token: usize) -> bool {
@@ -1583,7 +1545,6 @@ mod tests {
                     delay_seconds,
                     filter_mode,
                     max_replicas: 2,
-                    key_delay_us: 0,
                     now_ms: 0,
                 };
                 actual.push((
@@ -1612,10 +1573,11 @@ mod tests {
 
     #[test]
     fn boundary_filtered_full_sync_without_diskless_delay_decodes_real_body() {
-        use crate::foundation::io::persistence::rdb::load_rdb_bytes_checked_with_functions;
-        use crate::foundation::io::store::{kv_engine::DbSet, Robj};
+        use crate::engine::extension::config::persistence::BgsaveMethod;
+        use crate::foundation::io::store::Robj;
         use crate::framework::distributed::replication::PrimaryLinkState;
 
+        let _fork_guard = crate::framework::commands::server::save::diskless_fork_test_guard();
         let code = "#!lua name=boundarylib\nserver.register_function('boundary_fn', function() return 7 end)";
         let mut observations = Vec::new();
         for (filter_mode, filter) in [
@@ -1624,6 +1586,7 @@ mod tests {
         ] {
             for delay_seconds in [0, 30] {
                 let mut backend = ServerWorkerState::new(2).unwrap();
+                backend.ctx.config_mut().persistence.bgsave_default_method = BgsaveMethod::Forkless;
                 backend.ctx.config_mut().replication.repl_diskless_sync = false;
                 backend
                     .ctx
@@ -1646,7 +1609,7 @@ mod tests {
                     .function_registry
                     .load_library("boundarylib", code)
                     .unwrap();
-                let (token, _target) = boundary_connection(&mut backend);
+                let (token, mut target) = boundary_connection(&mut backend);
                 let args = CommandArgs::from_parts(vec![
                     Bytes::from_static(b"REPLCONF"),
                     Bytes::from_static(b"capa"),
@@ -1671,19 +1634,22 @@ mod tests {
                     .unwrap()
                     .state();
                 let mut decoded = None;
-                if let [fullresync, bulk] = replies.as_slice() {
+                if let [fullresync, bulk_header] = replies.as_slice() {
                     assert!(fullresync.starts_with(b"+FULLRESYNC "));
-                    let header_end = bulk.windows(2).position(|bytes| bytes == b"\r\n").unwrap();
-                    let marker = bulk[..header_end]
-                        .strip_prefix(b"$EOF:")
-                        .expect("filtered transport must remain EOF framed");
-                    assert_eq!(marker.len(), 40);
-                    assert!(bulk.ends_with(marker));
-                    let body = &bulk[header_end + 2..bulk.len() - marker.len()];
-                    let mut dbs = DbSet::new(2);
-                    let (loaded, consumed, expired, functions) =
-                        load_rdb_bytes_checked_with_functions(body, &mut dbs, true).unwrap();
-                    assert_eq!((loaded, consumed, expired), (0, body.len(), 0));
+                    assert!(bulk_header.starts_with(b"$EOF:"));
+                    assert_eq!(bulk_header.len(), 47, "only the header is returned inline");
+                    assert_eq!(state, PrimaryLinkState::PreparingFullResync);
+                    assert_eq!(backend.ctx.stats().total_forks, 1);
+                    assert_eq!(backend.ctx.stats().forkless_fallbacks_exclude_data, 1);
+                    assert!(backend.ctx.persistence().diskless_child_pid().is_some());
+                    for reply in &replies {
+                        backend.connection_registry[Token(token)].queue_reply(reply.clone());
+                    }
+                    let wire = backend.drain_diskless_sync_for_test(&mut [&mut target]);
+                    assert!(wire[0].starts_with(fullresync));
+                    let (loaded, dbs, functions) =
+                        ServerWorkerState::decode_eof_rdb_for_test(&wire[0][fullresync.len()..], 2);
+                    assert_eq!(loaded, 0);
                     assert_eq!(dbs.get(0).unwrap().dbsize(), 0);
                     assert_eq!(dbs.get(1).unwrap().dbsize(), 0);
                     let expected_functions = if filter_mode == RdbFilterMode::Functions {
@@ -1699,9 +1665,15 @@ mod tests {
                     delay_seconds,
                     deferred,
                     decoded,
-                    state,
+                    backend
+                        .replication_runtime
+                        .primary_for_connection(ConnectionId(token))
+                        .unwrap()
+                        .state(),
                     backend.ctx.stats().sync_full,
                 ));
+                backend.remove_connection(token);
+                assert!(backend.full_sync.diskless_relay.is_none());
             }
         }
         for (filter, delay, deferred, decoded, state, sync_full) in observations {

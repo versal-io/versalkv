@@ -259,18 +259,11 @@ fn serialize_key_value(
         Robj::StreamListpack(stream) => serialize_stream(out, key, stream),
         Robj::StreamRadix(_) => {}
         Robj::PathHash(hash) => {
-            if hash.is_empty() {
-                out.extend_from_slice(&encode_command(&[
-                    b"PHSET", key, b"", b"FIELDS", b"1", b"", b"",
-                ]));
-                out.extend_from_slice(&encode_command(&[b"PHDEL", key, b""]));
-            } else {
-                for (path, payload) in hash.iter() {
-                    for (field, value) in payload.entries() {
-                        out.extend_from_slice(&encode_command(&[
-                            b"PHSET", key, path, b"FIELDS", b"1", &field, &value,
-                        ]));
-                    }
+            for (path, payload) in hash.iter() {
+                for (field, value) in payload.entries() {
+                    out.extend_from_slice(&encode_command(&[
+                        b"PHSET", key, path, b"FIELDS", b"1", &field, &value,
+                    ]));
                 }
             }
         }

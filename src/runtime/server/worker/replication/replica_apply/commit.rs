@@ -10,6 +10,7 @@ pub(super) fn replication_buffer_limit_message(limit: usize) -> String {
 }
 
 pub(super) struct PreparedRdbCommit {
+    pub(super) functions_applied: bool,
     pub(super) function_codes: Vec<Vec<u8>>,
     pub(super) aux_fields: Vec<(Vec<u8>, Vec<u8>)>,
     pub(super) repl_stream_db: u32,

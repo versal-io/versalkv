@@ -1,4 +1,5 @@
 use super::ProtectedResources;
+use crate::engine::command::SessionId;
 use crate::framework::capabilities::io::Token;
 use crate::framework::distributed::replication::ConnectionId;
 use std::collections::VecDeque;
@@ -174,10 +175,23 @@ impl DeferredReadyEvent {
 #[derive(Default)]
 pub(crate) struct BlockedEventState {
     scopes: Vec<BlockedOperation>,
+    command_owners: Vec<SessionId>,
     deferred: VecDeque<DeferredReadyEvent>,
 }
 
 impl BlockedEventState {
+    pub(crate) fn push_command_owner(&mut self, session: SessionId) {
+        self.command_owners.push(session);
+    }
+
+    pub(crate) fn pop_command_owner(&mut self) -> Option<SessionId> {
+        self.command_owners.pop()
+    }
+
+    pub(crate) fn protects_command_owner(&self, session: SessionId) -> bool {
+        self.command_owners.contains(&session)
+    }
+
     pub(crate) fn push_scope(&mut self, operation: BlockedOperation) {
         self.scopes.push(operation);
     }

@@ -20,29 +20,34 @@ pub(crate) fn register_persistence_configs(reg: &mut ConfigRegistry) {
         },
     });
     reg.register(&ConfigSpec {
-        name: "bgsave-default-method",
+        name: "forkless-policy",
         type_: ConfigType::Enum,
-        enum_values: &["fork", "forkless"],
+        enum_values: &["require-fork", "prefer-forkless"],
         numeric_min: 0,
         numeric_max: 0,
         flags: &[],
         alias: None,
         get: |config| {
-            ConfigValue::String(
-                config
-                    .persistence
-                    .bgsave_default_method
-                    .as_str()
-                    .to_string(),
-            )
+            use crate::engine::extension::config::persistence::BgsaveMethod;
+            let policy = match config.persistence.bgsave_default_method {
+                BgsaveMethod::Fork => "require-fork",
+                BgsaveMethod::Forkless => "prefer-forkless",
+            };
+            ConfigValue::String(policy.to_string())
         },
         set: |config, value| {
             let ConfigValue::String(value) = value else {
-                return Err("bgsave-default-method must be an enum".to_string());
+                return Err("forkless-policy must be an enum".to_string());
             };
-            config.persistence.bgsave_default_method =
-                crate::engine::extension::config::persistence::BgsaveMethod::parse(value)
-                    .ok_or_else(|| "Invalid background save method".to_string())?;
+            use crate::engine::extension::config::persistence::BgsaveMethod;
+            config.persistence.bgsave_default_method = if value.eq_ignore_ascii_case("require-fork")
+            {
+                BgsaveMethod::Fork
+            } else if value.eq_ignore_ascii_case("prefer-forkless") {
+                BgsaveMethod::Forkless
+            } else {
+                return Err("Invalid forkless policy".to_string());
+            };
             Ok(())
         },
     });

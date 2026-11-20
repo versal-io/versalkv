@@ -23,16 +23,6 @@ impl BgsaveMethod {
             Self::Forkless => "forkless",
         }
     }
-
-    pub fn parse(value: &str) -> Option<Self> {
-        if value.eq_ignore_ascii_case("fork") {
-            Some(Self::Fork)
-        } else if value.eq_ignore_ascii_case("forkless") {
-            Some(Self::Forkless)
-        } else {
-            None
-        }
-    }
 }
 
 pub fn validate_aof_basename(value: &str, setting: &str) -> Result<(), String> {
@@ -136,7 +126,7 @@ impl PersistenceConfig {
             && !self.forkless_infrastructure_enabled
         {
             return Err(
-                "'bgsave-default-method forkless' can only be selected when the server was started with 'forkless-infrastructure-enabled yes'"
+                "'forkless-policy prefer-forkless' can only be selected when the server was started with 'forkless-infrastructure-enabled yes'"
                     .to_string(),
             );
         }

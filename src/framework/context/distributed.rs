@@ -45,7 +45,7 @@ impl ServerContext {
             info.aux_fields.extend(
                 cluster
                     .migrations
-                    .views()
+                    .import_snapshot_views()
                     .iter()
                     .filter_map(
                         crate::framework::distributed::migration::SlotImportMetadata::from_job,

@@ -90,6 +90,8 @@ pub struct RdbDecodedMetadata {
     pub expired: usize,
     pub empty_keys: usize,
     pub function_codes: Vec<Vec<u8>>,
+    /// A hosted loader installed the function header before inline replay.
+    pub functions_applied: bool,
     pub replication: Option<super::serialize::RdbReplicationInfo>,
     pub expiry_events: Vec<RdbExpiryEvent>,
 }
@@ -98,6 +100,7 @@ pub struct RdbDecodedMetadata {
 pub enum RdbStep {
     NeedInput,
     RecordApplied,
+    InlineCommand { db: u32, args: Vec<Bytes> },
     Finished(RdbDecodedMetadata),
 }
 
@@ -105,6 +108,10 @@ pub enum RdbStep {
 pub enum StreamStep {
     /// Buffer exhausted before a full record; caller must `feed` more bytes.
     NeedMore,
+    InlineCommand {
+        db: u32,
+        args: Vec<Bytes>,
+    },
     /// Reached RDB_OPCODE_EOF and verified the trailing CRC.
     Finished,
 }
@@ -213,6 +220,14 @@ impl RdbDecoder {
         std::mem::take(&mut self.function_codes)
     }
 
+    pub fn replication_id(&self) -> Option<&str> {
+        self.repl_id.as_deref()
+    }
+
+    pub fn replication_offset(&self) -> Option<i64> {
+        self.repl_offset
+    }
+
     /// Move subsystem-specific replication AUX fields out of the decoder.
     pub fn take_aux_fields(&mut self) -> Vec<(Vec<u8>, Vec<u8>)> {
         std::mem::take(&mut self.aux_fields)
@@ -282,6 +297,7 @@ impl RdbDecoder {
             expired: self.expired,
             empty_keys: self.empty_keys,
             function_codes: self.function_codes.clone(),
+            functions_applied: false,
             replication,
             expiry_events: self.expiry_events.clone(),
         }
@@ -429,7 +445,7 @@ impl RdbDecoder {
         use crate::foundation::io::persistence::codec::types::{
             load_len, RDB_FOREIGN_TYPE_MAX, RDB_FOREIGN_TYPE_MIN, RDB_OPCODE_AUX, RDB_OPCODE_EOF,
             RDB_OPCODE_EXPIRETIME, RDB_OPCODE_EXPIRETIME_MS, RDB_OPCODE_FREQ, RDB_OPCODE_FUNCTION2,
-            RDB_OPCODE_IDLE, RDB_OPCODE_RESIZEDB, RDB_OPCODE_SELECTDB,
+            RDB_OPCODE_IDLE, RDB_OPCODE_RESIZEDB, RDB_OPCODE_SELECTDB, RDB_OPCODE_UPDATE,
         };
 
         if !self.header_done && !self.parse_header()? {
@@ -464,7 +480,21 @@ impl RdbDecoder {
             }
 
             let mut pending_aux_field = None;
+            let mut inline_args = None;
             match op {
+                RDB_OPCODE_UPDATE => {
+                    if self.rdbver < 81 {
+                        return Err(LoadError::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Opcode 242 requires RDB version 81 or newer",
+                        )));
+                    }
+                    let Some((args, consumed)) = parse_inline_command(&input[pos..])? else {
+                        need_more!();
+                    };
+                    pos += consumed;
+                    inline_args = Some(args);
+                }
                 RDB_OPCODE_EOF => {
                     // Trailing CRC (rdbver >= 5): need 8 more bytes.
                     if self.rdbver >= 5 {
@@ -557,7 +587,13 @@ impl RdbDecoder {
                 self.apply_aux_field(key, value);
             }
 
-            Ok(RdbStep::RecordApplied)
+            Ok(match inline_args {
+                Some(args) => RdbStep::InlineCommand {
+                    db: self.cur_db,
+                    args,
+                },
+                None => RdbStep::RecordApplied,
+            })
         }
     }
 
@@ -573,10 +609,35 @@ impl RdbDecoder {
             match self.step(dbs)? {
                 RdbStep::NeedInput => return Ok(StreamStep::NeedMore),
                 RdbStep::RecordApplied => {}
+                RdbStep::InlineCommand { db, args } => {
+                    return Ok(StreamStep::InlineCommand { db, args });
+                }
                 RdbStep::Finished(_) => return Ok(StreamStep::Finished),
             }
         }
     }
+}
+
+fn parse_inline_command(input: &[u8]) -> Result<Option<(Vec<Bytes>, usize)>, LoadError> {
+    use crate::foundation::io::protocol::parser::{ParseError, Parser};
+    if input.is_empty() {
+        return Ok(None);
+    }
+    if input[0] != b'*' {
+        return Err(LoadError::Corrupt);
+    }
+    let mut parser = Parser::new();
+    for chunk in input.chunks(4096) {
+        parser.feed(chunk);
+        match parser.try_parse() {
+            Ok(Some(args)) if !args.is_empty() => {
+                return Ok(Some((args, parser.last_cmd_len())));
+            }
+            Ok(Some(_)) | Err(ParseError::Protocol(_)) => return Err(LoadError::Corrupt),
+            Ok(None) | Err(ParseError::Incomplete) => {}
+        }
+    }
+    Ok(None)
 }
 
 pub type RdbStreamDecoder = RdbDecoder;
@@ -839,6 +900,7 @@ mod tests {
                 match decoder.step(&mut destination).expect("decode RDB byte") {
                     RdbStep::NeedInput => break,
                     RdbStep::RecordApplied => {}
+                    RdbStep::InlineCommand { .. } => panic!("snapshot has no inline commands"),
                     RdbStep::Finished(metadata) => {
                         finished = Some(metadata);
                         break;

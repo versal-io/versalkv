@@ -1,5 +1,19 @@
 use bytes::Bytes;
 
+pub(crate) fn pfmerge_get_keys(args: &[Bytes]) -> Vec<(&[u8], Vec<&'static str>)> {
+    let Some((destination, sources)) = args.split_first() else {
+        return Vec::new();
+    };
+    let mut keys = Vec::with_capacity(args.len());
+    keys.push((destination.as_ref(), vec!["RW", "access", "insert"]));
+    keys.extend(
+        sources
+            .iter()
+            .map(|source| (source.as_ref(), vec!["RO", "access"])),
+    );
+    keys
+}
+
 pub(crate) fn set_get_keys(args: &[Bytes]) -> Vec<(&[u8], Vec<&'static str>)> {
     let Some(key) = args.first() else {
         return Vec::new();

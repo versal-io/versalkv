@@ -185,6 +185,54 @@ impl ValkeyStream {
         self.last_id
     }
 
+    /// Tests inclusive bounds against the historical maximum tombstone.
+    pub(crate) fn range_has_tombstones(
+        &self,
+        start: Option<StreamID>,
+        end: Option<StreamID>,
+    ) -> bool {
+        if self.is_empty() || self.max_deleted_entry_id == StreamID::zero() {
+            return false;
+        }
+        start.unwrap_or_else(StreamID::zero) <= self.max_deleted_entry_id
+            && self.max_deleted_entry_id <= end.unwrap_or_else(StreamID::max)
+    }
+
+    /// Estimates a historical read counter without recounting surviving entries.
+    pub(crate) fn estimate_distance_from_first_ever_entry(&self, id: StreamID) -> Option<u64> {
+        if self.entries_added == 0 {
+            return Some(0);
+        }
+        if self.is_empty() && id <= self.last_id {
+            return super::groups::valid_entries_read(self.entries_added);
+        }
+        if id != StreamID::zero() && id < self.max_deleted_entry_id {
+            return None;
+        }
+        if id == self.last_id {
+            return super::groups::valid_entries_read(self.entries_added);
+        }
+        if id > self.last_id {
+            return None;
+        }
+        let first_id = self.first_id()?;
+        if self.max_deleted_entry_id == StreamID::zero() || self.max_deleted_entry_id < first_id {
+            if id < first_id {
+                return super::groups::valid_entries_read(
+                    self.entries_added.wrapping_sub(self.len() as u64),
+                );
+            }
+            if id == first_id {
+                return super::groups::valid_entries_read(
+                    self.entries_added
+                        .wrapping_sub(self.len() as u64)
+                        .wrapping_add(1),
+                );
+            }
+        }
+        None
+    }
+
     pub fn append(
         &mut self,
         mut id: StreamID,

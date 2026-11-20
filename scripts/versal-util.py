@@ -1058,8 +1058,9 @@ def parse_codspeed_native_report(text: str, command: str, requests: int) -> dict
     counts = re.findall(r"^\s*(\d+) requests completed in [\d.]+ seconds\s*$", text, re.MULTILINE)
     throughput = re.findall(r"throughput summary:\s*([\d.]+) requests per second", text)
     latency = re.findall(
-        r"latency summary \(msec\):\s*avg\s+min\s+p50\s+p95\s+p99\s+max\s+"
-        r"([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)", text,
+        r"^\s*latency summary \(msec\):[ \t]*\r?\n"
+        r"[ \t]*(avg[ \t]+min[ \t]+p50[ \t]+p95[ \t]+p99(?:[ \t]+p99\.9)?[ \t]+max)[ \t]*\r?\n"
+        r"[ \t]*([^\r\n]+)", text, re.MULTILINE,
     )
     if headers != [command] or len(counts) != 1 or len(throughput) != 1 or len(latency) != 1:
         raise ToolError("Missing or ambiguous native benchmark report for {}".format(command))
@@ -1067,13 +1068,21 @@ def parse_codspeed_native_report(text: str, command: str, requests: int) -> dict
     if completed != requests:
         raise ToolError("{} completed {} requests, expected {}".format(command, completed, requests))
     qps = float(throughput[0])
-    values = [float(value) for value in latency[0]]
+    columns = latency[0][0].split()
+    tokens = latency[0][1].split()
+    if len(tokens) != len(columns):
+        raise ToolError("Incomplete native latency metrics for {}".format(command))
+    try:
+        values = [float(value) for value in tokens]
+    except ValueError:
+        raise ToolError("Invalid native latency metrics for {}".format(command))
     if not math.isfinite(qps) or qps <= 0 or any(not math.isfinite(value) or value < 0 for value in values):
         raise ToolError("Invalid native benchmark metrics for {}".format(command))
-    if not values[1] <= values[2] <= values[3] <= values[4] <= values[5] or not values[1] <= values[0] <= values[5]:
+    latency_ms = dict(zip(columns, values))
+    ordered = values[1:]
+    if any(left > right for left, right in zip(ordered, ordered[1:])) or not ordered[0] <= values[0] <= ordered[-1]:
         raise ToolError("Invalid native latency ordering for {}".format(command))
-    return {"requests": completed, "qps": qps,
-            "latency_ms": dict(zip(("avg", "min", "p50", "p95", "p99", "max"), values))}
+    return {"requests": completed, "qps": qps, "latency_ms": latency_ms}
 
 
 def codspeed_request_stats(rounds: Sequence[dict], warmup_iters: int) -> dict:
@@ -1173,13 +1182,14 @@ def command_codspeed_measure(args: argparse.Namespace, ctx: RepoContext) -> int:
     with (output / "metrics.csv").open("w", encoding="utf-8", newline="") as stream:
         writer = csv.writer(stream)
         writer.writerow(("benchmark", "phase", "round", "requests", "elapsed_ns", "ns_per_request", "qps",
-                         "latency_avg_ms", "latency_min_ms", "latency_p50_ms", "latency_p95_ms", "latency_p99_ms", "latency_max_ms"))
+                         "latency_avg_ms", "latency_min_ms", "latency_p50_ms", "latency_p95_ms", "latency_p99_ms",
+                         "latency_p999_ms", "latency_max_ms"))
         for diagnostic in diagnostics:
             for phase in ("warmup", "rounds"):
                 for index, item in enumerate(diagnostic[phase], 1):
                     writer.writerow([diagnostic["name"], phase, index, item["requests"], item["elapsed_ns"],
                                      item["elapsed_ns"] / item["requests"], item["qps"]] +
-                                    [item["latency_ms"][key] for key in ("avg", "min", "p50", "p95", "p99", "max")])
+                                    [item["latency_ms"].get(key) for key in ("avg", "min", "p50", "p95", "p99", "p99.9", "max")])
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary:
         with Path(summary).open("a", encoding="utf-8") as stream:
@@ -2445,6 +2455,31 @@ def selftest_codspeed(_ctx: RepoContext) -> None:
     _assert((known["q1_ns"], known["median_ns"], known["q3_ns"]) == (150, 300, 500),
             "quartiles must match the pinned CodSpeed runner")
     _assert(abs(known["stdev_ns"] - math.sqrt(37000)) < 1e-9, "standard deviation must use the sample denominator")
+    native_report = (
+        "====== SET ======\n16 requests completed in 0.10 seconds\n"
+        "throughput summary: 160.00 requests per second\n"
+        "latency summary (msec):\n"
+        "avg min p50 p95 p99 p99.9 max\n"
+        "0.300 0.020 0.200 0.500 0.800 0.900 1.000\n"
+    )
+    native_metrics = parse_codspeed_native_report(native_report, "SET", 16)
+    _assert(native_metrics["latency_ms"]["p99.9"] == 0.9, "native p99.9 must be retained")
+    _assert(native_metrics["latency_ms"]["max"] == 1.0, "p99.9 must not displace max")
+    legacy_metrics = parse_codspeed_native_report(
+        native_report.replace("p99.9 ", "").replace("0.900 ", ""), "SET", 16,
+    )
+    _assert("p99.9" not in legacy_metrics["latency_ms"], "legacy reports must not synthesize p99.9")
+    _assert(legacy_metrics["latency_ms"]["max"] == 1.0, "legacy max must be retained")
+    for invalid_report in (
+            native_report.replace("0.900", "1.100"),
+            native_report.replace("0.900", "0.700"),
+            native_report.replace("0.900 ", "")):
+        try:
+            parse_codspeed_native_report(invalid_report, "SET", 16)
+        except ToolError:
+            pass
+        else:
+            raise AssertionError("Invalid native p99.9 metrics must be rejected")
     with tempfile.TemporaryDirectory(prefix="versal-codspeed-measure-selftest-") as directory:
         root = Path(directory)
         write_executable(root, "target/codspeed/valkey-benchmark", """#!{python}
@@ -2463,8 +2498,8 @@ print("====== " + command + " ======")
 print(str(requests) + " requests completed in 0.10 seconds")
 print("throughput summary: 160000.00 requests per second")
 print("latency summary (msec):")
-print("avg min p50 p95 p99 max")
-print("0.300 0.020 0.200 0.500 0.800 1.000")
+print("avg min p50 p95 p99 p99.9 max")
+print("0.300 0.020 0.200 0.500 0.800 0.900 1.000")
 """.format(python=sys.executable))
         arguments = ["ci", "codspeed", "measure", "--requests", "16000",
                      "--rounds", "3", "--warmup-sec", "0"]
@@ -2487,7 +2522,8 @@ print("0.300 0.020 0.200 0.500 0.800 1.000")
             _assert(abs(stats["mean_ns"] - sum(samples) / 3) < 1e-9, "mean must be per request")
             expected_total = sum(item["elapsed_ns"] for item in diagnostic["rounds"]) / 1e9
             _assert(stats["total_time"] == expected_total, "total time must exclude warmup")
-            _assert(all(item["qps"] == 160000 and item["latency_ms"]["max"] == 1 for item in diagnostic["rounds"]),
+            _assert(all(item["qps"] == 160000 and item["latency_ms"]["max"] == 1
+                        and item["latency_ms"]["p99.9"] == 0.9 for item in diagnostic["rounds"]),
                     "native throughput and latency must be retained")
         for marker in ("exit-error", "missing-report", "incomplete"):
             write_fixture(root, marker, "")

@@ -483,8 +483,13 @@ impl AofDecoder {
                 break;
             }
             if bytes[self.pos] == b'#' {
+                self.stats.valid_up_to = self.pos;
                 while self.pos < bytes.len() && bytes[self.pos] != b'\n' {
                     self.pos += 1;
+                }
+                if self.pos == bytes.len() {
+                    self.finished = true;
+                    return Ok(AofStep::Truncated(self.stats));
                 }
                 continue;
             }

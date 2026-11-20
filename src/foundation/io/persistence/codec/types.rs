@@ -1,6 +1,7 @@
 use std::sync::OnceLock;
 
 pub const RDB_VERSION: u16 = 81;
+pub const RDB_OPCODE_UPDATE: u8 = 242;
 
 pub const RDB_TYPE_STRING: u8 = 0;
 pub const RDB_TYPE_LIST: u8 = 1;

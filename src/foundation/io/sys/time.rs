@@ -175,69 +175,81 @@ mod monotonic_aarch64_cntvct {
 
 thread_local! {
     static COMMAND_TIME_MS: Cell<Option<i64>> = const { Cell::new(None) };
+    static WALL_TIME_US: Cell<Option<i64>> = const { Cell::new(None) };
 }
-
-/// Sentinel stored in `COMMAND_TIME_MS` to mark a lazily-resolved snapshot.
-/// A real wall-clock millisecond value is always positive (epoch-based), so
-/// `i64::MIN` is a safe "read on first access" marker with no collision risk.
-const LAZY_SNAPSHOT_PENDING: i64 = i64::MIN;
 
 pub struct CommandTimeSnapshotGuard {
     previous: Option<i64>,
+    previous_wall_time: Option<i64>,
+    should_restore_wall_time: bool,
 }
 
 impl Drop for CommandTimeSnapshotGuard {
     fn drop(&mut self) {
         COMMAND_TIME_MS.with(|cell| cell.set(self.previous));
+        if self.should_restore_wall_time {
+            WALL_TIME_US.with(|cell| cell.set(self.previous_wall_time));
+        }
     }
 }
 
 pub fn enter_command_time_snapshot(ms: i64) -> CommandTimeSnapshotGuard {
     COMMAND_TIME_MS.with(|cell| {
         let previous = cell.get();
+        let previous_wall_time = WALL_TIME_US.with(Cell::get);
         if previous.is_none() {
             cell.set(Some(ms));
+            WALL_TIME_US.with(|cell| cell.set(Some(real_ustime())));
         }
-        CommandTimeSnapshotGuard { previous }
+        CommandTimeSnapshotGuard {
+            previous,
+            previous_wall_time,
+            should_restore_wall_time: previous.is_none(),
+        }
     })
 }
 
-/// Enter a command-time snapshot without reading the wall clock eagerly.
-/// The snapshot is resolved on the first call to `mstime`/`ustime`/`unixtime`
-/// during the command. Commands that never consult the clock (e.g. PING) avoid
-/// the `SystemTime::now` syscall entirely. Nested commands keep the outer
-/// snapshot exactly like `enter_command_time_snapshot`.
+/// Enter a command-time snapshot, reading the clock only at the outermost entry.
+/// The historical lazy entry point now caches TIME eagerly to preserve unit-entry
+/// time even if the first TIME follows a delay. Expiry uses the same sample in
+/// milliseconds, and nested commands keep both outer snapshots unchanged.
 pub fn enter_command_time_snapshot_lazy() -> CommandTimeSnapshotGuard {
     COMMAND_TIME_MS.with(|cell| {
         let previous = cell.get();
+        let previous_wall_time = WALL_TIME_US.with(Cell::get);
         if previous.is_none() {
-            cell.set(Some(LAZY_SNAPSHOT_PENDING));
+            let wall_time_us = real_ustime();
+            cell.set(Some(wall_time_us / 1_000));
+            WALL_TIME_US.with(|cell| cell.set(Some(wall_time_us)));
         }
-        CommandTimeSnapshotGuard { previous }
+        CommandTimeSnapshotGuard {
+            previous,
+            previous_wall_time,
+            should_restore_wall_time: previous.is_none(),
+        }
     })
 }
 
 /// Install a fresh wall-clock snapshot even when a command is already active.
 /// Nested blocked event-loop servicing uses this to give admitted commands the
 /// current time while restoring the outer command's frozen snapshot on return.
+/// TIME retains the refreshed wall-clock cache after nested servicing returns.
 pub fn enter_fresh_command_time_snapshot() -> CommandTimeSnapshotGuard {
     COMMAND_TIME_MS.with(|cell| {
-        let previous = cell.replace(Some(real_mstime()));
-        CommandTimeSnapshotGuard { previous }
+        let wall_time_us = real_ustime();
+        let previous = cell.replace(Some(wall_time_us / 1_000));
+        let previous_wall_time = WALL_TIME_US.with(|wall| wall.replace(Some(wall_time_us)));
+        // Blocked servicing refreshes TIME, but expiry restores the outer snapshot.
+        CommandTimeSnapshotGuard {
+            previous,
+            previous_wall_time,
+            should_restore_wall_time: previous.is_none(),
+        }
     })
 }
 
 fn command_time_ms() -> Option<i64> {
-    COMMAND_TIME_MS.with(|cell| {
-        let value = cell.get();
-        if value == Some(LAZY_SNAPSHOT_PENDING) {
-            let ms = real_mstime();
-            cell.set(Some(ms));
-            Some(ms)
-        } else {
-            value
-        }
-    })
+    COMMAND_TIME_MS.with(Cell::get)
 }
 
 fn real_mstime() -> i64 {
@@ -258,6 +270,21 @@ pub fn ustime() -> i64 {
     command_time_ms()
         .map(|ms| ms.saturating_mul(1000))
         .unwrap_or_else(real_ustime)
+}
+
+/// TIME uses a separate cache that nested event servicing may advance.
+pub(crate) fn cached_wall_ustime() -> i64 {
+    if command_time_ms().is_none() {
+        return real_ustime();
+    }
+    WALL_TIME_US.with(|cell| match cell.get() {
+        Some(us) => us,
+        None => {
+            let us = real_ustime();
+            cell.set(Some(us));
+            us
+        }
+    })
 }
 
 pub fn unixtime() -> i64 {
@@ -390,12 +417,87 @@ mod tests {
     }
 
     #[test]
-    fn lazy_snapshot_resolves_on_first_access_and_freezes() {
+    fn cached_wall_time_first_read_after_sleep_keeps_execution_unit_entry() {
+        for is_lazy in [false, true] {
+            let before_us = real_ustime();
+            let _outer = if is_lazy {
+                enter_command_time_snapshot_lazy()
+            } else {
+                enter_command_time_snapshot(1_000)
+            };
+            let after_us = real_ustime();
+            let expiry_ms = mstime();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+
+            let _nested = enter_command_time_snapshot(9_000);
+            let _nested_lazy = enter_command_time_snapshot_lazy();
+            let first_us = cached_wall_ustime();
+            assert!(
+                (before_us..=after_us).contains(&first_us),
+                "first TIME must use execution unit entry before sleep: \
+                 is_lazy={is_lazy}, entry={before_us}..={after_us}, first={first_us}"
+            );
+            assert_eq!(cached_wall_ustime(), first_us);
+            assert_eq!(mstime(), expiry_ms);
+            assert_eq!(ustime(), expiry_ms * 1_000);
+            if is_lazy {
+                assert_eq!(expiry_ms, first_us / 1_000);
+            }
+        }
+    }
+
+    #[test]
+    fn cached_wall_time_advances_through_nested_service_and_clears_at_unit_exit() {
+        for is_lazy in [false, true] {
+            assert!(command_time_ms().is_none());
+            assert_eq!(WALL_TIME_US.with(Cell::get), None);
+            let outer = if is_lazy {
+                enter_command_time_snapshot_lazy()
+            } else {
+                enter_command_time_snapshot(1_000)
+            };
+            let expiry_ms = mstime();
+            WALL_TIME_US.with(|cell| cell.set(Some(12_345)));
+            {
+                let _nested = enter_command_time_snapshot(9_000);
+                let _nested_lazy = enter_command_time_snapshot_lazy();
+                assert_eq!(cached_wall_ustime(), 12_345);
+                assert_eq!(mstime(), expiry_ms);
+            }
+            assert_eq!(cached_wall_ustime(), 12_345);
+
+            let refreshed_us;
+            {
+                let _service = enter_fresh_command_time_snapshot();
+                {
+                    let _nested_service = enter_fresh_command_time_snapshot();
+                    refreshed_us = cached_wall_ustime();
+                    assert_eq!(mstime(), refreshed_us / 1_000);
+                }
+                assert_eq!(cached_wall_ustime(), refreshed_us);
+            }
+            assert_ne!(refreshed_us, 12_345);
+            assert_eq!(cached_wall_ustime(), refreshed_us);
+            assert_eq!(mstime(), expiry_ms);
+            assert_eq!(ustime(), expiry_ms * 1_000);
+            drop(outer);
+            assert!(command_time_ms().is_none());
+            assert_eq!(WALL_TIME_US.with(Cell::get), None);
+        }
+        {
+            let _standalone_service = enter_fresh_command_time_snapshot();
+            assert_eq!(mstime(), cached_wall_ustime() / 1_000);
+        }
+        assert!(command_time_ms().is_none());
+        assert_eq!(WALL_TIME_US.with(Cell::get), None);
+    }
+
+    #[test]
+    fn lazy_snapshot_caches_entry_time_and_freezes() {
         let _guard = enter_command_time_snapshot_lazy();
         let first = mstime();
-        // The lazy snapshot must resolve to a real (positive) epoch value,
-        // never the internal sentinel.
         assert!(first > 0);
+        assert_eq!(first, cached_wall_ustime() / 1_000);
         // Subsequent reads within the same snapshot return the frozen value.
         assert_eq!(mstime(), first);
         assert_eq!(ustime(), first.saturating_mul(1000));

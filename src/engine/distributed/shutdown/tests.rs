@@ -56,6 +56,7 @@ fn handoff_fact(
     version: u32,
     is_online: bool,
     ack_offset: i64,
+    cluster_eligible: bool,
 ) -> ShutdownReplicaFacts<'_> {
     ShutdownReplicaFacts {
         connection_id,
@@ -63,6 +64,7 @@ fn handoff_fact(
         version,
         is_online,
         ack_offset: Some(offset(ack_offset)),
+        cluster_eligible,
     }
 }
 
@@ -71,8 +73,8 @@ fn shutdown_handoff_selects_a_fully_synced_current_replica_deterministically() {
     let low_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     let high_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     let replicas = [
-        handoff_fact(7, Some(low_id), 0x09_00_00, true, 42),
-        handoff_fact(9, Some(high_id), 0x09_01_00, true, 42),
+        handoff_fact(7, Some(low_id), 0x09_00_00, true, 42, true),
+        handoff_fact(9, Some(high_id), 0x09_01_00, true, 42, true),
     ];
 
     assert_eq!(
@@ -87,10 +89,10 @@ fn shutdown_handoff_selects_a_fully_synced_current_replica_deterministically() {
 fn shutdown_handoff_ignores_ineligible_replicas() {
     let valid = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     let replicas = [
-        handoff_fact(1, Some(valid), 0x09_00_00, true, 41),
-        handoff_fact(2, Some(valid), 0x09_00_00, false, 42),
-        handoff_fact(3, None, 0x09_00_00, true, 42),
-        handoff_fact(4, Some("short"), 0x09_00_00, true, 42),
+        handoff_fact(1, Some(valid), 0x09_00_00, true, 41, true),
+        handoff_fact(2, Some(valid), 0x09_00_00, false, 42, true),
+        handoff_fact(3, None, 0x09_00_00, true, 42, true),
+        handoff_fact(4, Some("short"), 0x09_00_00, true, 42, true),
     ];
 
     assert_eq!(
@@ -103,13 +105,71 @@ fn shutdown_handoff_ignores_ineligible_replicas() {
 fn shutdown_handoff_legacy_replica_blocks_all_candidates() {
     let valid = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     let replicas = [
-        handoff_fact(1, Some(valid), 0x09_00_00, true, 42),
-        handoff_fact(2, Some(valid), 0x08_01_00, false, 0),
+        handoff_fact(1, Some(valid), 0x09_00_00, true, 42, true),
+        handoff_fact(2, Some(valid), 0x08_01_00, false, 0, true),
     ];
 
     assert_eq!(
         select_shutdown_handoff(offset(42), &replicas),
         ShutdownHandoffDecision::LegacyReplica
+    );
+}
+
+#[test]
+fn shutdown_handoff_skips_nofailover_and_selects_eligible_replica() {
+    let eligible = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let nofailover = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let replicas = [
+        handoff_fact(7, Some(eligible), 0x09_00_00, true, 42, true),
+        handoff_fact(9, Some(nofailover), 0x09_01_00, true, 42, false),
+    ];
+
+    assert_eq!(
+        select_shutdown_handoff(offset(42), &replicas),
+        ShutdownHandoffDecision::Selected(
+            crate::engine::distributed::cluster::NodeId::parse(eligible.as_bytes()).unwrap()
+        )
+    );
+}
+
+#[test]
+fn shutdown_handoff_no_candidate_when_all_synced_replicas_nofailover() {
+    let first = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let second = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let replicas = [
+        handoff_fact(7, Some(first), 0x09_00_00, true, 42, false),
+        handoff_fact(9, Some(second), 0x09_01_00, true, 42, false),
+    ];
+
+    assert_eq!(
+        select_shutdown_handoff(offset(42), &replicas),
+        ShutdownHandoffDecision::NoCandidate
+    );
+}
+
+#[test]
+fn shutdown_handoff_does_not_pick_nofailover_when_eligible_replica_lagging() {
+    let eligible = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let nofailover = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let replicas = [
+        handoff_fact(7, Some(eligible), 0x09_00_00, true, 41, true),
+        handoff_fact(9, Some(nofailover), 0x09_01_00, true, 42, false),
+    ];
+
+    assert_eq!(
+        select_shutdown_handoff(offset(42), &replicas),
+        ShutdownHandoffDecision::NoCandidate
+    );
+}
+
+#[test]
+fn shutdown_handoff_skips_unknown_cluster_node() {
+    let unknown = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let replicas = [handoff_fact(7, Some(unknown), 0x09_00_00, true, 42, false)];
+
+    assert_eq!(
+        select_shutdown_handoff(offset(42), &replicas),
+        ShutdownHandoffDecision::NoCandidate
     );
 }
 

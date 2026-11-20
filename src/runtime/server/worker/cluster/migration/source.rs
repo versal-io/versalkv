@@ -341,7 +341,7 @@ impl ServerWorkerState {
                 }
                 if let MigrationAction::StartSnapshot(_) = &action {
                     if self.slot_migration_snapshot.is_some()
-                        || self.ctx.persistence().has_active_child()
+                        || self.ctx.persistence().has_child_process()
                     {
                         if let Some(state) = self.ctx.cluster_state_mut().as_deref_mut() {
                             state.queue_migration_actions(actions[index..].iter().cloned());
@@ -1254,6 +1254,17 @@ impl ServerWorkerState {
             state.queue_migration_actions(actions);
         }
         self.drive_slot_migration_actions();
+    }
+
+    /// Match the swapdb failure log while retaining incoming hidden data for
+    /// the primary's authoritative FINISH.
+    pub(crate) fn fail_tracking_imports_after_swap(&mut self) {
+        if let Some(state) = self.ctx.cluster_state_mut().as_deref_mut() {
+            state.migrations.fail_tracking_imports_after_swap(
+                "Full resynchronization occurred",
+                crate::foundation::io::sys::time::unixtime(),
+            );
+        }
     }
 
     /// Trim terminal migration jobs to the configured history length. Mirrors C's

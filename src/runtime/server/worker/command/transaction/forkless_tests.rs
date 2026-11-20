@@ -150,6 +150,7 @@ fn exec_resumes_after_target_capture_and_preserves_snapshot_values() {
             RdbStep::RecordApplied => {}
             RdbStep::Finished(_) => break,
             RdbStep::NeedInput => panic!("complete snapshot requested more input"),
+            RdbStep::InlineCommand { .. } => panic!("snapshot has no inline commands"),
         }
     }
     assert_eq!(
@@ -205,6 +206,7 @@ fn exec_waiting_for_serialization_does_not_recapture_a_queued_key() {
             RdbStep::RecordApplied => {}
             RdbStep::Finished(_) => break,
             RdbStep::NeedInput => panic!("complete snapshot requested more input"),
+            RdbStep::InlineCommand { .. } => panic!("snapshot has no inline commands"),
         }
     }
     assert_eq!(restored.get(0).unwrap().dbsize(), 257);

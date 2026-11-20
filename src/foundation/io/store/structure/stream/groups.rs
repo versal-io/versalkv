@@ -2,6 +2,11 @@ use super::{StreamEntry, StreamID, ValkeyStream};
 use bytes::Bytes;
 use std::collections::{BTreeMap, BTreeSet};
 
+/// The native stream format reserves the all-ones counter for unknown reads.
+pub(crate) fn valid_entries_read(read: u64) -> Option<u64> {
+    (read != u64::MAX).then_some(read)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamConsumer {
     pub name: Bytes,
@@ -42,7 +47,7 @@ impl StreamGroup {
         Self {
             name,
             last_id,
-            entries_read,
+            entries_read: entries_read.and_then(valid_entries_read),
             consumers: BTreeMap::new(),
             pending: BTreeMap::new(),
         }
@@ -183,7 +188,7 @@ impl ValkeyStream {
             .get_mut(name)
             .ok_or(StreamGroupLookupError::NoGroup)?;
         group.last_id = last_id;
-        group.entries_read = entries_read;
+        group.entries_read = entries_read.and_then(valid_entries_read);
         Ok(())
     }
 
@@ -235,16 +240,31 @@ impl ValkeyStream {
         noack: bool,
         now_ms: i64,
     ) -> Result<ReadGroupNewResult, StreamGroupLookupError> {
-        let start_id = self
+        let group = self
             .groups
             .get(group_name)
-            .ok_or(StreamGroupLookupError::NoGroup)?
-            .last_id;
+            .ok_or(StreamGroupLookupError::NoGroup)?;
+        let start_id = group.last_id;
+        let mut last_id = start_id;
+        let mut entries_read = group.entries_read.and_then(valid_entries_read);
         let entries = self.range_from_start(&start_id, count);
-        let entries_added = self.entries_added;
-        let max_deleted = self.max_deleted_entry_id;
-        let stream_last_id = self.last_id;
-        let known_len = self.entries.len();
+        let first_id = self.first_id();
+        // Advance the logical counter using each delivered entry's previous cursor.
+        for entry in &entries {
+            if entry.id <= last_id {
+                continue;
+            }
+            if entries_read.is_some()
+                && first_id.is_some_and(|first| last_id >= first)
+                && !self.range_has_tombstones(Some(last_id), None)
+            {
+                entries_read =
+                    entries_read.and_then(|read| valid_entries_read(read.wrapping_add(1)));
+            } else if self.entries_added != 0 {
+                entries_read = self.estimate_distance_from_first_ever_entry(entry.id);
+            }
+            last_id = entry.id;
+        }
 
         let group = self
             .groups
@@ -260,17 +280,9 @@ impl ValkeyStream {
             });
         }
 
-        let last_id = entries.last().map(|entry| entry.id).unwrap_or(start_id);
         group.last_id = last_id;
         group.mark_consumer_active(consumer_name, now_ms);
-        group.entries_read = calculate_entries_read(
-            entries_added,
-            known_len,
-            max_deleted,
-            stream_last_id,
-            last_id,
-            self.entries.keys().filter(|id| **id <= last_id).count(),
-        );
+        group.entries_read = entries_read;
 
         if !noack {
             for entry in &entries {
@@ -427,21 +439,4 @@ fn add_pending_to_group(
             delivery_count,
         },
     );
-}
-
-fn calculate_entries_read(
-    entries_added: u64,
-    known_len: usize,
-    max_deleted: StreamID,
-    stream_last_id: StreamID,
-    group_last_id: StreamID,
-    known_read: usize,
-) -> Option<u64> {
-    if group_last_id == stream_last_id {
-        return Some(entries_added);
-    }
-    if max_deleted != StreamID::zero() {
-        return None;
-    }
-    Some(known_read.min(known_len).min(entries_added as usize) as u64)
 }

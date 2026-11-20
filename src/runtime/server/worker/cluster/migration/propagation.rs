@@ -672,4 +672,68 @@ mod tests {
             1
         );
     }
+
+    #[test]
+    fn classifier_forwards_msetex_through_the_dynamic_key_extractor() {
+        use crate::engine::distributed::cluster::migration::{ExportPhase, MigrationPhase};
+
+        let key = b"{atomic}key";
+        let slot = crate::engine::distributed::cluster::node::key_hash_slot(key);
+        let mut registry = CommandRegistry::new();
+        crate::framework::commands::register_all(&mut registry);
+        let msetex_spec = registry.lookup(b"MSETEX").expect("MSETEX registered");
+        assert_eq!(
+            msetex_spec.first_key, 0,
+            "fixture relies on dynamic get_keys"
+        );
+
+        let build_views = |phase: ExportPhase| {
+            let id = MigrationJobId::parse(b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+            let mut job = MigrationJob::new(
+                id,
+                NodeId::parse(b"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap(),
+                NodeId::parse(b"cccccccccccccccccccccccccccccccccccccccc").unwrap(),
+                SlotRanges::new(vec![SlotRange::new(slot, slot).unwrap()]).unwrap(),
+                MigrationOperation::Export,
+                1,
+            );
+            job.phase = MigrationPhase::Export(phase);
+            let mut migrations = MigrationRegistry::default();
+            migrations.start(job).unwrap();
+            migrations.active_export_views()
+        };
+
+        let plain = encode_command(&[b"MSETEX", b"1", key, b"value"]);
+        let with_expiry = encode_command(&[b"MSETEX", b"1", key, b"value", b"EX", b"1000"]);
+        let streaming = classify_migration_mutations(
+            &[
+                PropagationOp::both(0, plain.clone()),
+                PropagationOp::both(0, with_expiry.clone()),
+            ],
+            &build_views(ExportPhase::Streaming),
+            &registry,
+        );
+        assert_eq!(streaming.len(), 2);
+        assert_eq!(streaming[0].frame, plain);
+        assert_eq!(streaming[1].frame, with_expiry);
+        assert!(streaming
+            .iter()
+            .all(|mutation| !mutation.defer_until_snapshot));
+
+        let snapshotting = classify_migration_mutations(
+            &[PropagationOp::both(0, plain.clone())],
+            &build_views(ExportPhase::Snapshotting),
+            &registry,
+        );
+        assert_eq!(snapshotting.len(), 1);
+        assert!(snapshotting[0].defer_until_snapshot);
+
+        let foreign = encode_command(&[b"MSETEX", b"1", b"outside-slot", b"value"]);
+        let ignored = classify_migration_mutations(
+            &[PropagationOp::both(0, foreign)],
+            &build_views(ExportPhase::Streaming),
+            &registry,
+        );
+        assert!(ignored.is_empty());
+    }
 }

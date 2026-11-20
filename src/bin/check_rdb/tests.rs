@@ -148,16 +148,87 @@ fn slot_import_rdb(count: u64, ranges: &[(u64, u64)]) -> Vec<u8> {
 }
 
 #[test]
-fn slot_import_accepts_counts_and_ranges_without_extra_range_validation() {
-    for ranges in [vec![], vec![(1, 2)], vec![(2, 1), (16384, u64::MAX - 1)]] {
+fn slot_import_accepts_valid_ranges_including_empty_duplicate_and_overlapping_ranges() {
+    for ranges in [
+        vec![],
+        vec![(1, 2)],
+        vec![(0, 0)],
+        vec![(16383, 16383)],
+        vec![(0, 16383)],
+        vec![(0, 1), (2, 16383)],
+        vec![(1, 2), (1, 2)],
+        vec![(1, 2), (2, 3)],
+        vec![(9, 11), (1, 2)],
+    ] {
         let data = slot_import_rdb(ranges.len() as u64, &ranges);
-        let report = scan_rdb(&data).expect("SLOT IMPORT lengths should be valid");
+        let report = scan_rdb(&data).expect("valid SLOT IMPORT ranges should be accepted");
         assert_eq!(report.state.final_offset, data.len() as u64);
         assert!(report
             .notices
             .iter()
             .any(|notice| notice.message.contains("Checksum OK")));
     }
+}
+
+#[test]
+fn slot_import_rejects_invalid_ranges_before_checksum_validation() {
+    for (start, end) in [
+        (2000, 1000),
+        (0, 16384),
+        (16384, 17384),
+        (16384, 16384),
+        (u64::MAX - 1, u64::MAX - 1),
+        (0, 65536),
+    ] {
+        for ranges in [vec![(start, end)], vec![(0, 0), (start, end)]] {
+            let data = slot_import_rdb(ranges.len() as u64, &ranges);
+            let failure = scan_rdb(&data).expect_err("invalid SLOT IMPORT range must fail");
+            assert_eq!(failure.phase, RdbCheckPhase::ReadLength);
+            assert_eq!(failure.offset, (60 + ranges.len() * 18) as u64);
+            assert_eq!(
+                failure.message,
+                format!("Invalid slot import range in RDB: start={start} end={end}")
+            );
+            assert!(!failure
+                .notices
+                .iter()
+                .any(|notice| notice.message.contains("Checksum OK")));
+        }
+    }
+}
+
+#[test]
+fn slot_import_rejects_invalid_ranges_with_disabled_checksum_and_stream_compression() {
+    use versal::foundation::io::persistence::rdb::compression::encode_rdb_stream;
+
+    let mut data = slot_import_rdb(1, &[(2000, 1000)]);
+    let checksum_offset = data.len() - 8;
+    data[checksum_offset..].fill(0);
+    let mut inputs = vec![data.clone()];
+    for checksum in [false, true] {
+        inputs.push(encode_rdb_stream(&data, checksum).unwrap());
+    }
+    for input in inputs {
+        let failure = scan_rdb(&input).expect_err("range validation must not depend on checksum");
+        assert_eq!(
+            failure.message,
+            "Invalid slot import range in RDB: start=2000 end=1000"
+        );
+        assert_eq!(failure.phase, RdbCheckPhase::ReadLength);
+        assert_eq!(failure.offset, 78);
+    }
+}
+
+#[test]
+fn slot_import_accepts_duplicate_job_records() {
+    let record = slot_import_rdb(1, &[(1, 2)]);
+    let mut data = record[..record.len() - 9].to_vec();
+    data.extend_from_slice(&record[9..record.len() - 9]);
+    data.push(255);
+    data.extend_from_slice(&crc64(0, &data).to_le_bytes());
+    let report = scan_rdb(&data).expect("C checker does not impose unique slot import jobs");
+    assert_eq!(report.state.final_offset, data.len() as u64);
+    assert_eq!(report.state.keys, 0);
 }
 
 #[test]

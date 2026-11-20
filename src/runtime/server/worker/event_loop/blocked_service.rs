@@ -14,6 +14,9 @@ impl ServerWorkerState {
         operation: BlockedOperation,
     ) -> BlockedServiceResult {
         let _command_time = crate::foundation::io::sys::time::enter_fresh_command_time_snapshot();
+        // Each progress callback starts a new bounded service turn. Otherwise
+        // an earlier reply keeps this client ineligible for the entire load.
+        self.writes.ordinary.begin_turn();
         let mut result = BlockedServiceResult::default();
         self.blocked_events.push_scope(operation);
         for round in 0..BLOCKED_EVENT_SERVICE_ROUNDS {

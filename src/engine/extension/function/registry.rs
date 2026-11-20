@@ -273,8 +273,14 @@ impl FunctionRegistry {
         }
     }
 
+    /// FUNCTION LIST and RDB function serialization must present libraries in
+    /// a deterministic order across independent registry instances. C relies on
+    /// a single process-wide dict seed, while each Rust `HashMap` has its own
+    /// random state, so sort by library name at every output boundary.
     pub fn list_libraries(&self) -> Vec<&FunctionLib> {
-        self.libraries.values().collect()
+        let mut libraries: Vec<&FunctionLib> = self.libraries.values().collect();
+        libraries.sort_by(|left, right| left.name.cmp(&right.name));
+        libraries
     }
 
     pub fn get_library(&self, name: &str) -> Option<&FunctionLib> {
@@ -291,7 +297,7 @@ impl FunctionRegistry {
 
     pub fn dump(&self) -> Vec<u8> {
         let mut data = Vec::new();
-        for lib in self.libraries.values() {
+        for lib in self.list_libraries() {
             data.extend_from_slice(lib.name.as_bytes());
             data.push(b'\n');
             data.extend_from_slice(lib.code.len().to_string().as_bytes());
@@ -640,6 +646,51 @@ mod transaction_tests {
             *events.lock().unwrap(),
             vec![format!("commit:{first_engine_name}")]
         );
+    }
+
+    #[test]
+    fn list_libraries_and_dump_are_deterministic_across_registry_instances() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let engine: &'static FakeEngine =
+            Box::leak(Box::new(FakeEngine::new("FAKE", Arc::clone(&events))));
+        let expected: Vec<String> = (0..21).map(|index| format!("lib{index:02}")).collect();
+        let build = || {
+            let mut libraries = HashMap::new();
+            for name in expected.iter().rev() {
+                libraries.insert(
+                    name.clone(),
+                    FunctionLib {
+                        name: name.clone(),
+                        engine: engine as &'static dyn ScriptEngine,
+                        functions: Vec::new(),
+                        code: String::new(),
+                    },
+                );
+            }
+            FunctionRegistry {
+                libraries,
+                functions: HashMap::new(),
+                engine_mgr: EngineManager {
+                    engines: HashMap::from([(engine.name(), engine as &'static dyn ScriptEngine)]),
+                },
+                memory_usage: 0,
+            }
+        };
+
+        for registry in [build(), build()] {
+            let names: Vec<String> = registry
+                .list_libraries()
+                .into_iter()
+                .map(|lib| lib.name.clone())
+                .collect();
+            assert_eq!(names, expected);
+
+            let expected_dump = expected
+                .iter()
+                .map(|name| format!("{name}\n0\n\n"))
+                .collect::<String>();
+            assert_eq!(String::from_utf8(registry.dump()).unwrap(), expected_dump);
+        }
     }
 
     #[test]

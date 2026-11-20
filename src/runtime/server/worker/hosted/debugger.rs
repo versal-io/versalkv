@@ -7,7 +7,7 @@ use bytes::Bytes;
 
 use crate::engine::command::context::CommandConn;
 use crate::engine::command::{CommandArgs, SessionId};
-use crate::engine::host::{HostError, HostRequest, HostYield};
+use crate::engine::host::{HostError, HostRequest, HostYield, ScriptDebugResume};
 use crate::foundation::io::protocol::{
     parser::{ParseError, Parser},
     serializer::serialize_to_vec,
@@ -22,6 +22,8 @@ use crate::runtime::server::worker::event_loop::sources::ChildOwner;
 use crate::runtime::server::worker::ServerWorkerState;
 
 use super::HostTaskScope;
+
+mod breakpoint;
 
 const MAX_DEBUGGER_REPLY_DEPTH: usize = 16;
 const MAX_DEBUGGER_REPLY_DEPTH_MESSAGE: &[u8] = b"<max reply depth reached>";
@@ -388,7 +390,11 @@ impl ServerWorkerState {
                 }
                 continue;
             }
-            if command.eq_ignore_ascii_case(b"c") || command.eq_ignore_ascii_case(b"continue") {
+            if command.eq_ignore_ascii_case(b"c")
+                || command.eq_ignore_ascii_case(b"continue")
+                || command.eq_ignore_ascii_case(b"s")
+                || command.eq_ignore_ascii_case(b"step")
+            {
                 if parts.len() != 1 {
                     if let Err(error) =
                         self.write_debugger_reply(token, debugger_wrong_arity_reply("continue"))
@@ -403,7 +409,21 @@ impl ServerWorkerState {
                 task.restart_timer();
                 // The debugger loop owns the connection until this execution
                 // returns to either the fork child or the synchronous host path.
-                let result = self.run_debugger_script(token, task);
+                let resume = if command.eq_ignore_ascii_case(b"s")
+                    || command.eq_ignore_ascii_case(b"step")
+                {
+                    ScriptDebugResume::Step
+                } else {
+                    ScriptDebugResume::Continue
+                };
+                let result = self.run_debugger_script(
+                    token,
+                    task,
+                    &mut parser,
+                    &source,
+                    &mut session_state,
+                    resume,
+                );
                 return self.finish_debugger_session(token, result, mode);
             }
             if command.eq_ignore_ascii_case(b"a") || command.eq_ignore_ascii_case(b"abort") {
@@ -570,24 +590,42 @@ impl ServerWorkerState {
         result
     }
 
-    fn run_debugger_script(&mut self, token: Token, mut task: LuaTask) -> Value {
+    fn run_debugger_script(
+        &mut self,
+        token: Token,
+        mut task: LuaTask,
+        parser: &mut Parser,
+        source: &str,
+        session_state: &mut DebuggerSessionState,
+        resume: ScriptDebugResume,
+    ) -> Value {
         self.ctx.enter_script(task.control());
-        let result = self.with_host_dispatcher(HostTaskScope::client(token), |dispatcher| {
-            task.run(&mut |request| {
-                process::exit_if_persistence_child_parent_changed();
-                if let HostRequest::Yield(HostYield::ScriptCheckpoint { run }) = &request {
-                    if run.timeout_ms > 0
-                        && run.start_time.is_some_and(|start| {
-                            start.elapsed().as_millis() >= run.timeout_ms as u128
-                        })
-                    {
-                        return Err(HostError::Runtime(
-                            "Script timed out in debugger".to_string(),
-                        ));
-                    }
+        let _guard = crate::engine::extension::lua::timeout::ScriptDebuggerGuard::enter(resume);
+        let result = task.run(&mut |request| {
+            process::exit_if_persistence_child_parent_changed();
+            if let HostRequest::Yield(HostYield::ScriptDebugStop { run, line, reason }) = request {
+                return self.run_debugger_breakpoint(
+                    token,
+                    parser,
+                    source,
+                    session_state,
+                    run,
+                    line,
+                    reason,
+                );
+            }
+            if let HostRequest::Yield(HostYield::ScriptCheckpoint { run }) = &request {
+                if run.timeout_ms > 0
+                    && run
+                        .start_time
+                        .is_some_and(|start| start.elapsed().as_millis() >= run.timeout_ms as u128)
+                {
+                    return Err(HostError::Runtime(
+                        "Script timed out in debugger".to_string(),
+                    ));
                 }
-                dispatcher(request)
-            })
+            }
+            self.dispatch_host_request(HostTaskScope::client(token), request)
         });
         self.ctx.leave_script();
         task.finish(result, &mut self.connection_registry[token], &mut self.ctx)
@@ -1073,7 +1111,7 @@ fn debugger_command_exceeds_size_limit(parts: &[Bytes]) -> bool {
 }
 
 fn parse_debugger_command(parser: &mut Parser) -> Result<Option<Vec<Bytes>>, ParseError> {
-    parser.try_parse_limited(MAX_DEBUGGER_COMMAND_BYTES, MAX_DEBUGGER_COMMAND_BYTES)
+    parser.try_parse_debugger(MAX_DEBUGGER_COMMAND_BYTES)
 }
 
 fn is_debugger_command_alias(command: &[u8]) -> bool {
@@ -1107,10 +1145,10 @@ mod tests {
         debugger_command_exceeds_size_limit, debugger_command_logs, debugger_session_end_replies,
         format_debugger_reply, format_debugger_reply_with_limit, parse_debugger_command,
         sanitize_debugger_reply_lines, DebuggerSessionState, DEBUGGER_LOG_HARD_LIMIT_HINT,
-        DEBUGGER_LOG_TRIM_SUFFIX, MAX_DEBUGGER_LOG_FORMAT_BYTES,
+        DEBUGGER_LOG_TRIM_SUFFIX, MAX_DEBUGGER_COMMAND_BYTES, MAX_DEBUGGER_LOG_FORMAT_BYTES,
     };
     use crate::engine::command::CommandArgs;
-    use crate::foundation::io::protocol::Value;
+    use crate::foundation::io::protocol::{parser::Parser, Value};
     use crate::framework::capabilities::connection::Connection;
     use crate::framework::capabilities::io::Token;
     use crate::runtime::server::worker::ServerWorkerState;
@@ -1165,6 +1203,29 @@ mod tests {
 
         assert_eq!(parsed[0].as_ref(), b"redis");
         assert_eq!(parsed[1].len(), 2048);
+    }
+
+    #[test]
+    fn debugger_incomplete_header_uses_the_session_cap() {
+        let mut bytes = vec![b'*'];
+        bytes.extend(std::iter::repeat_n(b'x', 65536));
+        let mut ordinary = Parser::new();
+        ordinary.feed(&bytes);
+        assert!(ordinary.try_parse().is_err());
+
+        let mut debugger = Parser::new();
+        debugger.feed(&bytes);
+        assert_eq!(parse_debugger_command(&mut debugger), Ok(None));
+        debugger.feed(&vec![b'x'; MAX_DEBUGGER_COMMAND_BYTES - bytes.len()]);
+        assert_eq!(parse_debugger_command(&mut debugger), Ok(None));
+        debugger.feed(b"x");
+        assert!(parse_debugger_command(&mut debugger).is_err());
+        assert_eq!(debugger.undecoded_len(), 0);
+        debugger.feed(b"*1\r\n$4\r\nping\r\n");
+        assert_eq!(
+            parse_debugger_command(&mut debugger).unwrap().unwrap(),
+            vec![Bytes::from_static(b"ping")],
+        );
     }
 
     #[test]

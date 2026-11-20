@@ -20,6 +20,86 @@ fn offset(value: i64) -> ReplicationOffset {
     ReplicationOffset::try_from(value).expect("test offset must be non-negative")
 }
 
+#[test]
+fn deferred_stream_decompression_error_accounts_for_rejected_wire_bytes() {
+    // Same corrupt VCS envelope used by the upstream
+    // "Corrupt buffered lz4 dual-channel stream" Tcl case.
+    let mut envelope = vec![0x56, 0x43, 0x53, 0x01, 0x01, 0x00, 0x02];
+    envelope.extend_from_slice(&[0u8; 64]);
+    let rejected_len = envelope.len();
+
+    let mut link = link();
+    link.set_compression_mode("lz4");
+    link.transition_rdb_channel_state(ReplicaRdbChannelState::Connecting)
+        .unwrap();
+    link.transition_rdb_channel_state(ReplicaRdbChannelState::Handshake)
+        .unwrap();
+    link.transition_rdb_channel_state(ReplicaRdbChannelState::WaitingForEndOffset)
+        .unwrap();
+    link.transition_rdb_channel_state(ReplicaRdbChannelState::ReceivingRdb)
+        .unwrap();
+    // A dual RDB still owns framing, so the main-channel Streaming branch
+    // defers the decode error instead of tearing down the link immediately.
+    link.state = ReplicaLinkState::Streaming;
+    assert_ne!(link.rdb_channel_state(), ReplicaRdbChannelState::RdbLoaded);
+
+    let (events, _actions) = link.on_bytes(&envelope, 6380).unwrap();
+
+    assert!(events.is_empty(), "a deferred error yields no events");
+    assert!(link.has_stream_decompression_error());
+    assert_eq!(link.pending_stream_error_bytes(), rejected_len);
+}
+
+#[test]
+fn fullresync_rdb_offset_is_validated_before_any_cursor_is_adopted() {
+    let replid = "0123456789abcdef0123456789abcdef01234567";
+    let mut link = link();
+    link.set_resume_position("cached".to_string(), offset(7), 3);
+    link.state = ReplicaLinkState::WaitPsyncReply;
+    link.on_bytes(format!("+FULLRESYNC {replid} -1\r\n").as_bytes(), 6380)
+        .unwrap();
+    assert!(link.requires_rdb_offset());
+    assert!(!link.can_ack_primary());
+    assert_eq!(link.applied_position(), offset(7));
+    assert_eq!(link.received_position(), offset(7));
+    for (id, value) in [
+        (None, Some(40)),
+        (Some("ffffffffffffffffffffffffffffffffffffffff"), Some(40)),
+        (Some(replid), None),
+        (Some(replid), Some(-1)),
+        (Some(replid), Some(i64::MAX)),
+    ] {
+        assert!(link.prevalidate_rdb_commit_position(id, value).is_err());
+        assert_eq!(link.applied_position(), offset(7));
+    }
+    let position = link
+        .prevalidate_rdb_commit_position(Some(replid), Some(40))
+        .unwrap();
+    link.finish_rdb_apply(position);
+    assert_eq!(link.applied_position(), offset(40));
+    assert_eq!(link.received_position(), offset(40));
+    assert_eq!(link.decoded_offset, offset(40));
+    assert_eq!(link.acknowledged_position(), offset(40));
+}
+
+#[test]
+fn psync_to_sync_fallback_does_not_require_replication_aux() {
+    let mut link = link();
+    link.state = ReplicaLinkState::WaitPsyncReply;
+    let (_, actions) = link
+        .on_bytes(b"-ERR unknown command 'PSYNC'\r\n", 6380)
+        .unwrap();
+    assert_eq!(
+        actions,
+        vec![ReplicaAction::Send(protocol::encode_command(&[b"SYNC"]))]
+    );
+    assert!(!link.requires_rdb_offset());
+    assert_eq!(
+        link.prevalidate_rdb_commit_position(None, None).unwrap(),
+        offset(0)
+    );
+}
+
 fn boundary_waiting_endoff_link() -> ReplicaLink {
     let mut link = link();
     link.transition_rdb_channel_state(ReplicaRdbChannelState::Connecting)
@@ -476,6 +556,50 @@ fn cluster_replica_handshake_advertises_version_and_node_id_before_psync() {
         link.state(),
         ReplicaLinkState::WaitReplconfReplies { remaining: 4 }
     );
+}
+
+#[test]
+fn legacy_primary_version_rejection_keeps_the_handshake_response_count() {
+    let mut link = link();
+    link.connected(None, None);
+    link.on_bytes(b"+PONG\r\n", 6380).unwrap();
+    let (_, actions) = link
+        .on_bytes(b"-ERR Unrecognized REPLCONF option: version\r\n", 6380)
+        .unwrap();
+    assert!(actions.is_empty());
+    assert_eq!(
+        link.state(),
+        ReplicaLinkState::WaitReplconfReplies { remaining: 1 }
+    );
+    let (_, actions) = link.on_bytes(b"+OK\r\n", 6380).unwrap();
+    assert_eq!(
+        actions,
+        vec![ReplicaAction::Send(protocol::build_psync_full())]
+    );
+    assert_eq!(link.state(), ReplicaLinkState::WaitPsyncReply);
+}
+
+#[test]
+fn optional_version_negotiation_does_not_hide_unrelated_handshake_errors() {
+    for reply in [
+        b"-NOAUTH Authentication required\r\n".as_slice(),
+        b"-ERR Unrecognized REPLCONF option: listening-port\r\n",
+    ] {
+        let mut link = link();
+        link.connected(None, None);
+        link.on_bytes(b"+PONG\r\n", 6380).unwrap();
+        assert!(matches!(
+            link.on_bytes(reply, 6380),
+            Err(LinkError::Protocol)
+        ));
+    }
+    let mut link = link();
+    link.connected(None, None);
+    link.on_bytes(b"+PONG\r\n+OK\r\n", 6380).unwrap();
+    assert!(matches!(
+        link.on_bytes(b"-ERR Unrecognized REPLCONF option: version\r\n", 6380),
+        Err(LinkError::Protocol)
+    ));
 }
 
 #[test]
@@ -1221,7 +1345,7 @@ fn position_snapshot(link: &ReplicaLink) -> (Option<i64>, i64, i64, i64, i64) {
 #[test]
 fn fullresync_rejects_invalid_offsets_before_mutating_link_state() {
     let replid = "0123456789abcdef0123456789abcdef01234567";
-    for offset in [-1, i64::MAX] {
+    for offset in [-2, i64::MAX] {
         let mut link = link();
         advance_to_waitpsyncreply(&mut link, 6380);
         let positions = position_snapshot(&link);

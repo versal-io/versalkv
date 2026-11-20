@@ -197,10 +197,15 @@ impl ServerWorkerState {
         // server's replication buffers; counting them makes callers believe a
         // following write is queued behind backpressure when it may still be
         // accepted by the socket.
+        let pending_error_bytes = self
+            .replication_runtime
+            .replica_link()
+            .map_or(0, |link| link.pending_stream_error_bytes());
         let live_total = if self.ctx.replication().is_replica() {
             self.replication_runtime
                 .replica_pending_buffer()
                 .map_or(0, |buffer| buffer.used_bytes())
+                .saturating_add(pending_error_bytes)
         } else {
             let backlog_bytes = self.ctx.replication().backlog.history_len();
             let queued = self

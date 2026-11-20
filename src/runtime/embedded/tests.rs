@@ -243,15 +243,15 @@ fn command_count_list_and_help_use_the_compiled_catalog() {
     assert_eq!(
         pathhash_names,
         [
-            "phcard",
             "phdel",
-            "phdelprefix",
-            "phexists",
             "phget",
             "phgetall",
-            "phlongest",
             "phmget",
             "phmset",
+            "phpathcount",
+            "phpathdel",
+            "phpathexists",
+            "phpathscan",
             "phprefixes",
             "phscan",
             "phset"

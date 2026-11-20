@@ -384,7 +384,7 @@ fn finish(args: &[Bytes], _conn: &mut dyn CommandConn, ctx: &mut ServerContext) 
     let Some(state) = ctx.cluster_state_mut().as_deref_mut() else {
         return Value::error("ERR This instance has cluster support disabled");
     };
-    match state.finish_migration(
+    match state.reconcile_remote_finish_migration(
         name.as_ref().unwrap(),
         terminal.unwrap(),
         message,

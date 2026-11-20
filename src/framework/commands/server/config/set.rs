@@ -116,12 +116,12 @@ fn apply_config_set_one_with_exec(
         return Ok(());
     }
     let old_dual_channel = ctx.config().replication.dual_channel_replication;
-    if param == "bgsave-default-method"
-        && val_trimmed.eq_ignore_ascii_case("forkless")
+    if param == "forkless-policy"
+        && val_trimmed.eq_ignore_ascii_case("prefer-forkless")
         && !ctx.config().persistence.forkless_infrastructure_enabled
     {
         return Err(
-            "'forkless' can only be selected when the server was started with 'forkless-infrastructure-enabled yes'"
+            "'prefer-forkless' can only be selected when the server was started with 'forkless-infrastructure-enabled yes'"
                 .to_string(),
         );
     }

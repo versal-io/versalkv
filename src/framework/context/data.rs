@@ -86,6 +86,10 @@ impl ServerContext {
     }
     pub fn update_dict_resize_policy(&mut self) {
         use crate::foundation::io::store::structure::dict::ResizePolicy;
+        // Leaf compaction protects fork-shared pages independently of hash resizing.
+        crate::foundation::io::store::structure::zset::ordered_index::set_leaf_compaction_allowed(
+            self.persistence().child().is_none(),
+        );
         let policy = if !self.config().server.dict_resizing {
             ResizePolicy::Forbid
         } else if self.persistence().has_active_child() {

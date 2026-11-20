@@ -469,8 +469,9 @@ impl ServerWorkerState {
         }
         let applied_offset = result.link.applied_position();
         let is_streaming = result.link.is_streaming();
-        let is_loading =
-            result.link.is_dual_rdb_mode_active() || result.link.has_pending_rdb_receive();
+        let is_loading = result.link.is_dual_rdb_mode_active()
+            || result.link.has_pending_rdb_receive()
+            || self.ctx.is_loading();
         self.replication_runtime.set_replica_link(result.link);
         self.queue_replica_actions(connection_token, result.actions);
         self.ctx.replication_mut().slave_repl_offset = applied_offset;
@@ -596,6 +597,23 @@ impl ServerWorkerState {
                         return ResumeDecision::Resume(link);
                     }
                     Ok(RdbStep::Finished(_)) => break,
+                    Ok(RdbStep::InlineCommand { db, args }) => {
+                        if self
+                            .apply_streamed_rdb_inline(
+                                &mut link,
+                                crate::runtime::server::worker::hosted::HostTaskScope::blocked(
+                                    operation,
+                                ),
+                                db,
+                                args,
+                            )
+                            .is_err()
+                        {
+                            self.replication_runtime.set_replica_link(link);
+                            self.tear_down_master_link(main.0);
+                            return ResumeDecision::Aborted;
+                        }
+                    }
                     Ok(RdbStep::RecordApplied) => {
                         link = match self.service_rdb_progress_boundary(
                             link,
@@ -713,17 +731,33 @@ impl ServerWorkerState {
         let input_complete =
             !link.is_receiving_rdb() && (!is_dual_mode || link.rdb_framing_is_complete());
         let key_load_delay_us = self.ctx.config().persistence.key_load_delay;
-        let step = {
+        let step = loop {
             let Some(recv) = link.rdb_receive_mut() else {
                 return Ok(());
             };
             if input_complete {
                 recv.finish_input();
             }
-            recv.drive(self.ctx.dbs_mut(), key_load_delay_us)
+            let step = recv.drive(self.ctx.dbs_mut(), key_load_delay_us);
+            if let Ok(StreamStep::InlineCommand { db, args }) = step {
+                self.apply_streamed_rdb_inline(
+                    link,
+                    crate::runtime::server::worker::hosted::HostTaskScope::background(),
+                    db,
+                    args,
+                )?;
+                continue;
+            }
+            break step;
         };
         match step {
             Ok(StreamStep::NeedMore) => Ok(()),
+            Ok(StreamStep::InlineCommand { db, args }) => self.apply_streamed_rdb_inline(
+                link,
+                crate::runtime::server::worker::hosted::HostTaskScope::background(),
+                db,
+                args,
+            ),
             Ok(StreamStep::Finished) => {
                 if link.is_receiving_rdb() || (is_dual_mode && !link.rdb_framing_is_complete()) {
                     return Ok(());
@@ -778,6 +812,39 @@ impl ServerWorkerState {
         }
     }
 
+    fn apply_streamed_rdb_inline(
+        &mut self,
+        link: &mut ReplicaLink,
+        scope: crate::runtime::server::worker::hosted::HostTaskScope,
+        db: u32,
+        args: Vec<bytes::Bytes>,
+    ) -> Result<(), ()> {
+        let (repl_id, repl_offset) = link.rdb_receive_mut().ok_or(())?.replication_metadata();
+        let repl_id = repl_id.map(str::to_owned);
+        link.prevalidate_rdb_commit_position(repl_id.as_deref(), repl_offset)
+            .map_err(|_| ())?;
+        let receive = link.rdb_receive_mut().ok_or(())?;
+        if let Some(codes) = receive.take_inline_function_codes() {
+            crate::framework::host_tasks::replace_function_libraries(&mut self.ctx, &codes)?;
+        }
+        receive.swap_inline_dataset(self.ctx.dbs_mut());
+        let result = self.apply_rdb_inline_command(
+            scope,
+            db,
+            &crate::engine::command::CommandArgs::from_parts(args),
+        );
+        if let Some(receive) = link.rdb_receive_mut() {
+            receive.swap_inline_dataset(self.ctx.dbs_mut());
+        }
+        result.map_err(|error| {
+            crate::server_log!(
+                warning,
+                "Error applying inline command from RDB stream: {}",
+                error
+            );
+        })
+    }
+
     /// Select the decode target on the first driveable chunk, mirroring the old
     /// buffered path's swapdb-vs-flush split. `swapdb` decodes into a fresh DbSet
     /// swapped in atomically at commit; the default flushes the serving DbSet once
@@ -805,7 +872,7 @@ impl ServerWorkerState {
             // non-SWAPDB RDB: downstream replicas are disconnected and the
             // old replication backlog is discarded before the new dataset is
             // installed.
-            if let Some(replid) = link.master_replid() {
+            if let Some(replid) = link.master_replid().filter(|_| !link.requires_rdb_offset()) {
                 let snapshot_position = link.prevalidate_rdb_apply_position()?;
                 let boundary = ReplicationBacklog::rdb_snapshot_boundary(snapshot_position)
                     .map_err(|_| LinkError::Protocol)?;
@@ -1067,10 +1134,16 @@ impl ServerWorkerState {
         let applied_offset = link.applied_position();
         let is_streaming = link.is_streaming();
         let dual_join_pending = link.is_dual_rdb_mode_active();
+        // C publishes REPL_STATE_CONNECTED only after rdbLoad completes. Mirror
+        // that single gate: an EOF marker may advance the protocol link to
+        // streaming while the paced decoder still holds a pending RDB and the
+        // context remains in the loading state.
+        let rdb_receive_pending = link.has_pending_rdb_receive();
+        let context_loading = self.ctx.is_loading();
         self.replication_runtime.set_replica_link(link);
         self.queue_replica_actions(connection_token, actions);
         self.ctx.replication_mut().slave_repl_offset = applied_offset;
-        if is_streaming && !dual_join_pending {
+        if is_streaming && !dual_join_pending && !rdb_receive_pending && !context_loading {
             self.ctx.config_mut().replication.master_link_status = "up".to_string();
             self.ctx.replication_mut().mark_failover_complete();
             self.replication_runtime.reset_master_reconnect_backoff();
@@ -1735,7 +1808,7 @@ mod tests {
 
         assert!(matches!(
             link.on_bytes(
-                b"+FULLRESYNC 0123456789abcdef0123456789abcdef01234567 -1\r\n$5\r\nab",
+                b"+FULLRESYNC 0123456789abcdef0123456789abcdef01234567 -2\r\n$5\r\nab",
                 6380,
             ),
             Err(LinkError::Protocol)

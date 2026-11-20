@@ -188,7 +188,11 @@ impl ServerWorkerState {
             self.replication_runtime.take_replica_rdb_link();
         }
         self.retire_runtime_source(Token(rdb_connection_id.0));
-        self.connection_registry.remove(Token(rdb_connection_id.0));
+        if let Some(connection) = self.connection_registry.remove(Token(rdb_connection_id.0)) {
+            if connection.priority.is_priority() {
+                self.priority_connections = self.priority_connections.saturating_sub(1);
+            }
+        }
         self.deregister_or_defer(Token(rdb_connection_id.0), PendingRemovalOwner::ReplicaRdb);
     }
 
@@ -209,6 +213,7 @@ impl ServerWorkerState {
         let mut connection = Connection::new_fake();
         connection.set_token_for_test(Token(rdb_connection_id.0));
         self.connection_registry.register_for_test(connection);
+        self.prioritize_connection(Token(rdb_connection_id.0));
         self.complete_replica_rdb_open(main_connection_id, rdb_connection_id, Vec::new())
     }
 }

@@ -1,10 +1,12 @@
 use crate::engine::core::{CommandEffects, CommandOutcome, Value};
-use crate::framework::commands::hyperloglog::common::{
-    cached_observed_count, empty_hll, error_value, is_dense_hll, looks_like_integer, parse_hll,
-    register_for, serialize_hll, set_observed_count, HllEncoding, HllState, HLL_REGISTERS,
-};
+use crate::foundation::io::store::kv_engine::Db;
 use crate::foundation::io::store::Robj;
 use crate::framework::commands::command_runtime::CommandRuntime;
+use crate::framework::commands::hyperloglog::common::{
+    c_format, cached_observed_count, empty_hll, error_value, hll_format, is_dense_hll,
+    looks_like_integer, parse_hll, register_for, serialize_hll, set_observed_count, HllEncoding,
+    HllFormat, HllState, HLL_REGISTERS,
+};
 use crate::framework::{CommandArgs, CommandError};
 use command_macros::command;
 
@@ -19,6 +21,19 @@ pub fn pfadd(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> CommandOut
     let key = &args.args[0];
     let elements = &args.args[1..];
     let non_integer_inputs = elements.iter().any(|elem| !looks_like_integer(elem));
+
+    match db.get_string(key) {
+        Ok(Some(data)) => match hll_format(data) {
+            Ok(HllFormat::Standard) => {
+                let serialized = data.to_vec();
+                return add_standard_hll(db, db_idx, args, serialized, hll_sparse_max_bytes);
+            }
+            Ok(HllFormat::Legacy) => {}
+            Err(err) => return CommandOutcome::reply(error_value(err)),
+        },
+        Ok(None) => {}
+        Err(_) => return CommandOutcome::reply(CommandError::wrong_type()),
+    }
 
     if elements.is_empty() {
         // No elements to add; validate/create empty HLL key
@@ -123,6 +138,53 @@ pub fn pfadd(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> CommandOut
     } else {
         unchanged(reply)
     }
+}
+
+fn add_standard_hll(
+    db: &mut Db,
+    db_idx: u32,
+    args: &CommandArgs,
+    mut serialized: Vec<u8>,
+    sparse_max_bytes: i64,
+) -> CommandOutcome {
+    let key = &args.args[0];
+    let elements = &args.args[1..];
+    let mut updated = 0i64;
+    for (index, element) in elements.iter().enumerate() {
+        match c_format::add(&mut serialized, element, sparse_max_bytes) {
+            Ok(true) => updated += 1,
+            Ok(false) => {}
+            Err(err) => {
+                if updated == 0 {
+                    return CommandOutcome::reply(error_value(err));
+                }
+                serialized[15] |= 0x80;
+                db.set_keep_ttl(key.to_vec(), Robj::string_raw(serialized));
+                let mut propagation = Vec::with_capacity(index + 2);
+                propagation.push(args.name.clone());
+                propagation.push(key.clone());
+                propagation.extend_from_slice(&elements[..index]);
+                return CommandOutcome {
+                    reply: error_value(err),
+                    effects: CommandEffects {
+                        changed_keys: vec![(db_idx, key.clone())],
+                        custom_propagations: vec![propagation],
+                        dirty_delta: Some(updated),
+                        skip_propagate: true,
+                        ..CommandEffects::default()
+                    },
+                };
+            }
+        }
+    }
+    if updated == 0 {
+        return unchanged(Value::integer(0));
+    }
+    serialized[15] |= 0x80;
+    db.set_keep_ttl(key.to_vec(), Robj::string_raw(serialized));
+    let mut outcome = changed_outcome(Value::integer(1), db_idx, key);
+    outcome.effects.dirty_delta = Some(updated);
+    outcome
 }
 
 fn changed_outcome(reply: Value, db_idx: u32, key: &bytes::Bytes) -> CommandOutcome {

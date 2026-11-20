@@ -86,6 +86,19 @@ pub(crate) struct ClientMemoryUsage {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct OutputAccountingError;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConnectionPriority {
+    Normal,
+    Subnet,
+    Internal,
+}
+
+impl ConnectionPriority {
+    pub(crate) fn is_priority(self) -> bool {
+        self != Self::Normal
+    }
+}
+
 pub struct Connection {
     token: Token,
     /// Stable, externally visible ID, decoupled from the reusable transport token.
@@ -95,7 +108,7 @@ pub struct Connection {
     /// Replication offset produced by this connection's latest propagated write.
     last_write_offset: crate::engine::distributed::replication::ReplicationOffset,
     pub peer_addr: SocketAddr,
-    pub(crate) is_priority: bool,
+    pub(crate) priority: ConnectionPriority,
     pub state: ConnectionState,
     pub parser: Parser,
     pub last_query_snapshot: Vec<u8>,
@@ -198,7 +211,7 @@ impl Connection {
             command_seq: 0,
             last_write_offset: crate::engine::distributed::replication::ReplicationOffset::ZERO,
             peer_addr,
-            is_priority: false,
+            priority: ConnectionPriority::Normal,
             state: ConnectionState::Connected,
             parser: Parser::new(),
             last_query_snapshot: Vec::new(),
@@ -910,7 +923,7 @@ impl Connection {
             command_seq: 0,
             last_write_offset: crate::engine::distributed::replication::ReplicationOffset::ZERO,
             peer_addr: ([127, 0, 0, 1], 0).into(),
-            is_priority: false,
+            priority: ConnectionPriority::Normal,
             state: ConnectionState::Connected,
             parser: Parser::new(),
             last_query_snapshot: Vec::new(),

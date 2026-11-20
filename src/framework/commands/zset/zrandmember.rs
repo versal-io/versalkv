@@ -1,6 +1,7 @@
 use crate::engine::command::{CommandArgs, CommandError};
 use crate::engine::core::CommandOutcome;
 use crate::foundation::io::protocol::Value;
+use crate::foundation::io::store::Robj;
 use crate::framework::commands::command_runtime::CommandRuntime;
 use crate::framework::commands::zset::basic::{score_value, simple_random_usize};
 use bytes::Bytes;
@@ -16,7 +17,7 @@ pub fn zrandmember(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> Comm
     let Some(db) = runtime.db_mut() else {
         return CommandOutcome::reply(CommandError::db_index_out_of_range());
     };
-    let zset = match db.get_zset_object(&args.args[0]) {
+    let zset = match db.get_zset_object_mut(&args.args[0]) {
         Ok(None) => {
             if has_count {
                 return CommandOutcome::reply(Value::Array(Vec::new()));
@@ -31,9 +32,11 @@ pub fn zrandmember(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> Comm
         if zset.zset_is_empty() {
             return CommandOutcome::reply(Value::null());
         }
-        let entries = zset.zset_entries();
-        let idx = simple_random_usize(entries.len());
-        return CommandOutcome::reply(Value::bulk(entries[idx].0.clone()));
+        return CommandOutcome::reply(
+            random_entry(zset, None)
+                .map(|(member, _)| Value::bulk(member))
+                .unwrap_or_else(Value::null),
+        );
     }
     let count = match std::str::from_utf8(&args.args[1])
         .ok()
@@ -63,12 +66,27 @@ pub fn zrandmember(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> Comm
     } else if args.args.len() > 3 {
         return CommandOutcome::reply(CommandError::syntax_error());
     }
-    if zset.zset_is_empty() {
+    if zset.zset_is_empty() || count == 0 {
         return CommandOutcome::reply(Value::Array(Vec::new()));
     }
-    let entries = zset.zset_entries();
     let abs_count = count.unsigned_abs() as usize;
-    let result: Vec<(Bytes, f64)> = if count >= 0 {
+    // Decode listpack entries once per command, rather than once per sample.
+    let listpack_entries = matches!(zset, Robj::ZSetListpack(_)).then(|| zset.zset_entries());
+    let result: Vec<(Bytes, f64)> = if count == 1 || (count > 0 && abs_count < zset.zset_len() / 3)
+    {
+        let mut selected = std::collections::HashSet::with_capacity(abs_count);
+        let mut result = Vec::with_capacity(abs_count);
+        while result.len() < abs_count {
+            let Some(entry) = random_entry(zset, listpack_entries.as_deref()) else {
+                break;
+            };
+            if selected.insert(entry.0.clone()) {
+                result.push(entry);
+            }
+        }
+        result
+    } else if count >= 0 {
+        let entries = listpack_entries.unwrap_or_else(|| zset.zset_entries());
         let mut indices: Vec<usize> = (0..entries.len()).collect();
         for i in (1..indices.len()).rev() {
             let j = simple_random_usize(i + 1);
@@ -81,10 +99,7 @@ pub fn zrandmember(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> Comm
             .collect()
     } else {
         (0..abs_count)
-            .map(|_| {
-                let idx = simple_random_usize(entries.len());
-                entries[idx].clone()
-            })
+            .filter_map(|_| random_entry(zset, listpack_entries.as_deref()))
             .collect()
     };
     let mut out = Vec::new();
@@ -102,4 +117,18 @@ pub fn zrandmember(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> Comm
         }
     }
     CommandOutcome::reply(Value::Array(out))
+}
+
+fn random_entry(
+    zset: &mut Robj,
+    listpack_entries: Option<&[(Bytes, f64)]>,
+) -> Option<(Bytes, f64)> {
+    if let Robj::ZSetSkiplist(tree) = zset {
+        tree.random_entry()
+    } else if let Some(entries) = listpack_entries {
+        entries.get(simple_random_usize(entries.len())).cloned()
+    } else {
+        let entries = zset.zset_entries();
+        entries.get(simple_random_usize(entries.len())).cloned()
+    }
 }

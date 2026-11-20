@@ -91,7 +91,7 @@ fn priority_arriving_during_normal_batch_obeys_preemption_setting() {
 }
 
 #[test]
-fn priority_reclassification_moves_queued_readiness_in_both_turns() {
+fn priority_promotion_and_config_changes_preserve_queued_readiness() {
     for is_next_turn in [false, true] {
         for should_upgrade in [false, true] {
             let mut runtime = ServerWorkerState::new(1).expect("create classification runtime");
@@ -114,9 +114,21 @@ fn priority_reclassification_moves_queued_readiness_in_both_turns() {
             if should_upgrade {
                 runtime.prioritize_connection(token);
             } else {
-                runtime.ctx.config_mut().server.priority_subnets_generation += 1;
+                runtime.ctx.config_mut().server.compiled_priority_subnets =
+                    crate::engine::extension::config::qos::parse_priority_subnets("127.0.0.1/32")
+                        .expect("parse changed priority subnet");
+                runtime.refresh_connection_priorities();
+                runtime
+                    .ctx
+                    .config_mut()
+                    .server
+                    .compiled_priority_subnets
+                    .clear();
                 runtime.refresh_connection_priorities();
             }
+            assert!(runtime.is_priority_connection(token));
+            assert_eq!(runtime.priority_connections, 1);
+            assert_eq!(runtime.ctx.stats().connected_priority_clients, 0);
             if is_next_turn {
                 assert!(runtime.event_batch.pop_ready().is_none());
                 runtime.event_batch.begin_next_turn();
@@ -129,11 +141,7 @@ fn priority_reclassification_moves_queued_readiness_in_both_turns() {
             assert_eq!(event.phase, EventPhase::Ready);
             assert_eq!(
                 event.lane,
-                if should_upgrade {
-                    EventLane::Upstream
-                } else {
-                    EventLane::Normal
-                },
+                EventLane::Upstream,
                 "next turn {is_next_turn}, upgrade {should_upgrade}"
             );
             assert!(runtime.event_batch.pop_ready().is_none());

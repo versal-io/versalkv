@@ -154,9 +154,12 @@ impl<'a> AofScanner<'a> {
         while self.pos < self.data.len() && self.data[self.pos] != b'\n' {
             self.pos += 1;
         }
-        if self.pos < self.data.len() {
-            self.pos += 1;
+        if self.pos == self.data.len() {
+            return Some(
+                self.corrupt_at(start, "Torn annotation at the end of the file".to_string()),
+            );
         }
+        self.pos += 1;
         let timestamp = annotation_timestamp(&self.data[start..self.pos]);
         if self.multi == 0 {
             self.ok_up_to = self.pos;

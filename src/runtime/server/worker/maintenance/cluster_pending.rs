@@ -115,6 +115,7 @@ impl ServerWorkerState {
                 bus_port,
                 crate::foundation::io::sys::time::mstime(),
             );
+            state.arm_node_meet(&handshake_id);
             let connect_result = if self.ctx.config().server.tls_cluster {
                 self.configure_tls_client_from_config()
                     .and_then(|_| self.transport.connect_tls_bound(addr, None, host.as_str()))
@@ -732,6 +733,10 @@ mod tests {
             .find(|connection| !connection.handshake_node_name.is_empty())
             .expect("explicit MEET connection");
         assert!(connection.handshake_sent);
+        assert!(
+            state.nodes[&connection.handshake_node_name].meet_pending,
+            "the first MEET frame must retain its node-level intent"
+        );
         let bytes = queued_or_sent_bus_bytes(&listener, &connection.write_buf);
         let (message, _) =
             crate::engine::distributed::cluster::msg::ClusterBusMessage::decode(&bytes).unwrap();

@@ -11,6 +11,9 @@ pub fn config_rewrite(ctx: &mut ServerContext) -> Value {
         Some(p) => p.clone(),
         None => return Value::error("ERR The server is running without a config file"),
     };
+    if let Err(error) = validate_old_config_file(&path) {
+        return Value::error(format!("ERR Rewriting config file: {error}"));
+    }
 
     let num_dbs = ctx.num_dbs();
     let r = ctx.config();
@@ -407,8 +410,24 @@ pub fn config_rewrite(ctx: &mut ServerContext) -> Value {
     let content = lines.join("\n") + "\n";
     match fs::write(&path, content) {
         Ok(_) => Value::ok(),
-        Err(e) => Value::error(format!("ERR writing config file: {}", e)),
+        Err(e) => Value::error(format!("ERR Rewriting config file: {}", e)),
     }
+}
+
+fn validate_old_config_file(path: &str) -> std::io::Result<()> {
+    use std::io::Read;
+
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let expected = file.metadata()?.len();
+    let actual = std::io::copy(&mut file.take(expected), &mut std::io::sink())?;
+    if actual != expected {
+        return Err(std::io::Error::from_raw_os_error(libc::EIO));
+    }
+    Ok(())
 }
 
 fn quote_binary_config_value(value: &str) -> String {
@@ -454,6 +473,55 @@ mod tests {
     use crate::foundation::io::protocol::Value;
     use crate::framework::context::ServerContext;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rewrite_rejects_short_old_config_read_before_writing() {
+        let sysfs = std::path::Path::new("/sys/kernel/mm/transparent_hugepage/enabled");
+        let Ok(metadata) = sysfs.metadata() else {
+            return;
+        };
+        let Ok(contents) = std::fs::read(sysfs) else {
+            return;
+        };
+        if metadata.len() <= contents.len() as u64 {
+            return;
+        }
+        let path = std::env::temp_dir().join(format!(
+            "versal-short-config-rewrite-{}-{}.conf",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::os::unix::fs::symlink(sysfs, &path).unwrap();
+        let mut context = ServerContext::new(1);
+        context.config_mut().server.config_file = Some(path.to_string_lossy().into_owned());
+        let result = config_rewrite(&mut context);
+        std::fs::remove_file(path).unwrap();
+
+        assert_eq!(
+            result,
+            Value::error(format!(
+                "ERR Rewriting config file: {}",
+                std::io::Error::from_raw_os_error(libc::EIO)
+            ))
+        );
+        assert_eq!(std::fs::read(sysfs).unwrap(), contents);
+    }
+
+    #[test]
+    fn rewrite_returns_native_error_prefix_for_unreadable_old_config() {
+        let mut context = ServerContext::new(1);
+        context.config_mut().server.config_file =
+            Some(std::env::temp_dir().to_string_lossy().into_owned());
+
+        let Value::Error(error) = config_rewrite(&mut context) else {
+            panic!("rewriting a directory must fail");
+        };
+        assert!(error.starts_with(b"ERR Rewriting config file: "));
+    }
 
     #[test]
     fn loader_rewrite_preserves_dynamic_order_and_omits_static_module_paths() {

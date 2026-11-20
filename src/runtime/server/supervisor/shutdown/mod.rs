@@ -319,17 +319,34 @@ impl crate::runtime::server::worker::ServerWorkerState {
             .replication_runtime
             .primary_links()
             .values()
-            .map(|link| ShutdownReplicaFacts {
-                connection_id: link.connection_id().0,
-                node_id: self
+            .map(|link| {
+                let node_id = self
                     .replication_runtime
-                    .replica_node_id(link.connection_id()),
-                version: link.replica_version(),
-                is_online: matches!(
-                    link.state(),
-                    crate::framework::distributed::replication::PrimaryLinkState::Streaming
-                ),
-                ack_offset: link.last_ack_position(),
+                    .replica_node_id(link.connection_id());
+                // Match C clusterAutoFailoverOnShutdown(): a candidate must
+                // resolve to a known cluster node without NOFAILOVER.
+                let cluster_eligible = node_id.is_some_and(|id| {
+                    self.ctx
+                        .cluster_state()
+                        .as_ref()
+                        .and_then(|state| state.nodes.get(id))
+                        .is_some_and(|node| {
+                            !node.has_flag(
+                                crate::engine::distributed::cluster::node::CLUSTER_NODE_NOFAILOVER,
+                            )
+                        })
+                });
+                ShutdownReplicaFacts {
+                    connection_id: link.connection_id().0,
+                    node_id,
+                    version: link.replica_version(),
+                    is_online: matches!(
+                        link.state(),
+                        crate::framework::distributed::replication::PrimaryLinkState::Streaming
+                    ),
+                    ack_offset: link.last_ack_position(),
+                    cluster_eligible,
+                }
             })
             .collect();
         let selected = match select_shutdown_handoff(primary_offset, &replicas) {
@@ -786,7 +803,17 @@ mod tests {
         let mut runtime = crate::runtime::server::worker::ServerWorkerState::new(1).unwrap();
         runtime.ctx.replication_mut().backlog.activate();
         runtime.ctx.config_mut().server.cluster_enabled = true;
-        let cluster = ClusterState::new("127.0.0.1", 6379, 16_379);
+        let node_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let mut cluster = ClusterState::new("127.0.0.1", 6379, 16_379);
+        let mut replica_node = crate::engine::distributed::cluster::node::ClusterNode::new(
+            node_id.to_string(),
+            "127.0.0.1".to_string(),
+            6380,
+            16_380,
+            true,
+        );
+        replica_node.flags &= !crate::engine::distributed::cluster::node::CLUSTER_NODE_MYSELF;
+        cluster.nodes.insert(node_id.to_string(), replica_node);
         *runtime.ctx.cluster_state_mut() = Some(Box::new(cluster));
         runtime.ctx.shutdown_state_mut().flags =
             SHUTDOWN_NOSAVE | crate::engine::distributed::shutdown::SHUTDOWN_FAILOVER;
@@ -801,7 +828,6 @@ mod tests {
                 rdb_filter_mode: RdbFilterMode::All,
             },
         );
-        let node_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         runtime
             .replication_runtime
             .set_replica_node_id(connection_id, node_id.to_string());
@@ -828,5 +854,129 @@ mod tests {
             ),
             Some(expected)
         );
+    }
+
+    fn register_streaming_shutdown_replica(
+        runtime: &mut crate::runtime::server::worker::ServerWorkerState,
+        connection_id: usize,
+        node_id: &str,
+        port: u16,
+    ) {
+        use crate::framework::distributed::replication::{
+            ConnectionId, PrimaryLinkState, RdbFilterMode, ReplicaConnectionInfo,
+        };
+
+        let connection_id = ConnectionId(connection_id);
+        let replica_id = runtime.replication_runtime.register_primary(
+            connection_id,
+            ReplicaConnectionInfo {
+                ip: "127.0.0.1".to_string(),
+                port,
+                capability: Vec::new(),
+                rdb_filter_mode: RdbFilterMode::All,
+            },
+        );
+        runtime
+            .replication_runtime
+            .set_replica_node_id(connection_id, node_id.to_string());
+        let link = runtime
+            .replication_runtime
+            .primary_link_mut(replica_id)
+            .unwrap();
+        link.set_replica_version(0x09_00_00);
+        link.set_state(PrimaryLinkState::Streaming);
+        link.acknowledge(offset(0), 1);
+    }
+
+    fn insert_cluster_replica_node(
+        runtime: &mut crate::runtime::server::worker::ServerWorkerState,
+        node_id: &str,
+        port: u16,
+        nofailover: bool,
+    ) {
+        use crate::engine::distributed::cluster::node::{
+            ClusterNode, CLUSTER_NODE_MYSELF, CLUSTER_NODE_NOFAILOVER,
+        };
+
+        let state = runtime
+            .ctx
+            .cluster_state_mut()
+            .as_deref_mut()
+            .expect("cluster state installed by test");
+        let mut node = ClusterNode::new(
+            node_id.to_string(),
+            "127.0.0.1".to_string(),
+            port,
+            port + 10_000,
+            true,
+        );
+        node.flags &= !CLUSTER_NODE_MYSELF;
+        if nofailover {
+            node.flags |= CLUSTER_NODE_NOFAILOVER;
+        }
+        state.nodes.insert(node_id.to_string(), node);
+    }
+
+    #[test]
+    fn shutdown_handoff_skips_nofailover_replica() {
+        let mut runtime = crate::runtime::server::worker::ServerWorkerState::new(1).unwrap();
+        runtime.ctx.replication_mut().backlog.activate();
+        runtime.ctx.config_mut().server.cluster_enabled = true;
+        *runtime.ctx.cluster_state_mut() =
+            Some(Box::new(ClusterState::new("127.0.0.1", 6379, 16_379)));
+        runtime.ctx.shutdown_state_mut().flags =
+            SHUTDOWN_NOSAVE | crate::engine::distributed::shutdown::SHUTDOWN_FAILOVER;
+        runtime.ctx.set_shutdown_requested(true);
+        let eligible = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let nofailover = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        register_streaming_shutdown_replica(&mut runtime, 77, eligible, 6380);
+        register_streaming_shutdown_replica(&mut runtime, 78, nofailover, 6381);
+        insert_cluster_replica_node(&mut runtime, eligible, 6380, false);
+        insert_cluster_replica_node(&mut runtime, nofailover, 6381, true);
+
+        runtime.perform_shutdown_handoff_if_needed();
+
+        let expected = crate::engine::distributed::replication::protocol::encode_command(&[
+            b"CLUSTER",
+            b"FAILOVER",
+            b"FORCE",
+            b"REPLICAID",
+            eligible.as_bytes(),
+        ]);
+        assert_eq!(
+            runtime.ctx.replication().backlog.read_from(
+                crate::engine::distributed::replication::BacklogCursor::try_from(0).unwrap(),
+            ),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn shutdown_handoff_with_only_nofailover_replicas_queues_no_frame() {
+        let mut runtime = crate::runtime::server::worker::ServerWorkerState::new(1).unwrap();
+        runtime.ctx.replication_mut().backlog.activate();
+        runtime.ctx.config_mut().server.cluster_enabled = true;
+        *runtime.ctx.cluster_state_mut() =
+            Some(Box::new(ClusterState::new("127.0.0.1", 6379, 16_379)));
+        runtime.ctx.shutdown_state_mut().flags =
+            SHUTDOWN_NOSAVE | crate::engine::distributed::shutdown::SHUTDOWN_FAILOVER;
+        runtime.ctx.set_shutdown_requested(true);
+        let first = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let second = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        register_streaming_shutdown_replica(&mut runtime, 77, first, 6380);
+        register_streaming_shutdown_replica(&mut runtime, 78, second, 6381);
+        insert_cluster_replica_node(&mut runtime, first, 6380, true);
+        insert_cluster_replica_node(&mut runtime, second, 6381, true);
+
+        runtime.perform_shutdown_handoff_if_needed();
+
+        let queued = runtime.ctx.replication().backlog.read_from(
+            crate::engine::distributed::replication::BacklogCursor::try_from(0).unwrap(),
+        );
+        assert!(
+            queued.unwrap_or_default().is_empty(),
+            "nofailover-only replicas must not produce a FAILOVER frame"
+        );
+        assert!(runtime.ctx.shutdown_state().cluster_handoff_done);
     }
 }

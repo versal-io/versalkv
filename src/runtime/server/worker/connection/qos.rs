@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 
+use crate::framework::capabilities::connection::ConnectionPriority;
 use crate::framework::capabilities::io::Token;
 use crate::runtime::server::worker::event_loop::EventLane;
 use crate::runtime::server::worker::ServerWorkerState;
@@ -23,32 +24,9 @@ impl ServerWorkerState {
     }
 
     pub(crate) fn refresh_connection_priorities(&mut self) {
-        let config = &self.ctx.config().server;
-        if self.priority_subnets_generation != config.priority_subnets_generation {
-            let subnets = &config.compiled_priority_subnets;
-            let mut priority_clients = 0;
-            for (token, connection) in self.connection_registry.iter_mut() {
-                connection.is_priority = connection.peer_addr.port() != 0
-                    && subnets
-                        .iter()
-                        .any(|subnet| subnet.contains(connection.peer_addr.ip()));
-                priority_clients += u64::from(connection.is_priority);
-                self.event_batch.reclassify_readiness(
-                    token,
-                    if connection.is_priority {
-                        EventLane::Upstream
-                    } else {
-                        EventLane::Normal
-                    },
-                );
-            }
-            self.priority_subnets_generation = config.priority_subnets_generation;
-            self.ctx.stats_mut().connected_priority_clients = priority_clients;
-        }
-        // Fast path: with no priority clients connected, no token can resolve
-        // to a priority connection, so the per-command lookup and stat update
-        // are skipped. This covers the common standalone PING workload.
-        if self.ctx.stats().connected_priority_clients == 0 {
+        // Subnet classification is fixed at admission. Internal priority
+        // connections still participate in command accounting and scheduling.
+        if self.priority_connections == 0 {
             return;
         }
         if let Some(token) = self.priority_command_token {
@@ -62,10 +40,10 @@ impl ServerWorkerState {
     pub(crate) fn prioritize_connection(&mut self, token: Token) {
         self.refresh_connection_priorities();
         if let Some(connection) = self.connection_registry.get_mut(token) {
-            if !connection.is_priority {
-                self.ctx.stats_mut().connected_priority_clients += 1;
+            if !connection.priority.is_priority() {
+                self.priority_connections += 1;
+                connection.priority = ConnectionPriority::Internal;
             }
-            connection.is_priority = true;
             self.event_batch
                 .reclassify_readiness(token, EventLane::Upstream);
         }
@@ -77,14 +55,13 @@ impl ServerWorkerState {
     }
 
     pub(crate) fn is_priority_connection(&self, token: Token) -> bool {
-        // Fast path: no priority clients means no connection can be priority,
-        // so skip the `connection_registry` HashMap lookup entirely.
-        if self.ctx.stats().connected_priority_clients == 0 {
+        // Include internal connections in the scheduling fast-path count.
+        if self.priority_connections == 0 {
             return false;
         }
         self.connection_registry
             .get(token)
-            .is_some_and(|connection| connection.is_priority)
+            .is_some_and(|connection| connection.priority.is_priority())
     }
 
     pub(crate) fn has_client_capacity(&self, is_priority: bool) -> bool {

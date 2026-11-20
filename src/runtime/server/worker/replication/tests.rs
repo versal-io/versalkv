@@ -687,6 +687,7 @@ fn stalled_receiving_rdb_with_cluster_pfail_disconnects_master_link_and_clears_a
 
 #[test]
 fn deferred_diskless_resync_advertises_fire_time_offset_and_resumes_from_it() {
+    let _fork_guard = crate::framework::commands::server::save::diskless_fork_test_guard();
     let mut backend = ServerWorkerState::new(1).unwrap();
     crate::framework::commands::register_all(&mut backend.registry);
     backend.ctx.config_mut().replication.repl_diskless_sync = true;
@@ -696,20 +697,10 @@ fn deferred_diskless_resync_advertises_fire_time_offset_and_resumes_from_it() {
         .backlog
         .restore_primary_from_rdb("restored", offset(41))
         .unwrap();
-    // Exercise real admission and offset alignment without forking the shared
-    // test process. Invalid affinity preparation fails before fork and selects
-    // the in-process fallback. An active child would correctly keep All queued.
-    backend.ctx.config_mut().server.bgsave_cpulist = "not-a-cpu-list".to_string();
-    assert!(
-        crate::framework::commands::server::save::prepare_bgsave_cpu_affinity(
-            &backend.ctx.config().server.bgsave_cpulist,
-        )
-        .is_err()
-    );
     assert!(!backend.ctx.persistence().has_active_child());
 
-    let token_value = 41usize;
-    let connection_token = add_connection(&mut backend, token_value);
+    let (connection_token, mut target) = add_runtime_connection(&mut backend);
+    let token_value = connection_token;
     let id = backend.replication_runtime.register_primary(
         ConnectionId(token_value),
         ReplicaConnectionInfo {
@@ -738,6 +729,10 @@ fn deferred_diskless_resync_advertises_fire_time_offset_and_resumes_from_it() {
         .defer_diskless_sync(5_000, now, true);
 
     for i in 0..64u32 {
+        backend.ctx.db_mut(0).unwrap().set(
+            format!("k{i}").into_bytes(),
+            crate::foundation::io::store::Robj::string("v"),
+        );
         let frame = crate::engine::distributed::replication::protocol::encode_command(&[
             b"SET",
             format!("k{i}").as_bytes(),
@@ -753,7 +748,17 @@ fn deferred_diskless_resync_advertises_fire_time_offset_and_resumes_from_it() {
     );
 
     backend.fire_deferred_full_resyncs(vec![id]);
-    assert_eq!(backend.ctx.stats().total_forks, 0);
+    assert_eq!(backend.ctx.stats().total_forks, 1);
+    assert!(backend.ctx.persistence().diskless_child_pid().is_some());
+    assert!(backend.full_sync.diskless_relay.is_some());
+    assert_eq!(
+        backend
+            .replication_runtime
+            .primary_link(id)
+            .unwrap()
+            .state(),
+        PrimaryLinkState::PreparingFullResync
+    );
 
     let queued: Vec<u8> = backend.connection_registry[Token(connection_token)]
         .output
@@ -774,6 +779,43 @@ fn deferred_diskless_resync_advertises_fire_time_offset_and_resumes_from_it() {
         !header.contains(&format!(" {}\r\n", psync_offset)),
         "must NOT advertise stale PSYNC-time offset {psync_offset}, header: {header:?}"
     );
+    let wire = backend.drain_diskless_sync_for_test(&mut [&mut target]);
+    let header_end = wire[0]
+        .windows(2)
+        .position(|bytes| bytes == b"\r\n")
+        .unwrap()
+        + 2;
+    assert_eq!(
+        &wire[0][..header_end],
+        format!(
+            "+FULLRESYNC {} {}\r\n",
+            backend.ctx.replication().backlog.replid(),
+            fire_offset
+        )
+        .as_bytes()
+    );
+    let (loaded, mut dbs, functions) =
+        ServerWorkerState::decode_eof_rdb_for_test(&wire[0][header_end..], 1);
+    assert_eq!(loaded, 64);
+    assert!(functions.is_empty());
+    for i in 0..64u32 {
+        assert_eq!(
+            dbs.get_mut(0)
+                .unwrap()
+                .get(format!("k{i}").as_bytes())
+                .unwrap()
+                .as_bytes(),
+            b"v"
+        );
+    }
+    assert_eq!(
+        backend
+            .replication_runtime
+            .primary_link(id)
+            .unwrap()
+            .state(),
+        PrimaryLinkState::WaitingForReplicaAck
+    );
 
     let link = backend
         .replication_runtime
@@ -793,9 +835,11 @@ fn deferred_diskless_resync_advertises_fire_time_offset_and_resumes_from_it() {
             .replication_runtime
             .primary_link_mut(id)
             .expect("deferred replica link remains registered");
-        link.acknowledge(offset(0), now);
+        link.acknowledge(offset(fire_offset), now);
         assert!(link.promote_full_resync_on_ack());
     }
+    backend.on_diskless_terminal_ack(id);
+    assert!(backend.full_sync.diskless_relay.is_none());
     let queued_before_post = backend.connection_registry[Token(connection_token)]
         .output
         .queue
@@ -819,6 +863,36 @@ fn deferred_diskless_resync_advertises_fire_time_offset_and_resumes_from_it() {
         "must NOT re-stream RDB-baked writes; stale next send cursor detected: {:?}",
         String::from_utf8_lossy(&streamed_after_post)
     );
+}
+
+#[test]
+fn deferred_diskless_resync_failed_producer_closes_without_inline_fallback() {
+    let mut backend = ServerWorkerState::new(1).unwrap();
+    backend.ctx.config_mut().replication.repl_diskless_sync = true;
+    backend.ctx.config_mut().server.bgsave_cpulist = "not-a-cpu-list".to_string();
+    let (token, _target) = add_runtime_connection(&mut backend);
+    let id = backend.replication_runtime.register_primary(
+        ConnectionId(token),
+        ReplicaConnectionInfo {
+            ip: "127.0.0.1".to_string(),
+            port: 6380,
+            capability: vec!["eof".to_string()],
+            rdb_filter_mode: crate::framework::distributed::replication::RdbFilterMode::All,
+        },
+    );
+    backend.ctx.replication_mut().backlog.activate();
+    let link = backend.replication_runtime.primary_link_mut(id).unwrap();
+    link.plan_full_resync(&backend.ctx.replication().backlog);
+    link.defer_diskless_sync(0, 0, true);
+
+    backend.fire_deferred_full_resyncs(vec![id]);
+
+    assert!(!backend.connection_registry.contains(Token(token)));
+    assert!(backend.replication_runtime.primary_link(id).is_none());
+    assert_eq!(backend.ctx.stats().total_forks, 0);
+    assert!(!backend.ctx.persistence().has_active_child());
+    assert!(backend.full_sync.diskless_relay.is_none());
+    assert!(backend.full_sync.disk_sync_batch.is_none());
 }
 
 #[test]
@@ -2766,6 +2840,18 @@ fn boundary_dual_candidates_keep_other_filter_deadlines_and_waits() {
 fn boundary_dual_same_filter_max_starts_before_deadline() {
     let _fork_guard = crate::framework::commands::server::save::diskless_fork_test_guard();
     let mut backend = ServerWorkerState::new(1).unwrap();
+    let code =
+        "#!lua name=boundarylib\nserver.register_function('boundary_fn', function() return 7 end)";
+    backend
+        .ctx
+        .script_mut()
+        .function_registry
+        .load_library("boundarylib", code)
+        .unwrap();
+    backend.ctx.db_mut(0).unwrap().set(
+        b"excluded".to_vec(),
+        crate::foundation::io::store::Robj::string("value"),
+    );
     backend
         .ctx
         .config_mut()
@@ -2789,23 +2875,38 @@ fn boundary_dual_same_filter_max_starts_before_deadline() {
         backend.full_sync.pending_dual_rdb_snapshots[&Token(first)].0
             > crate::foundation::io::sys::time::mstime()
     );
-    let (_second, mut second_target) = boundary_sync_candidate(&mut backend, b"functions");
+    let (second, mut second_target) = boundary_sync_candidate(&mut backend, b"functions");
     let boundary = backend.ctx.replication().backlog.snapshot_boundary();
     backend.drive_pending_dual_rdb_snapshots();
-    let relay_started = backend.full_sync.diskless_relay.is_some();
     let waits = backend.replication_runtime.psync_wait_owner_count();
-    backend.abort_diskless_relay_for_dataset_flush();
 
     assert!(
-        !relay_started,
-        "filtered same-cohort sync must complete without a pipe relay"
+        backend.full_sync.diskless_relay.is_some(),
+        "filtered same-cohort sync must share a real pipe producer"
     );
+    assert_eq!(backend.ctx.stats().total_forks, 1);
+    assert!(backend.ctx.persistence().diskless_child_pid().is_some());
     assert_eq!(waits, 2);
     for target in [&mut first_target, &mut second_target] {
         assert_eq!(
             boundary_read_endoff(target).offset,
             boundary.reported_offset()
         );
+    }
+    let wire = backend.drain_diskless_sync_for_test(&mut [&mut first_target, &mut second_target]);
+    assert_eq!(
+        wire[0], wire[1],
+        "cohort must share the same snapshot and marker"
+    );
+    for bulk in wire {
+        let (loaded, dbs, functions) = ServerWorkerState::decode_eof_rdb_for_test(&bulk, 1);
+        assert_eq!(loaded, 0);
+        assert_eq!(dbs.get(0).unwrap().dbsize(), 0);
+        assert_eq!(functions, vec![code.as_bytes().to_vec()]);
+    }
+    assert_eq!(backend.replication_runtime.psync_wait_owner_count(), 2);
+    for token in [first, second] {
+        backend.remove_connection(token);
     }
 }
 
@@ -2842,17 +2943,24 @@ fn boundary_dual_expired_group_starts_with_two_waiting_mains() {
         .0 = crate::foundation::io::sys::time::mstime().saturating_sub(1);
     let boundary = backend.ctx.replication().backlog.snapshot_boundary();
     backend.drive_pending_dual_rdb_snapshots();
-    let relay_started = backend.full_sync.diskless_relay.is_some();
     let waits = backend.replication_runtime.psync_wait_owner_count();
-    backend.abort_diskless_relay_for_dataset_flush();
 
     assert!(
-        !relay_started,
-        "filtered expired cohort must complete without a pipe relay"
+        backend.full_sync.diskless_relay.is_some(),
+        "filtered expired cohort must start a real pipe producer"
     );
+    assert_eq!(backend.ctx.stats().total_forks, 1);
+    assert!(backend.ctx.persistence().diskless_child_pid().is_some());
     assert_eq!(waits, 1);
     assert_eq!(
         boundary_read_endoff(&mut target).offset,
         boundary.reported_offset()
     );
+    let wire = backend.drain_diskless_sync_for_test(&mut [&mut target]);
+    let (loaded, dbs, functions) = ServerWorkerState::decode_eof_rdb_for_test(&wire[0], 1);
+    assert_eq!(loaded, 0);
+    assert_eq!(dbs.get(0).unwrap().dbsize(), 0);
+    assert!(functions.is_empty());
+    assert_eq!(backend.replication_runtime.psync_wait_owner_count(), 1);
+    backend.remove_connection(rdb);
 }

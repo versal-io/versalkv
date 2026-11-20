@@ -112,8 +112,10 @@ pub(crate) fn install_rdb_preamble(
     metadata: &RdbDecodedMetadata,
 ) -> Result<(), AofFileTaskError> {
     *ctx.dbs_mut() = dataset;
-    super::replace_function_libraries(ctx, &metadata.function_codes)
-        .map_err(|()| AofFileTaskError::InvalidRdbMetadata)?;
+    if !metadata.functions_applied {
+        super::replace_function_libraries(ctx, &metadata.function_codes)
+            .map_err(|()| AofFileTaskError::InvalidRdbMetadata)?;
+    }
     let aux_fields = metadata
         .replication
         .as_ref()

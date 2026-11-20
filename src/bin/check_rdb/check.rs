@@ -365,17 +365,33 @@ impl<'a> RdbScanner<'a> {
                     );
                 }
                 for _ in 0..num_slot_ranges {
-                    for _ in 0..2 {
-                        let (slot, _) = self.load_len(
+                    let (start_slot, _) = self.load_len(
+                        RdbCheckPhase::ReadLength,
+                        "Unexpected EOF reading SLOT IMPORT",
+                    )?;
+                    if start_slot == u64::MAX {
+                        return self.fail(
                             RdbCheckPhase::ReadLength,
                             "Unexpected EOF reading SLOT IMPORT",
-                        )?;
-                        if slot == u64::MAX {
-                            return self.fail(
-                                RdbCheckPhase::ReadLength,
-                                "Unexpected EOF reading SLOT IMPORT",
-                            );
-                        }
+                        );
+                    }
+                    let (end_slot, _) = self.load_len(
+                        RdbCheckPhase::ReadLength,
+                        "Unexpected EOF reading SLOT IMPORT",
+                    )?;
+                    if end_slot == u64::MAX {
+                        return self.fail(
+                            RdbCheckPhase::ReadLength,
+                            "Unexpected EOF reading SLOT IMPORT",
+                        );
+                    }
+                    if start_slot >= 16384 || end_slot >= 16384 || start_slot > end_slot {
+                        return self.fail(
+                            RdbCheckPhase::ReadLength,
+                            format!(
+                                "Invalid slot import range in RDB: start={start_slot} end={end_slot}"
+                            ),
+                        );
                     }
                 }
             }

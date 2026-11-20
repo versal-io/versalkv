@@ -225,6 +225,11 @@ pub struct ServerStats {
     pub keyspace_hits: u64,
     pub keyspace_misses: u64,
     pub total_forks: u64,
+    pub forkless_fallbacks_module: u64,
+    pub forkless_fallbacks_slot_import: u64,
+    pub forkless_fallbacks_exclude_data: u64,
+    pub forkless_fallbacks_missing_inband_repl: u64,
+    pub forkless_fallbacks_compression: u64,
     pub latest_fork_usec: u64,
     pub instantaneous_ops_per_sec: u64,
     pub instantaneous_input_kbps: f64,
@@ -328,6 +333,11 @@ impl ServerStats {
             keyspace_hits: 0,
             keyspace_misses: 0,
             total_forks: 0,
+            forkless_fallbacks_module: 0,
+            forkless_fallbacks_slot_import: 0,
+            forkless_fallbacks_exclude_data: 0,
+            forkless_fallbacks_missing_inband_repl: 0,
+            forkless_fallbacks_compression: 0,
             latest_fork_usec: 0,
             instantaneous_ops_per_sec: 0,
             instantaneous_input_kbps: 0.0,
@@ -746,6 +756,11 @@ impl ServerStats {
         self.keyspace_hits = 0;
         self.keyspace_misses = 0;
         self.total_forks = 0;
+        self.forkless_fallbacks_module = 0;
+        self.forkless_fallbacks_slot_import = 0;
+        self.forkless_fallbacks_exclude_data = 0;
+        self.forkless_fallbacks_missing_inband_repl = 0;
+        self.forkless_fallbacks_compression = 0;
         self.latest_fork_usec = 0;
         self.instantaneous_ops_per_sec = 0;
         self.instantaneous_input_kbps = 0.0;

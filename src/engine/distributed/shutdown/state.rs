@@ -18,6 +18,10 @@ pub struct ShutdownReplicaFacts<'a> {
     pub version: u32,
     pub is_online: bool,
     pub ack_offset: Option<crate::engine::distributed::replication::ReplicationOffset>,
+    /// Equivalent to C's `node && !clusterNodeIsNoFailover(node)`: the
+    /// cluster lookup succeeded and the node is not flagged NOFAILOVER.
+    /// Unknown nodes and NOFAILOVER replicas are never shutdown candidates.
+    pub cluster_eligible: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -40,7 +44,11 @@ pub fn select_shutdown_handoff(
 
     replicas
         .iter()
-        .filter(|replica| replica.is_online && replica.ack_offset == Some(primary_offset))
+        .filter(|replica| {
+            replica.is_online
+                && replica.ack_offset == Some(primary_offset)
+                && replica.cluster_eligible
+        })
         .filter_map(|replica| {
             crate::engine::distributed::cluster::NodeId::parse(replica.node_id?.as_bytes())
                 .ok()

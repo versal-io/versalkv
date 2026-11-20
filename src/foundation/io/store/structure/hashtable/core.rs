@@ -342,6 +342,73 @@ impl<V: Clone> HashTable<V> {
         self.iter().map(|(_, v)| v)
     }
 
+    /// Sample independent buckets fairly and repay the old-table scan work.
+    pub fn fair_random_entry(&mut self) -> Option<(Bytes, V)> {
+        use crate::foundation::io::sys::rand::random_usize;
+
+        if self.is_empty() {
+            return None;
+        }
+        let buckets = self.tables.iter().map(|table| table.buckets.len()).sum();
+        let sample_size = if self.len() >= buckets {
+            ENTRIES_PER_BUCKET * 10
+        } else {
+            ENTRIES_PER_BUCKET
+        }
+        .min(self.len());
+        let mut samples = Vec::with_capacity(sample_size);
+        let mut seen = 0usize;
+        let mut old_buckets_scanned = 0usize;
+        let bucket_count = if self.is_rehashing() {
+            self.tables[0]
+                .buckets
+                .len()
+                .min(self.tables[1].buckets.len())
+        } else {
+            self.tables[0].buckets.len()
+        };
+        while seen < sample_size {
+            let index = random_usize(bucket_count);
+            let mut collect = |key: &Bytes, value: &V| {
+                seen += 1;
+                if samples.len() < sample_size {
+                    samples.push((key.clone(), value.clone()));
+                } else {
+                    let position = random_usize(seen);
+                    if position < sample_size {
+                        samples[position] = (key.clone(), value.clone());
+                    }
+                }
+            };
+            for (table_index, table) in self.tables.iter().enumerate() {
+                for index in (index..table.buckets.len()).step_by(bucket_count) {
+                    if table_index == 0 {
+                        old_buckets_scanned += 1;
+                        if self.is_rehashing() && index < self.rehash_idx as usize {
+                            continue;
+                        }
+                    }
+                    Self::walk_chain(&table.buckets[index], &mut collect);
+                }
+            }
+        }
+        // Shrink scans visit every old bucket mapped to a sampled small-table
+        // bucket. Advancing only once would repeatedly scan the same slack.
+        let steps = if self.is_rehashing() && self.tables[1].exp < self.tables[0].exp {
+            old_buckets_scanned
+        } else {
+            1
+        };
+        for _ in 0..steps {
+            if !self.is_rehashing() {
+                break;
+            }
+            self.rehash_step_on_read_if_needed();
+        }
+        let position = random_usize(samples.len());
+        Some(samples.swap_remove(position))
+    }
+
     pub fn scan<F: FnMut(&Bytes, &V)>(&self, cursor: u64, mut f: F) -> u64 {
         if self.is_empty() {
             return 0;

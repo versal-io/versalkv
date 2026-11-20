@@ -25,10 +25,18 @@ impl From<ReplicaId> for DisklessTarget {
     }
 }
 
+pub(crate) struct DisklessSyncOutput {
+    pub(crate) read: std::fs::File,
+    pub(crate) marker: Vec<u8>,
+    pub(crate) release: Option<std::fs::File>,
+    pub(crate) method: crate::engine::extension::config::persistence::BgsaveMethod,
+}
+
 /// In-flight diskless fork relay: bytes stream from the child's pipe to every
 /// replica in this batch until EOF, then the trailing `$EOF` marker is sent.
-/// The producer is released once every marker drains. Classic targets must
-/// acknowledge that boundary (or be removed) before final relay publication.
+/// The producer is released once every marker drains. Classic streaming targets
+/// must acknowledge that boundary (or be removed) before final publication;
+/// classic RDB-only targets close after the producer succeeds without an ACK.
 pub(crate) struct DisklessRelay {
     pub(crate) transfer_id: TransferId,
     pub(crate) source: Option<RuntimeSourceHandle>,
@@ -78,6 +86,8 @@ pub(crate) enum DisklessFact {
     ChildExited(crate::runtime::server::worker::event_loop::sources::ChildExitOutcome),
     MarkersFlushed,
     TerminalAckSatisfied,
+    ProducerSucceeded,
+    ProducerFailed,
 }
 
 impl DisklessCompletionState {
@@ -90,6 +100,8 @@ impl DisklessCompletionState {
             DisklessFact::ChildExited(_) => self.failed = true,
             DisklessFact::MarkersFlushed => self.markers_flushed = true,
             DisklessFact::TerminalAckSatisfied => self.terminal_ack_satisfied = true,
+            DisklessFact::ProducerSucceeded => self.child_succeeded = true,
+            DisklessFact::ProducerFailed => self.failed = true,
         }
         self.try_publish()
     }
@@ -126,6 +138,92 @@ impl DisklessRelay {
 }
 
 impl ServerWorkerState {
+    pub(crate) fn try_begin_diskless_sync(
+        &mut self,
+        connections: &[ConnectionId],
+        libraries: &[Vec<u8>],
+        snapshot: crate::foundation::io::persistence::rdb::compression::RdbSnapshotOptions,
+    ) -> Option<DisklessSyncOutput> {
+        if self.ctx.persistence().has_active_child() || self.full_sync.diskless_relay.is_some() {
+            return None;
+        }
+        let plan = self.full_sync_save_plan(connections, snapshot);
+        if plan.channel == super::full_sync_plan::FullSyncChannel::Dual
+            && self.ctx.config().server.debug_pause_after_fork
+        {
+            if let Err(error) = self.quiesce_ordinary_threaded_writes() {
+                crate::server_log!(
+                    warning,
+                    "Failed to reclaim ordinary writes before the dual-channel pause: {}",
+                    error
+                );
+                return None;
+            }
+        }
+        self.record_full_sync_plan(plan, snapshot);
+        let (read, release) = if plan.method
+            == crate::engine::extension::config::persistence::BgsaveMethod::Forkless
+        {
+            let frozen = self.capture_full_sync(libraries, snapshot);
+            let (task, read) = crate::foundation::io::persistence::snapshot::background::BackgroundRdbSave::start_to_pipe(
+                frozen,
+                self.ctx.config().persistence.rdb_key_save_delay,
+                snapshot,
+            ).ok()?;
+            self.ctx
+                .persistence_mut()
+                .begin_forkless_transfer(
+                    task,
+                    crate::engine::persistence::ForklessSavePurpose::ReplicationSocket,
+                )
+                .ok()?;
+            (read, None)
+        } else {
+            let include_data = connections.first().is_some_and(|connection| {
+                self.replication_runtime
+                    .replica_sync_preferences(*connection)
+                    .0
+                    == crate::framework::distributed::replication::RdbFilterMode::All
+            });
+            let replication = self.full_sync_replication_info();
+            let child =
+                crate::framework::commands::server::save::fork_diskless_rdb_child_with_filter(
+                    &mut self.ctx,
+                    libraries,
+                    snapshot,
+                    include_data,
+                    &replication,
+                )?;
+            self.ctx
+                .persistence_mut()
+                .begin_diskless_child(child.pid)
+                .ok()?;
+            self.register_child_process(
+                crate::runtime::server::worker::event_loop::sources::ChildOwner::DisklessReplication,
+                child.pid,
+            );
+            crate::foundation::io::sys::fd::set_nonblocking(
+                std::os::fd::AsFd::as_fd(&child.data_read_end),
+                true,
+            )
+            .ok()?;
+            (child.data_read_end, Some(child.child_release_write_end))
+        };
+        self.ctx.reset_repl_seldb();
+        if plan.channel == super::full_sync_plan::FullSyncChannel::Classic {
+            let _ = crate::framework::commands::server::save::pause_parent_after_replication_fork(
+                &self.ctx,
+            );
+        }
+        Some(DisklessSyncOutput {
+            read,
+            marker: crate::engine::distributed::replication::protocol::generate_replid()
+                .into_bytes(),
+            release,
+            method: plan.method,
+        })
+    }
+
     pub(crate) fn on_diskless_pipe_readable(
         &mut self,
         transfer_id: TransferId,
@@ -240,6 +338,7 @@ impl ServerWorkerState {
         self.try_begin_diskless_fork_with_options(libs, snapshot, "normal sync", true)
     }
 
+    #[cfg(test)]
     pub(crate) fn try_begin_diskless_fork_with_options(
         &mut self,
         libs: &[Vec<u8>],
@@ -310,6 +409,7 @@ impl ServerWorkerState {
     /// Install the batch's diskless relay after headers have been enqueued. If no
     /// EOF replica actually enrolled (all links dropped between fork and enqueue),
     /// reap the orphan child so the single-child slot is not leaked.
+    #[cfg(test)]
     pub(crate) fn store_diskless_relay(
         &mut self,
         read_end: std::fs::File,
@@ -329,10 +429,30 @@ impl ServerWorkerState {
         );
     }
 
+    #[cfg(test)]
     pub(crate) fn store_diskless_transport_relay(
         &mut self,
         read_end: std::fs::File,
         child_release_write_end: std::fs::File,
+        marker: Vec<u8>,
+        targets: Vec<DisklessTarget>,
+        complete_full_resync: bool,
+        not_before_ms: i64,
+    ) {
+        self.store_diskless_producer_relay(
+            read_end,
+            Some(child_release_write_end),
+            marker,
+            targets,
+            complete_full_resync,
+            not_before_ms,
+        );
+    }
+
+    pub(crate) fn store_diskless_producer_relay(
+        &mut self,
+        read_end: std::fs::File,
+        child_release_write_end: Option<std::fs::File>,
         marker: Vec<u8>,
         targets: Vec<DisklessTarget>,
         complete_full_resync: bool,
@@ -358,6 +478,7 @@ impl ServerWorkerState {
                 "Failed to register diskless RDB pipe source; aborting diskless relay"
             );
             self.close_diskless_relay_targets(&targets);
+            self.abort_forkless_socket_producer();
             self.reap_registered_diskless_child_if_any();
             return;
         };
@@ -371,7 +492,7 @@ impl ServerWorkerState {
         self.full_sync.diskless_relay = Some(DisklessRelay {
             transfer_id,
             source: Some(source),
-            child_release_write_end: Some(child_release_write_end),
+            child_release_write_end,
             targets,
             marker,
             complete_full_resync,
@@ -467,6 +588,7 @@ impl ServerWorkerState {
     }
 
     fn abort_empty_diskless_relay(&mut self) {
+        self.abort_forkless_socket_producer();
         if let Some(pid) = self.ctx.persistence().diskless_child_pid() {
             crate::server_log!(
                 notice,
@@ -537,25 +659,6 @@ impl ServerWorkerState {
                 );
             }
             self.release_paused_dual_main_replies();
-        }
-        // Reply enqueueing may synchronously close the last target after an
-        // output-buffer overrun and retire the relay along with its child.
-        let Some(relay) = self.full_sync.diskless_relay.as_mut() else {
-            return;
-        };
-        if !relay.complete_full_resync
-            || relay.targets.iter().all(|id| {
-                self.replication_runtime
-                    .primary_link(match id {
-                        DisklessTarget::Replica(id) => *id,
-                        DisklessTarget::Rdb { .. } => return false,
-                    })
-                    .is_some_and(|link| link.state() == PrimaryLinkState::Streaming)
-            })
-        {
-            relay
-                .completion_state
-                .apply_fact(DisklessFact::TerminalAckSatisfied);
         }
         let _ = self.reap_diskless_relay_child_if_done();
     }
@@ -647,6 +750,7 @@ impl ServerWorkerState {
     /// fact until all replica outcomes allow publication. New diskless forks
     /// remain excluded while that relay still owns the transport cohort.
     pub(crate) fn collect_idle_diskless_child_exit(&mut self) {
+        self.poll_forkless_socket_producer();
         if self.full_sync.diskless_relay.is_some() {
             let _ = self.reap_diskless_relay_child_if_done();
             return;
@@ -686,6 +790,13 @@ impl ServerWorkerState {
     }
 
     pub(crate) fn abort_diskless_relay_for_dataset_flush(&mut self) {
+        if self.ctx.persistence().forkless_save_purpose()
+            == Some(crate::engine::persistence::ForklessSavePurpose::ReplicationSocket)
+        {
+            self.abort_forkless_socket_producer();
+            self.fail_diskless_relay();
+            return;
+        }
         let Some(pid) = self.ctx.persistence().diskless_child_pid() else {
             return;
         };
@@ -715,6 +826,7 @@ impl ServerWorkerState {
 
     fn reap_diskless_relay_child_if_done(&mut self) -> bool {
         let Some(pid) = self.ctx.persistence().diskless_child_pid() else {
+            self.settle_diskless_targets_after_producer_success();
             if self
                 .full_sync
                 .diskless_relay
@@ -747,16 +859,23 @@ impl ServerWorkerState {
         } else {
             crate::runtime::server::worker::event_loop::sources::ChildExitOutcome::Exited(1)
         };
-        let ready_to_publish = self.full_sync.diskless_relay.as_mut().is_some_and(|relay| {
+        if let Some(relay) = self.full_sync.diskless_relay.as_mut() {
             relay
                 .completion_state
                 .apply_fact(DisklessFact::ChildExited(child_fact));
-            relay.completion_state.published
-        });
+        }
         // Reaping ends ownership of the PID and its permanently readable
         // pidfd even when the relay is still waiting for a replica's ACK.
         self.ctx.persistence_mut().complete_diskless_child();
         self.finalize_child_registry_entry(handle);
+        if child_succeeded {
+            self.settle_diskless_targets_after_producer_success();
+        }
+        let ready_to_publish = self
+            .full_sync
+            .diskless_relay
+            .as_ref()
+            .is_some_and(|relay| relay.completion_state.published);
         if child_succeeded && !ready_to_publish {
             return true;
         }
@@ -780,6 +899,87 @@ impl ServerWorkerState {
         true
     }
 
+    fn is_classic_rdb_only_target(&self, target: DisklessTarget) -> bool {
+        let DisklessTarget::Replica(id) = target else {
+            return false;
+        };
+        self.replication_runtime
+            .primary_link(id)
+            .is_some_and(|link| {
+                link.dual_state()
+                    == crate::framework::distributed::replication::PrimaryDualChannelState::Disabled
+                    && self.replication_runtime.rdb_only(link.connection_id())
+            })
+    }
+
+    fn settle_diskless_targets_after_producer_success(&mut self) {
+        let Some(relay) = self.full_sync.diskless_relay.as_ref() else {
+            return;
+        };
+        if !relay.completion_state.pipe_eof
+            || !relay.completion_state.markers_flushed
+            || !relay.completion_state.child_succeeded
+            || relay.completion_state.failed
+        {
+            return;
+        }
+        let complete_full_resync = relay.complete_full_resync;
+        let targets = relay.targets.clone();
+        // REPLCONF may revoke RDB-only after the one-time marker flush. Resolve
+        // the current mode at successful producer settlement, as C does.
+        if complete_full_resync {
+            for target in &targets {
+                if self.is_classic_rdb_only_target(*target) {
+                    continue;
+                }
+                if let DisklessTarget::Replica(id) = target {
+                    if let Some(link) = self.replication_runtime.primary_link_mut(*id) {
+                        if link.state() == PrimaryLinkState::PreparingFullResync {
+                            link.finish_full_resync();
+                        }
+                    }
+                }
+            }
+        }
+        let completed: Vec<_> = targets
+            .iter()
+            .copied()
+            .filter(|target| complete_full_resync && self.is_classic_rdb_only_target(*target))
+            .map(|target| (target, self.diskless_main_target_token(target)))
+            .collect();
+        // Detach successful targets before connection teardown can interpret
+        // the last close as a failed cohort and abort its healthy producer.
+        if let Some(relay) = self.full_sync.diskless_relay.as_mut() {
+            for (target, _) in &completed {
+                relay.targets.retain(|id| id != target);
+                relay.marker_queued_targets.remove(target);
+                relay.marker_sent_targets.remove(target);
+            }
+        }
+        for (_, token) in completed {
+            if let Some(token) = token {
+                self.remove_connection(token.0);
+            }
+        }
+        let terminal_ack_satisfied = self.full_sync.diskless_relay.as_ref().is_some_and(|relay| {
+            !relay.complete_full_resync
+                || relay.targets.iter().all(|target| match target {
+                    DisklessTarget::Replica(id) => self
+                        .replication_runtime
+                        .primary_link(*id)
+                        .is_some_and(|link| link.state() == PrimaryLinkState::Streaming),
+                    DisklessTarget::Rdb { .. } => false,
+                })
+        });
+        if terminal_ack_satisfied {
+            if let Some(relay) = self.full_sync.diskless_relay.as_mut() {
+                relay
+                    .completion_state
+                    .apply_fact(DisklessFact::TerminalAckSatisfied);
+            }
+        }
+    }
+
     fn close_diskless_relay_targets(&mut self, targets: &[DisklessTarget]) {
         let connections: Vec<Token> = targets
             .iter()
@@ -795,6 +995,7 @@ impl ServerWorkerState {
     }
 
     fn fail_diskless_relay(&mut self) {
+        self.abort_forkless_socket_producer();
         let targets = self
             .full_sync
             .diskless_relay
@@ -806,6 +1007,54 @@ impl ServerWorkerState {
             .unwrap_or_default();
         self.close_diskless_relay_targets(&targets);
         self.release_paused_dual_main_replies();
+    }
+
+    fn abort_forkless_socket_producer(&mut self) {
+        if self.ctx.persistence().forkless_save_purpose()
+            == Some(crate::engine::persistence::ForklessSavePurpose::ReplicationSocket)
+        {
+            self.ctx
+                .abort_forkless_save(crate::foundation::io::sys::time::mstime() / 1_000);
+            crate::server_log!(notice, "forkless save cancelled");
+        }
+    }
+
+    fn poll_forkless_socket_producer(&mut self) {
+        if self.ctx.persistence().forkless_save_purpose()
+            != Some(crate::engine::persistence::ForklessSavePurpose::ReplicationSocket)
+        {
+            return;
+        }
+        let Some(outcome) = self
+            .ctx
+            .poll_forkless_save(crate::foundation::io::sys::time::mstime() / 1_000)
+        else {
+            return;
+        };
+        let succeeded = matches!(
+            outcome,
+            crate::foundation::io::persistence::snapshot::background::RdbSaveOutcome::Saved
+        );
+        if let Some(relay) = self.full_sync.diskless_relay.as_mut() {
+            relay.completion_state.apply_fact(if succeeded {
+                DisklessFact::ProducerSucceeded
+            } else {
+                DisklessFact::ProducerFailed
+            });
+        }
+        if succeeded {
+            crate::server_log!(notice, "forkless-save: replication done");
+            self.finish_diskless_relay_if_ready();
+        } else {
+            if matches!(
+                outcome,
+                crate::foundation::io::persistence::snapshot::background::RdbSaveOutcome::Cancelled
+            ) {
+                crate::server_log!(notice, "forkless save cancelled");
+            }
+            crate::server_log!(warning, "Background RDB transfer error");
+            self.fail_diskless_relay();
+        }
     }
 
     fn clear_diskless_relay_source(&mut self) {
@@ -963,6 +1212,11 @@ impl ServerWorkerState {
     }
 
     fn complete_diskless_target(&mut self, target: DisklessTarget, complete_full_resync: bool) {
+        if complete_full_resync && self.is_classic_rdb_only_target(target) {
+            // Keep command pumping disabled until successful producer settlement
+            // closes this export-only connection; it never owes a terminal ACK.
+            return;
+        }
         if let DisklessTarget::Rdb { connection_id, .. } = target {
             if self.diskless_target_token(target).is_some() {
                 self.replication_runtime
@@ -981,9 +1235,10 @@ impl ServerWorkerState {
     }
 
     /// Pump a diskless child's pipe into replica output queues. On EOF, append
-    /// each `$EOF` marker and move classic targets into their terminal-ACK
+    /// each `$EOF` marker and move classic streaming targets into terminal-ACK
     /// wait. Release the child after its markers drain; final publication also
-    /// requires every survivor to ACK or be removed and a successful child exit.
+    /// requires every streaming survivor to ACK or be removed and producer
+    /// success. Classic RDB-only exports settle without entering ACK wait.
     fn service_diskless_relay_source(&mut self) {
         if self.full_sync.diskless_relay.is_none() {
             return;
@@ -1221,9 +1476,145 @@ impl ServerWorkerState {
     /// events, but this keeps the persistence slot recoverable if the batch was
     /// cancelled after the child had already exited.
     pub(crate) fn collect_idle_disk_sync_child_exit(&mut self) {
+        self.poll_forkless_disk_sync_production();
         if self.full_sync.disk_sync_batch.is_some() {
             return;
         }
         self.reap_registered_disk_sync_child_if_any();
+    }
+}
+
+#[cfg(test)]
+mod producer_tests {
+    use super::{DisklessCompletionState, DisklessFact, ServerWorkerState};
+
+    impl ServerWorkerState {
+        pub(crate) fn drain_diskless_sync_for_test(
+            &mut self,
+            targets: &mut [&mut std::net::TcpStream],
+        ) -> Vec<Vec<u8>> {
+            use std::io::Read;
+            use std::time::{Duration, Instant};
+
+            let relay = self.full_sync.diskless_relay.as_ref().expect("real relay");
+            let marker = relay.marker.clone();
+            let requires_ack = relay.complete_full_resync;
+            assert_eq!(relay.targets.len(), targets.len());
+            assert!(relay.source.is_some());
+            assert!(self.ctx.persistence().has_active_child());
+            if let Some(pid) = self.ctx.persistence().diskless_child_pid() {
+                assert!(self.child_registry.child_for_pid(pid).is_some());
+            } else {
+                assert_eq!(
+                    self.ctx.persistence().forkless_save_purpose(),
+                    Some(crate::engine::persistence::ForklessSavePurpose::ReplicationSocket)
+                );
+            }
+            for target in targets.iter_mut() {
+                target.set_nonblocking(true).unwrap();
+            }
+            let mut wire = vec![Vec::new(); targets.len()];
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                self.service_diskless_relay_source();
+                self.finish_diskless_relay_if_ready();
+                self.collect_idle_diskless_child_exit();
+                for (target, bytes) in targets.iter_mut().zip(&mut wire) {
+                    let mut buffer = [0; 16 * 1024];
+                    loop {
+                        match target.read(&mut buffer) {
+                            Ok(0) => break,
+                            Ok(count) => bytes.extend_from_slice(&buffer[..count]),
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                                continue
+                            }
+                            Err(error) => panic!("read real full-sync output: {error}"),
+                        }
+                    }
+                }
+                if !self.ctx.persistence().has_active_child()
+                    && wire.iter().all(|bytes| bytes.ends_with(&marker))
+                {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "real producer did not drain and exit"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            if requires_ack {
+                let relay = self
+                    .full_sync
+                    .diskless_relay
+                    .as_ref()
+                    .expect("ACK wait relay");
+                assert!(relay.eof_reached);
+                assert!(relay.source.is_none());
+                assert_eq!(relay.marker_sent_targets.len(), targets.len());
+                assert!(relay.completion_state.pipe_eof);
+                assert!(relay.completion_state.child_succeeded);
+                assert!(relay.completion_state.markers_flushed);
+                assert!(!relay.completion_state.failed);
+                assert!(!relay.completion_state.terminal_ack_satisfied);
+                assert!(!relay.completion_state.published());
+            } else {
+                assert!(
+                    self.full_sync.diskless_relay.is_none(),
+                    "dual relay must publish"
+                );
+            }
+            wire
+        }
+
+        pub(crate) fn decode_eof_rdb_for_test(
+            bulk: &[u8],
+            db_count: u32,
+        ) -> (
+            usize,
+            crate::foundation::io::store::kv_engine::DbSet,
+            Vec<Vec<u8>>,
+        ) {
+            let header_end = bulk.windows(2).position(|bytes| bytes == b"\r\n").unwrap();
+            let marker = bulk[..header_end]
+                .strip_prefix(b"$EOF:")
+                .expect("EOF header");
+            assert_eq!(marker.len(), 40);
+            assert!(bulk.ends_with(marker), "complete terminal marker");
+            let body = &bulk[header_end + 2..bulk.len() - marker.len()];
+            let mut dbs = crate::foundation::io::store::kv_engine::DbSet::new(db_count);
+            let (loaded, consumed, expired, functions) =
+                crate::foundation::io::persistence::rdb::load_rdb_bytes_checked_with_functions(
+                    body, &mut dbs, true,
+                )
+                .unwrap();
+            assert_eq!((consumed, expired), (body.len(), 0));
+            (loaded, dbs, functions)
+        }
+    }
+
+    #[test]
+    fn thread_success_requires_eof_markers_and_terminal_ack_without_a_child_event() {
+        let mut completion = DisklessCompletionState::default();
+        assert!(!completion.apply_fact(DisklessFact::ProducerSucceeded));
+        assert!(!completion.apply_fact(DisklessFact::PipeEof));
+        assert!(!completion.apply_fact(DisklessFact::MarkersFlushed));
+        assert!(completion.apply_fact(DisklessFact::TerminalAckSatisfied));
+        assert!(completion.published());
+    }
+
+    #[test]
+    fn a_failed_thread_cannot_publish_a_truncated_pipe() {
+        let mut completion = DisklessCompletionState::default();
+        for fact in [
+            DisklessFact::PipeEof,
+            DisklessFact::ProducerFailed,
+            DisklessFact::MarkersFlushed,
+            DisklessFact::TerminalAckSatisfied,
+        ] {
+            assert!(!completion.apply_fact(fact));
+        }
+        assert!(!completion.published());
     }
 }

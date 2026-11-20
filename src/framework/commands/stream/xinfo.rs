@@ -9,7 +9,10 @@ fn bs(s: &str) -> Value {
     Value::bulk(Bytes::from(s.to_string()))
 }
 
-fn entry_to_full_value(id: &crate::foundation::io::store::structure::stream::StreamID, fields: &[(Bytes, Bytes)]) -> Value {
+fn entry_to_full_value(
+    id: &crate::foundation::io::store::structure::stream::StreamID,
+    fields: &[(Bytes, Bytes)],
+) -> Value {
     let mut arr = Vec::with_capacity(2);
     arr.push(Value::bulk(Bytes::from(id.fmt_id())));
     let mut fv = Vec::with_capacity(fields.len() * 2);
@@ -129,7 +132,9 @@ fn xinfo_stream(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> Value {
     }
 }
 
-fn entry_to_simple_value(e: &crate::foundation::io::store::structure::stream::StreamEntry) -> Value {
+fn entry_to_simple_value(
+    e: &crate::foundation::io::store::structure::stream::StreamEntry,
+) -> Value {
     let mut arr = Vec::with_capacity(2);
     arr.push(Value::bulk(Bytes::from(e.id.fmt_id())));
     let mut fields = Vec::with_capacity(e.fields.len() * 2);
@@ -141,7 +146,9 @@ fn entry_to_simple_value(e: &crate::foundation::io::store::structure::stream::St
     Value::Array(arr)
 }
 
-fn xinfo_stream_basic_reply(stream: &crate::foundation::io::store::structure::stream::ValkeyStream) -> Value {
+fn xinfo_stream_basic_reply(
+    stream: &crate::foundation::io::store::structure::stream::ValkeyStream,
+) -> Value {
     let mut reply = vec![bs("length")];
     reply.push(Value::integer(stream.len() as i64));
 
@@ -226,7 +233,9 @@ fn xinfo_stream_full_reply(
     Value::Array(reply)
 }
 
-fn xinfo_groups_reply(stream: &crate::foundation::io::store::structure::stream::ValkeyStream) -> Value {
+fn xinfo_groups_reply(
+    stream: &crate::foundation::io::store::structure::stream::ValkeyStream,
+) -> Value {
     Value::Array(
         stream
             .groups()
@@ -235,7 +244,9 @@ fn xinfo_groups_reply(stream: &crate::foundation::io::store::structure::stream::
     )
 }
 
-fn xinfo_groups_full_reply(stream: &crate::foundation::io::store::structure::stream::ValkeyStream) -> Value {
+fn xinfo_groups_full_reply(
+    stream: &crate::foundation::io::store::structure::stream::ValkeyStream,
+) -> Value {
     Value::Array(
         stream
             .groups()
@@ -302,17 +313,13 @@ fn group_full_value(
         bs("pending"),
         Value::Array(pending),
         bs("consumers"),
-        Value::Array(
-            group
-                .consumers
-                .values()
-                .map(consumer_full_value)
-                .collect(),
-        ),
+        Value::Array(group.consumers.values().map(consumer_full_value).collect()),
     ])
 }
 
-fn consumer_full_value(consumer: &crate::foundation::io::store::structure::stream::groups::StreamConsumer) -> Value {
+fn consumer_full_value(
+    consumer: &crate::foundation::io::store::structure::stream::groups::StreamConsumer,
+) -> Value {
     Value::Array(vec![
         bs("name"),
         Value::bulk(consumer.name.clone()),
@@ -378,34 +385,24 @@ fn group_lag(
     stream: &crate::foundation::io::store::structure::stream::ValkeyStream,
     group: &crate::foundation::io::store::structure::stream::groups::StreamGroup,
 ) -> Value {
-    if group.entries_read.is_some() {
-        if stream.max_deleted_entry_id > group.last_id
-            && stream
-                .first_id()
-                .is_some_and(|first| stream.max_deleted_entry_id >= first)
-            && stream.max_deleted_entry_id <= stream.last_entry_id()
-        {
-            return Value::null();
-        }
-        return group_lag_for_counts(group.entries_read, stream.entries_added, 0);
-    }
-    if stream.entries_added == 0 || stream.is_empty() {
+    if stream.entries_added == 0 {
         return Value::integer(0);
     }
-    if stream
-        .first_id()
-        .is_some_and(|first| stream.max_deleted_entry_id >= first)
+    if let Some(entries_read) = group
+        .entries_read
+        .and_then(crate::foundation::io::store::structure::stream::groups::valid_entries_read)
     {
-        return Value::null();
+        if !stream.range_has_tombstones(Some(group.last_id), None) {
+            if stream.is_empty() || stream.first_id().is_some_and(|first| group.last_id < first) {
+                return Value::integer(stream.len() as i64);
+            }
+            return Value::integer(stream.entries_added.wrapping_sub(entries_read) as i64);
+        }
     }
-    Value::integer(stream.len() as i64)
-}
-
-fn group_lag_for_counts(entries_read: Option<u64>, entries_added: u64, default: i64) -> Value {
-    match entries_read {
-        Some(read) => Value::integer(entries_added.saturating_sub(read) as i64),
-        None => Value::integer(default),
-    }
+    stream
+        .estimate_distance_from_first_ever_entry(group.last_id)
+        .map(|read| Value::integer(stream.entries_added.wrapping_sub(read) as i64))
+        .unwrap_or_else(Value::null)
 }
 
 fn opt_u64(value: Option<u64>) -> Value {
@@ -413,3 +410,7 @@ fn opt_u64(value: Option<u64>) -> Value {
         .map(|v| Value::integer(v as i64))
         .unwrap_or_else(Value::null)
 }
+
+#[cfg(test)]
+#[path = "xinfo_lag_tests.rs"]
+mod lag_tests;

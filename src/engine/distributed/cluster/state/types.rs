@@ -530,20 +530,123 @@ impl ClusterState {
         if !self.nodes.contains_key(node_id) {
             return None;
         }
+        // Deletion orphans replicas without promoting them or changing shards.
+        if self.myself.replicaof == node_id {
+            self.myself.replicaof.clear();
+        }
         for node in self.nodes.values_mut() {
             if node.replicaof == node_id {
                 node.replicaof.clear();
             }
         }
-        let changed = self.unassign_slots_owned_by(node_id) > 0;
+        if self
+            .pending_replication_switch
+            .as_ref()
+            .is_some_and(|pending| pending.node_id == node_id)
+        {
+            self.pending_replication_switch = None;
+        }
+        self.unassign_slots_owned_by(node_id);
         let removed = self
             .nodes
             .remove(node_id)
             .expect("known node remains present until removal");
-        if changed {
-            self.mark_topology_changed();
-        }
+        self.mark_topology_changed();
         Some(removed)
+    }
+
+    /// Confirm an unknown peer without applying node-deletion side effects.
+    pub(crate) fn rename_handshake_node(&mut self, node_id: &str, new_name: &str) -> bool {
+        use crate::engine::distributed::cluster::action::ClusterAction;
+        use crate::engine::distributed::cluster::node::CLUSTER_NODE_HANDSHAKE;
+
+        let Ok(new_id) = NodeId::parse(new_name.as_bytes()) else {
+            return false;
+        };
+        if new_name == self.myself.name
+            || self.nodes.contains_key(new_name)
+            || self.nodes_black_list.contains_key(new_name)
+            || !self
+                .nodes
+                .get(node_id)
+                .is_some_and(|node| node.has_flag(CLUSTER_NODE_HANDSHAKE))
+        {
+            return false;
+        }
+        // C clusterRenameNode retains the node object. Strings and indexes
+        // must follow that same identity before any sender observation runs.
+        let mut node = self.nodes.remove(node_id).expect("handshake was checked");
+        node.name = new_name.to_string();
+        self.nodes.insert(new_name.to_string(), node);
+        for node in std::iter::once(&mut self.myself).chain(self.nodes.values_mut()) {
+            if node.replicaof == node_id {
+                node.replicaof = new_name.to_string();
+            }
+        }
+        if let Some(pending) = &mut self.pending_replication_switch {
+            if pending.node_id == node_id {
+                pending.node_id = new_name.to_string();
+            }
+        }
+        for owner in &mut self.slot_ownership.owners {
+            if matches!(owner, SlotOwner::Remote(id) if id.as_str() == node_id) {
+                *owner = SlotOwner::Remote(new_id.clone());
+            }
+        }
+        for reference in self
+            .slot_ownership
+            .withdrawn_by
+            .iter_mut()
+            .flatten()
+            .chain(self.slot_ownership.migrating_to.values_mut())
+            .chain(self.slot_ownership.importing_from.values_mut())
+            .chain(self.pending_forgets.iter_mut())
+        {
+            if reference.as_str() == node_id {
+                *reference = new_name.to_string();
+            }
+        }
+        if let Some(reports) = self.fail_reports.remove(node_id) {
+            self.fail_reports.insert(new_name.to_string(), reports);
+        }
+        for reports in self.fail_reports.values_mut() {
+            if let Some(time_ms) = reports.remove(node_id) {
+                reports.insert(new_name.to_string(), time_ms);
+            }
+        }
+        if let Some(since_ms) = self.replica_migration_orphaned_since.remove(node_id) {
+            self.replica_migration_orphaned_since
+                .insert(new_name.to_string(), since_ms);
+        }
+        for direction in [ClusterLinkDirection::To, ClusterLinkDirection::From] {
+            if let Some(mut view) = self.link_views.remove(&(node_id.to_string(), direction)) {
+                view.node_id = new_id.clone();
+                view.temporary_handshake = false;
+                self.link_views
+                    .insert((new_name.to_string(), direction), view);
+            }
+        }
+        for (reference, _) in &mut self.pending_link_closes {
+            if reference.as_str() == node_id {
+                *reference = new_name.to_string();
+            }
+        }
+        for action in &mut self.pending_cluster_actions {
+            let reference = match action {
+                ClusterAction::FollowPrimary(target) => &mut target.node_id,
+                ClusterAction::PromoteSelf(promotion) => &mut promotion.old_primary,
+                ClusterAction::SendManualFailoverStart { primary } => primary,
+                ClusterAction::SendFailoverAuthAck { recipient, .. } => recipient,
+                ClusterAction::PauseWrites { requester, .. } => requester,
+                _ => continue,
+            };
+            if reference.as_str() == node_id {
+                *reference = new_id.clone();
+            }
+        }
+        self.mark_topology_changed();
+        self.request_config_save();
+        true
     }
 
     pub(crate) fn blacklist_node_until(&mut self, node_id: String, expires_at: i64) {
@@ -899,6 +1002,14 @@ impl ClusterState {
     }
 
     pub(crate) fn queue_meet(&mut self, meet: PendingMeet) {
+        // Publish the temporary node before replying; only socket I/O is deferred.
+        let handshake_id = self.ensure_handshake_node(
+            &meet.0,
+            meet.1,
+            meet.2,
+            crate::foundation::io::sys::time::mstime(),
+        );
+        self.arm_node_meet(&handshake_id);
         self.pending_meets.push(meet);
     }
 
@@ -1034,6 +1145,23 @@ impl ClusterState {
         now: i64,
     ) -> Result<Vec<MigrationAction>, MigrationError> {
         let actions = self.migrations.finish(id, terminal, message, now)?;
+        self.debug_assert_migration_invariants();
+        Ok(actions)
+    }
+
+    /// Authority-aware terminal transition for replicated SYNCSLOTS FINISH.
+    /// Same-terminal calls are idempotent after retained imports are released;
+    /// a locally failed tracking import still accepts the primary's result.
+    pub fn reconcile_remote_finish_migration(
+        &mut self,
+        id: &MigrationJobId,
+        terminal: TerminalPhase,
+        message: Option<String>,
+        now: i64,
+    ) -> Result<Vec<MigrationAction>, MigrationError> {
+        let actions = self
+            .migrations
+            .reconcile_remote_finish(id, terminal, message, now)?;
         self.debug_assert_migration_invariants();
         Ok(actions)
     }
@@ -1395,7 +1523,7 @@ impl ClusterState {
             .map(|node| node.name.clone())
             .collect();
         for node_id in &expired {
-            if let Some(node) = self.nodes.remove(node_id) {
+            if let Some(node) = self.remove_node(node_id) {
                 let endpoint = (node.ip().to_string(), node.port(), node.cport());
                 self.handshake_cooldowns
                     .insert(endpoint, now_ms.saturating_add(timeout_ms));
@@ -1406,6 +1534,7 @@ impl ClusterState {
                     // pending connects can register a MEET handshake.
                     let handshake_id =
                         self.ensure_handshake_node(node.ip(), node.port(), node.cport(), now_ms);
+                    self.arm_node_meet(&handshake_id);
                     self.mark_handshake_retry(&handshake_id);
                     let retry = (node.ip().to_string(), node.cport(), true);
                     self.queue_connect_once(retry);
@@ -1461,9 +1590,8 @@ impl ClusterState {
             node.has_flag(crate::engine::distributed::cluster::node::CLUSTER_NODE_HANDSHAKE)
         });
         if is_handshake {
-            self.nodes.remove(node_id);
+            self.remove_node(node_id);
             self.observe_link_close(node_id, ClusterLinkDirection::All);
-            self.mark_topology_changed();
         }
     }
 }
@@ -1509,8 +1637,145 @@ pub(super) fn role_str(
 mod tests {
     use super::ClusterState;
     use crate::engine::distributed::cluster::msg::ClusterMsgType;
-    use crate::engine::distributed::cluster::node::ClusterNode;
+    use crate::engine::distributed::cluster::node::{ClusterNode, CLUSTER_NODE_HANDSHAKE};
     use crate::engine::distributed::cluster::ClusterLinkDirection;
+
+    #[test]
+    fn handshake_confirmation_rekeys_identity_indexes_and_pending_actions() {
+        use crate::engine::command::context::Token;
+        use crate::engine::distributed::cluster::action::{
+            ClusterAction, ReplicationSwitchMode, ReplicationTarget,
+        };
+        use crate::engine::distributed::cluster::bus::ClusterBusManager;
+        use crate::engine::distributed::cluster::{ClusterLinkView, LinkEvents, NodeId};
+
+        let mut state = ClusterState::new("127.0.0.1", 6379, 16379);
+        let handshake_id = state.ensure_handshake_node("127.0.0.1", 6380, 16380, 100);
+        let old_id = NodeId::parse(handshake_id.as_bytes()).unwrap();
+        state.replicate(handshake_id.as_bytes()).unwrap();
+        let handshake = state.nodes.get_mut(&handshake_id).unwrap();
+        handshake.slots[7] = true;
+        handshake.numslots = 1;
+        // Import the handshake bitmap before seeding its identity references.
+        state.index_inserted_node_slots(&handshake_id);
+        assert_eq!(
+            state.canonical_slot_owner_id(7),
+            Some(handshake_id.as_str())
+        );
+        assert!(!state.slots[7]);
+        state.slot_ownership.withdrawn_by[8] = Some(handshake_id.clone());
+        state
+            .slot_ownership
+            .migrating_to
+            .insert(9, handshake_id.clone());
+        state
+            .slot_ownership
+            .importing_from
+            .insert(10, handshake_id.clone());
+        state.fail_reports.insert(
+            handshake_id.clone(),
+            std::collections::HashMap::from([(handshake_id.clone(), 123)]),
+        );
+        state
+            .replica_migration_orphaned_since
+            .insert(handshake_id.clone(), 50);
+        state.queue_forget(handshake_id.clone());
+        state.queue_link_close((handshake_id.clone(), ClusterLinkDirection::From));
+        state.observe_link_open(
+            ClusterLinkView::new(
+                old_id.clone(),
+                ClusterLinkDirection::To,
+                101,
+                LinkEvents::READ_WRITE,
+            )
+            .with_temporary_handshake(true),
+        );
+        state.queue_cluster_actions(vec![ClusterAction::FollowPrimary(ReplicationTarget {
+            node_id: old_id,
+            host: "127.0.0.1".to_string(),
+            port: 6380,
+            mode: ReplicationSwitchMode::ForceFull,
+        })]);
+        let mut manager = ClusterBusManager::new();
+        manager.register_outgoing_for_handshake(
+            Token(29),
+            "127.0.0.1:16380".parse().unwrap(),
+            handshake_id.clone(),
+        );
+        let mut sender = ClusterNode::new(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            "127.0.0.1".to_string(),
+            6380,
+            16380,
+            true,
+        );
+        sender.flags &= !crate::engine::distributed::cluster::node::CLUSTER_NODE_MYSELF;
+        sender.slots[7] = true;
+        sender.numslots = 1;
+        let packet = crate::engine::distributed::cluster::msg::encode_msg(
+            ClusterMsgType::Pong,
+            &sender,
+            0,
+            &[],
+        );
+
+        assert!(!manager.process_read_bytes(&mut state, 29, &packet, 200));
+
+        let real_id = NodeId::parse(sender.name.as_bytes()).unwrap();
+        assert_eq!(state.myself.replicaof, sender.name);
+        assert_eq!(
+            state.slot_ownership.owners[7],
+            super::SlotOwner::Remote(real_id.clone())
+        );
+        assert_eq!(
+            state.slot_ownership.withdrawn_by[8].as_deref(),
+            Some(sender.name.as_str())
+        );
+        assert_eq!(state.slot_ownership.migrating_to[&9], sender.name);
+        assert_eq!(state.slot_ownership.importing_from[&10], sender.name);
+        assert_eq!(state.fail_reports[&sender.name][&sender.name], 123);
+        assert!(!state.fail_reports.contains_key(&handshake_id));
+        assert_eq!(state.replica_migration_orphaned_since[&sender.name], 50);
+        assert_eq!(state.take_pending_forgets(), vec![sender.name.clone()]);
+        assert_eq!(
+            state.take_pending_link_closes(),
+            vec![(sender.name.clone(), ClusterLinkDirection::From)],
+        );
+        let view = &state.link_views[&(sender.name.clone(), ClusterLinkDirection::To)];
+        assert_eq!(view.node_id, real_id.clone());
+        assert_eq!(view.created_at_ms, 101);
+        assert!(!view.temporary_handshake);
+        assert_eq!(
+            state.take_cluster_actions(),
+            vec![ClusterAction::FollowPrimary(ReplicationTarget {
+                node_id: real_id,
+                host: "127.0.0.1".to_string(),
+                port: 6380,
+                mode: ReplicationSwitchMode::ForceFull,
+            })],
+        );
+    }
+
+    #[test]
+    fn handshake_timeout_still_orphans_installed_replication_identity() {
+        let mut state = ClusterState::new("127.0.0.1", 6379, 16379);
+        let handshake_id = state.ensure_handshake_node("127.0.0.1", 6380, 16380, 100);
+        state.replicate(handshake_id.as_bytes()).unwrap();
+        state.set_pending_replication_switch(super::PendingReplicationSwitch {
+            node_id: handshake_id.clone(),
+            mode: crate::engine::distributed::cluster::action::ReplicationSwitchMode::TryPartial,
+        });
+
+        assert_eq!(
+            state.expire_handshake_nodes(1_101, 1_000),
+            vec![handshake_id.clone()]
+        );
+
+        assert!(state.myself.replicaof.is_empty());
+        assert!(state.myself.is_replica());
+        assert!(state.pending_replication_switch.is_none());
+        assert!(!state.nodes.contains_key(&handshake_id));
+    }
 
     #[test]
     fn named_failover_events_keep_machine_state_owned() {
@@ -1822,6 +2087,48 @@ mod tests {
         assert!(!state.nodes.contains_key(&handshake_id));
         assert!(state.pending_connects.is_empty());
         assert_eq!(state.link_views().count(), 0);
+    }
+
+    #[test]
+    fn explicit_meet_publication_records_node_intent() {
+        let mut state = ClusterState::new("127.0.0.1", 6379, 16379);
+        let endpoint = ("127.0.0.1".to_string(), 6380, 16380);
+        state.queue_meet(endpoint.clone());
+
+        let node = state
+            .nodes
+            .values()
+            .find(|node| node.has_flag(CLUSTER_NODE_HANDSHAKE))
+            .unwrap();
+        assert!(
+            node.meet_pending,
+            "a published explicit MEET must retain its node-level intent"
+        );
+        assert_eq!(state.take_pending_meets(), vec![endpoint]);
+    }
+
+    #[test]
+    fn explicit_meet_timeout_replacement_retains_node_intent() {
+        let mut state = ClusterState::new("127.0.0.1", 6379, 16379);
+        let old_id = state.ensure_handshake_node("127.0.0.1", 6380, 16380, 1_000);
+        state.queue_meet(("127.0.0.1".to_string(), 6380, 16380));
+        state.mark_handshake_retry(&old_id);
+
+        assert_eq!(
+            state.expire_handshake_nodes(2_001, 500),
+            vec![old_id.clone()]
+        );
+        let replacement = state
+            .nodes
+            .values()
+            .find(|node| node.has_flag(CLUSTER_NODE_HANDSHAKE))
+            .unwrap();
+        assert_ne!(replacement.name, old_id);
+        assert!(
+            replacement.meet_pending,
+            "a timed-out explicit MEET must retain its node-level intent"
+        );
+        assert!(replacement.handshake_retry_on_timeout);
     }
 
     #[test]

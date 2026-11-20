@@ -56,6 +56,92 @@ fn test_ctx() -> ScriptRunCtx {
     }
 }
 
+#[test]
+fn debugger_breakpoint_error_is_caught_and_next_stop_keeps_the_lua_frame() {
+    use crate::engine::host::{HostError, HostReply, HostRequest, HostYield};
+
+    reset_lua_runtime();
+    let mut ctx = test_ctx();
+    let mut stopped_lines = Vec::new();
+    let mut host = |request: HostRequest<'_>| match request {
+        HostRequest::Yield(HostYield::ScriptDebugStop { line, .. }) => {
+            stopped_lines.push(line);
+            if stopped_lines.len() == 1 {
+                Err(HostError::Runtime("max client buffer reached".to_string()))
+            } else {
+                Ok(HostReply::Continue)
+            }
+        }
+        request => echo_host(request),
+    };
+    {
+        ctx.func_name = "debugger-breakpoint-frame".to_string();
+        let _guard =
+            timeout::ScriptDebuggerGuard::enter(crate::engine::host::ScriptDebugResume::Continue);
+        let value = LuaEngine
+            .eval_cached_with_host(
+                "local ok = pcall(function()\n\
+                 server.breakpoint()\n\
+                 return 1\n\
+                 end)\n\
+                 server.breakpoint()\n\
+                 return {ok, 'done'}",
+                &mut ctx,
+                &[],
+                &[],
+                &mut host,
+            )
+            .unwrap();
+        assert_eq!(
+            value,
+            Value::Array(vec![Value::Null, Value::Bulk(Bytes::from_static(b"done"))])
+        );
+    }
+    assert_eq!(stopped_lines, vec![3, 6]);
+    assert_eq!(
+        LuaEngine
+            .eval_with_host("return server.breakpoint()", &mut ctx, &mut echo_host)
+            .unwrap(),
+        Value::Null,
+    );
+    reset_lua_runtime();
+}
+
+#[test]
+fn debugger_step_stops_on_the_next_same_line_loop_event() {
+    use crate::engine::host::{HostReply, HostRequest, HostYield};
+
+    reset_lua_runtime();
+    let mut ctx = test_ctx();
+    ctx.func_name = "debugger-same-line-step".to_string();
+    let mut stopped_lines = Vec::new();
+    let mut host = |request: HostRequest<'_>| match request {
+        HostRequest::Yield(HostYield::ScriptDebugStop { line, .. }) => {
+            stopped_lines.push(line);
+            Ok(HostReply::Continue)
+        }
+        request => echo_host(request),
+    };
+    {
+        let _guard =
+            timeout::ScriptDebuggerGuard::enter(crate::engine::host::ScriptDebugResume::Step);
+        assert_eq!(
+            LuaEngine
+                .eval_cached_with_host(
+                    "local n=0; while n<3 do n=n+1 end; return n",
+                    &mut ctx,
+                    &[],
+                    &[],
+                    &mut host,
+                )
+                .unwrap(),
+            Value::integer(3),
+        );
+    }
+    assert_eq!(stopped_lines, vec![1]);
+    reset_lua_runtime();
+}
+
 fn table_string_keys(table: mlua::Table) -> Result<Vec<String>, ScriptError> {
     let mut names = Vec::new();
     for pair in table.pairs::<String, mlua::Table>() {
@@ -674,6 +760,75 @@ fn lua_redis_call_does_not_checkpoint_each_command() {
 
     assert_eq!(command_count, 2);
     assert_eq!(checkpoint_count, 0);
+}
+
+#[test]
+fn lua_coroutine_hook_shares_budget_across_short_resumes() {
+    for body in [
+        "local function spin() for i=1,1000 do end end; for i=1,200 do coroutine.resume(coroutine.create(spin)) end",
+        "local function spin() for i=1,1000 do end end; for i=1,200 do coroutine.wrap(spin)() end",
+        "local co = coroutine.create(function() for i=1,200 do for j=1,1000 do end; coroutine.yield() end end); for i=1,200 do coroutine.resume(co) end",
+        "local function spin() for i=1,1000 do end; error('ordinary error') end; for i=1,200 do local ok, err = coroutine.resume(coroutine.create(spin)); assert(not ok); assert(type(err) == 'string') end",
+    ] {
+        reset_lua_runtime();
+        let mut ctx = test_ctx();
+        let mut checkpoints = 0;
+        let mut host = |request: crate::engine::host::HostRequest<'_>| {
+            if matches!(
+                request,
+                crate::engine::host::HostRequest::Yield(
+                    crate::engine::host::HostYield::ScriptCheckpoint { .. }
+                )
+            ) {
+                checkpoints += 1;
+            }
+            echo_host(request)
+        };
+        LuaEngine.eval_with_host(body, &mut ctx, &mut host).unwrap();
+        assert!(checkpoints > 0, "shared budget must cover short coroutines: {body}");
+    }
+    reset_lua_runtime();
+}
+
+#[test]
+fn lua_coroutine_hook_kill_escapes_nested_resumers() {
+    // Finite loops keep the old implementation's missing hooks from hanging the test.
+    let body = r#"
+        local function spin() for i=1,200000 do end end
+        local function mid()
+            for i=1,4 do coroutine.resume(coroutine.create(spin)) end
+        end
+        for i=1,4 do coroutine.resume(coroutine.create(mid)) end
+        return 42
+    "#;
+    reset_lua_runtime();
+    let mut ctx = test_ctx();
+    let mut checkpoints = 0;
+    let mut host = |request: crate::engine::host::HostRequest<'_>| {
+        if let crate::engine::host::HostRequest::Yield(
+            crate::engine::host::HostYield::ScriptCheckpoint { run },
+        ) = request
+        {
+            checkpoints += 1;
+            assert!(run
+                .control
+                .request_kill(crate::engine::extension::script::KillSource::ScriptKill));
+            return Ok(crate::engine::host::HostReply::Continue);
+        }
+        echo_host(request)
+    };
+    let result = LuaEngine.eval_with_host(body, &mut ctx, &mut host);
+    assert!(
+        matches!(result, Err(ScriptError::KillError(_))),
+        "nested resumers must not swallow a script kill: {result:?}"
+    );
+    assert_eq!(checkpoints, 1);
+    let mut clean_ctx = test_ctx();
+    assert_eq!(
+        eval_without_commands(&LuaEngine, "return 42", &mut clean_ctx).unwrap(),
+        Value::Integer(42)
+    );
+    reset_lua_runtime();
 }
 
 #[test]

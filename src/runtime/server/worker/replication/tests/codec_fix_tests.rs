@@ -224,18 +224,33 @@ fn codec_fix_extra_logical_data_is_a_fatal_compression_error() {
 }
 
 #[test]
-fn codec_fix_filtered_cohorts_progress_while_all_snapshot_child_is_active() {
+fn codec_fix_filtered_cohorts_wait_for_real_child_and_relay_then_progress() {
     use crate::framework::distributed::replication::RdbFilterMode;
 
+    let _fork_guard = crate::framework::commands::server::save::diskless_fork_test_guard();
     let mut backend = ServerWorkerState::new(1).unwrap();
     backend.ctx.config_mut().replication.repl_diskless_sync = true;
+    let code =
+        "#!lua name=cohortlib\nserver.register_function('cohort_fn', function() return 7 end)";
+    backend
+        .ctx
+        .script_mut()
+        .function_registry
+        .load_library("cohortlib", code)
+        .unwrap();
+    backend
+        .ctx
+        .db_mut(0)
+        .unwrap()
+        .set(b"key".to_vec(), Robj::string("value"));
+    backend.ctx.replication_mut().backlog.activate();
     let mut targets = Vec::new();
-    for (token, mode) in [
-        (41, RdbFilterMode::All),
-        (42, RdbFilterMode::Functions),
-        (43, RdbFilterMode::Empty),
+    for mode in [
+        RdbFilterMode::All,
+        RdbFilterMode::Functions,
+        RdbFilterMode::Empty,
     ] {
-        add_connection(&mut backend, token);
+        let (token, peer) = add_runtime_connection(&mut backend);
         let id = backend.replication_runtime.register_primary(
             ConnectionId(token),
             ReplicaConnectionInfo {
@@ -248,26 +263,87 @@ fn codec_fix_filtered_cohorts_progress_while_all_snapshot_child_is_active() {
         let link = backend.replication_runtime.primary_link_mut(id).unwrap();
         link.plan_full_resync(&backend.ctx.replication().backlog);
         link.defer_diskless_sync(0, 0, true);
-        targets.push((id, token, mode));
+        targets.push((id, token, mode, peer));
     }
-    backend
+    backend.fire_deferred_full_resyncs(vec![targets[0].0]);
+    let active_pid = backend
         .ctx
-        .persistence_mut()
-        .begin_diskless_child(424242)
-        .unwrap();
+        .persistence()
+        .diskless_child_pid()
+        .expect("real child");
+    assert_eq!(backend.ctx.stats().total_forks, 1);
     backend.drive_deferred_full_resyncs();
     backend.drive_deferred_full_resyncs();
-    for (id, token, mode) in targets {
-        let is_deferred = backend
-            .replication_runtime
-            .primary_link(id)
-            .unwrap()
-            .is_deferred_diskless();
-        assert_eq!(is_deferred, mode == RdbFilterMode::All, "{mode:?}");
-        if mode != RdbFilterMode::All {
-            assert!(_queued(&backend.connection_registry[Token(token)]).starts_with(b"+FULLRESYNC"));
-        }
+    assert_eq!(
+        backend.ctx.persistence().diskless_child_pid(),
+        Some(active_pid)
+    );
+    assert_eq!(backend.ctx.stats().total_forks, 1);
+    for (id, token, mode, _) in &targets[1..] {
+        assert!(
+            backend
+                .replication_runtime
+                .primary_link(*id)
+                .unwrap()
+                .is_deferred_diskless(),
+            "{mode:?}"
+        );
+        assert!(_queued(&backend.connection_registry[Token(*token)]).is_empty());
     }
+    for (index, (id, token, mode, peer)) in targets.iter_mut().enumerate() {
+        if index > 0 {
+            backend.fire_deferred_full_resyncs(vec![*id]);
+            assert!(backend.ctx.persistence().diskless_child_pid().is_some());
+            assert_eq!(backend.ctx.stats().total_forks, (index + 1) as u64);
+        }
+        let wire = backend.drain_diskless_sync_for_test(&mut [peer]);
+        if *mode == RdbFilterMode::All {
+            let header_end = wire[0]
+                .windows(2)
+                .position(|bytes| bytes == b"\r\n")
+                .unwrap()
+                + 2;
+            let (loaded, mut dbs, functions) =
+                ServerWorkerState::decode_eof_rdb_for_test(&wire[0][header_end..], 1);
+            assert_eq!(loaded, 1);
+            assert_eq!(
+                dbs.get_mut(0).unwrap().get(b"key").unwrap().as_bytes(),
+                b"value"
+            );
+            assert_eq!(functions, vec![code.as_bytes().to_vec()]);
+        } else {
+            final_edges_assert_filtered_body(
+                &wire[0],
+                if *mode == RdbFilterMode::Functions {
+                    vec![code.as_bytes().to_vec()]
+                } else {
+                    Vec::new()
+                },
+            );
+        }
+        assert_eq!(
+            backend
+                .replication_runtime
+                .primary_link(*id)
+                .unwrap()
+                .state(),
+            PrimaryLinkState::WaitingForReplicaAck
+        );
+        // A reaped producer still cannot be replaced while its relay waits for ACK.
+        backend.drive_deferred_full_resyncs();
+        assert_eq!(backend.ctx.stats().total_forks, (index + 1) as u64);
+        let link = backend.replication_runtime.primary_link_mut(*id).unwrap();
+        link.acknowledge(offset(0), crate::foundation::io::sys::time::mstime());
+        assert!(link.promote_full_resync_on_ack());
+        backend.on_diskless_terminal_ack(*id);
+        assert!(backend.full_sync.diskless_relay.is_none());
+        backend.remove_connection(*token);
+    }
+    assert!(!backend.ctx.persistence().has_active_child());
+    assert_eq!(
+        backend.replication_runtime.count_deferred_diskless_links(),
+        0
+    );
 }
 
 fn final_edges_transport(
@@ -471,10 +547,9 @@ fn final_edges_assert_filtered_body(wire: &[u8], expected_functions: Vec<Vec<u8>
 }
 
 #[test]
-fn final_edges_max_replica_threshold_preserves_all_defer_during_active_child() {
+fn final_edges_max_replica_threshold_preserves_every_cohort_during_active_child() {
     use crate::framework::distributed::replication::RdbFilterMode;
 
-    let code = "#!lua name=final_edges\nserver.register_function('edge', function() return 1 end)";
     for compression in [RdbCompression::No, RdbCompression::Lz4] {
         let mut backend = ServerWorkerState::new(1).unwrap();
         backend.ctx.config_mut().persistence.rdbcompression = compression;
@@ -494,12 +569,6 @@ fn final_edges_max_replica_threshold_preserves_all_defer_during_active_child() {
             .db_mut(0)
             .unwrap()
             .set(b"key".to_vec(), Robj::string("value"));
-        backend
-            .ctx
-            .script_mut()
-            .function_registry
-            .load_library("final_edges", code)
-            .unwrap();
         backend
             .ctx
             .persistence_mut()
@@ -541,31 +610,20 @@ fn final_edges_max_replica_threshold_preserves_all_defer_during_active_child() {
                     .replication_runtime
                     .primary_for_connection(ConnectionId(token))
                     .unwrap();
-                assert_eq!(
-                    link.is_deferred_diskless(),
-                    mode == RdbFilterMode::All,
-                    "{mode:?}"
-                );
+                assert!(link.is_deferred_diskless(), "{mode:?}");
                 let wire = _queued(&backend.connection_registry[Token(token)]);
-                if mode == RdbFilterMode::All {
-                    assert!(
-                        wire.is_empty(),
-                        "All must not serialize while a child is active"
-                    );
-                    assert!(!link.diskless_delay_ready(crate::foundation::io::sys::time::mstime()));
-                    all_connections.push(token);
-                } else {
-                    let functions = if mode == RdbFilterMode::Functions {
-                        vec![code.as_bytes().to_vec()]
-                    } else {
-                        Vec::new()
-                    };
-                    final_edges_assert_filtered_body(&wire, functions);
-                }
+                assert!(
+                    wire.is_empty(),
+                    "{mode:?} must not serialize while a child is active"
+                );
+                assert!(!link.diskless_delay_ready(crate::foundation::io::sys::time::mstime()));
+                all_connections.push(token);
             }
             assert_eq!(backend.ctx.persistence().diskless_child_pid(), Some(424242));
             assert_eq!(backend.ctx.stats().total_forks, 0);
             assert!(backend.full_sync.disk_sync_batch.is_none());
+            assert!(backend.full_sync.diskless_relay.is_none());
+            assert!(!backend.ctx.persistence().forkless_save_in_progress());
         }
         for token in all_connections {
             assert!(backend
@@ -575,11 +633,16 @@ fn final_edges_max_replica_threshold_preserves_all_defer_during_active_child() {
                 .is_deferred_diskless());
             assert!(_queued(&backend.connection_registry[Token(token)]).is_empty());
         }
+        assert_eq!(
+            backend.replication_runtime.count_deferred_diskless_links(),
+            6
+        );
+        backend.ctx.persistence_mut().complete_diskless_child();
     }
 }
 
 #[test]
-fn final_edges_shared_fire_filters_active_child_before_cohort_selection() {
+fn final_edges_shared_fire_preserves_every_cohort_during_active_child() {
     use crate::framework::distributed::replication::RdbFilterMode;
 
     let mut backend = ServerWorkerState::new(1).unwrap();
@@ -619,21 +682,25 @@ fn final_edges_shared_fire_filters_active_child_before_cohort_selection() {
         backend.fire_deferred_full_resyncs(ids);
     }
     for (id, token, mode) in targets {
-        assert_eq!(
+        assert!(
             backend
                 .replication_runtime
                 .primary_link(id)
                 .unwrap()
                 .is_deferred_diskless(),
-            mode == RdbFilterMode::All
+            "{mode:?}"
         );
         let wire = _queued(&backend.connection_registry[Token(token)]);
-        if mode == RdbFilterMode::All {
-            assert!(wire.is_empty());
-        } else {
-            final_edges_assert_filtered_body(&wire, Vec::new());
-        }
+        assert!(wire.is_empty(), "{mode:?} must retain its deferred wire");
     }
     assert_eq!(backend.ctx.persistence().diskless_child_pid(), Some(424242));
     assert_eq!(backend.ctx.stats().total_forks, 0);
+    assert!(backend.full_sync.disk_sync_batch.is_none());
+    assert!(backend.full_sync.diskless_relay.is_none());
+    assert!(!backend.ctx.persistence().forkless_save_in_progress());
+    assert_eq!(
+        backend.replication_runtime.count_deferred_diskless_links(),
+        3
+    );
+    backend.ctx.persistence_mut().complete_diskless_child();
 }

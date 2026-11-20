@@ -16,6 +16,7 @@ pub struct WatchedKey {
     pub db_id: u32,
     pub key: Bytes,
     pub expired: bool,
+    epoch: Option<crate::foundation::io::store::kv_engine::WatchSnapshot>,
 }
 
 impl WatchedKey {
@@ -24,7 +25,28 @@ impl WatchedKey {
             db_id,
             key,
             expired,
+            epoch: None,
         }
+    }
+
+    pub fn with_epoch(
+        db_id: u32,
+        key: Bytes,
+        expired: bool,
+        epoch: crate::foundation::io::store::kv_engine::WatchSnapshot,
+    ) -> Self {
+        Self {
+            db_id,
+            key,
+            expired,
+            epoch: Some(epoch),
+        }
+    }
+
+    pub fn has_changed(&self) -> bool {
+        self.epoch
+            .as_ref()
+            .is_some_and(|epoch| epoch.has_changed(self.expired))
     }
 
     pub fn matches(&self, db_id: u32, key: &[u8]) -> bool {
@@ -32,8 +54,14 @@ impl WatchedKey {
     }
 
     pub fn touched(&mut self, exists_after: bool) -> bool {
+        if self.has_changed() {
+            return true;
+        }
         if self.expired && !exists_after {
             self.expired = false;
+            if let Some(epoch) = &mut self.epoch {
+                epoch.acknowledge_deletion();
+            }
             return false;
         }
         true

@@ -76,31 +76,24 @@ pub enum ReplyValues<'a> {
 
 pub struct MatchOptions<'a> {
     pub has_lengths: bool,
+    pub should_exclude_self: bool,
     pub values: ReplyValues<'a>,
     pub count: Option<usize>,
     pub max_path_len: Option<usize>,
 }
 
-pub fn parse_match_options(
-    args: &[Bytes],
-    has_plural_lengths: bool,
-    allows_limits: bool,
-) -> Result<MatchOptions<'_>, Value> {
+pub fn parse_match_options(args: &[Bytes]) -> Result<MatchOptions<'_>, Value> {
     let mut options = MatchOptions {
         has_lengths: false,
+        should_exclude_self: false,
         values: ReplyValues::None,
         count: None,
         max_path_len: None,
     };
-    let length_option: &[u8] = if has_plural_lengths {
-        b"LENGTHS"
-    } else {
-        b"LENGTH"
-    };
     let mut index = 0;
     while index < args.len() {
         let option = &args[index];
-        if is_option(option, length_option) && !options.has_lengths {
+        if is_option(option, b"LENGTHS") && !options.has_lengths {
             options.has_lengths = true;
             index += 1;
         } else if is_option(option, b"WITHVALUES") && matches!(options.values, ReplyValues::None) {
@@ -118,15 +111,13 @@ pub fn parse_match_options(
             let end = fields_index + count;
             options.values = ReplyValues::Fields(&args[fields_index..end]);
             index = end;
-        } else if allows_limits
-            && is_option(option, b"COUNT")
-            && options.count.is_none()
-            && index + 1 < args.len()
-        {
+        } else if is_option(option, b"EXCLUDESELF") && !options.should_exclude_self {
+            options.should_exclude_self = true;
+            index += 1;
+        } else if is_option(option, b"COUNT") && options.count.is_none() && index + 1 < args.len() {
             options.count = Some(parse_long_range(&args[index + 1], 1)?);
             index += 2;
-        } else if allows_limits
-            && is_option(option, b"MAXPATHLEN")
+        } else if is_option(option, b"MAXPATHLEN")
             && options.max_path_len.is_none()
             && index + 1 < args.len()
         {
@@ -137,6 +128,42 @@ pub fn parse_match_options(
         }
     }
     Ok(options)
+}
+
+pub struct ScanOptions<'a> {
+    pub count: usize,
+    pub filter: Option<&'a [u8]>,
+}
+
+pub fn parse_scan_options<'a>(
+    args: &'a [Bytes],
+    filter_name: &[u8],
+) -> Result<ScanOptions<'a>, Value> {
+    let mut options = ScanOptions {
+        count: 10,
+        filter: None,
+    };
+    let mut has_count = false;
+    let mut index = 0;
+    while index < args.len() {
+        if index + 1 >= args.len() {
+            return Err(CommandError::syntax_error());
+        }
+        if is_option(&args[index], b"COUNT") && !has_count {
+            options.count = parse_long_range(&args[index + 1], 1)?;
+            has_count = true;
+        } else if is_option(&args[index], filter_name) && options.filter.is_none() {
+            options.filter = Some(&args[index + 1]);
+        } else {
+            return Err(CommandError::syntax_error());
+        }
+        index += 2;
+    }
+    Ok(options)
+}
+
+pub fn reply_page(cursor: Bytes, entries: Vec<Value>) -> Value {
+    Value::Array(vec![Value::bulk(cursor), Value::Array(entries)])
 }
 
 pub fn read_path_hash<'a>(

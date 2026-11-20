@@ -224,6 +224,175 @@ fn finish_and_cancel_are_idempotent() {
 }
 
 #[test]
+fn reconcile_remote_finish_accepts_primary_terminal_state_after_local_failure() {
+    let mut registry = MigrationRegistry::default();
+    registry.start(export_job(b'1', &[(1, 1)], 10)).unwrap();
+
+    // A local full-sync failure marks the tracking import failed first.
+    registry
+        .finish(
+            &job_id(b'1'),
+            TerminalPhase::Failed,
+            Some("Full resynchronization occurred".into()),
+            11,
+        )
+        .unwrap();
+
+    // The primary's later authoritative FINISH SUCCESS must reconcile it.
+    let actions = registry
+        .reconcile_remote_finish(
+            &job_id(b'1'),
+            TerminalPhase::Success,
+            Some("done".into()),
+            12,
+        )
+        .unwrap();
+    assert_eq!(actions, vec![MigrationAction::Cleanup(job_id(b'1'))]);
+    let view = registry.views().into_iter().next().unwrap();
+    assert_eq!(view.phase, MigrationPhase::Terminal(TerminalPhase::Success));
+    assert_eq!(view.message.as_deref(), Some("done"));
+    assert_eq!(view.last_update_time, 12);
+
+    // Repeating the same reconciled terminal state stays idempotent.
+    assert!(registry
+        .reconcile_remote_finish(
+            &job_id(b'1'),
+            TerminalPhase::Success,
+            Some("again".into()),
+            13,
+        )
+        .unwrap()
+        .is_empty());
+    let view = registry.views().into_iter().next().unwrap();
+    assert_eq!(view.message.as_deref(), Some("done"));
+    assert_eq!(view.last_update_time, 12);
+}
+
+#[test]
+fn reconcile_remote_finish_keeps_failed_when_primary_reports_failed() {
+    let mut registry = MigrationRegistry::default();
+    registry.start(export_job(b'1', &[(1, 1)], 10)).unwrap();
+    registry
+        .finish(
+            &job_id(b'1'),
+            TerminalPhase::Failed,
+            Some("local".into()),
+            11,
+        )
+        .unwrap();
+
+    assert!(registry
+        .reconcile_remote_finish(
+            &job_id(b'1'),
+            TerminalPhase::Failed,
+            Some("remote".into()),
+            12,
+        )
+        .unwrap()
+        .is_empty());
+    let view = registry.views().into_iter().next().unwrap();
+    assert_eq!(view.phase, MigrationPhase::Terminal(TerminalPhase::Failed));
+    assert_eq!(view.message.as_deref(), Some("local"));
+}
+
+#[test]
+fn reconcile_remote_finish_on_active_job_matches_finish_contract() {
+    let mut registry = MigrationRegistry::default();
+    registry.start(export_job(b'1', &[(1, 1)], 10)).unwrap();
+
+    let actions = registry
+        .reconcile_remote_finish(
+            &job_id(b'1'),
+            TerminalPhase::Success,
+            Some("done".into()),
+            12,
+        )
+        .unwrap();
+    assert_eq!(actions, vec![MigrationAction::Cleanup(job_id(b'1'))]);
+    assert!(matches!(
+        registry.reconcile_remote_finish(&job_id(b'9'), TerminalPhase::Success, None, 13),
+        Err(MigrationError::UnknownJob(_))
+    ));
+}
+
+#[test]
+fn swap_tracking_import_retains_ownership_until_explicit_cleanup() {
+    let mut registry = MigrationRegistry::default();
+    let tracking = || {
+        MigrationJob::new_tracking_import(
+            job_id(b'1'),
+            node_id(b'a'),
+            node_id(b'b'),
+            ranges(&[(1, 1)]),
+            10,
+        )
+    };
+    registry.start(tracking()).unwrap();
+    registry.fail_tracking_imports_after_swap("full sync", 11);
+    assert_eq!(
+        registry.get(&job_id(b'1')).unwrap().phase,
+        MigrationPhase::Terminal(TerminalPhase::Failed)
+    );
+    assert_eq!(registry.tracking_import_views().len(), 1);
+    assert_eq!(registry.import_snapshot_views().len(), 1);
+    assert_eq!(
+        registry.start(tracking()),
+        Err(MigrationError::DuplicateJob(job_id(b'1')))
+    );
+    let overlapping = MigrationJob::new_tracking_import(
+        job_id(b'2'),
+        node_id(b'a'),
+        node_id(b'b'),
+        ranges(&[(1, 1)]),
+        12,
+    );
+    assert_eq!(
+        registry.start(overlapping),
+        Err(MigrationError::ActiveSlotOverlap { slot: 1 })
+    );
+    assert_eq!(
+        registry
+            .finish(&job_id(b'1'), TerminalPhase::Failed, None, 13)
+            .unwrap(),
+        vec![MigrationAction::Cleanup(job_id(b'1'))]
+    );
+    assert!(registry.tracking_import_views().is_empty());
+    assert!(registry.import_snapshot_views().is_empty());
+    assert!(registry
+        .finish(&job_id(b'1'), TerminalPhase::Failed, None, 14)
+        .unwrap()
+        .is_empty());
+    registry.start(tracking()).unwrap();
+}
+
+#[test]
+fn role_change_cleanup_includes_locally_failed_tracking_imports() {
+    for should_fail_all in [false, true] {
+        let mut registry = MigrationRegistry::default();
+        registry
+            .start(MigrationJob::new_tracking_import(
+                job_id(b'1'),
+                node_id(b'a'),
+                node_id(b'b'),
+                ranges(&[(1, 1)]),
+                10,
+            ))
+            .unwrap();
+        registry.fail_tracking_imports_after_swap("full sync", 11);
+        let actions = if should_fail_all {
+            registry.fail_all("role change", 12)
+        } else {
+            registry.fail_imports("role change", 12)
+        };
+        assert_eq!(actions, vec![MigrationAction::Cleanup(job_id(b'1'))]);
+        assert!(registry.tracking_import_views().is_empty());
+        assert!(registry.import_snapshot_views().is_empty());
+        registry.trim_history(0);
+        assert!(registry.views().is_empty());
+    }
+}
+
+#[test]
 fn flush_failure_terminates_all_active_jobs() {
     let mut registry = MigrationRegistry::default();
     registry.start(export_job(b'1', &[(1, 1)], 10)).unwrap();

@@ -52,7 +52,8 @@ impl CommandRuntime for ServerCommandRuntime<'_> {
     }
 
     fn now_us(&self) -> u64 {
-        crate::foundation::io::sys::time::ustime().max(0) as u64
+        // Blocked servicing advances TIME without thawing script expiry.
+        crate::foundation::io::sys::time::cached_wall_ustime().max(0) as u64
     }
 
     fn ensure_db_access(&mut self, index: u32, command: &str) -> Result<(), Value> {
@@ -266,7 +267,12 @@ impl CommandRuntime for ServerCommandRuntime<'_> {
         drop(users);
         fail_slot_migrations_for_flush(self.ctx);
         self.ctx.hotkeys().purge(|id, _| id == db_idx);
-        if self.ctx.db(db_idx).is_some_and(|db| db.dbsize() > 0) {
+        let should_cancel_snapshot = match self.ctx.persistence().forkless_save_purpose() {
+            Some(crate::engine::persistence::ForklessSavePurpose::ReplicationFile) => true,
+            Some(crate::engine::persistence::ForklessSavePurpose::ReplicationSocket) => false,
+            _ => self.ctx.db(db_idx).is_some_and(|db| db.dbsize() > 0),
+        };
+        if should_cancel_snapshot {
             self.ctx.persistence().cancel_forkless_save();
         }
         let lazyfree = match mode {
@@ -557,7 +563,7 @@ fn apply_server_event(
         "keymiss" => NOTIFY_KEY_MISS,
         "set" | "setbit" | "incrby" | "incrbyfloat" => NOTIFY_STRING,
         "expired" => NOTIFY_EXPIRED,
-        "phset" | "phmset" | "phdel" | "phdelprefix" => NOTIFY_PATH_HASH,
+        "phset" | "phmset" | "phdel" | "phpathdel" => NOTIFY_PATH_HASH,
         "linsert" | "lmove_from" | "lmove_to" | "lpop" | "lpush" | "lrem" | "lset" | "ltrim"
         | "rpop" | "rpush" => NOTIFY_LIST,
         "sadd" | "sdiffstore" | "sinterstore" | "srem" | "sunionstore" => NOTIFY_SET,

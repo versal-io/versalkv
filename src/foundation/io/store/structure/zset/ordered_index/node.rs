@@ -6,6 +6,12 @@ use std::mem::size_of;
 pub(super) const MAX_ITEMS: usize = 32;
 pub(super) const MIN_ITEMS: usize = MAX_ITEMS / 2;
 
+#[derive(Clone, Copy)]
+pub(super) enum DeletionPolicy {
+    Rebalance,
+    CompactLeaves(bool),
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct Entry {
     pub score: f64,
@@ -93,7 +99,7 @@ impl Node {
                         .skip(1)
                         .filter_map(|child| child.minimum.clone()),
                 );
-                debug_assert_eq!(separators.len() + 1, children.len());
+                debug_assert_eq!(separators.len(), children.len().saturating_sub(1));
             }
         }
     }
@@ -166,7 +172,7 @@ impl Node {
         Some(right)
     }
 
-    pub fn delete(&mut self, score: f64, member: &[u8]) -> bool {
+    pub fn delete(&mut self, score: f64, member: &[u8], policy: DeletionPolicy) -> bool {
         match &mut self.data {
             NodeData::Leaf(entries) => {
                 let Ok(position) = entries.binary_search_by(|key| key.compare(score, member))
@@ -188,14 +194,27 @@ impl Node {
                 separators,
             } => {
                 let position = separators.partition_point(|key| key.compare(score, member).is_le());
-                if !children[position].delete(score, member) {
+                if !children[position].delete(score, member, policy) {
                     return false;
                 }
-                if children[position].occupancy() < MIN_ITEMS {
+                if matches!(policy, DeletionPolicy::Rebalance)
+                    && children[position].occupancy() < MIN_ITEMS
+                {
                     // Rebalance may borrow or merge children, so rebuild.
                     Self::rebalance(children, position);
                     self.refresh();
                     return true;
+                }
+                if let DeletionPolicy::CompactLeaves(is_allowed) = policy {
+                    let has_empty_child = children[position].count == 0;
+                    if has_empty_child {
+                        children.remove(position);
+                    }
+                    let has_compacted = is_allowed && Self::compact_leaves(children);
+                    if has_empty_child || has_compacted {
+                        self.refresh();
+                        return true;
+                    }
                 }
                 self.count = children.iter().map(|child| child.count).sum();
                 if position == 0 {
@@ -206,6 +225,39 @@ impl Node {
                 true
             }
         }
+    }
+
+    fn compact_leaves(children: &mut Vec<Self>) -> bool {
+        if children.len() < 2 || !matches!(children[0].data, NodeData::Leaf(_)) {
+            return false;
+        }
+        let total: usize = children.iter().map(|child| child.count).sum();
+        if total * 100 >= children.len() * MAX_ITEMS * 50 {
+            return false;
+        }
+        let target = MAX_ITEMS * 80 / 100;
+        let needed = total.div_ceil(target);
+        if needed >= children.len() {
+            return false;
+        }
+        // Move shared entry owners in sorted order, retaining the first leaves
+        // and dropping only surplus nodes. No member payloads are copied.
+        let mut entries = Vec::with_capacity(total);
+        for child in children.iter_mut() {
+            if let NodeData::Leaf(items) = &mut child.data {
+                entries.append(items);
+            }
+        }
+        let mut entries = entries.into_iter();
+        children.truncate(needed);
+        for (position, child) in children.iter_mut().enumerate() {
+            let count = total / needed + usize::from(position < total % needed);
+            if let NodeData::Leaf(items) = &mut child.data {
+                items.extend(entries.by_ref().take(count));
+            }
+            child.refresh();
+        }
+        true
     }
 
     fn rebalance(children: &mut Vec<Self>, position: usize) {

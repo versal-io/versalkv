@@ -246,3 +246,118 @@ fn extract_module_keys<'a>(
     }
     keys
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::framework::commands::introspection::CommandCatalog;
+
+    fn assert_pfmerge_keys(key_args: &[&'static [u8]], expected_flags: &[&[&'static str]]) {
+        assert_eq!(key_args.len(), expected_flags.len());
+        let mut registry = CommandRegistry::new();
+        registry.register(crate::framework::commands::hyperloglog::pfmerge::PFMERGE_SPEC);
+        let mut ctx = ServerContext::new(1);
+        ctx.set_command_registry_snapshot(&registry);
+        let mut args = vec![Bytes::from_static(b"PfMeRgE")];
+        args.extend(key_args.iter().map(|key| Bytes::from_static(key)));
+        let expected_keys = Value::Array(
+            key_args
+                .iter()
+                .map(|key| Value::bulk(Bytes::from_static(key)))
+                .collect(),
+        );
+        let expected_keys_and_flags = Value::Array(
+            key_args
+                .iter()
+                .zip(expected_flags)
+                .map(|(key, flags)| {
+                    Value::Array(vec![
+                        Value::bulk(Bytes::from_static(key)),
+                        Value::Array(
+                            flags
+                                .iter()
+                                .map(|flag| Value::bulk(Bytes::from_static(flag.as_bytes())))
+                                .collect(),
+                        ),
+                    ])
+                })
+                .collect(),
+        );
+        let catalogs: [&dyn CommandCatalog; 2] =
+            [&ctx, &super::super::static_catalog::STATIC_COMMAND_CATALOG];
+        for catalog in catalogs {
+            assert_eq!(catalog.getkeys(&args, false), expected_keys);
+            assert_eq!(catalog.getkeys(&args, true), expected_keys_and_flags);
+        }
+        assert_eq!(
+            extract_command_keys("pfmerge", &args[1..], &ctx),
+            key_args
+                .iter()
+                .zip(expected_flags)
+                .map(|(key, flags)| (*key, flags.to_vec()))
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            registry
+                .lookup(b"pfmerge")
+                .unwrap()
+                .descriptor()
+                .extract_key_accesses(&crate::framework::CommandArgs::from_parts(args)),
+            Some(
+                key_args
+                    .iter()
+                    .zip(expected_flags)
+                    .map(|(key, flags)| (Bytes::from_static(key), flags.to_vec()))
+                    .collect::<Vec<_>>(),
+            ),
+        );
+    }
+
+    #[test]
+    fn pfmerge_getkeys_without_source_keys() {
+        assert_pfmerge_keys(&[b"k1"], &[&["RW", "access", "insert"]]);
+    }
+
+    #[test]
+    fn pfmerge_getkeys_sources_are_read_only() {
+        assert_pfmerge_keys(
+            &[b"k1", b"k2"],
+            &[&["RW", "access", "insert"], &["RO", "access"]],
+        );
+        assert_pfmerge_keys(
+            &[b"k1", b"k2", b"k3"],
+            &[
+                &["RW", "access", "insert"],
+                &["RO", "access"],
+                &["RO", "access"],
+            ],
+        );
+    }
+
+    #[test]
+    fn pfmerge_getkeys_preserves_duplicate_sources_and_destination_aliases() {
+        assert_pfmerge_keys(
+            &[b"k1", b"k2", b"k2", b"k1", b"k1"],
+            &[
+                &["RW", "access", "insert"],
+                &["RO", "access"],
+                &["RO", "access"],
+                &["RO", "access"],
+                &["RO", "access"],
+            ],
+        );
+    }
+
+    #[test]
+    fn pfmerge_getkeys_preserves_binary_and_empty_keys() {
+        assert_pfmerge_keys(
+            &[b"dst\0\xff", b"", b"src\0\xfe", b"dst\0\xff"],
+            &[
+                &["RW", "access", "insert"],
+                &["RO", "access"],
+                &["RO", "access"],
+                &["RO", "access"],
+            ],
+        );
+    }
+}

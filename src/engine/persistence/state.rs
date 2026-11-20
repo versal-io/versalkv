@@ -15,6 +15,13 @@ pub enum OperationStatus {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForklessSavePurpose {
+    Persistence,
+    ReplicationFile,
+    ReplicationSocket,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PersistenceChild {
     Rdb {
         pid: i32,
@@ -148,6 +155,7 @@ pub struct PersistenceState {
     aof: AofState,
     child: Option<PersistenceChild>,
     forkless: Option<(BackgroundRdbSave, i64)>,
+    forkless_purpose: ForklessSavePurpose,
     forkless_feed: Option<ForklessFeed>,
     forkless_keys: HashSet<ForklessItemId>,
     forkless_captured_keys: HashSet<ForklessItemId>,
@@ -209,6 +217,7 @@ impl PersistenceState {
             },
             child: None,
             forkless: None,
+            forkless_purpose: ForklessSavePurpose::Persistence,
             forkless_feed: None,
             forkless_keys: HashSet::new(),
             forkless_captured_keys: HashSet::new(),
@@ -306,12 +315,49 @@ impl PersistenceState {
         self.child
     }
 
+    fn replace_child(&mut self, child: Option<PersistenceChild>) -> Option<PersistenceChild> {
+        let previous = std::mem::replace(&mut self.child, child);
+        // Match the parent's fork registration/reset boundary, not the next cron.
+        crate::foundation::io::store::structure::zset::ordered_index::set_leaf_compaction_allowed(
+            self.child.is_none(),
+        );
+        previous
+    }
+
     pub fn has_active_child(&self) -> bool {
         self.child.is_some() || self.forkless.is_some()
     }
 
+    /// Equivalent to C `hasActiveChildProcess()`: only a real forked child is
+    /// counted. A forkless background save runs without a child process and
+    /// must not block slot-export snapshot scheduling on its own.
+    pub fn has_child_process(&self) -> bool {
+        self.child.is_some()
+    }
+
     pub fn forkless_save_in_progress(&self) -> bool {
         self.forkless.is_some()
+    }
+
+    pub fn forkless_save_purpose(&self) -> Option<ForklessSavePurpose> {
+        self.forkless.as_ref().map(|_| self.forkless_purpose)
+    }
+
+    pub fn begin_forkless_transfer(
+        &mut self,
+        task: BackgroundRdbSave,
+        purpose: ForklessSavePurpose,
+    ) -> Result<(), StateError> {
+        if self.has_active_child() {
+            return Err(StateError::ChildAlreadyRunning);
+        }
+        debug_assert!(purpose != ForklessSavePurpose::Persistence);
+        self.begin_rdb_metrics(task.control().progress().total_keys);
+        self.rdb.current_bgsave_type = Some(BgsaveMethod::Forkless);
+        self.rdb.started = Some(Instant::now());
+        self.forkless_purpose = purpose;
+        self.forkless = Some((task, self.dirty));
+        Ok(())
     }
 
     pub fn forkless_capture_in_progress(&self) -> bool {
@@ -364,6 +410,7 @@ impl PersistenceState {
         }
         self.begin_rdb_metrics(task.control().progress().total_keys);
         self.begin_save_metrics(BgsaveMethod::Forkless, now_sec);
+        self.forkless_purpose = ForklessSavePurpose::Persistence;
         self.forkless_keys = forkless_keys
             .into_iter()
             .map(|(db_id, key)| ForklessItemId {
@@ -594,6 +641,21 @@ impl PersistenceState {
         }
         self.forkless_current_to_original_db.clear();
         self.forkless_original_to_current_db.clear();
+        if self.forkless_purpose != ForklessSavePurpose::Persistence {
+            match &outcome {
+                RdbSaveOutcome::Saved => {
+                    self.rdb.last_bgsave_type = Some(BgsaveMethod::Forkless);
+                    self.rdb.last_bgsave_status = OperationStatus::Ok;
+                }
+                RdbSaveOutcome::Failed(_) => {
+                    self.rdb.last_bgsave_type = Some(BgsaveMethod::Forkless);
+                    self.rdb.last_bgsave_status = OperationStatus::Err;
+                }
+                RdbSaveOutcome::Cancelled => {}
+            }
+            self.clear_save_metrics();
+            return Some(outcome);
+        }
         match &outcome {
             RdbSaveOutcome::Saved => {
                 self.rdb.last_bgsave_status = OperationStatus::Ok;
@@ -621,10 +683,6 @@ impl PersistenceState {
 
     pub fn schedule_bgsave(&mut self, method: BgsaveMethod) {
         self.bgsave_scheduled = Some(method);
-    }
-
-    pub fn scheduled_bgsave_method(&self) -> Option<BgsaveMethod> {
-        self.bgsave_scheduled
     }
 
     pub fn aof_rewrite_scheduled(&self) -> bool {
@@ -735,22 +793,20 @@ impl PersistenceState {
             return Err(StateError::ChildAlreadyRunning);
         }
         self.begin_save_metrics(BgsaveMethod::Fork, now_sec);
-        self.child = Some(PersistenceChild::Rdb {
+        self.replace_child(Some(PersistenceChild::Rdb {
             pid,
             dirty_at_fork: self.dirty,
-        });
+        }));
         crate::foundation::io::sys::signal::set_rdb_child_pid(pid);
         Ok(())
     }
 
     pub fn complete_rdb_child(&mut self, success: bool, now_sec: i64) -> Result<(), StateError> {
-        let dirty_at_fork = match self.child.take() {
+        let dirty_at_fork = match self.child {
             Some(PersistenceChild::Rdb { dirty_at_fork, .. }) => dirty_at_fork,
-            other => {
-                self.child = other;
-                return Err(StateError::WrongChild);
-            }
+            _ => return Err(StateError::WrongChild),
         };
+        self.replace_child(None);
         self.rdb.last_bgsave_status = if success {
             self.rdb.last_save_time_sec = now_sec;
             self.dirty = self.dirty.saturating_sub(dirty_at_fork);
@@ -770,7 +826,7 @@ impl PersistenceState {
             return Err(StateError::ChildAlreadyRunning);
         }
         self.begin_transfer_metrics();
-        self.child = Some(PersistenceChild::DisklessSync { pid });
+        self.replace_child(Some(PersistenceChild::DisklessSync { pid }));
         Ok(())
     }
 
@@ -778,7 +834,7 @@ impl PersistenceState {
     /// dirty accounting: a diskless full-sync is not a disk persistence point.
     pub fn complete_diskless_child(&mut self) {
         if matches!(self.child, Some(PersistenceChild::DisklessSync { .. })) {
-            self.child = None;
+            self.replace_child(None);
             self.clear_save_metrics();
         }
     }
@@ -788,7 +844,7 @@ impl PersistenceState {
             return Err(StateError::ChildAlreadyRunning);
         }
         self.begin_transfer_metrics();
-        self.child = Some(PersistenceChild::DiskSync { pid });
+        self.replace_child(Some(PersistenceChild::DiskSync { pid }));
         Ok(())
     }
 
@@ -796,7 +852,7 @@ impl PersistenceState {
     /// no dirty accounting, because a full-sync transfer is not a disk save.
     pub fn complete_disk_sync_child(&mut self) {
         if matches!(self.child, Some(PersistenceChild::DiskSync { .. })) {
-            self.child = None;
+            self.replace_child(None);
             self.clear_save_metrics();
         }
     }
@@ -805,13 +861,13 @@ impl PersistenceState {
         if self.has_active_child() {
             return Err(StateError::ChildAlreadyRunning);
         }
-        self.child = Some(PersistenceChild::SlotMigration { pid });
+        self.replace_child(Some(PersistenceChild::SlotMigration { pid }));
         Ok(())
     }
 
     pub fn complete_slot_migration_child(&mut self) {
         if matches!(self.child, Some(PersistenceChild::SlotMigration { .. })) {
-            self.child = None;
+            self.replace_child(None);
         }
     }
 
@@ -819,7 +875,7 @@ impl PersistenceState {
         if self.has_active_child() {
             return Err(StateError::ChildAlreadyRunning);
         }
-        self.child = Some(PersistenceChild::AofRewrite { pid, started_ms });
+        self.replace_child(Some(PersistenceChild::AofRewrite { pid, started_ms }));
         self.aof_rewrite_scheduled = false;
         self.reset_aof_selected_db();
         self.aof.rewrite.buffer.clear();
@@ -834,13 +890,11 @@ impl PersistenceState {
         success: bool,
         completed_ms: i64,
     ) -> Result<Vec<u8>, StateError> {
-        let started_ms = match self.child.take() {
+        let started_ms = match self.child {
             Some(PersistenceChild::AofRewrite { started_ms, .. }) => started_ms,
-            other => {
-                self.child = other;
-                return Err(StateError::WrongChild);
-            }
+            _ => return Err(StateError::WrongChild),
         };
+        self.replace_child(None);
         self.aof.rewrite.last_duration_sec = completed_ms.saturating_sub(started_ms) / 1_000;
         self.aof.rewrite.last_status = if success {
             OperationStatus::Ok
@@ -872,7 +926,7 @@ impl PersistenceState {
     }
 
     pub fn abort_child(&mut self) -> Option<PersistenceChild> {
-        let child = self.child.take();
+        let child = self.replace_child(None);
         match child {
             Some(PersistenceChild::Rdb { .. }) => {
                 self.clear_save_metrics();
@@ -936,6 +990,412 @@ impl Default for PersistenceState {
 #[cfg(test)]
 mod tests {
     use super::{OperationStatus, PersistenceChild, PersistenceState, StateError};
+
+    mod child_compaction_lifecycle {
+        use super::{PersistenceChild, PersistenceState, StateError};
+        use crate::foundation::io::store::structure::zset::{
+            ordered_index::set_leaf_compaction_allowed, ZSetSl,
+        };
+        use crate::foundation::memory::value::ZSetOps;
+
+        const CHILDREN: [PersistenceChild; 5] = [
+            PersistenceChild::Rdb {
+                pid: 101,
+                dirty_at_fork: 0,
+            },
+            PersistenceChild::AofRewrite {
+                pid: 102,
+                started_ms: 1_000,
+            },
+            PersistenceChild::DisklessSync { pid: 103 },
+            PersistenceChild::DiskSync { pid: 104 },
+            PersistenceChild::SlotMigration { pid: 105 },
+        ];
+
+        struct ResetCompaction;
+
+        impl Drop for ResetCompaction {
+            fn drop(&mut self) {
+                set_leaf_compaction_allowed(true);
+            }
+        }
+
+        fn begin_child(
+            state: &mut PersistenceState,
+            child: PersistenceChild,
+        ) -> Result<(), StateError> {
+            match child {
+                PersistenceChild::Rdb { pid, .. } => state.begin_rdb_child(pid, 1),
+                PersistenceChild::AofRewrite { pid, started_ms } => {
+                    state.begin_aof_rewrite_child(pid, started_ms)
+                }
+                PersistenceChild::DisklessSync { pid } => state.begin_diskless_child(pid),
+                PersistenceChild::DiskSync { pid } => state.begin_disk_sync_child(pid),
+                PersistenceChild::SlotMigration { pid } => state.begin_slot_migration_child(pid),
+            }
+        }
+
+        fn complete_child(
+            state: &mut PersistenceState,
+            child: PersistenceChild,
+            is_success: bool,
+        ) -> Result<(), StateError> {
+            match child {
+                PersistenceChild::Rdb { .. } => state.complete_rdb_child(is_success, 2),
+                PersistenceChild::AofRewrite { .. } => state
+                    .complete_aof_rewrite_child(is_success, 2_000)
+                    .map(|_| ()),
+                PersistenceChild::DisklessSync { .. } => {
+                    state.complete_diskless_child();
+                    Ok(())
+                }
+                PersistenceChild::DiskSync { .. } => {
+                    state.complete_disk_sync_child();
+                    Ok(())
+                }
+                PersistenceChild::SlotMigration { .. } => {
+                    state.complete_slot_migration_child();
+                    Ok(())
+                }
+            }
+        }
+
+        fn sparse_zset() -> ZSetSl {
+            // Keep every original leaf nonempty so leaf loss means compaction,
+            // not the permitted removal of an empty subtree.
+            set_leaf_compaction_allowed(false);
+            let mut zset = ZSetSl::new();
+            for index in 0..4_096 {
+                assert!(zset
+                    .add(&index.to_string().into_bytes(), index as f64)
+                    .unwrap());
+            }
+            let leaves_before = zset.ordered_index().memory_layout().leaf_nodes;
+            assert!(leaves_before > 1);
+            for index in 0..4_096 {
+                if index % 16 >= 4 {
+                    assert!(zset.remove(index.to_string().as_bytes()).unwrap());
+                }
+            }
+            assert_eq!(zset.len(), 1_024);
+            assert_eq!(
+                zset.ordered_index().memory_layout().leaf_nodes,
+                leaves_before
+            );
+            zset
+        }
+
+        fn assert_compaction(mut zset: ZSetSl, is_allowed: bool, boundary: &str) {
+            let leaves_before = zset.ordered_index().memory_layout().leaf_nodes;
+            for index in 0..4_096 {
+                if (1..4).contains(&(index % 16)) {
+                    assert!(zset.remove(index.to_string().as_bytes()).unwrap());
+                }
+            }
+            let leaves_after = zset.ordered_index().memory_layout().leaf_nodes;
+            println!("{boundary}: allowed={is_allowed}, leaves={leaves_before}->{leaves_after}");
+            assert_eq!(zset.len(), 256);
+            assert_eq!(zset.ordered_index().len(), 256);
+            for (rank, (member, score)) in zset.sorted_entries().into_iter().enumerate() {
+                let index = rank * 16;
+                assert_eq!(member.as_ref(), index.to_string().as_bytes());
+                assert_eq!(score, index as f64);
+                assert_eq!(zset.rank(&member), Some(rank));
+            }
+            if is_allowed {
+                assert!(
+                    leaves_after < leaves_before,
+                    "{boundary}: clearing a child must immediately resume leaf compaction"
+                );
+            } else {
+                assert_eq!(
+                    leaves_after, leaves_before,
+                    "{boundary}: a registered child must immediately preserve nonempty leaves"
+                );
+            }
+        }
+
+        fn assert_begin_pauses(child: PersistenceChild) {
+            let _reset = ResetCompaction;
+            let zset = sparse_zset();
+            set_leaf_compaction_allowed(true);
+            let mut state = PersistenceState::new();
+            begin_child(&mut state, child).unwrap();
+            assert_eq!(state.child(), Some(child));
+            assert_compaction(zset, false, &format!("begin {child:?}"));
+            assert_eq!(state.abort_child(), Some(child));
+        }
+
+        #[test]
+        fn begin_rdb_pauses_nonempty_leaf_compaction() {
+            assert_begin_pauses(CHILDREN[0]);
+        }
+
+        #[test]
+        fn begin_aof_rewrite_pauses_nonempty_leaf_compaction() {
+            assert_begin_pauses(CHILDREN[1]);
+        }
+
+        #[test]
+        fn begin_diskless_pauses_nonempty_leaf_compaction() {
+            assert_begin_pauses(CHILDREN[2]);
+        }
+
+        #[test]
+        fn begin_disk_sync_pauses_nonempty_leaf_compaction() {
+            assert_begin_pauses(CHILDREN[3]);
+        }
+
+        #[test]
+        fn begin_slot_migration_pauses_nonempty_leaf_compaction() {
+            assert_begin_pauses(CHILDREN[4]);
+        }
+
+        #[test]
+        fn completion_immediately_resumes_for_every_child_and_outcome() {
+            let _reset = ResetCompaction;
+            for child in CHILDREN {
+                for is_success in [true, false] {
+                    let zset = sparse_zset();
+                    let mut state = PersistenceState::new();
+                    begin_child(&mut state, child).unwrap();
+                    complete_child(&mut state, child, is_success).unwrap();
+                    assert_eq!(state.child(), None);
+                    assert_compaction(
+                        zset,
+                        true,
+                        &format!("complete {child:?}, success={is_success}"),
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn abort_immediately_resumes_for_every_child() {
+            let _reset = ResetCompaction;
+            for child in CHILDREN {
+                let zset = sparse_zset();
+                let mut state = PersistenceState::new();
+                begin_child(&mut state, child).unwrap();
+                assert_eq!(state.abort_child(), Some(child));
+                assert_eq!(state.child(), None);
+                assert_compaction(zset, true, &format!("abort {child:?}"));
+                assert_eq!(state.abort_child(), None);
+            }
+        }
+
+        #[test]
+        fn rejected_registration_preserves_child_and_compaction_gate() {
+            let _reset = ResetCompaction;
+            for child in CHILDREN {
+                for attempted in CHILDREN {
+                    let zset = sparse_zset();
+                    let mut state = PersistenceState::new();
+                    begin_child(&mut state, child).unwrap();
+                    assert_eq!(
+                        begin_child(&mut state, attempted),
+                        Err(StateError::ChildAlreadyRunning)
+                    );
+                    assert_eq!(state.child(), Some(child));
+                    assert_compaction(
+                        zset,
+                        false,
+                        &format!("reject {attempted:?} while {child:?}"),
+                    );
+                    assert_eq!(state.abort_child(), Some(child));
+                }
+            }
+        }
+
+        #[test]
+        fn wrong_completion_preserves_live_child_and_compaction_gate() {
+            let _reset = ResetCompaction;
+            for child in CHILDREN {
+                for attempted in CHILDREN {
+                    if child == attempted {
+                        continue;
+                    }
+                    let zset = sparse_zset();
+                    let mut state = PersistenceState::new();
+                    begin_child(&mut state, child).unwrap();
+                    let result = complete_child(&mut state, attempted, false);
+                    if matches!(
+                        attempted,
+                        PersistenceChild::Rdb { .. } | PersistenceChild::AofRewrite { .. }
+                    ) {
+                        assert_eq!(result, Err(StateError::WrongChild));
+                    } else {
+                        assert_eq!(result, Ok(()));
+                    }
+                    assert_eq!(state.child(), Some(child));
+                    assert_compaction(
+                        zset,
+                        false,
+                        &format!("wrong completion {attempted:?} while {child:?}"),
+                    );
+                    assert_eq!(state.abort_child(), Some(child));
+                }
+            }
+        }
+
+        #[test]
+        fn completion_without_child_does_not_change_compaction_gate() {
+            let _reset = ResetCompaction;
+            for child in CHILDREN {
+                for is_allowed in [true, false] {
+                    let zset = sparse_zset();
+                    set_leaf_compaction_allowed(is_allowed);
+                    let mut state = PersistenceState::new();
+                    let result = complete_child(&mut state, child, false);
+                    if matches!(
+                        child,
+                        PersistenceChild::Rdb { .. } | PersistenceChild::AofRewrite { .. }
+                    ) {
+                        assert_eq!(result, Err(StateError::WrongChild));
+                    } else {
+                        assert_eq!(result, Ok(()));
+                    }
+                    assert_eq!(state.child(), None);
+                    assert_compaction(zset, is_allowed, &format!("no child, complete {child:?}"));
+                }
+            }
+        }
+
+        #[test]
+        fn forkless_begin_rejection_completion_and_abort_do_not_pause_compaction() {
+            use crate::foundation::io::persistence::rdb::{
+                compression::{RdbCompression, RdbSnapshotOptions},
+                frozen::FrozenRdb,
+            };
+            use crate::foundation::io::persistence::snapshot::background::BackgroundRdbSave;
+            use crate::foundation::io::persistence::RdbSerializeOptions;
+            use crate::foundation::io::store::kv_engine::DbSet;
+
+            let _reset = ResetCompaction;
+            for purpose in [
+                super::super::ForklessSavePurpose::Persistence,
+                super::super::ForklessSavePurpose::ReplicationFile,
+                super::super::ForklessSavePurpose::ReplicationSocket,
+            ] {
+                for should_abort in [true, false] {
+                    let mut primary = DbSet::new(1);
+                    let frozen = FrozenRdb::capture(
+                        &primary,
+                        &[],
+                        &[],
+                        None,
+                        RdbSerializeOptions::default(),
+                        0,
+                        true,
+                    );
+                    let (task, reader) = BackgroundRdbSave::start_to_pipe(
+                        frozen,
+                        0,
+                        RdbSnapshotOptions {
+                            compression: RdbCompression::No,
+                            checksum: true,
+                        },
+                    )
+                    .unwrap();
+                    let zset = sparse_zset();
+                    set_leaf_compaction_allowed(true);
+                    let mut state = PersistenceState::new();
+                    if purpose == super::super::ForklessSavePurpose::Persistence {
+                        state
+                            .begin_forkless_save(task, 1, Vec::new(), None)
+                            .unwrap();
+                    } else {
+                        state.begin_forkless_transfer(task, purpose).unwrap();
+                    }
+                    assert!(state.has_active_child());
+                    assert_eq!(state.child(), None);
+                    assert_compaction(zset, true, &format!("begin forkless {purpose:?}"));
+                    for child in CHILDREN {
+                        let zset = sparse_zset();
+                        set_leaf_compaction_allowed(true);
+                        assert_eq!(
+                            begin_child(&mut state, child),
+                            Err(StateError::ChildAlreadyRunning)
+                        );
+                        assert_eq!(state.child(), None);
+                        assert!(state.forkless_save_in_progress());
+                        assert_compaction(zset, true, &format!("reject {child:?} during forkless"));
+                    }
+                    let zset = sparse_zset();
+                    set_leaf_compaction_allowed(true);
+                    if should_abort {
+                        state.abort_forkless_save(2, &mut primary, &mut []);
+                    } else {
+                        assert!(state
+                            .finish_primary_forkless_save_for_test(&mut primary)
+                            .is_some());
+                    }
+                    assert!(!state.has_active_child());
+                    assert_compaction(
+                        zset,
+                        true,
+                        &format!("finish forkless {purpose:?}, abort={should_abort}"),
+                    );
+                    drop(reader);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn forkless_socket_completion_preserves_dirty_and_lastsave_without_a_pid() {
+        use crate::foundation::io::persistence::rdb::{
+            compression::{RdbCompression, RdbSnapshotOptions},
+            frozen::FrozenRdb,
+        };
+        use crate::foundation::io::persistence::snapshot::background::{
+            BackgroundRdbSave, RdbSaveOutcome,
+        };
+        use crate::foundation::io::persistence::RdbSerializeOptions;
+        use crate::foundation::io::store::kv_engine::DbSet;
+        let mut primary = DbSet::new(1);
+        let frozen = FrozenRdb::capture(
+            &primary,
+            &[],
+            &[],
+            None,
+            RdbSerializeOptions::default(),
+            0,
+            true,
+        );
+        let (task, reader) = BackgroundRdbSave::start_to_pipe(
+            frozen,
+            0,
+            RdbSnapshotOptions {
+                compression: RdbCompression::No,
+                checksum: true,
+            },
+        )
+        .unwrap();
+        let mut state = PersistenceState::new();
+        state.set_dirty(13);
+        state.rdb.last_save_time_sec = 42;
+        state
+            .begin_forkless_transfer(task, super::ForklessSavePurpose::ReplicationSocket)
+            .unwrap();
+        assert!(state.has_active_child());
+        assert_eq!(state.child(), None);
+        assert_eq!(state.rdb_child_pid(), None);
+        assert_eq!(state.diskless_child_pid(), None);
+        state.add_dirty(7);
+        assert!(matches!(
+            state.finish_forkless_save(99, &mut primary, &mut []),
+            Some(RdbSaveOutcome::Saved),
+        ));
+        assert_eq!(state.dirty(), 20);
+        assert_eq!(state.rdb.last_save_time_sec, 42);
+        assert_eq!(
+            state.rdb.last_bgsave_type,
+            Some(super::BgsaveMethod::Forkless)
+        );
+        assert!(!state.has_active_child());
+        drop(reader);
+    }
 
     #[test]
     fn replication_transfer_registers_timing_without_persistence_accounting() {

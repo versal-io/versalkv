@@ -200,7 +200,6 @@ pub struct ServerConfig {
     pub maxclients_reserved: u32,
     pub priority_subnets: String,
     pub compiled_priority_subnets: Vec<super::qos::PrioritySubnet>,
-    pub priority_subnets_generation: u64,
     pub priority_preemptive_poll_interval_us: u64,
     /// C `max-new-connections-per-cycle`, shared per TCP listener callback.
     pub max_new_connections_per_cycle: u16,
@@ -395,7 +394,6 @@ impl ServerConfig {
             maxclients_reserved: 0,
             priority_subnets: String::new(),
             compiled_priority_subnets: Vec::new(),
-            priority_subnets_generation: 0,
             priority_preemptive_poll_interval_us: 2000,
             max_new_connections_per_cycle: 10,
             max_new_tls_connections_per_cycle: 1,

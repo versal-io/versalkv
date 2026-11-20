@@ -364,7 +364,7 @@ impl Robj {
             Robj::HashHashtable(_) | Robj::HashListpack(_) => self.hash_is_empty(),
             Robj::ZSetSkiplist(_) | Robj::ZSetListpack(_) => self.zset_is_empty(),
             Robj::StreamListpack(_) | Robj::StreamRadix(_) => false,
-            Robj::PathHash(_) => false,
+            Robj::PathHash(hash) => hash.is_empty(),
             Robj::StrInt(_) | Robj::StrEmbstr(_) | Robj::StrRaw(_) => false,
         }
     }

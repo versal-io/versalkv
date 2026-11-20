@@ -45,6 +45,39 @@ mod commit;
 use commit::*;
 
 impl ServerWorkerState {
+    /// A paused dual main has no read handler in C. Keep its failure attached
+    /// to this session until RDB loading ends and local replay checks liveness.
+    pub(crate) fn defer_paused_dual_main_failure(&mut self, token: Token, error: String) -> bool {
+        if !self.replication_runtime.replica_main_read_paused() {
+            return false;
+        }
+        let Some(link) = self.replication_runtime.replica_link_mut() else {
+            return false;
+        };
+        if link.connection_id().0 != token.0 || !link.is_dual_rdb_mode_active() {
+            return false;
+        }
+        link.record_primary_connection_error(error);
+        if let Some(connection) = self.connection_registry.get_mut(token) {
+            connection.clear_output_queue();
+        }
+        // Linux still reports HUP with no read/write interest. Release only
+        // the failed transport; the connection identity, session and pending
+        // data remain owned until the independent RDB load reaches replay.
+        if let Err(error) = self.transport.remove_registered(token) {
+            crate::server_log!(
+                warning,
+                "Failed to detach broken replica main transport: token={} error={}",
+                token.0,
+                error
+            );
+            // Retaining a source that cannot be isolated would spin the
+            // loader. Use the existing complete failure cleanup and retries.
+            self.tear_down_master_link(token.0);
+        }
+        true
+    }
+
     pub(crate) fn apply_replica_handshake_transitions(
         &mut self,
         link: &mut ReplicaLink,
@@ -375,7 +408,9 @@ impl ServerWorkerState {
         link: &mut ReplicaLink,
         commit: RdbCommit,
     ) -> Result<(), ()> {
-        let rdb_apply_position = link.prevalidate_rdb_apply_position().map_err(|_| ())?;
+        let rdb_apply_position = link
+            .prevalidate_rdb_commit_position(commit.repl_id.as_deref(), commit.repl_offset)
+            .map_err(|_| ())?;
         let rdb_boundary =
             ReplicationBacklog::rdb_snapshot_boundary(rdb_apply_position).map_err(|_| ())?;
         let is_dual = link.is_dual_rdb_mode_active();
@@ -398,9 +433,19 @@ impl ServerWorkerState {
         if let Some(received_rdb) = received_rdb {
             received_rdb.commit().map_err(|_| ())?;
         }
-        self.install_prepared_functions(&prepared.function_codes)?;
+        if !prepared.functions_applied {
+            self.install_prepared_functions(&prepared.function_codes)?;
+        }
         self.install_prepared_dataset(link, &mut prepared, rdb_boundary);
         self.install_prepared_aux(&prepared.aux_fields);
+        // Direct and disk loads replace old migrations before restoring AUX.
+        // Swap loading fails the restored log, but the incoming data must still
+        // consume replication until the primary sends SYNCSLOTS FINISH.
+        if link.rdb_load_mode()
+            == Some(crate::framework::distributed::replication::RdbLoadMode::Swap)
+        {
+            self.fail_tracking_imports_after_swap();
+        }
         let reused_aof_base = aof_base.is_some();
         self.publish_prepared_aof_base(aof_base);
         if delete_received_rdb && !reused_aof_base {
@@ -456,6 +501,9 @@ impl ServerWorkerState {
             function_codes,
             aux_fields,
             repl_stream_db,
+            repl_id: _,
+            repl_offset: _,
+            functions_applied,
             diskless,
             disk_backed,
             raw,
@@ -474,6 +522,7 @@ impl ServerWorkerState {
             function_codes,
             aux_fields,
             repl_stream_db,
+            functions_applied,
             disk_backed,
             raw,
             swapped,
@@ -560,13 +609,15 @@ impl ServerWorkerState {
         prepared: &mut PreparedRdbCommit,
         rdb_boundary: SnapshotBoundary,
     ) {
-        if prepared.swapped.is_some() {
+        if prepared.swapped.is_some() || link.requires_rdb_offset() {
             if let Some(rid) = link.master_replid() {
                 self.ctx
                     .replication_mut()
                     .backlog
                     .adopt_primary_from_rdb_boundary(rid, rdb_boundary);
             }
+        }
+        if prepared.swapped.is_some() {
             self.replication_runtime.discard_replica_resume();
             self.reset_downstream_after_full_sync(link.connection_id());
         }
@@ -625,6 +676,7 @@ impl ServerWorkerState {
             cluster.set_local_replication_offset(applied_offset);
         }
         link.set_selected_db(repl_stream_db);
+        self.ctx.set_tracking_import_selected_db(repl_stream_db);
         self.connection_registry
             [crate::framework::capabilities::io::Token(main_connection_token)]
         .selected_db = repl_stream_db;
@@ -644,10 +696,10 @@ impl ServerWorkerState {
                     .backlog
                     .adopt_primary_from_rdb_boundary(rid, rdb_boundary);
             }
+            // The snapshot transport no longer owns input after commit. Its
+            // later EOF must not invalidate the main channel's local replay.
+            self.close_replica_rdb_transport_after_load();
             self.commit_and_replay_dual_handoff_only(main_connection_token, link)?;
-            if !link.is_streaming() {
-                self.close_replica_rdb_transport_after_load();
-            }
         } else {
             self.ctx.config_mut().replication.master_link_status = "up".to_string();
             self.ctx.replication_mut().complete_full_sync();
@@ -703,6 +755,16 @@ impl ServerWorkerState {
         if self.pending_replication_replay.is_some() {
             self.pause_replica_main_reads(main_connection_token)?;
             return Ok(());
+        }
+        // Match C stopLoading() before dualChannelSyncSuccess(): the RDB load
+        // is complete once the handoff starts, so the buffered command stream
+        // replays with loading already cleared even when a pending buffer keeps
+        // the main link busy.
+        self.ctx.replication_mut().async_loading = false;
+        self.ctx.set_loading(false);
+        if link.primary_connection_error().is_some() {
+            self.log_primary_lost_while_streaming();
+            return Err(());
         }
         crate::server_log!(
             notice,
@@ -902,6 +964,22 @@ impl ServerWorkerState {
         self.remove_connection(main.0);
     }
 
+    /// Equivalent to C primaryConnBrokenWhileStreaming(): a retained socket
+    /// failure or retired transport makes the current session unusable.
+    fn primary_connection_broken_while_streaming(&self, link: &ReplicaLink) -> bool {
+        let token = Token(link.connection_id().0);
+        link.primary_connection_error().is_some()
+            || !self.connection_registry.contains(token)
+            || !self.transport.is_registered(token)
+    }
+
+    fn log_primary_lost_while_streaming(&self) {
+        crate::server_log!(
+            warning,
+            "Primary connection lost while streaming local replication buffer: connection closed"
+        );
+    }
+
     fn drive_pending_replication_replay_unit(
         &mut self,
         connection_token: usize,
@@ -912,6 +990,10 @@ impl ServerWorkerState {
             || !matches!(link.rdb_channel_state(), ReplicaRdbChannelState::RdbLoaded)
         {
             return Ok(());
+        }
+        if self.primary_connection_broken_while_streaming(link) {
+            self.log_primary_lost_while_streaming();
+            return Err(());
         }
 
         let Some(mut pending) = self
@@ -930,6 +1012,11 @@ impl ServerWorkerState {
             .is_err()
         {
             self.dispose_replica_pending_buffer(Some(pending));
+            return Err(());
+        }
+        if self.primary_connection_broken_while_streaming(link) {
+            self.dispose_replica_pending_buffer(Some(pending));
+            self.log_primary_lost_while_streaming();
             return Err(());
         }
 
@@ -972,6 +1059,7 @@ impl ServerWorkerState {
             // Snapshot selection is local setup, not an upstream SELECT frame.
             // Keep the AOF cursor unchanged so its next write selects this DB.
             link.set_selected_db(selected_db);
+            self.ctx.set_tracking_import_selected_db(selected_db);
             self.connection_registry[Token(connection_token)].selected_db = selected_db;
             self.ctx.set_repl_seldb(i64::from(selected_db));
             continuation.selected_db_applied = true;
@@ -1011,6 +1099,7 @@ impl ServerWorkerState {
         let owned = std::mem::replace(link, placeholder);
         self.replication_runtime.set_replica_link(owned);
         if !self.queue_replica_loading_newline(main) {
+            self.log_primary_lost_while_streaming();
             return ResumeDecision::Aborted;
         }
         let processed_bytes = self
@@ -1640,6 +1729,19 @@ impl ServerWorkerState {
         self.deliver_published(outcome.notifications, outcome.shard_notifications);
         if let Some((db1, db2)) = outcome.swapdb {
             self.apply_swapdb_watch_state(db1, db2);
+        }
+        if self.watched_key_clients > 0 {
+            for (db_id, key) in &outcome.dirty_keys {
+                let exists_after = self
+                    .ctx
+                    .db(*db_id)
+                    .is_some_and(|db| db.get_allow_expired(key).is_some());
+                for (_, connection) in self.connection_registry.iter_mut() {
+                    connection
+                        .transaction
+                        .touch_watched_key(*db_id, key, exists_after);
+                }
+            }
         }
         match pending_wakeup {
             Some(keys) => keys.extend(outcome.dirty_keys),

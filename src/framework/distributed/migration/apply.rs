@@ -31,19 +31,13 @@ pub(crate) fn apply_tracking_import_command(
         .map(|state| {
             state
                 .migrations
-                .views()
+                .tracking_import_views()
                 .into_iter()
                 .filter(|job| {
-                    job.operation
-                        == crate::engine::distributed::cluster::migration::MigrationOperation::Import
-                        && job.phase
-                            == crate::engine::distributed::cluster::migration::MigrationPhase::Import(
-                                crate::engine::distributed::cluster::migration::ImportPhase::OccurringOnPrimary,
-                            )
-                        && (is_stream_control
-                            || slots.as_ref().is_some_and(|slots| {
-                                slots.iter().any(|slot| job.ranges.contains(*slot))
-                            }))
+                    is_stream_control
+                        || slots.as_ref().is_some_and(|slots| {
+                            slots.iter().any(|slot| job.ranges.contains(*slot))
+                        })
                 })
                 .map(|job| job.id)
                 .collect::<Vec<_>>()
@@ -101,6 +95,10 @@ impl MigrationCommandPlayer {
             .selected_db()
             .and_then(|db| u32::try_from(db).ok())
             .unwrap_or(self.conn.selected_db)
+    }
+
+    pub(crate) fn set_selected_db(&mut self, selected_db: u32) {
+        self.conn.selected_db = selected_db;
     }
 
     pub fn apply(

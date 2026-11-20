@@ -1,8 +1,6 @@
 //! HSETEX typed parse, execute, and side-effect commit pipeline.
 
-use super::runtime_support::{
-    hash_field_deletion_propagation, hash_field_value_propagation,
-};
+use super::runtime_support::{hash_field_deletion_propagation, hash_field_value_propagation};
 use crate::engine::core::{CommandEffects, CommandOutcome, CoreEvent, Value};
 use crate::foundation::io::store::kv_engine::Db;
 use crate::framework::commands::command_runtime::CommandRuntime;
@@ -51,7 +49,9 @@ impl HSetExExpiry {
         }
         let value = match self {
             Self::None | Self::KeepTtl => return Ok(None),
-            Self::Seconds(value) => value.checked_mul(1_000).and_then(|v| v.checked_add(now as i64)),
+            Self::Seconds(value) => value
+                .checked_mul(1_000)
+                .and_then(|v| v.checked_add(now as i64)),
             Self::Milliseconds(value) => value.checked_add(now as i64),
             Self::UnixSeconds(value) => value.checked_mul(1_000),
             Self::UnixMilliseconds(value) => Some(value),
@@ -69,6 +69,7 @@ struct HSetExRequest {
     hash_condition: HashExistence,
     field_condition: FieldExistence,
     expiry: HSetExExpiry,
+    fields_token: Bytes,
     pairs: Vec<(Bytes, Bytes)>,
 }
 
@@ -82,14 +83,14 @@ impl HSetExRequest {
             .position(|arg| arg.eq_ignore_ascii_case(b"fields"))
             .map(|index| index + 1)
             .ok_or_else(CommandError::syntax_error)?;
-        let (hash_condition, field_condition, expiry) =
-            parse_options(&args.args[1..fields_index])?;
+        let (hash_condition, field_condition, expiry) = parse_options(&args.args[1..fields_index])?;
         let pairs = parse_pairs(&args.args, fields_index)?;
         Ok(Self {
             key: args.args[0].clone(),
             hash_condition,
             field_condition,
             expiry,
+            fields_token: args.args[fields_index].clone(),
             pairs,
         })
     }
@@ -101,29 +102,62 @@ fn parse_options(
     let mut hash = HashExistence::Any;
     let mut field = FieldExistence::Any;
     let mut expiry = HSetExExpiry::None;
+    let mut expiry_mode: Option<&[u8]> = None;
+    let mut expiry_index = None;
     let mut index = 0;
     while index < options.len() {
         let option = &options[index];
         if option.eq_ignore_ascii_case(b"nx") {
-            set_once(&mut hash, HashExistence::Missing, "ERR NX and XX are incompatible")?;
+            set_once(
+                &mut hash,
+                HashExistence::Missing,
+                "ERR NX and XX are incompatible",
+            )?;
         } else if option.eq_ignore_ascii_case(b"xx") {
-            set_once(&mut hash, HashExistence::Existing, "ERR NX and XX are incompatible")?;
+            set_once(
+                &mut hash,
+                HashExistence::Existing,
+                "ERR NX and XX are incompatible",
+            )?;
         } else if option.eq_ignore_ascii_case(b"fnx") {
-            set_once(&mut field, FieldExistence::AllMissing, "ERR FNX and FXX are incompatible")?;
+            set_once(
+                &mut field,
+                FieldExistence::AllMissing,
+                "ERR FNX and FXX are incompatible",
+            )?;
         } else if option.eq_ignore_ascii_case(b"fxx") {
-            set_once(&mut field, FieldExistence::AllExisting, "ERR FNX and FXX are incompatible")?;
+            set_once(
+                &mut field,
+                FieldExistence::AllExisting,
+                "ERR FNX and FXX are incompatible",
+            )?;
         } else {
-            let (parsed, consumed) = parse_expiry(options, index)?;
-            if expiry != HSetExExpiry::None
-                && !(expiry == HSetExExpiry::KeepTtl && parsed == HSetExExpiry::KeepTtl)
-            {
+            if expiry_mode.is_some_and(|mode| !mode.eq_ignore_ascii_case(option)) {
                 return Err(expiry_conflict());
             }
-            expiry = parsed;
-            index += consumed;
+            expiry_mode = Some(option);
+            if option.eq_ignore_ascii_case(b"keepttl") {
+                expiry = HSetExExpiry::KeepTtl;
+                index += 1;
+            } else {
+                if ![b"EX".as_slice(), b"PX", b"EXAT", b"PXAT"]
+                    .iter()
+                    .any(|mode| option.eq_ignore_ascii_case(mode))
+                {
+                    return Err(CommandError::syntax_error());
+                }
+                if index + 1 >= options.len() {
+                    return Err(Value::error("ERR value is not an integer or out of range"));
+                }
+                expiry_index = Some(index);
+                index += 2;
+            }
             continue;
         }
         index += 1;
+    }
+    if let Some(index) = expiry_index {
+        expiry = parse_expiry(options, index)?.0;
     }
     Ok((hash, field, expiry))
 }
@@ -241,7 +275,8 @@ fn conditions_allow(db: &mut Db, request: &HSetExRequest, settings: &HSetExSetti
             .ok()
             .flatten()
             .is_some_and(|hash| hash.hash_contains(field))
-            && (settings.ignore_expiry || !db.hash_field_expired_at(&request.key, field, settings.now_ms));
+            && (settings.ignore_expiry
+                || !db.hash_field_expired_at(&request.key, field, settings.now_ms));
         match request.field_condition {
             FieldExistence::Any => true,
             FieldExistence::AllMissing => !exists,
@@ -264,7 +299,8 @@ fn execute_hsetex(
     .map_err(|_| CommandError::wrong_type())?;
     let mut outcome = HSetExOutcome::default();
     for (field, value) in &request.pairs {
-        let expired = !settings.ignore_expiry && db.hash_field_expired_at(&request.key, field, settings.now_ms);
+        let expired = !settings.ignore_expiry
+            && db.hash_field_expired_at(&request.key, field, settings.now_ms);
         let preserved = if matches!(request.expiry, HSetExExpiry::KeepTtl) && !expired {
             db.get_hash_field_expire(&request.key, field)
         } else {
@@ -298,7 +334,9 @@ fn apply_new_expiry(
     settings: &HSetExSettings,
     outcome: &mut HSetExOutcome,
 ) {
-    let Some(expire_at) = settings.expire_at_ms else { return };
+    let Some(expire_at) = settings.expire_at_ms else {
+        return;
+    };
     db.set_hash_field_expire(&request.key, field, expire_at);
     if expire_at <= settings.now_ms && !settings.should_preserve_deadline {
         if let Ok(Some(hash)) = db.get_hash_object_mut(&request.key) {
@@ -362,11 +400,7 @@ fn build_settings(
 }
 
 impl HSetExCommit {
-    fn into_outcome(
-        self,
-        db: &mut Db,
-        db_index: u32,
-    ) -> CommandOutcome {
+    fn into_outcome(self, db: &mut Db, db_index: u32) -> CommandOutcome {
         let mut effects = CommandEffects {
             changed_keys: vec![(db_index, self.request.key.clone())],
             expired_hash_fields: self.outcome.expired_count(),
@@ -392,12 +426,14 @@ impl HSetExCommit {
                 .iter()
                 .zip(&self.outcome.preserved_expiries)
             {
-                effects.custom_propagations.push(hash_field_value_propagation(
-                    &self.request.key,
-                    field,
-                    value,
-                    *expiry,
-                ));
+                effects
+                    .custom_propagations
+                    .push(hash_field_value_propagation(
+                        &self.request.key,
+                        field,
+                        value,
+                        *expiry,
+                    ));
             }
         }
         if self.outcome.overwritten_expired > 0 {
@@ -433,7 +469,7 @@ fn encode_hsetex_at(request: &HSetExRequest, expire_at: u64) -> Vec<Bytes> {
         request.key.clone(),
         Bytes::from_static(b"PXAT"),
         expire_at.to_string().into(),
-        Bytes::from_static(b"FIELDS"),
+        request.fields_token.clone(),
         request.pairs.len().to_string().into(),
     ];
     for (field, value) in &request.pairs {
@@ -458,11 +494,11 @@ fn remove_empty_hash(db: &mut Db, key: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{hsetex, FieldExistence, HashExistence, HSetExExpiry, HSetExRequest};
+    use super::{hsetex, FieldExistence, HSetExExpiry, HSetExRequest, HashExistence};
     use crate::engine::command::CommandArgs;
-    use crate::framework::commands::command_runtime::{CommandRuntime, TestCommandRuntime};
     use crate::foundation::io::protocol::Value;
     use crate::foundation::io::store::kv_engine::now_ms;
+    use crate::framework::commands::command_runtime::{CommandRuntime, TestCommandRuntime};
     use bytes::Bytes;
 
     fn runtime_with_field(now_ms: u64, expire_at: u64) -> TestCommandRuntime {
@@ -507,6 +543,17 @@ mod tests {
         assert_eq!(request.field_condition, FieldExistence::AllMissing);
         assert_eq!(request.expiry, HSetExExpiry::Milliseconds(10));
         assert_eq!(request.pairs.len(), 1);
+        for options in [
+            vec!["PX", "100", "pX", "200"],
+            vec!["PX", "invalid", "PX", "200"],
+        ] {
+            let mut parts = vec!["HSETEX", "hash"];
+            parts.extend(options);
+            parts.extend(["FIELDS", "1", "field", "value"]);
+            let args = CommandArgs::from_parts(parts.into_iter().map(Bytes::from).collect());
+            let request = HSetExRequest::parse(&args).unwrap();
+            assert_eq!(request.expiry, HSetExExpiry::Milliseconds(200));
+        }
     }
 
     #[test]

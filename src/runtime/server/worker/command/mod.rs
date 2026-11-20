@@ -24,6 +24,15 @@ pub(crate) fn extract_key_args(
     spec: &crate::framework::CommandSpec,
     args: &CommandArgs,
 ) -> Option<Vec<Bytes>> {
+    // Match C getKeysFromCommand(): a mounted getkeys callback is authoritative
+    // and overrides the static first/last/step key spec (e.g. MSETEX).
+    if let Some(get_keys) = spec.get_keys {
+        let keys = get_keys(&args.args)
+            .into_iter()
+            .map(|(key, _)| Bytes::copy_from_slice(key))
+            .collect::<Vec<_>>();
+        return (!keys.is_empty()).then_some(keys);
+    }
     if spec.first_key <= 0 {
         return None;
     }

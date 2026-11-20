@@ -62,7 +62,7 @@ impl TransactionState {
                 debug_assert!(self.is_active());
             }
             TransactionEnd::WatchInvalidated => {
-                debug_assert!(self.is_active() && self.watch.is_dirty);
+                debug_assert!(self.is_active() && self.is_watch_dirty());
             }
             TransactionEnd::ExecutionCompleted => {
                 debug_assert!(self
@@ -175,7 +175,7 @@ impl TransactionState {
     }
 
     pub(crate) fn is_watch_dirty(&self) -> bool {
-        self.watch.is_dirty
+        self.watch.is_dirty || self.watch.keys.iter().any(WatchedKey::has_changed)
     }
 
     pub(crate) fn touch_watched_key(&mut self, db_id: u32, key: &[u8], exists_after: bool) -> bool {
@@ -199,6 +199,10 @@ impl TransactionState {
             if watched.db_id != db1 && watched.db_id != db2 {
                 continue;
             }
+            if watched.has_changed() {
+                self.watch.is_dirty = true;
+                break;
+            }
             let original_db = if watched.db_id == db1 { db2 } else { db1 };
             let (original_exists, _) = key_state(original_db, &watched.key);
             let (replacement_exists, replacement_expired) = key_state(watched.db_id, &watched.key);
@@ -206,7 +210,7 @@ impl TransactionState {
                 continue;
             }
             if watched.expired && !replacement_exists {
-                watched.expired = false;
+                watched.touched(false);
             } else if watched.expired && replacement_expired {
                 continue;
             } else if !watched.expired && !original_exists && replacement_expired {

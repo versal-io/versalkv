@@ -16,6 +16,7 @@ pub use body::{
     GossipEntry, SlotOwnershipUpdate, SLOT_BYTES,
 };
 pub use extension::ClusterExtension;
+pub(crate) use header::{validate_packet_prefix, CLUSTER_BUS_PREFIX_LEN};
 pub use header::{
     ClusterBusHeader, ClusterMsgType, ClusterProtocolError, CLUSTER_BUS_HEADER_LEN, NET_IP_STR_LEN,
 };

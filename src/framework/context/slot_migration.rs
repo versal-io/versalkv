@@ -2,6 +2,28 @@ use super::ServerContext;
 use crate::foundation::io::store::kv_engine::DbSet;
 
 impl ServerContext {
+    /// Initialize hidden players when a shared replication stream is restored.
+    /// Live import sockets keep their own independent database selection.
+    pub(crate) fn set_tracking_import_selected_db(&mut self, selected_db: u32) {
+        let ids = self
+            .cluster_state()
+            .as_deref()
+            .map(|state| {
+                state
+                    .migrations
+                    .tracking_import_views()
+                    .into_iter()
+                    .map(|job| job.id)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for id in ids {
+            if let Some(dataset) = self.slot_imports.get_mut(&id) {
+                dataset.set_selected_db(selected_db);
+            }
+        }
+    }
+
     pub fn create_slot_import(
         &mut self,
         id: crate::engine::distributed::cluster::migration::MigrationJobId,
@@ -9,6 +31,15 @@ impl ServerContext {
     ) {
         if self.slot_imports.contains_key(&id) {
             return;
+        }
+        if self
+            .persistence()
+            .forkless_save_purpose()
+            .is_some_and(|purpose| {
+                purpose != crate::engine::persistence::ForklessSavePurpose::Persistence
+            })
+        {
+            self.persistence().cancel_forkless_save();
         }
         for range in ranges.iter() {
             for slot in range.start..=range.end {
@@ -127,14 +158,10 @@ impl ServerContext {
         let jobs = self
             .cluster_state
             .as_deref()
-            .map(|cluster| cluster.migrations.views())
+            .map(|cluster| cluster.migrations.import_snapshot_views())
             .unwrap_or_default();
         let mut snapshot = Vec::new();
-        for job in jobs.iter().filter(|job| {
-            job.operation
-                == crate::engine::distributed::cluster::migration::MigrationOperation::Import
-                && !job.phase.is_terminal()
-        }) {
+        for job in &jobs {
             let mut fields = vec![
                 b"CLUSTER".to_vec(),
                 b"SYNCSLOTS".to_vec(),

@@ -17,6 +17,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+// Cancellation is terminal; Interrupted would make Write::write_all retry forever.
 #[derive(Debug)]
 struct SaveCancelled;
 
@@ -72,6 +73,41 @@ impl Write for IncrementalSyncWriter {
 
     fn flush(&mut self) -> io::Result<()> {
         self.file.flush()
+    }
+}
+
+struct CancellablePipeWriter {
+    file: std::fs::File,
+    control: Arc<RdbSaveControl>,
+}
+
+impl Write for CancellablePipeWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        loop {
+            self.control.check_cancelled()?;
+            match self.file.write(bytes) {
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    // Never join a serializer blocked in write(2). A bounded
+                    // wait also observes cancellation while the reader is idle.
+                    let state = self.control.lock();
+                    if state.is_cancelled {
+                        return Err(io::Error::other(SaveCancelled));
+                    }
+                    drop(
+                        self.control
+                            .changed
+                            .wait_timeout(state, Duration::from_millis(1))
+                            .unwrap_or_else(std::sync::PoisonError::into_inner),
+                    );
+                }
+                result => return result,
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.control.check_cancelled()
     }
 }
 
@@ -241,7 +277,7 @@ impl RdbSaveControl {
 
     pub(crate) fn check_cancelled(&self) -> io::Result<()> {
         if self.lock().is_cancelled {
-            Err(io::Error::new(io::ErrorKind::Interrupted, SaveCancelled))
+            Err(io::Error::other(SaveCancelled))
         } else {
             Ok(())
         }
@@ -261,7 +297,7 @@ impl RdbSaveControl {
         let mut state = self.lock();
         loop {
             if state.is_cancelled {
-                return Err(io::Error::new(io::ErrorKind::Interrupted, SaveCancelled));
+                return Err(io::Error::other(SaveCancelled));
             }
             match receiver.try_recv() {
                 Ok(item) => return Ok(Some(item)),
@@ -279,7 +315,7 @@ impl RdbSaveControl {
     pub(crate) fn begin_item(&self) -> io::Result<()> {
         let mut state = self.lock();
         if state.is_cancelled {
-            return Err(io::Error::new(io::ErrorKind::Interrupted, SaveCancelled));
+            return Err(io::Error::other(SaveCancelled));
         }
         state.queued = state.queued.saturating_sub(1);
         state.item_started = Some(Instant::now());
@@ -289,7 +325,7 @@ impl RdbSaveControl {
     fn queued_item(&self) -> io::Result<()> {
         let mut state = self.lock();
         if state.is_cancelled {
-            return Err(io::Error::new(io::ErrorKind::Interrupted, SaveCancelled));
+            return Err(io::Error::other(SaveCancelled));
         }
         state.queued = state.queued.saturating_add(1);
         state.enqueued = state.enqueued.saturating_add(1);
@@ -328,7 +364,7 @@ impl RdbSaveControl {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .0;
         }
-        Err(io::Error::new(io::ErrorKind::Interrupted, SaveCancelled))
+        Err(io::Error::other(SaveCancelled))
     }
 }
 
@@ -411,10 +447,11 @@ where
                 write(&chunk)?;
                 let completion = entry.completion.clone();
                 drop(entry);
-                control.finish_item()?;
                 if let (Some(completion), Some(sender)) = (completion, completed_items) {
                     let _ = sender.send(completion);
                 }
+                // Publish progress only after the release notification is visible.
+                control.finish_item()?;
             }
         }
     }
@@ -434,7 +471,7 @@ where
 {
     let mut state = control.lock();
     if state.is_cancelled {
-        return Err(io::Error::new(io::ErrorKind::Interrupted, SaveCancelled));
+        return Err(io::Error::other(SaveCancelled));
     }
     std::fs::rename(temporary, destination)?;
     sync_directory()?;
@@ -443,6 +480,75 @@ where
 }
 
 impl BackgroundRdbSave {
+    /// Serialize owned snapshot entries directly into a bounded OS pipe.
+    pub fn start_to_pipe(
+        frozen: FrozenRdb,
+        key_delay_us: i64,
+        serialization: RdbSnapshotOptions,
+    ) -> io::Result<(Self, std::fs::File)> {
+        let (read, write) = crate::foundation::io::sys::fd::pipe(
+            crate::foundation::io::sys::fd::PipeFlags::CLOEXEC_NONBLOCK,
+        )?
+        .into_parts();
+        let control = Arc::new(RdbSaveControl::new(frozen.total_keys(), key_delay_us));
+        let feeder_control = Arc::clone(&control);
+        let worker_control = Arc::clone(&control);
+        let (sender, receiver) = sync_channel(WORK_QUEUE_CAPACITY);
+        let feeder = std::thread::Builder::new()
+            .name("rdb-sync-feed".into())
+            .spawn(move || feed_work_items(frozen, sender, feeder_control))?;
+        let thread = std::thread::Builder::new()
+            .name("rdb-sync".into())
+            .spawn(move || {
+                let options = RdbSerializeOptions {
+                    compression: serialization.compression.uses_lzf(),
+                    checksum: serialization.checksum
+                        && serialization.compression != RdbCompression::Lz4,
+                };
+                let mut writer = CancellablePipeWriter {
+                    file: write,
+                    control: Arc::clone(&worker_control),
+                };
+                let result = if serialization.compression == RdbCompression::Lz4 {
+                    (|| -> io::Result<()> {
+                        writer.write_all(VCS_RDB_HEADER)?;
+                        let mut encoder = new_rdb_frame_encoder(writer, serialization.checksum);
+                        serialize_work_items(receiver, options, &worker_control, None, |chunk| {
+                            encoder.write_all(chunk)
+                        })?;
+                        encoder.finish().map_err(io::Error::other)?;
+                        Ok(())
+                    })()
+                } else {
+                    serialize_work_items(receiver, options, &worker_control, None, |chunk| {
+                        writer.write_all(chunk)
+                    })
+                };
+                // Dropping the receiver unblocks the feeder on every error.
+                // The pipe writer closes before a successful result is joined.
+                let _ = feeder.join();
+                match result {
+                    Ok(()) => RdbSaveOutcome::Saved,
+                    Err(error)
+                        if error
+                            .get_ref()
+                            .is_some_and(|cause| cause.is::<SaveCancelled>()) =>
+                    {
+                        RdbSaveOutcome::Cancelled
+                    }
+                    Err(error) => RdbSaveOutcome::Failed(error),
+                }
+            })?;
+        Ok((
+            Self {
+                control,
+                thread: Some(thread),
+                completed_items: None,
+            },
+            read,
+        ))
+    }
+
     pub(crate) fn start_incremental(
         total_keys: usize,
         dir: PathBuf,
@@ -680,6 +786,100 @@ impl Drop for BackgroundRdbSave {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn freeze_source(source: &crate::foundation::io::store::kv_engine::DbSet) -> FrozenRdb {
+        FrozenRdb::capture(
+            source,
+            &[],
+            &[],
+            None,
+            RdbSerializeOptions::default(),
+            0,
+            true,
+        )
+    }
+
+    #[test]
+    fn pipe_serializer_preserves_frozen_values_and_reports_actual_progress() {
+        use crate::foundation::io::store::{kv_engine::DbSet, Robj};
+        use std::io::Read;
+        use std::os::fd::AsFd;
+        let mut source = DbSet::new(1);
+        source
+            .get_mut(0)
+            .unwrap()
+            .set(b"key".to_vec(), Robj::string("before"));
+        let frozen = freeze_source(&source);
+        source
+            .get_mut(0)
+            .unwrap()
+            .set(b"key".to_vec(), Robj::string("after"));
+        let (mut task, mut read) = BackgroundRdbSave::start_to_pipe(
+            frozen,
+            0,
+            RdbSnapshotOptions {
+                compression: RdbCompression::No,
+                checksum: true,
+            },
+        )
+        .unwrap();
+        crate::foundation::io::sys::fd::set_nonblocking(read.as_fd(), false).unwrap();
+        let mut bytes = Vec::new();
+        read.read_to_end(&mut bytes).unwrap();
+        assert!(matches!(task.finish(), RdbSaveOutcome::Saved));
+        let progress = task.control().progress();
+        assert_eq!(progress.total_keys, 1);
+        assert_eq!(progress.enqueued, 1);
+        assert_eq!(progress.processed, 1);
+        let mut loaded = DbSet::new(1);
+        crate::foundation::io::persistence::rdb::load_rdb_bytes(&bytes, &mut loaded).unwrap();
+        assert_eq!(
+            loaded
+                .get(0)
+                .unwrap()
+                .get_no_expire(b"key")
+                .unwrap()
+                .as_bytes(),
+            b"before"
+        );
+    }
+
+    #[test]
+    fn pipe_serializer_cancels_with_a_live_reader_and_a_full_pipe() {
+        use crate::foundation::io::store::{kv_engine::DbSet, Robj};
+        let mut source = DbSet::new(1);
+        source.get_mut(0).unwrap().set(
+            b"large".to_vec(),
+            Robj::string_raw("x".repeat(4 * 1024 * 1024)),
+        );
+        let (task, read) = BackgroundRdbSave::start_to_pipe(
+            freeze_source(&source),
+            0,
+            RdbSnapshotOptions {
+                compression: RdbCompression::No,
+                checksum: true,
+            },
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while task.control().progress().current_item_ms == 0 && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(
+            !task.is_finished(),
+            "a live unread pipe must backpressure the serializer"
+        );
+        let (sent, received) = channel();
+        let dropping = std::thread::spawn(move || {
+            drop(task);
+            sent.send(()).unwrap();
+        });
+        received
+            .recv_timeout(Duration::from_secs(2))
+            .expect("cancellation must not depend on closing the reader");
+        dropping.join().unwrap();
+        drop(read);
+    }
 
     #[test]
     fn incremental_save_drop_cancels_an_idle_receiver_with_a_live_feeder() {

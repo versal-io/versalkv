@@ -139,6 +139,25 @@ pub(crate) struct DiskSyncBatch {
 }
 
 impl DiskSyncBatch {
+    pub(crate) fn new_forkless_producing(
+        snapshot_path: PathBuf,
+        boundary: SnapshotBoundary,
+        dirty_at_start: i64,
+    ) -> Self {
+        Self {
+            child_pid: None,
+            snapshot_path,
+            boundary,
+            phase: DiskSyncPhase::Producing,
+            file_len: 0,
+            targets: HashMap::new(),
+            dirty_at_fork: dirty_at_start,
+            persist_when_targetless: false,
+            production_started_at: Instant::now(),
+            serving_started_at: None,
+        }
+    }
+
     pub(crate) fn new_producing(
         child_pid: i32,
         snapshot_path: PathBuf,
@@ -267,8 +286,15 @@ impl ServerWorkerState {
         if batch.is_empty() && !preserve_producing_child {
             let pid = batch.child_pid();
             let phase = batch.phase;
+            if self.ctx.persistence().forkless_save_purpose()
+                == Some(crate::engine::persistence::ForklessSavePurpose::ReplicationFile)
+            {
+                self.ctx
+                    .abort_forkless_save(crate::foundation::io::sys::time::mstime() / 1_000);
+            }
             self.full_sync.disk_sync_batch = None;
             if phase == DiskSyncPhase::Producing
+                && pid.is_some()
                 && self.ctx.persistence().disk_sync_child_pid() == pid
             {
                 crate::server_log!(
@@ -306,27 +332,48 @@ impl ServerWorkerState {
         let dir = self.ctx.config().persistence.dir.clone();
         let unique = format!("temp-disk-sync-{}.rdb", std::process::id());
         let snapshot_path = std::path::PathBuf::from(dir).join(unique);
-        let pid = crate::framework::commands::server::save::fork_disk_rdb_file_child_with_options(
-            &mut self.ctx,
-            libs,
-            &snapshot_path,
-            snapshot,
-        )?;
-        crate::server_log!(
-            notice,
-            "Starting BGSAVE for SYNC with target: disk using: normal sync, compression: {}",
-            if snapshot.compression
-                == crate::foundation::io::persistence::rdb::compression::RdbCompression::Lz4
-            {
-                "lz4"
-            } else {
-                "none"
-            }
-        );
-        self.register_child_process(
-            crate::runtime::server::worker::event_loop::sources::ChildOwner::DiskSyncReplication,
-            pid,
-        );
+        let plan = self.full_sync_save_plan(&[connection], snapshot);
+        self.record_full_sync_plan(plan, snapshot);
+        let dirty_at_fork = self.ctx.persistence().dirty();
+        let mut batch = if plan.method
+            == crate::engine::extension::config::persistence::BgsaveMethod::Forkless
+        {
+            let frozen = self.capture_full_sync(libs, snapshot);
+            let task =
+                crate::foundation::io::persistence::snapshot::background::BackgroundRdbSave::start(
+                    frozen,
+                    snapshot_path.parent()?.to_path_buf(),
+                    snapshot_path.file_name()?.to_str()?.to_string(),
+                    self.full_sync.next_transfer_id,
+                    self.ctx.config().persistence.rdb_key_save_delay,
+                    self.ctx.config().persistence.rdb_save_incremental_fsync,
+                    snapshot,
+                )
+                .ok()?;
+            self.ctx
+                .persistence_mut()
+                .begin_forkless_transfer(
+                    task,
+                    crate::engine::persistence::ForklessSavePurpose::ReplicationFile,
+                )
+                .ok()?;
+            DiskSyncBatch::new_forkless_producing(snapshot_path, boundary, dirty_at_fork)
+        } else {
+            let replication = self.full_sync_replication_info();
+            let pid =
+                crate::framework::commands::server::save::fork_disk_rdb_file_child_with_options(
+                    &mut self.ctx,
+                    libs,
+                    &snapshot_path,
+                    snapshot,
+                    &replication,
+                )?;
+            self.register_child_process(
+                crate::runtime::server::worker::event_loop::sources::ChildOwner::DiskSyncReplication,
+                pid,
+            );
+            DiskSyncBatch::new_producing(pid, snapshot_path, boundary, dirty_at_fork)
+        };
         // The RDB fixes the dataset at this fork. Replicas load it with their
         // command stream reset to DB 0, so force the first following write to
         // carry an explicit SELECT just as C Valkey does after replication
@@ -340,11 +387,11 @@ impl ServerWorkerState {
             crate::server_log!(
                 debug,
                 "disk-sync batch replication fork pause: pid={} phase=after-sigcont",
-                pid
+                batch
+                    .child_pid()
+                    .map_or_else(|| "forkless".to_string(), |pid| pid.to_string())
             );
         }
-        let dirty_at_fork = self.ctx.persistence().dirty();
-        let mut batch = DiskSyncBatch::new_producing(pid, snapshot_path, boundary, dirty_at_fork);
         batch.add_waiting_target(first_target);
         self.full_sync.disk_sync_batch = Some(batch);
         let failed_connection = self
@@ -483,6 +530,37 @@ impl ServerWorkerState {
             production_elapsed_ms
         );
         Some(true)
+    }
+
+    pub(crate) fn poll_forkless_disk_sync_production(&mut self) {
+        if self.ctx.persistence().forkless_save_purpose()
+            != Some(crate::engine::persistence::ForklessSavePurpose::ReplicationFile)
+        {
+            return;
+        }
+        let Some(outcome) = self
+            .ctx
+            .poll_forkless_save(crate::foundation::io::sys::time::mstime() / 1_000)
+        else {
+            return;
+        };
+        use crate::foundation::io::persistence::snapshot::background::RdbSaveOutcome;
+        match outcome {
+            RdbSaveOutcome::Saved => {
+                if let Some(promoted) = self.complete_disk_sync_production() {
+                    self.arm_disk_sync_batch_targets_writable();
+                    self.service_disk_sync_batch_targets_once();
+                    self.cleanup_finished_disk_sync_batch(promoted);
+                }
+            }
+            RdbSaveOutcome::Cancelled => {
+                crate::server_log!(notice, "forkless save cancelled");
+                self.fail_disk_sync_batch("forkless snapshot was cancelled");
+            }
+            RdbSaveOutcome::Failed(error) => {
+                self.fail_disk_sync_batch(&format!("forkless snapshot failed: {error}"));
+            }
+        }
     }
 
     pub(crate) fn on_disk_sync_child_completed(
@@ -923,6 +1001,12 @@ impl ServerWorkerState {
     }
 
     pub(crate) fn cancel_disk_sync_batch(&mut self) {
+        if self.ctx.persistence().forkless_save_purpose()
+            == Some(crate::engine::persistence::ForklessSavePurpose::ReplicationFile)
+        {
+            self.ctx
+                .abort_forkless_save(crate::foundation::io::sys::time::mstime() / 1_000);
+        }
         let child_pid = self
             .full_sync
             .disk_sync_batch

@@ -3,6 +3,64 @@ use crate::framework::distributed::replication::PendingReplicationBuffer;
 use std::net::TcpStream;
 
 #[test]
+fn completed_rdb_transport_is_retired_before_pending_replay() {
+    let mut backend = ServerWorkerState::new(16).unwrap();
+    crate::framework::commands::register_all(&mut backend.registry);
+    backend.ctx.replication_mut().switch_to_replica();
+    let (main_token, main_slab, rdb_token, _main_peer, rdb_peer) =
+        setup_dual_blocked_main_receiver_with_rdb_peer(&mut backend);
+    let mut link = backend.replication_runtime.take_replica_link().unwrap();
+    let frame = protocol::encode_command(&[b"SET", b"pending", b"value"]);
+    let (events, _) = link.on_bytes(&frame, 6379).unwrap();
+    backend
+        .buffer_replica_events_into_pending(main_slab, &mut link, events)
+        .unwrap();
+    let mut payload = minimal_valid_rdb_body().to_vec();
+    payload.extend_from_slice(b"0123456789abcdef0123456789abcdef01234567");
+    link.on_rdb_bytes(&payload).unwrap();
+    backend
+        .drive_streaming_decode(main_token, main_slab, &mut link)
+        .unwrap();
+    backend.replication_runtime.set_replica_link(link);
+
+    assert!(
+        !backend.transport.is_registered(Token(rdb_token)),
+        "the completed RDB transport must not stay paired during local replay"
+    );
+    assert!(backend.transport.is_registered(Token(main_token)));
+    assert!(backend.pending_replication_replay.is_some());
+    assert!(backend
+        .ctx
+        .db(0)
+        .unwrap()
+        .get_no_expire(b"pending")
+        .is_none());
+    drop(rdb_peer);
+    backend.dispatch_transport_event(
+        crate::runtime::server::worker::event_loop::ReadyEvent {
+            token: Token(rdb_token),
+            readable: true,
+            writable: false,
+            read_hup: true,
+            error: false,
+        },
+        false,
+    );
+    backend.drive_one_pending_replication_replay();
+    assert_eq!(
+        backend
+            .ctx
+            .db(0)
+            .unwrap()
+            .get_no_expire(b"pending")
+            .unwrap()
+            .as_bytes(),
+        b"value"
+    );
+    assert_eq!(backend.ctx.config().replication.master_link_status, "up");
+}
+
+#[test]
 fn blocked_readiness_matrix_dual_main_readable_enters_pending_buffer() {
     let mut backend = ServerWorkerState::new(16).unwrap();
     crate::framework::commands::register_all(&mut backend.registry);
@@ -569,6 +627,68 @@ fn blocked_readiness_matrix_pending_replay_hup_only_aborts_without_resurrection(
 }
 
 #[test]
+fn pending_replay_aborts_when_the_main_connection_disappears() {
+    let mut backend = ServerWorkerState::new(16).unwrap();
+    crate::framework::commands::register_all(&mut backend.registry);
+    let main_slab = add_connection(&mut backend, 954);
+    let main_slab = register_transport_for_slab(&mut backend, main_slab);
+    let main_token = backend.connection_registry
+        [crate::framework::capabilities::io::Token(main_slab)]
+    .token()
+    .0;
+    let main = ConnectionId(main_token);
+    let snapshot_end = 100;
+    let replid = "0123456789abcdef0123456789abcdef01234567".to_string();
+    let mut link = ReplicaLink::streaming(
+        main,
+        MasterInfo {
+            host: "127.0.0.1".to_string(),
+            port: 6379,
+        },
+        replid,
+        offset(snapshot_end),
+    );
+    link.transition_rdb_channel_state(ReplicaRdbChannelState::Connecting)
+        .unwrap();
+    link.transition_rdb_channel_state(ReplicaRdbChannelState::Handshake)
+        .unwrap();
+    link.transition_rdb_channel_state(ReplicaRdbChannelState::WaitingForEndOffset)
+        .unwrap();
+    link.transition_rdb_channel_state(ReplicaRdbChannelState::ReceivingRdb)
+        .unwrap();
+    link.transition_rdb_channel_state(ReplicaRdbChannelState::RdbLoaded)
+        .unwrap();
+    let replay_session_id = link.session_id();
+    backend.replication_runtime.set_replica_link(link);
+    let _ = backend.replication_runtime.set_replica_pending_buffer(
+        replay_session_id,
+        PendingReplicationBuffer::new(1 << 20, offset(snapshot_end), 0),
+    );
+    backend.pending_replication_replay = Some(
+        crate::runtime::server::worker::event_loop::blocked_events::PendingReplayContinuation::new_for_test(
+            main,
+            replay_session_id,
+            (crate::foundation::io::sys::time::MonotonicInstant::now().as_millis() as i64)
+                .saturating_sub(101),
+        ),
+    );
+
+    // The primary connection drops while the local buffer still has to replay.
+    backend.remove_connection(main_token);
+    backend.drive_one_pending_replication_replay();
+
+    assert!(backend.replication_runtime.replica_link().is_none());
+    assert!(backend
+        .replication_runtime
+        .replica_pending_buffer()
+        .is_none());
+    assert!(backend.pending_replication_replay.is_none());
+    assert!(!backend.transport.is_registered(Token(main_token)));
+    assert_eq!(backend.ctx.config().replication.master_link_status, "down");
+    assert!(!backend.ctx.is_loading());
+}
+
+#[test]
 fn pending_replay_does_not_resurrect_cancelled_session() {
     let mut backend = ServerWorkerState::new(16).unwrap();
     backend.ctx.replication_mut().switch_to_replica();
@@ -966,13 +1086,14 @@ fn dual_commit_handoff_ordering_a_buffered_then_commit() {
         .commit_streamed_rdb(rdb_slab, &mut link, commit)
         .unwrap();
     assert!(
-        backend.transport.is_registered(Token(rdb_token)),
-        "pending replay must retain the RDB transport until terminal handoff"
+        !backend.transport.is_registered(Token(rdb_token)),
+        "the completed RDB transport must retire before pending replay"
     );
-    assert!(backend
+    assert!(!backend
         .connection_registry
         .contains(crate::framework::capabilities::io::Token(rdb_slab)));
-    assert!(backend.replication_runtime.replica_rdb_link().is_some());
+    assert!(backend.replication_runtime.replica_rdb_link().is_none());
+    assert!(backend.transport.is_registered(Token(main_token)));
     backend.replication_runtime.set_replica_link(link);
     backend.drive_one_pending_replication_replay();
     let mut link = backend.replication_runtime.take_replica_link().unwrap();

@@ -439,11 +439,12 @@ impl Server {
         metadata: crate::foundation::io::persistence::RdbDecodedMetadata,
         load_role: crate::engine::distributed::replication::ReplicationRole,
     ) {
-        if crate::framework::host_tasks::replace_function_libraries(
-            &mut backend.ctx,
-            &metadata.function_codes,
-        )
-        .is_err()
+        if !metadata.functions_applied
+            && crate::framework::host_tasks::replace_function_libraries(
+                &mut backend.ctx,
+                &metadata.function_codes,
+            )
+            .is_err()
         {
             self.exit_after_rdb_task_error(crate::framework::host_tasks::RdbTaskError::Load(
                 crate::foundation::io::persistence::LoadError::Corrupt,

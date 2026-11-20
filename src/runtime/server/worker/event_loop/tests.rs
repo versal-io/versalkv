@@ -111,6 +111,39 @@ fn connected_test_client(backend: &mut ServerWorkerState) -> (TcpStream, Token) 
     (client, peer.token)
 }
 
+#[test]
+fn repeated_replication_service_flushes_new_replies_each_time() {
+    for operation in [
+        BlockedOperation::ClassicRdb {
+            main: ConnectionId(usize::MAX),
+        },
+        BlockedOperation::DualRdb {
+            main: ConnectionId(usize::MAX),
+            rdb: ConnectionId(usize::MAX - 1),
+        },
+        BlockedOperation::PendingReplay {
+            main: ConnectionId(usize::MAX),
+        },
+    ] {
+        let mut backend = ServerWorkerState::new(1).unwrap();
+        let (mut peer, token) = connected_test_client(&mut backend);
+        peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        for reply in [b"+first\r\n".as_slice(), b"+second\r\n"] {
+            backend.connection_registry[token].queue_reply(reply.to_vec());
+            assert!(backend.schedule_ordinary_write(token.0));
+            backend.transport.queue_test_transport_event_batch(&[]);
+            backend.process_events_while_blocked(operation);
+            assert!(
+                !backend.connection_registry[token].has_pending_output(),
+                "each replication service must admit a fresh ordinary write"
+            );
+            let mut received = vec![0; reply.len()];
+            peer.read_exact(&mut received).unwrap();
+            assert_eq!(received, reply);
+        }
+    }
+}
+
 fn queue_pending_request(
     backend: &mut ServerWorkerState,
     client: &mut TcpStream,

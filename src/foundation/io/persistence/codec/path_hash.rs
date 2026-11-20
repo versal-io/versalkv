@@ -31,6 +31,8 @@ impl PathHashCodec {
         if encoded || path_count > buf.len().checked_sub(*pos)? / 4 {
             return None;
         }
+        // Keep an empty outer tree distinguishable from truncated data so RDB
+        // loading can skip it and RESTORE can reject it as an empty key.
         let mut hash = PathHash::new();
         for _ in 0..path_count {
             let path = Bytes::from(decoder::load_string(buf, pos)?);
@@ -110,8 +112,7 @@ mod tests {
         invalid.write_string(b"path");
         invalid.write_len(0);
         assert!(PathHashCodec::load_with_limits(&invalid, &mut 0, 512, 64).is_none());
-        assert!(PathHashCodec::load_with_limits(&[0], &mut 0, 512, 64)
-            .unwrap()
-            .is_empty());
+        let empty = PathHashCodec::load_dispatch(&[0], &mut 0, 0).unwrap();
+        assert!(empty.is_empty_rdb_key());
     }
 }

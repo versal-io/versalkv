@@ -88,6 +88,12 @@ pub(super) fn debug_object(
     if matches!(obj, Robj::ListQuicklist(_)) && enc == "quicklist" {
         line.push_str(&quicklist_extras(&obj, ctx, fast));
     }
+    if let Robj::ZSetSkiplist(tree) = &obj {
+        line.push_str(&format!(
+            " btree_leaves:{}",
+            tree.ordered_index().memory_layout().leaf_nodes
+        ));
+    }
     Value::SimpleString(line.into())
 }
 

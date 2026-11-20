@@ -72,9 +72,9 @@ pub struct ClusterNode {
     pub handshake_retry_on_timeout: bool,
     /// Start time for a node learned from an unconfirmed MEET gossip section.
     pub asymmetric_meet_started_at: i64,
-    /// Whether this normal node still needs a reciprocal MEET. This follows
-    /// C's node-level CLUSTER_NODE_MEET state rather than the lifetime of any
-    /// individual bus connection.
+    /// Whether this node still needs an explicit or reciprocal MEET. This
+    /// follows C's node-level CLUSTER_NODE_MEET state across handshake and
+    /// normal nodes rather than the lifetime of an individual bus connection.
     pub meet_pending: bool,
     /// Last time a MEET was queued for this normal node (ms). This is the
     /// node-level retry cooldown, so reconnecting links retain it.

@@ -6,6 +6,9 @@ use super::{
 #[derive(Default)]
 pub struct MigrationRegistry {
     jobs: Vec<MigrationJob>,
+    // Swap loading can fail the operator log before the primary finishes.
+    // These imports still own hidden data and consume the shared stream.
+    imports_awaiting_remote_finish: std::collections::HashSet<MigrationJobId>,
 }
 
 impl MigrationRegistry {
@@ -42,20 +45,22 @@ impl MigrationRegistry {
         job: &MigrationJob,
         pending: &[MigrationJob],
     ) -> Result<(), MigrationError> {
-        if self
-            .jobs
+        if self.jobs.iter().any(|current| {
+            (current.is_active() || self.imports_awaiting_remote_finish.contains(&current.id))
+                && current.id == job.id
+        }) || pending
             .iter()
             .any(|current| current.is_active() && current.id == job.id)
-            || pending
-                .iter()
-                .any(|current| current.is_active() && current.id == job.id)
         {
             return Err(MigrationError::DuplicateJob(job.id.clone()));
         }
         let overlapping_slot = self
             .jobs
             .iter()
-            .filter(|current| current.is_active() && current.operation == job.operation)
+            .filter(|current| {
+                (current.is_active() || self.imports_awaiting_remote_finish.contains(&current.id))
+                    && current.operation == job.operation
+            })
             .chain(
                 pending
                     .iter()
@@ -137,7 +142,37 @@ impl MigrationRegistry {
             .find(|job| &job.id == id)
             .ok_or_else(|| MigrationError::UnknownJob(id.clone()))?;
         job.clear_auth();
-        if !job.is_active() {
+        let was_awaiting_remote_finish = self.imports_awaiting_remote_finish.remove(id);
+        if !job.is_active() && !was_awaiting_remote_finish {
+            return Ok(Vec::new());
+        }
+        job.phase = MigrationPhase::Terminal(terminal);
+        job.last_update_time = now;
+        job.message = message;
+        job.remaining_repl_size = 0;
+        Ok(vec![MigrationAction::Cleanup(id.clone())])
+    }
+
+    /// Authority-aware terminal transition used only by the replicated
+    /// `CLUSTER SYNCSLOTS FINISH` command (upstream #5367). A job already in
+    /// the same terminal state is an idempotent no-op once its retained import
+    /// is released. A locally failed tracking import after a full
+    /// resynchronization still accepts the primary's authoritative result.
+    pub fn reconcile_remote_finish(
+        &mut self,
+        id: &MigrationJobId,
+        terminal: TerminalPhase,
+        message: Option<String>,
+        now: i64,
+    ) -> Result<Vec<MigrationAction>, MigrationError> {
+        let job = self
+            .jobs
+            .iter_mut()
+            .find(|job| &job.id == id)
+            .ok_or_else(|| MigrationError::UnknownJob(id.clone()))?;
+        job.clear_auth();
+        let was_awaiting_remote_finish = self.imports_awaiting_remote_finish.remove(id);
+        if job.phase == MigrationPhase::Terminal(terminal) && !was_awaiting_remote_finish {
             return Ok(Vec::new());
         }
         job.phase = MigrationPhase::Terminal(terminal);
@@ -167,7 +202,7 @@ impl MigrationRegistry {
         let active = self
             .jobs
             .iter()
-            .filter(|job| job.is_active())
+            .filter(|job| job.is_active() || self.imports_awaiting_remote_finish.contains(&job.id))
             .map(|job| job.id.clone())
             .collect::<Vec<_>>();
         active
@@ -183,7 +218,10 @@ impl MigrationRegistry {
         let active = self
             .jobs
             .iter()
-            .filter(|job| job.is_active() && job.operation == super::MigrationOperation::Import)
+            .filter(|job| {
+                (job.is_active() || self.imports_awaiting_remote_finish.contains(&job.id))
+                    && job.operation == super::MigrationOperation::Import
+            })
             .map(|job| job.id.clone())
             .collect::<Vec<_>>();
         active
@@ -193,6 +231,22 @@ impl MigrationRegistry {
                     .unwrap_or_default()
             })
             .collect()
+    }
+
+    /// Preserve the loaded dataset despite the local swapdb failure log.
+    /// Only the primary's FINISH or an explicit role-change cleanup releases it.
+    pub fn fail_tracking_imports_after_swap(&mut self, message: &str, now: i64) {
+        for job in self.jobs.iter_mut().filter(|job| {
+            job.operation == super::MigrationOperation::Import
+                && job.phase == MigrationPhase::Import(ImportPhase::OccurringOnPrimary)
+        }) {
+            self.imports_awaiting_remote_finish.insert(job.id.clone());
+            job.clear_auth();
+            job.phase = MigrationPhase::Terminal(TerminalPhase::Failed);
+            job.last_update_time = now;
+            job.message = Some(message.to_string());
+            job.remaining_repl_size = 0;
+        }
     }
 
     pub fn track_imports_after_demotion(&mut self, now: i64) -> Vec<MigrationJobId> {
@@ -210,10 +264,13 @@ impl MigrationRegistry {
     }
 
     pub fn trim_history(&mut self, max_len: usize) {
-        let terminal_count = self.jobs.iter().filter(|job| !job.is_active()).count();
+        let can_remove = |job: &MigrationJob| {
+            !job.is_active() && !self.imports_awaiting_remote_finish.contains(&job.id)
+        };
+        let terminal_count = self.jobs.iter().filter(|job| can_remove(job)).count();
         let mut to_remove = terminal_count.saturating_sub(max_len);
         while to_remove != 0 {
-            let Some(index) = self.jobs.iter().rposition(|job| !job.is_active()) else {
+            let Some(index) = self.jobs.iter().rposition(can_remove) else {
                 break;
             };
             self.jobs.remove(index);
@@ -223,6 +280,36 @@ impl MigrationRegistry {
 
     pub fn views(&self) -> Vec<MigrationJobView> {
         self.jobs.iter().map(MigrationJob::view).collect()
+    }
+
+    pub fn tracking_import_views(&self) -> Vec<MigrationJobView> {
+        self.jobs
+            .iter()
+            .filter(|job| {
+                job.phase == MigrationPhase::Import(ImportPhase::OccurringOnPrimary)
+                    || self.imports_awaiting_remote_finish.contains(&job.id)
+            })
+            .map(MigrationJob::view)
+            .collect()
+    }
+
+    /// Snapshot pending imports as recoverable tracking jobs without changing
+    /// the operator-visible terminal log.
+    pub fn import_snapshot_views(&self) -> Vec<MigrationJobView> {
+        self.jobs
+            .iter()
+            .filter(|job| {
+                job.operation == super::MigrationOperation::Import
+                    && (job.is_active() || self.imports_awaiting_remote_finish.contains(&job.id))
+            })
+            .map(|job| {
+                let mut view = job.view();
+                if self.imports_awaiting_remote_finish.contains(&job.id) {
+                    view.phase = MigrationPhase::Import(ImportPhase::OccurringOnPrimary);
+                }
+                view
+            })
+            .collect()
     }
 
     pub fn active_export_views(&self) -> Vec<MigrationJobView> {

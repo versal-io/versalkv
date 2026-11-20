@@ -1112,6 +1112,68 @@ mod tests {
         (pos == fixture.body.len()).then_some(*stream)
     }
 
+    fn legacy_counter_fixture(count: u64, entries_added: u64) -> LegacyFixtureSpec {
+        let mut spec = legacy_fixture_spec(RDB_TYPE_STREAM_LISTPACKS_2, StreamID::new(1, 1));
+        spec.nodes[0].entries = (1..=count)
+            .map(|ms| LegacyEntryFixture {
+                id: StreamID::new(ms, 1),
+                value: b"value".to_vec(),
+                is_deleted: false,
+            })
+            .collect();
+        spec.metadata.length = count;
+        spec.metadata.last_id = StreamID::new(count, 1);
+        spec.metadata.entries_added = entries_added;
+        spec.groups[0].last_id = StreamID::new(3, 1);
+        spec.groups[0].entries_read = u64::MAX;
+        spec.groups[0].pending.clear();
+        spec.groups[0].consumers.clear();
+        spec
+    }
+
+    #[test]
+    fn legacy_stream_counter_unknown_sentinel_remains_unknown_until_tail_delivery() {
+        let spec = legacy_counter_fixture(6, 6);
+        let fixture = encode_legacy_fixture(&spec);
+        let mut stream =
+            load_legacy_fixture(&fixture, spec.type_byte).expect("valid legacy stream");
+        assert_eq!(stream.group(b"group").unwrap().entries_read, None);
+        let result = stream
+            .read_group_new(b"group", b"alice", 1, false, 7)
+            .unwrap();
+        assert_eq!(result.last_id, StreamID::new(4, 1));
+        assert_eq!(result.entries_read, None);
+        let result = stream
+            .read_group_new(b"group", b"alice", 2, false, 9)
+            .unwrap();
+        assert_eq!(result.last_id, StreamID::new(6, 1));
+        assert_eq!(result.entries_read, Some(6));
+    }
+
+    #[test]
+    fn legacy_stream_counter_below_length_uses_native_wrapping_distance() {
+        let mut spec = legacy_counter_fixture(3, 1);
+        spec.groups.clear();
+        let fixture = encode_legacy_fixture(&spec);
+        let mut stream =
+            load_legacy_fixture(&fixture, spec.type_byte).expect("accepted legacy stream");
+        assert_eq!(stream.len(), 3);
+        assert_eq!(stream.entries_added, 1);
+        assert_eq!(
+            stream.estimate_distance_from_first_ever_entry(StreamID::zero()),
+            Some(u64::MAX - 1),
+        );
+        assert_eq!(
+            stream.estimate_distance_from_first_ever_entry(StreamID::new(1, 1)),
+            None,
+        );
+        stream
+            .create_group(Bytes::from_static(b"g"), StreamID::zero(), None)
+            .unwrap();
+        let result = stream.read_group_new(b"g", b"c", 1, false, 7).unwrap();
+        assert_eq!(result.entries_read, None);
+    }
+
     fn stream_with_two_entries() -> ValkeyStream {
         let mut stream = ValkeyStream::new();
         stream

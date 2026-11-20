@@ -989,11 +989,13 @@ impl ServerWorkerState {
             [crate::framework::capabilities::io::Token(connection_token)]
         .resp_version
             >= 3;
-        let frame = if resp3 {
+        let mut frame = if resp3 {
             serialize_to_vec_resp3(reply)
         } else {
             serialize_to_vec_resp2(reply)
         };
+        // Do not let serializer growth slack make a large waiter the eviction victim.
+        frame.shrink_to_fit();
         let reply_bytes = if effects.has_custom_reply() {
             effects.reply_bytes()
         } else {
@@ -1264,6 +1266,62 @@ mod tests {
 
     #[path = "stream_durability_tests.rs"]
     mod stream_durability_tests;
+
+    #[test]
+    fn large_wakeup_replies_preserve_client_eviction_order() {
+        for resp_version in [2, 3] {
+            let mut backend = ServerWorkerState::new(1).unwrap();
+            let waiters = [Token(8), Token(9)];
+            let executing = Token(10);
+            for token in [waiters[0], waiters[1], executing] {
+                let mut connection = Connection::new(token, ([127, 0, 0, 1], 6379).into(), false);
+                connection.resp_version = resp_version;
+                if token == executing {
+                    connection.queue_reply(vec![b'x'; 3_300_000]);
+                }
+                backend.connection_registry.insert(connection);
+            }
+            backend.refresh_all_client_memory_usage();
+            backend.ctx.config_mut().server.maxmemory_clients =
+                (backend.ctx.normal_client_memory() + 1_572_864).to_string();
+            let payload = Bytes::from(vec![b'e'; 100]);
+            let reply = Value::Array(vec![
+                Value::bulk("mylist"),
+                Value::Array(vec![Value::Bulk(payload); 20_000]),
+            ]);
+            for token in waiters {
+                let connection = &mut backend.connection_registry[token];
+                connection.begin_nested_command_effects();
+                connection.set_custom_reply_enabled(false);
+                let mut effects = connection
+                    .take_command_effects(CommandEffectDrain::Completed)
+                    .expect("active wakeup command effects");
+                let (frame, visible_bytes) =
+                    backend.capture_wakeup_reply(token.0, &reply, &mut effects);
+                assert_eq!(visible_bytes, 2_160_024);
+                assert_eq!(frame.len(), visible_bytes);
+                assert!(frame.capacity() <= visible_bytes + 16 * 1024);
+                backend.connection_registry[token].queue_reply(frame);
+                backend.refresh_client_memory_usage(token, false);
+            }
+
+            backend.evict_clients();
+
+            for token in waiters {
+                assert!(backend.connection_registry.contains(token));
+                assert_eq!(
+                    backend.connection_registry[token].output_buffer_bytes(),
+                    2_160_024
+                );
+            }
+            assert!(!backend.connection_registry.contains(executing));
+            assert_eq!(backend.ctx.stats().evicted_clients, 1);
+            assert!(
+                backend.ctx.normal_client_memory()
+                    <= backend.effective_client_memory_limit().unwrap()
+            );
+        }
+    }
 
     #[test]
     fn stream_spec_repairs_paused_exec_swapdb_reply_precedes_reblock_notification() {

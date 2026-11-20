@@ -1,5 +1,6 @@
+use crate::engine::extension::function::FunctionLib;
 use crate::engine::host::{
-    yield_rdb, HostAbort, HostControl, HostDispatcher, HostError, LoadProgress,
+    yield_rdb, FunctionLoadPolicy, HostAbort, HostControl, HostDispatcher, HostError, LoadProgress,
 };
 use crate::foundation::io::persistence::{
     LoadError, RdbDecodePolicy, RdbDecodedMetadata, RdbDecoder, RdbStep,
@@ -41,25 +42,53 @@ pub(crate) struct RdbLoadTask {
     progress_interval_bytes: u64,
     skip_codec_checksums: bool,
     compressed_physical_bytes: Option<usize>,
+    functions_applied: bool,
+    function_policy: FunctionLoadPolicy,
 }
 
 pub(crate) struct DebugRdbTask {
     load: RdbLoadTask,
-    replace_functions: bool,
     rollback_dataset: Option<DbSet>,
+    rollback_functions: Option<Vec<FunctionLib>>,
 }
 
 impl DebugRdbTask {
     pub(crate) fn new(
-        load: RdbLoadTask,
+        mut load: RdbLoadTask,
         replace_functions: bool,
         rollback_dataset: Option<DbSet>,
     ) -> Self {
+        load.function_policy = if replace_functions {
+            FunctionLoadPolicy::Replace
+        } else {
+            FunctionLoadPolicy::Merge
+        };
         Self {
             load,
-            replace_functions,
             rollback_dataset,
+            rollback_functions: None,
         }
+    }
+
+    pub(crate) fn begin_function_rollback(&mut self, ctx: &ServerContext) -> Result<(), HostError> {
+        if self.rollback_functions.is_some() {
+            return Err(HostError::Invariant(
+                "DEBUG function rollback is already active",
+            ));
+        }
+        ctx.script()
+            .function_registry
+            .begin_restore_transaction()
+            .map_err(|error| HostError::Runtime(error.to_string()))?;
+        self.rollback_functions = Some(
+            ctx.script()
+                .function_registry
+                .list_libraries()
+                .into_iter()
+                .map(clone_function_library)
+                .collect(),
+        );
+        Ok(())
     }
 
     pub(crate) fn run(
@@ -74,18 +103,44 @@ impl DebugRdbTask {
         result: Result<RdbDecodedMetadata, RdbTaskError>,
         ctx: &mut ServerContext,
     ) -> Value {
+        let function_policy = self.load.function_policy;
         let loaded_dataset = self.load.into_dataset();
         ctx.set_host_task_loading(false);
-        match result {
-            Ok(metadata) => {
-                if self.replace_functions
-                    && replace_function_libraries(ctx, &metadata.function_codes).is_err()
+        let mut result = result.and_then(|metadata| {
+            if !metadata.functions_applied {
+                RdbLoadTask::install_function_libraries(
+                    ctx,
+                    &metadata.function_codes,
+                    function_policy,
+                )
+                .map_err(|()| RdbTaskError::Load(LoadError::Corrupt))?;
+            }
+            if self.rollback_functions.is_some() {
+                ctx.script()
+                    .function_registry
+                    .commit_restore_transaction()
+                    .map_err(|error| RdbTaskError::Host(HostError::Runtime(error.to_string())))?;
+            }
+            Ok(())
+        });
+        if result.is_err() {
+            if let Some(libraries) = self.rollback_functions {
+                if let Err(error) = ctx
+                    .script()
+                    .function_registry
+                    .rollback_restore_transaction()
                 {
-                    if let Some(dataset) = self.rollback_dataset {
-                        *ctx.dbs_mut() = dataset;
+                    result = Err(RdbTaskError::Host(HostError::Runtime(error.to_string())));
+                } else {
+                    drop(ctx.script_mut().function_registry.take_all_libraries());
+                    for library in libraries {
+                        ctx.script_mut().function_registry.restore_library(library);
                     }
-                    return debug_rdb_error(&LoadError::Corrupt);
                 }
+            }
+        }
+        match result {
+            Ok(()) => {
                 *ctx.dbs_mut() = loaded_dataset;
                 ctx.set_suppress_eviction_until_write(true);
                 Value::ok()
@@ -108,57 +163,96 @@ impl DebugRdbTask {
     }
 }
 
+fn clone_function_library(library: &FunctionLib) -> FunctionLib {
+    FunctionLib {
+        name: library.name.clone(),
+        engine: library.engine,
+        functions: library.functions.clone(),
+        code: library.code.clone(),
+    }
+}
+
 pub(crate) fn replace_function_libraries(
     ctx: &mut ServerContext,
     codes: &[Vec<u8>],
 ) -> Result<(), ()> {
-    ctx.script()
-        .function_registry
-        .begin_restore_transaction()
-        .map_err(|_| ())?;
-    let old_libraries = ctx.script_mut().function_registry.take_all_libraries();
+    RdbLoadTask::install_function_libraries(ctx, codes, FunctionLoadPolicy::Replace)
+}
 
-    let replacement = (|| {
-        for code in codes {
-            let code = std::str::from_utf8(code).map_err(|_| ())?;
-            let name = crate::engine::extension::lua::shebang::extract_shebang_name(code)
-                .map_err(|_| ())?;
-            ctx.script_mut()
-                .function_registry
-                .load_library(&name, code)
-                .map_err(|_| ())?;
-        }
-        for old_library in &old_libraries {
-            ctx.script()
-                .function_registry
-                .finish_library_replacement(old_library)
-                .map_err(|_| ())?;
+impl RdbLoadTask {
+    pub(crate) fn install_function_libraries(
+        ctx: &mut ServerContext,
+        codes: &[Vec<u8>],
+        policy: FunctionLoadPolicy,
+    ) -> Result<(), ()> {
+        if policy == FunctionLoadPolicy::Merge && codes.is_empty() {
+            return Ok(());
         }
         ctx.script()
             .function_registry
-            .commit_restore_transaction()
-            .map_err(|_| ())
-    })();
-
-    if replacement.is_ok() {
-        drop(old_libraries);
-        return Ok(());
-    }
-
-    drop(ctx.script_mut().function_registry.take_all_libraries());
-    if ctx
-        .script()
-        .function_registry
-        .rollback_restore_transaction()
-        .is_ok()
-    {
-        for old_library in old_libraries {
-            ctx.script_mut()
-                .function_registry
-                .restore_library(old_library);
+            .begin_restore_transaction()
+            .map_err(|_| ())?;
+        let old_libraries = ctx.script_mut().function_registry.take_all_libraries();
+        if policy == FunctionLoadPolicy::Merge {
+            for library in &old_libraries {
+                ctx.script_mut()
+                    .function_registry
+                    .restore_library(clone_function_library(library));
+            }
         }
+
+        let replacement = (|| {
+            let mut replaced_libraries = Vec::new();
+            for code in codes {
+                let code = std::str::from_utf8(code).map_err(|_| ())?;
+                let name = crate::engine::extension::lua::shebang::extract_shebang_name(code)
+                    .map_err(|_| ())?;
+                if policy == FunctionLoadPolicy::Merge {
+                    if let Some(library) = ctx.script_mut().function_registry.take_library(&name) {
+                        replaced_libraries.push(library);
+                    }
+                }
+                ctx.script_mut()
+                    .function_registry
+                    .load_library(&name, code)
+                    .map_err(|_| ())?;
+            }
+            let removed_libraries = match policy {
+                FunctionLoadPolicy::Replace => &old_libraries,
+                FunctionLoadPolicy::Merge => &replaced_libraries,
+            };
+            for old_library in removed_libraries {
+                ctx.script()
+                    .function_registry
+                    .finish_library_replacement(old_library)
+                    .map_err(|_| ())?;
+            }
+            ctx.script()
+                .function_registry
+                .commit_restore_transaction()
+                .map_err(|_| ())
+        })();
+
+        if replacement.is_ok() {
+            drop(old_libraries);
+            return Ok(());
+        }
+
+        drop(ctx.script_mut().function_registry.take_all_libraries());
+        if ctx
+            .script()
+            .function_registry
+            .rollback_restore_transaction()
+            .is_ok()
+        {
+            for old_library in old_libraries {
+                ctx.script_mut()
+                    .function_registry
+                    .restore_library(old_library);
+            }
+        }
+        Err(())
     }
-    Err(())
 }
 
 fn debug_rdb_error(error: &LoadError) -> Value {
@@ -186,6 +280,8 @@ impl RdbLoadTask {
             progress_interval_bytes,
             skip_codec_checksums: policy.skip_checksum,
             compressed_physical_bytes: None,
+            functions_applied: false,
+            function_policy: FunctionLoadPolicy::Replace,
         }
     }
 
@@ -223,6 +319,7 @@ impl RdbLoadTask {
         loop {
             match self.decoder.step(&mut self.dataset)? {
                 RdbStep::Finished(mut metadata) => {
+                    metadata.functions_applied = self.functions_applied;
                     if let Some(physical_bytes) = self.compressed_physical_bytes {
                         if metadata.consumed != self.bytes.len() {
                             return Err(RdbTaskError::Load(LoadError::Corrupt));
@@ -235,6 +332,27 @@ impl RdbLoadTask {
                     return Ok(metadata);
                 }
                 RdbStep::RecordApplied => continue,
+                RdbStep::InlineCommand { db, args } => {
+                    let args = crate::engine::command::CommandArgs::from_parts(args);
+                    let value = crate::engine::host::dispatch_command(
+                        dispatcher,
+                        &args,
+                        crate::engine::host::HostCommandOrigin::RdbReplay {
+                            db,
+                            dataset: &mut self.dataset,
+                            function_codes: (!self.functions_applied)
+                                .then(|| self.decoder.function_codes()),
+                            function_policy: self.function_policy,
+                        },
+                    )?;
+                    if let Value::Error(error) = value {
+                        return Err(RdbTaskError::Host(HostError::Runtime(
+                            String::from_utf8_lossy(&error).into_owned(),
+                        )));
+                    }
+                    self.functions_applied = true;
+                    continue;
+                }
                 RdbStep::NeedInput => {}
             }
 

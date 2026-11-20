@@ -1,4 +1,287 @@
 use super::*;
+use crate::engine::distributed::cluster::migration::TerminalPhase;
+use crate::foundation::io::protocol::Value;
+
+#[test]
+fn chained_full_sync_after_partial_reconnect_preserves_upstream_database() {
+    assert_chained_snapshot_database(SnapshotUpstream::Connected);
+}
+
+#[test]
+fn chained_full_sync_queued_before_upstream_disconnect_preserves_cached_database() {
+    assert_chained_snapshot_database(SnapshotUpstream::Cached);
+}
+
+#[derive(Clone, Copy)]
+enum SnapshotUpstream {
+    Connected,
+    Cached,
+}
+
+fn assert_chained_snapshot_database(snapshot_upstream: SnapshotUpstream) {
+    use crate::engine::extension::config::persistence::BgsaveMethod;
+    use crate::foundation::io::persistence::rdb::load_rdb_bytes_checked_with_delay_stats_and_replication_info;
+    use crate::foundation::io::store::{kv_engine::DbSet, Robj};
+
+    let _fork_guard = crate::framework::commands::server::save::diskless_fork_test_guard();
+    for method in [BgsaveMethod::Fork, BgsaveMethod::Forkless] {
+        let mut backend = ServerWorkerState::new(16).unwrap();
+        crate::framework::commands::register_all(&mut backend.registry);
+        backend.ctx.replication_mut().switch_to_replica();
+        backend.ctx.config_mut().replication.master_host = Some("127.0.0.1".to_string());
+        backend.ctx.config_mut().replication.master_port = 6379;
+        backend.ctx.config_mut().replication.master_link_status = "up".to_string();
+        backend.ctx.config_mut().replication.repl_diskless_sync = true;
+        backend
+            .ctx
+            .config_mut()
+            .replication
+            .repl_diskless_sync_delay = 0;
+        backend
+            .ctx
+            .config_mut()
+            .replication
+            .dual_channel_replication = false;
+        backend.ctx.config_mut().persistence.bgsave_default_method = method;
+        let replid = "0123456789abcdef0123456789abcdef01234567";
+        backend
+            .ctx
+            .replication_mut()
+            .backlog
+            .adopt_primary_from_rdb(replid, offset(100))
+            .unwrap();
+        backend.ctx.replication_mut().backlog.activate();
+        backend.ctx.replication_mut().slave_repl_offset = offset(100);
+        backend.ctx.set_repl_seldb(9);
+        backend
+            .ctx
+            .db_mut(9)
+            .unwrap()
+            .set(b"before".to_vec(), Robj::string(b"snapshot".to_vec()));
+        let (mut upstream_token, _upstream_peer) = add_runtime_connection(&mut backend);
+        let mut upstream = ReplicaLink::streaming(
+            ConnectionId(upstream_token),
+            MasterInfo {
+                host: "127.0.0.1".to_string(),
+                port: 6379,
+            },
+            replid.to_string(),
+            offset(100),
+        );
+        upstream.set_selected_db(9);
+        backend.connection_registry[Token(upstream_token)].selected_db = 9;
+        backend.replication_runtime.set_replica_link(upstream);
+
+        let capabilities = vec![
+            "eof".to_string(),
+            "psync2".to_string(),
+            "inband-repl".to_string(),
+        ];
+        let (partial_token, _partial_peer) = add_runtime_connection(&mut backend);
+        backend.replication_runtime.register_primary(
+            ConnectionId(partial_token),
+            ReplicaConnectionInfo {
+                ip: "127.0.0.1".to_string(),
+                port: 6380,
+                capability: capabilities.clone(),
+                rdb_filter_mode: crate::framework::distributed::replication::RdbFilterMode::All,
+            },
+        );
+        let psync = CommandArgs::from_parts(vec![
+            Bytes::from_static(b"PSYNC"),
+            Bytes::from_static(replid.as_bytes()),
+            Bytes::from_static(b"101"),
+        ]);
+        let mut replies = Vec::new();
+        assert_eq!(
+            backend.try_handle_transport_cmd(
+                partial_token,
+                partial_token,
+                &psync,
+                "psync",
+                false,
+                &mut replies,
+                &mut Vec::new(),
+            ),
+            Some(false)
+        );
+        assert!(replies[0].starts_with(b"+CONTINUE"));
+        assert_eq!(backend.ctx.repl_seldb(), -1);
+        assert_eq!(
+            backend.connection_registry[Token(upstream_token)].selected_db,
+            9
+        );
+        backend.remove_connection(partial_token);
+
+        let boundary = backend.ctx.replication().backlog.snapshot_boundary();
+        let (downstream_token, mut downstream_peer) = add_runtime_connection(&mut backend);
+        let downstream_id = backend.replication_runtime.register_primary(
+            ConnectionId(downstream_token),
+            ReplicaConnectionInfo {
+                ip: "127.0.0.1".to_string(),
+                port: 6380,
+                capability: capabilities,
+                rdb_filter_mode: crate::framework::distributed::replication::RdbFilterMode::All,
+            },
+        );
+        if matches!(snapshot_upstream, SnapshotUpstream::Cached) {
+            backend
+                .ctx
+                .config_mut()
+                .replication
+                .repl_diskless_sync_delay = 1;
+        }
+        let replies = run_psync(&mut backend, downstream_token, downstream_token, b"PSYNC");
+        for reply in replies {
+            backend.connection_registry[Token(downstream_token)].queue_reply(reply);
+        }
+        if matches!(snapshot_upstream, SnapshotUpstream::Cached) {
+            assert!(backend
+                .replication_runtime
+                .primary_link(downstream_id)
+                .unwrap()
+                .is_deferred_diskless());
+            assert_eq!(backend.ctx.stats().total_forks, 0);
+            backend.remove_connection(upstream_token);
+            assert!(backend.replication_runtime.replica_link().is_none());
+            assert!(backend
+                .connection_registry
+                .get(Token(upstream_token))
+                .is_none());
+            backend.fire_deferred_full_resyncs(vec![downstream_id]);
+        }
+        assert_eq!(
+            backend.ctx.stats().total_forks,
+            u64::from(method == BgsaveMethod::Fork)
+        );
+
+        let mut _resumed_peer = None;
+        let mut upstream = match snapshot_upstream {
+            SnapshotUpstream::Connected => backend.replication_runtime.take_replica_link().unwrap(),
+            SnapshotUpstream::Cached => {
+                let master = MasterInfo {
+                    host: "127.0.0.1".to_string(),
+                    port: 6379,
+                };
+                let (resume_id, resume_offset, resume_db) = backend
+                    .replication_runtime
+                    .replica_resume_for(&master)
+                    .map(|(id, offset, db)| (id.to_string(), offset, db))
+                    .unwrap();
+                assert_eq!((resume_offset, resume_db), (offset(100), 9));
+                let (token, peer) = add_runtime_connection(&mut backend);
+                _resumed_peer = Some(peer);
+                upstream_token = token;
+                backend.connection_registry[Token(token)].selected_db = resume_db;
+                let mut link =
+                    ReplicaLink::streaming(ConnectionId(token), master, resume_id, resume_offset);
+                link.set_selected_db(resume_db);
+                link
+            }
+        };
+        let mut expected_tail = Vec::new();
+        for index in 0..32 {
+            let key = format!("load:{index}");
+            let value = index.to_string();
+            let frame = protocol::encode_command(&[b"SET", key.as_bytes(), value.as_bytes()]);
+            let (events, _) = upstream.on_bytes(&frame, 6381).unwrap();
+            backend
+                .apply_replica_events(upstream_token, &mut upstream, events)
+                .unwrap();
+            expected_tail.extend_from_slice(&frame);
+        }
+        let final_offset = upstream.applied_position();
+        backend.replication_runtime.set_replica_link(upstream);
+        let wire = backend.drain_diskless_sync_for_test(&mut [&mut downstream_peer]);
+        let fullresync_end = wire[0]
+            .windows(2)
+            .position(|bytes| bytes == b"\r\n")
+            .unwrap()
+            + 2;
+        let fullresync = protocol::parse_fullresync(&wire[0][..fullresync_end - 2]).unwrap();
+        assert_eq!(
+            fullresync.offset,
+            if method == BgsaveMethod::Forkless {
+                protocol::FullResyncOffset::FromRdb
+            } else {
+                protocol::FullResyncOffset::Explicit(boundary.reported_offset())
+            }
+        );
+        let bulk = &wire[0][fullresync_end..];
+        let header_end = bulk.windows(2).position(|bytes| bytes == b"\r\n").unwrap();
+        let marker = bulk[..header_end].strip_prefix(b"$EOF:").unwrap();
+        assert_eq!(marker.len(), 40);
+        assert!(bulk.ends_with(marker));
+        let body = &bulk[header_end + 2..bulk.len() - marker.len()];
+        let mut dbs = DbSet::new(16);
+        let (loaded, consumed, expired, metadata) =
+            load_rdb_bytes_checked_with_delay_stats_and_replication_info(body, &mut dbs, true, 0)
+                .unwrap();
+        let metadata = metadata.unwrap();
+
+        let tail = {
+            let backlog = &backend.ctx.replication().backlog;
+            let link = backend
+                .replication_runtime
+                .primary_link_mut(downstream_id)
+                .unwrap();
+            assert_eq!(link.next_send_cursor(), boundary.stream_cursor());
+            link.acknowledge(offset(100), crate::foundation::io::sys::time::mstime());
+            assert!(link.promote_full_resync_on_ack());
+            link.pump(backlog).unwrap()
+        };
+        backend.remove_connection(downstream_token);
+        backend.remove_connection(upstream_token);
+
+        assert_eq!((loaded, consumed, expired), (1, body.len(), 0));
+        assert_eq!(
+            metadata.repl_stream_db, 9,
+            "snapshot stream DB for {method:?}"
+        );
+        assert_eq!(metadata.repl_id, replid);
+        assert_eq!(metadata.repl_offset, 100);
+        assert_eq!(tail, expected_tail, "relay must not insert a SELECT");
+        assert!(dbs.get(9).unwrap().get_no_expire(b"load:0").is_none());
+
+        let mut subreplica = ServerWorkerState::new(16).unwrap();
+        crate::framework::commands::register_all(&mut subreplica.registry);
+        *subreplica.ctx.dbs_mut() = dbs;
+        let token = 40;
+        add_connection(&mut subreplica, token);
+        subreplica.connection_registry[Token(token)].selected_db = metadata.repl_stream_db as u32;
+        let mut link = ReplicaLink::streaming(
+            ConnectionId(token),
+            MasterInfo {
+                host: "127.0.0.1".to_string(),
+                port: 6380,
+            },
+            metadata.repl_id,
+            offset(metadata.repl_offset),
+        );
+        link.set_selected_db(metadata.repl_stream_db as u32);
+        let (events, _) = link.on_bytes(&tail, 6381).unwrap();
+        subreplica
+            .apply_replica_events(token, &mut link, events)
+            .unwrap();
+        assert_eq!(link.applied_position(), final_offset);
+        assert_eq!(subreplica.ctx.db(0).unwrap().dbsize(), 0);
+        assert_eq!(subreplica.ctx.db(9).unwrap().dbsize(), 33);
+        for index in 0..32 {
+            let key = format!("load:{index}");
+            let value = index.to_string();
+            assert_eq!(
+                subreplica
+                    .ctx
+                    .db(9)
+                    .unwrap()
+                    .get_no_expire(key.as_bytes())
+                    .unwrap()
+                    .as_bytes(),
+                value.as_bytes()
+            );
+        }
+    }
+}
 
 struct AtomicFullSyncFixture {
     backend: ServerWorkerState,
@@ -74,6 +357,9 @@ fn atomic_full_sync_fixture(
         function_codes: vec![b"#!lua name=newatomic\nserver.register_function('newatomicfn', function() return 'new' end)".to_vec()],
         aux_fields: vec![(b"cluster-slot-states".to_vec(), b"9>cccccccccccccccccccccccccccccccccccccccc,".to_vec())],
         repl_stream_db: 0,
+        repl_id: None,
+        repl_offset: None,
+        functions_applied: false,
         diskless: true,
         disk_backed: true,
         raw: Some(raw),
@@ -918,6 +1204,9 @@ fn classic_full_sync_commit_reports_master_link_up_without_dual_handoff() {
         function_codes: Vec::new(),
         aux_fields: Vec::new(),
         repl_stream_db: 0,
+        repl_id: None,
+        repl_offset: None,
+        functions_applied: false,
         diskless: true,
         disk_backed: false,
         raw: None,
@@ -961,6 +1250,9 @@ fn full_sync_commit_preserves_the_rdb_replication_stream_db() {
         function_codes: Vec::new(),
         aux_fields: Vec::new(),
         repl_stream_db: 9,
+        repl_id: None,
+        repl_offset: None,
+        functions_applied: false,
         diskless: true,
         disk_backed: false,
         raw: None,
@@ -1006,6 +1298,9 @@ fn full_sync_commit_restores_local_cluster_replica_offset() {
         function_codes: Vec::new(),
         aux_fields: Vec::new(),
         repl_stream_db: 0,
+        repl_id: None,
+        repl_offset: None,
+        functions_applied: false,
         diskless: true,
         disk_backed: false,
         raw: None,
@@ -1056,6 +1351,9 @@ fn full_sync_commit_replaces_replica_cluster_open_slots_from_aux() {
             format!("13<{SOURCE},7>{TARGET},").into_bytes(),
         )],
         repl_stream_db: 0,
+        repl_id: None,
+        repl_offset: None,
+        functions_applied: false,
         diskless: true,
         disk_backed: false,
         raw: None,
@@ -1133,6 +1431,9 @@ fn full_sync_without_slot_import_aux_discards_stale_hidden_imports() {
         function_codes: Vec::new(),
         aux_fields: Vec::new(),
         repl_stream_db: 0,
+        repl_id: None,
+        repl_offset: None,
+        functions_applied: false,
         diskless: true,
         disk_backed: false,
         raw: None,
@@ -1152,9 +1453,270 @@ fn full_sync_without_slot_import_aux_discards_stale_hidden_imports() {
 }
 
 #[test]
-fn full_sync_slot_import_aux_rebuilds_hidden_tracking_dataset() {
-    use crate::engine::distributed::cluster::migration::{ImportPhase, MigrationPhase};
+fn tracking_import_stream_restores_nonzero_database_before_finish_success() {
+    use crate::framework::distributed::replication::RdbLoadMode;
+    for mode in [
+        RdbLoadMode::Direct,
+        RdbLoadMode::Swap,
+        RdbLoadMode::DiskBacked,
+    ] {
+        assert_tracking_import_stream_database(mode, TerminalPhase::Success);
+    }
+}
+
+#[test]
+fn tracking_import_stream_restores_nonzero_database_before_finish_failed() {
+    use crate::framework::distributed::replication::RdbLoadMode;
+    for mode in [
+        RdbLoadMode::Direct,
+        RdbLoadMode::Swap,
+        RdbLoadMode::DiskBacked,
+    ] {
+        assert_tracking_import_stream_database(mode, TerminalPhase::Failed);
+    }
+}
+
+fn assert_tracking_import_stream_database(
+    mode: crate::framework::distributed::replication::RdbLoadMode,
+    terminal: TerminalPhase,
+) {
+    use crate::engine::distributed::cluster::migration::{
+        ImportPhase, MigrationJobId, MigrationPhase,
+    };
+    use crate::engine::distributed::cluster::node::{
+        key_hash_slot, CLUSTER_NODE_PRIMARY, CLUSTER_NODE_REPLICA,
+    };
+    use crate::foundation::io::persistence::rdb::{
+        serialize_all_with_functions_and_replication, RdbReplicationInfo,
+    };
     use crate::foundation::io::store::Robj;
+    use crate::framework::distributed::replication::RdbLoadMode;
+    const JOB: &str = "cccccccccccccccccccccccccccccccccccccccc";
+    const SOURCE: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const TARGET: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let dir = std::env::temp_dir().join(format!(
+        "versal-import-stream-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    let mut backend =
+        ServerWorkerState::new_with_slot_router(3, 14, |key| key_hash_slot(key) as usize).unwrap();
+    crate::framework::commands::register_all(&mut backend.registry);
+    backend.ctx.config_mut().persistence.dir = dir.to_string_lossy().into_owned();
+    backend.ctx.config_mut().persistence.dbfilename = "dump.rdb".to_string();
+    backend.ctx.replication_mut().switch_to_replica();
+    let mut cluster =
+        crate::engine::distributed::cluster::ClusterState::new("127.0.0.1", 6380, 16_380);
+    cluster.myself.flags &= !CLUSTER_NODE_PRIMARY;
+    cluster.myself.flags |= CLUSTER_NODE_REPLICA;
+    cluster.myself.replicaof = TARGET.to_string();
+    *backend.ctx.cluster_state_mut() = Some(Box::new(cluster));
+    let token = 45;
+    add_connection(&mut backend, token);
+    let key = b"{atomic}stream";
+    let slot = key_hash_slot(key);
+    let deadline = 9_999_999_999_999;
+    let id = MigrationJobId::parse(JOB.as_bytes()).unwrap();
+    let replid = backend.ctx.replication().backlog.replid().to_string();
+    let mut incoming = backend.ctx.dbs().empty_like();
+    incoming
+        .get_mut(2)
+        .unwrap()
+        .set(key.to_vec(), Robj::string("7"));
+    incoming.get_mut(2).unwrap().set_expire(key, deadline);
+    let info = RdbReplicationInfo {
+        repl_stream_db: 2,
+        repl_id: replid.clone(),
+        repl_offset: 100,
+        aux_fields: vec![(
+            b"cluster-slot-imports".to_vec(),
+            format!("v1|{JOB}|{SOURCE}|{TARGET}|{slot}-{slot}").into_bytes(),
+        )],
+    };
+    let mut snapshot =
+        serialize_all_with_functions_and_replication(&incoming, 0, &[], true, Some(&info), &[]);
+    let mut final_link = None;
+    // Serialize the retained hidden dataset after the first incremental write,
+    // then replace it through another real full-sync receive on the same replica.
+    for round in 0..2 {
+        backend
+            .ctx
+            .db_mut(0)
+            .unwrap()
+            .set(b"old".to_vec(), Robj::string("discard"));
+        let mut link = ReplicaLink::new(
+            ConnectionId(token),
+            MasterInfo {
+                host: "127.0.0.1".to_string(),
+                port: 6379,
+            },
+        );
+        link.pin_rdb_load_mode(mode);
+        let _ = link.connected(None, None);
+        let marker = "0123456789abcdef0123456789abcdef01234567";
+        let mut frame =
+            format!("+PONG\r\n+OK\r\n+OK\r\n+FULLRESYNC {replid} 100\r\n$EOF:{marker}\r\n")
+                .into_bytes();
+        frame.extend_from_slice(&snapshot);
+        frame.extend_from_slice(marker.as_bytes());
+        let (events, _) = link.on_bytes(&frame, 6380).unwrap();
+        backend
+            .apply_replica_handshake_transitions(&mut link)
+            .unwrap();
+        backend
+            .drive_streaming_decode(token, token, &mut link)
+            .unwrap();
+        backend
+            .apply_replica_events(token, &mut link, events)
+            .unwrap();
+        assert!(
+            !link.has_pending_rdb_receive(),
+            "full-sync decode must commit for {mode:?}"
+        );
+        if mode == RdbLoadMode::DiskBacked {
+            assert_eq!(std::fs::read(dir.join("dump.rdb")).unwrap(), snapshot);
+        }
+        let expected_phase = if mode == RdbLoadMode::Swap {
+            MigrationPhase::Terminal(TerminalPhase::Failed)
+        } else {
+            MigrationPhase::Import(ImportPhase::OccurringOnPrimary)
+        };
+        assert_eq!(
+            backend
+                .ctx
+                .cluster_state()
+                .as_deref()
+                .unwrap()
+                .migrations
+                .get(&id)
+                .unwrap()
+                .phase,
+            expected_phase
+        );
+        assert_eq!(backend.ctx.dbs().db_size(0), 0);
+        assert_eq!(backend.ctx.dbs().db_size(2), 0);
+        assert_eq!(backend.ctx.slot_import_key_count(2, slot as usize), 1);
+        let increment = protocol::encode_command(&[b"INCR", key]);
+        let (events, _) = link.on_bytes(&increment, 6380).unwrap();
+        backend
+            .apply_replica_events(token, &mut link, events)
+            .unwrap();
+        assert_eq!(
+            link.applied_position(),
+            offset(100 + increment.len() as i64)
+        );
+        assert_eq!(backend.ctx.slot_import_key_count(0, slot as usize), 0);
+        let hidden = backend.ctx.slot_import_dbs();
+        assert_eq!(hidden.len(), 1);
+        assert_eq!(
+            hidden[0]
+                .get(2)
+                .unwrap()
+                .get_allow_expired(key)
+                .unwrap()
+                .as_bytes(),
+            if round == 0 { b"8" } else { b"9" }
+        );
+        assert_eq!(hidden[0].get(2).unwrap().get_expire(key), Some(deadline));
+        let mut metadata = backend.ctx.rdb_replication_info();
+        metadata.repl_stream_db = 2;
+        metadata.repl_id = replid.clone();
+        metadata.repl_offset = 100;
+        snapshot = serialize_all_with_functions_and_replication(
+            backend.ctx.dbs(),
+            0,
+            &[],
+            true,
+            Some(&metadata),
+            &hidden,
+        );
+        final_link = Some(link);
+    }
+    let mut link = final_link.unwrap();
+    let state = if terminal == TerminalPhase::Success {
+        b"SUCCESS".as_slice()
+    } else {
+        b"FAILED"
+    };
+    let finish = protocol::encode_command(&[
+        b"CLUSTER",
+        b"SYNCSLOTS",
+        b"FINISH",
+        b"STATE",
+        state,
+        b"NAME",
+        JOB.as_bytes(),
+    ]);
+    let (events, _) = link.on_bytes(&finish, 6380).unwrap();
+    backend
+        .apply_replica_events(token, &mut link, events)
+        .unwrap();
+    backend.drive_slot_migration_actions();
+    assert_eq!(backend.ctx.dbs().db_size(0), 0);
+    assert_eq!(backend.ctx.dbs().db_size(1), 0);
+    assert!(backend.ctx.slot_import_dbs().is_empty());
+    assert!(backend.ctx.slot_import_aof_snapshot().unwrap().is_empty());
+    if terminal == TerminalPhase::Success {
+        let db = backend.ctx.db_mut(2).unwrap();
+        assert_eq!(db.get_no_expire(key).unwrap().as_bytes(), b"9");
+        assert_eq!(db.get_expire(key), Some(deadline));
+    } else {
+        assert_eq!(backend.ctx.dbs().db_size(2), 0);
+    }
+    backend
+        .ctx
+        .cluster_state_mut()
+        .as_deref_mut()
+        .unwrap()
+        .trim_migration_history(0);
+    assert!(backend
+        .ctx
+        .cluster_state()
+        .as_deref()
+        .unwrap()
+        .migrations
+        .get(&id)
+        .is_none());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn full_sync_preserves_tracking_import_until_remote_finish_success() {
+    use crate::framework::distributed::replication::RdbLoadMode;
+    for mode in [
+        RdbLoadMode::Direct,
+        RdbLoadMode::Swap,
+        RdbLoadMode::DiskBacked,
+    ] {
+        assert_full_sync_tracking_import(mode, TerminalPhase::Success);
+    }
+}
+
+#[test]
+fn full_sync_preserves_tracking_import_until_remote_finish_failed() {
+    use crate::framework::distributed::replication::RdbLoadMode;
+    for mode in [
+        RdbLoadMode::Direct,
+        RdbLoadMode::Swap,
+        RdbLoadMode::DiskBacked,
+    ] {
+        assert_full_sync_tracking_import(mode, TerminalPhase::Failed);
+    }
+}
+
+fn assert_full_sync_tracking_import(
+    mode: crate::framework::distributed::replication::RdbLoadMode,
+    terminal: TerminalPhase,
+) {
+    use crate::engine::distributed::cluster::migration::{
+        ImportPhase, MigrationJobId, MigrationPhase,
+    };
+    use crate::foundation::io::store::Robj;
+    use crate::framework::distributed::replication::RdbLoadMode;
     const JOB: &str = "cccccccccccccccccccccccccccccccccccccccc";
     const SOURCE: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const TARGET: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -1162,6 +1724,8 @@ fn full_sync_slot_import_aux_rebuilds_hidden_tracking_dataset() {
         crate::engine::distributed::cluster::node::key_hash_slot(key) as usize
     })
     .unwrap();
+    crate::framework::commands::register_all(&mut backend.registry);
+    backend.ctx.replication_mut().switch_to_replica();
     let token_value = 44;
     let connection_token = add_connection(&mut backend, token_value);
     *backend.ctx.cluster_state_mut() = Some(Box::new(
@@ -1173,7 +1737,7 @@ fn full_sync_slot_import_aux_rebuilds_hidden_tracking_dataset() {
     incoming
         .get_mut(0)
         .unwrap()
-        .set(key.to_vec(), Robj::string("value"));
+        .set(key.to_vec(), Robj::string("7"));
     let mut link = ReplicaLink::streaming(
         ConnectionId(token_value),
         MasterInfo {
@@ -1183,6 +1747,7 @@ fn full_sync_slot_import_aux_rebuilds_hidden_tracking_dataset() {
         backend.ctx.replication().backlog.replid().to_string(),
         offset(0),
     );
+    link.pin_rdb_load_mode(mode);
     let commit = crate::framework::distributed::replication::RdbCommit {
         function_codes: Vec::new(),
         aux_fields: vec![(
@@ -1190,6 +1755,9 @@ fn full_sync_slot_import_aux_rebuilds_hidden_tracking_dataset() {
             format!("v1|{JOB}|{SOURCE}|{TARGET}|{slot}-{slot}").into_bytes(),
         )],
         repl_stream_db: 0,
+        repl_id: None,
+        repl_offset: None,
+        functions_applied: false,
         diskless: true,
         disk_backed: false,
         raw: None,
@@ -1198,10 +1766,7 @@ fn full_sync_slot_import_aux_rebuilds_hidden_tracking_dataset() {
     backend
         .commit_streamed_rdb(connection_token, &mut link, commit)
         .expect("full sync with import metadata should commit");
-    assert_eq!(backend.ctx.dbs().count_keys_in_slot(slot as usize), 0);
-    assert_eq!(backend.ctx.slot_import_key_count(0, slot as usize), 1);
-    let id = crate::engine::distributed::cluster::migration::MigrationJobId::parse(JOB.as_bytes())
-        .unwrap();
+    let id = MigrationJobId::parse(JOB.as_bytes()).unwrap();
     let job = backend
         .ctx
         .cluster_state()
@@ -1210,10 +1775,155 @@ fn full_sync_slot_import_aux_rebuilds_hidden_tracking_dataset() {
         .migrations
         .get(&id)
         .unwrap();
-    assert_eq!(
-        job.phase,
+    let expected_phase = if mode == RdbLoadMode::Swap {
+        MigrationPhase::Terminal(TerminalPhase::Failed)
+    } else {
         MigrationPhase::Import(ImportPhase::OccurringOnPrimary)
+    };
+    assert_eq!(job.phase, expected_phase);
+    assert_eq!(backend.ctx.slot_import_key_count(0, slot as usize), 1);
+    assert_eq!(backend.ctx.dbs().db_size(0), 0);
+    assert!(backend
+        .ctx
+        .rdb_replication_info()
+        .aux_fields
+        .iter()
+        .any(|(key, value)| {
+            key == b"cluster-slot-imports"
+                && value.windows(JOB.len()).any(|part| part == JOB.as_bytes())
+        }));
+    assert!(!backend.ctx.slot_import_aof_snapshot().unwrap().is_empty());
+    backend
+        .ctx
+        .cluster_state_mut()
+        .as_deref_mut()
+        .unwrap()
+        .trim_migration_history(0);
+    assert!(backend
+        .ctx
+        .cluster_state()
+        .as_deref()
+        .unwrap()
+        .migrations
+        .get(&id)
+        .is_some());
+    let increment = CommandArgs::from_parts(vec![
+        Bytes::from_static(b"INCR"),
+        Bytes::copy_from_slice(key),
+    ]);
+    assert!(
+        crate::framework::distributed::migration::apply_tracking_import_command(
+            &increment,
+            &backend.registry,
+            &mut backend.ctx,
+        )
+        .unwrap()
     );
+    assert_eq!(backend.ctx.slot_import_key_count(0, slot as usize), 1);
+    assert_eq!(backend.ctx.dbs().db_size(0), 0);
+
+    let finish = CommandArgs::from_parts(vec![
+        Bytes::from_static(b"CLUSTER"),
+        Bytes::from_static(b"SYNCSLOTS"),
+        Bytes::from_static(b"FINISH"),
+        Bytes::from_static(b"STATE"),
+        Bytes::from_static(match terminal {
+            TerminalPhase::Success => b"SUCCESS",
+            _ => b"FAILED",
+        }),
+        Bytes::from_static(b"NAME"),
+        Bytes::from_static(JOB.as_bytes()),
+    ]);
+    let mut conn = Connection::new_fake();
+    conn.import_source = true;
+    assert_eq!(
+        crate::framework::commands::cluster::cluster::cluster(&mut conn, &finish, &mut backend.ctx),
+        Value::ok()
+    );
+    let phase = backend
+        .ctx
+        .cluster_state()
+        .as_deref()
+        .unwrap()
+        .migrations
+        .get(&id)
+        .unwrap()
+        .phase;
+    assert_eq!(phase, MigrationPhase::Terminal(terminal));
+    assert_eq!(backend.ctx.slot_import_key_count(0, slot as usize), 0);
+    if terminal == TerminalPhase::Success {
+        assert_eq!(
+            backend
+                .ctx
+                .db_mut(0)
+                .unwrap()
+                .get_no_expire(key)
+                .unwrap()
+                .as_bytes(),
+            b"8"
+        );
+    } else {
+        assert_eq!(backend.ctx.dbs().db_size(0), 0);
+    }
+    backend
+        .ctx
+        .cluster_state_mut()
+        .as_deref_mut()
+        .unwrap()
+        .trim_migration_history(0);
+    assert!(backend
+        .ctx
+        .cluster_state()
+        .as_deref()
+        .unwrap()
+        .migrations
+        .get(&id)
+        .is_none());
+}
+
+#[test]
+fn streaming_read_while_loading_keeps_master_link_down() {
+    use crate::engine::distributed::cluster::node::key_hash_slot;
+    use crate::engine::distributed::cluster::ClusterState;
+    use crate::engine::distributed::replication::ReplicationRole;
+
+    let mut backend =
+        ServerWorkerState::new_with_slot_router(2, 14, |key| key_hash_slot(key) as usize).unwrap();
+    crate::framework::commands::register_all(&mut backend.registry);
+    *backend.ctx.cluster_state_mut() = Some(Box::new(ClusterState::new("127.0.0.1", 6380, 16_380)));
+    backend.ctx.replication_mut().role = ReplicationRole::Replica;
+    backend.ctx.replication_mut().backlog.activate();
+    let (token, mut primary) = add_runtime_connection(&mut backend);
+    backend
+        .replication_runtime
+        .set_replica_link(ReplicaLink::streaming(
+            ConnectionId(token),
+            MasterInfo {
+                host: "127.0.0.1".to_string(),
+                port: 6379,
+            },
+            backend.ctx.replication().backlog.replid().to_string(),
+            offset(0),
+        ));
+    backend.ctx.set_loading(true);
+    backend.ctx.config_mut().replication.master_link_status = "down".to_string();
+    let ping = protocol::encode_command(&[b"PING"]);
+
+    primary.write_all(&ping).unwrap();
+    backend.transport.wait_readable_for_test(Token(token));
+    backend.recv_replication_stream(token, token);
+    assert_eq!(
+        backend.ctx.config().replication.master_link_status,
+        "down",
+        "C keeps repl_state non-CONNECTED until rdbLoad finishes"
+    );
+
+    // Once loading ends, the next streaming read may publish the up state.
+    backend.ctx.set_loading(false);
+    primary.write_all(&ping).unwrap();
+    backend.transport.wait_readable_for_test(Token(token));
+    backend.recv_replication_stream(token, token);
+    assert_eq!(backend.ctx.config().replication.master_link_status, "up");
 }
 
 #[test]

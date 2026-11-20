@@ -408,6 +408,7 @@ impl ServerWorkerState {
         }
         value.eq_ignore_ascii_case(b"eof")
             || value.eq_ignore_ascii_case(b"psync2")
+            || value.eq_ignore_ascii_case(b"inband-repl")
             || value.eq_ignore_ascii_case(b"lz4")
             || value.eq_ignore_ascii_case(b"zstd")
             || value.eq_ignore_ascii_case(b"skip-rdb-checksum")

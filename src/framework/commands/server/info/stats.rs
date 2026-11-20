@@ -154,7 +154,11 @@ fn emit_connection_and_network_stats(s: &mut String, ctx: &ServerContext) {
 fn emit_expiration_and_keyspace_stats(s: &mut String, ctx: &ServerContext) {
     let stats = ctx.stats();
     emit_line(s, "rejected_connections", stats.rejected_connections);
-    emit_line(s, "rejected_priority_connections", stats.rejected_priority_connections);
+    emit_line(
+        s,
+        "rejected_priority_connections",
+        stats.rejected_priority_connections,
+    );
     emit_line(s, "sync_full", stats.sync_full);
     emit_line(s, "sync_partial_ok", stats.sync_partial_ok);
     emit_line(s, "sync_partial_err", stats.sync_partial_err);
@@ -314,9 +318,21 @@ fn emit_eventloop_and_acl_stats(s: &mut String, ctx: &ServerContext) {
         "instantaneous_eventloop_duration_usec",
         stats.instantaneous_eventloop_duration_usec,
     );
-    emit_line(s, "eventloop_priority_cycles", stats.eventloop_priority_cycles);
-    emit_line(s, "eventloop_priority_duration_sum", stats.eventloop_priority_duration_sum);
-    emit_line(s, "eventloop_priority_duration_cmd_sum", stats.eventloop_priority_duration_cmd_sum);
+    emit_line(
+        s,
+        "eventloop_priority_cycles",
+        stats.eventloop_priority_cycles,
+    );
+    emit_line(
+        s,
+        "eventloop_priority_duration_sum",
+        stats.eventloop_priority_duration_sum,
+    );
+    emit_line(
+        s,
+        "eventloop_priority_duration_cmd_sum",
+        stats.eventloop_priority_duration_cmd_sum,
+    );
     emit_line(
         s,
         "acl_access_denied_auth",
@@ -337,7 +353,11 @@ fn emit_eventloop_and_acl_stats(s: &mut String, ctx: &ServerContext) {
         "acl_access_denied_channel",
         ACL_STATS_CHANNEL.load(std::sync::atomic::Ordering::Relaxed),
     );
-    emit_line(s, "acl_access_denied_tls_cert", stats.acl_access_denied_tls_cert);
+    emit_line(
+        s,
+        "acl_access_denied_tls_cert",
+        stats.acl_access_denied_tls_cert,
+    );
     emit_line(
         s,
         "acl_access_denied_db",
@@ -348,17 +368,82 @@ fn emit_eventloop_and_acl_stats(s: &mut String, ctx: &ServerContext) {
 pub(super) fn gen_debug_section(ctx: &ServerContext) -> String {
     let mut s = String::new();
     s.push_str("# Debug\r\n");
-    emit_line(&mut s, "eventloop_priority_duration_max", ctx.stats().eventloop_priority_duration_max);
-    emit_line(&mut s, "eventloop_priority_cmd_per_cycle_max", ctx.stats().eventloop_priority_cmd_per_cycle_max);
+    emit_line(
+        &mut s,
+        "forkless_fallbacks_module",
+        ctx.stats().forkless_fallbacks_module,
+    );
+    emit_line(
+        &mut s,
+        "forkless_fallbacks_slot_import",
+        ctx.stats().forkless_fallbacks_slot_import,
+    );
+    emit_line(
+        &mut s,
+        "forkless_fallbacks_exclude_data",
+        ctx.stats().forkless_fallbacks_exclude_data,
+    );
+    emit_line(
+        &mut s,
+        "forkless_fallbacks_missing_inband_repl",
+        ctx.stats().forkless_fallbacks_missing_inband_repl,
+    );
+    emit_line(
+        &mut s,
+        "forkless_fallbacks_compression",
+        ctx.stats().forkless_fallbacks_compression,
+    );
+    emit_line(
+        &mut s,
+        "eventloop_priority_duration_max",
+        ctx.stats().eventloop_priority_duration_max,
+    );
+    emit_line(
+        &mut s,
+        "eventloop_priority_cmd_per_cycle_max",
+        ctx.stats().eventloop_priority_cmd_per_cycle_max,
+    );
     let forkless = ctx.persistence().forkless_progress();
-    emit_line(&mut s, "forkless_current_item_ms", forkless.map_or(-1, |p| p.current_item_ms));
-    emit_line(&mut s, "forkless_current_queue_length", forkless.map_or(0, |p| p.queue_length));
-    emit_line(&mut s, "forkless_queue_length_target", forkless.map_or(0, |p| p.queue_length_target));
-    emit_line(&mut s, "forkless_dbentries_queued", forkless.map_or(0, |p| p.enqueued));
-    emit_line(&mut s, "forkless_dbentries_processed", forkless.map_or(0, |p| p.processed));
-    emit_line(&mut s, "repl_throttle_more_events", ctx.replication().throttle.more_events);
-    emit_line(&mut s, "repl_throttle_less_events", ctx.replication().throttle.less_events);
-    emit_line(&mut s, "repl_throttle_current_clients", ctx.throttled_clients().len());
+    emit_line(
+        &mut s,
+        "forkless_current_item_ms",
+        forkless.map_or(-1, |p| p.current_item_ms),
+    );
+    emit_line(
+        &mut s,
+        "forkless_current_queue_length",
+        forkless.map_or(0, |p| p.queue_length),
+    );
+    emit_line(
+        &mut s,
+        "forkless_queue_length_target",
+        forkless.map_or(0, |p| p.queue_length_target),
+    );
+    emit_line(
+        &mut s,
+        "forkless_dbentries_queued",
+        forkless.map_or(0, |p| p.enqueued),
+    );
+    emit_line(
+        &mut s,
+        "forkless_dbentries_processed",
+        forkless.map_or(0, |p| p.processed),
+    );
+    emit_line(
+        &mut s,
+        "repl_throttle_more_events",
+        ctx.replication().throttle.more_events,
+    );
+    emit_line(
+        &mut s,
+        "repl_throttle_less_events",
+        ctx.replication().throttle.less_events,
+    );
+    emit_line(
+        &mut s,
+        "repl_throttle_current_clients",
+        ctx.throttled_clients().len(),
+    );
     emit_line(
         &mut s,
         "eventloop_duration_aof_sum",

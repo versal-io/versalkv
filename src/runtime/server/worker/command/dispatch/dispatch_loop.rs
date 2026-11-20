@@ -91,14 +91,9 @@ impl ServerWorkerState {
             self.queue_command_propagation(batch);
         }
         self.refresh_connection_priorities();
-        // With no priority clients connected, no token can resolve to a
-        // priority connection, so the per-command priority save/restore
-        // (Cell swaps, stats write, priority-cycle bookkeeping) is dead
-        // work. Skip it entirely on the common standalone PING hot path.
-        // `refresh_connection_priorities` still runs to detect subnet
-        // generation changes; its own fast path returns before touching
-        // `priority_command_token` when the count is zero.
-        let priority_state = if self.ctx.stats().connected_priority_clients != 0 {
+        // Skip priority bookkeeping only when neither admitted subnet clients
+        // nor internally promoted connections need priority scheduling.
+        let priority_state = if self.priority_connections != 0 {
             let is_priority = self.is_priority_connection(token);
             let previous_token = self.priority_command_token.replace(token);
             let previous_nested = std::mem::replace(

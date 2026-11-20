@@ -35,6 +35,8 @@ pub fn build_replconf_port(port: u16) -> Vec<u8> {
         b"REPLCONF" as &[u8],
         b"listening-port" as &[u8],
         port.to_string().as_bytes(),
+        b"version",
+        crate::foundation::memory::util_version::VALKEY_VERSION.as_bytes(),
     ])
 }
 
@@ -47,10 +49,11 @@ pub fn build_replconf_capa() -> Vec<u8> {
 }
 
 pub fn build_replconf_version() -> Vec<u8> {
-    // SHUTDOWN FAILOVER and its internal REPLICAID option were introduced in
-    // the 9.0 replication protocol. Advertising that floor records that this
-    // implementation understands the handoff frame.
-    encode_command(&[b"REPLCONF", b"version", b"9.0.0"])
+    encode_command(&[
+        b"REPLCONF",
+        b"version",
+        crate::foundation::memory::util_version::VALKEY_VERSION.as_bytes(),
+    ])
 }
 
 pub fn build_replconf_cluster_node_id(node_id: &str) -> Vec<u8> {
@@ -72,7 +75,13 @@ pub struct EndOffset {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FullResync {
     pub replid: String,
-    pub offset: ReplicationOffset,
+    pub offset: FullResyncOffset,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FullResyncOffset {
+    Explicit(ReplicationOffset),
+    FromRdb,
 }
 
 #[allow(dead_code)] // Wired into the dual-channel state machine in a later slice.
@@ -192,7 +201,11 @@ pub fn negotiate_lz4(mode: &str, capabilities: &[String]) -> bool {
     compression_is_lz4(mode) && peer_supports_capability(capabilities, "lz4")
 }
 
-pub fn build_replconf_capabilities(dual_channel: bool, mode: &str) -> Vec<u8> {
+pub fn build_replconf_capabilities_with_inband(
+    dual_channel: bool,
+    mode: &str,
+    inband: bool,
+) -> Vec<u8> {
     let mut parts: Vec<&[u8]> = vec![b"REPLCONF", b"capa", b"eof", b"capa", b"psync2"];
     if dual_channel {
         parts.extend([b"capa".as_slice(), DUAL_CHANNEL_CAPABILITY.as_bytes()]);
@@ -202,6 +215,9 @@ pub fn build_replconf_capabilities(dual_channel: bool, mode: &str) -> Vec<u8> {
     }
     if compression_is_lz4(mode) || mode.eq_ignore_ascii_case("zstd") {
         parts.extend([b"capa".as_slice(), b"lz4"]);
+    }
+    if inband {
+        parts.extend([b"capa".as_slice(), b"inband-repl"]);
     }
     encode_command(&parts)
 }
@@ -284,7 +300,11 @@ pub fn parse_fullresync(line: &[u8]) -> Option<FullResync> {
     if raw_offset.is_empty() || raw_offset.iter().any(|byte| byte.is_ascii_whitespace()) {
         return None;
     }
-    let offset = parse_live_replication_offset(raw_offset)?;
+    let offset = if raw_offset == b"-1" {
+        FullResyncOffset::FromRdb
+    } else {
+        FullResyncOffset::Explicit(parse_live_replication_offset(raw_offset)?)
+    };
     Some(FullResync { replid, offset })
 }
 
@@ -354,7 +374,7 @@ mod tests {
     fn replconf_port_frame() {
         assert_eq!(
             build_replconf_port(6380),
-            b"*3\r\n$8\r\nREPLCONF\r\n$14\r\nlistening-port\r\n$4\r\n6380\r\n".to_vec()
+            b"*5\r\n$8\r\nREPLCONF\r\n$14\r\nlistening-port\r\n$4\r\n6380\r\n$7\r\nversion\r\n$11\r\n255.255.255\r\n".to_vec()
         );
     }
 
@@ -500,11 +520,7 @@ mod tests {
         let fullresync =
             parse_fullresync(b"+FULLRESYNC 0123456789abcdef0123456789abcdef01234567 12").unwrap();
         assert_eq!(fullresync.replid.len(), 40);
-        assert_eq!(fullresync.offset.get(), 12);
-        assert_eq!(
-            std::any::type_name_of_val(&fullresync.offset),
-            std::any::type_name::<crate::engine::distributed::replication::ReplicationOffset>()
-        );
+        assert_eq!(fullresync.offset, FullResyncOffset::Explicit(offset(12)));
     }
 
     #[test]
@@ -519,7 +535,11 @@ mod tests {
             ),
         ] {
             let parsed = parse_fullresync(reply.as_bytes()).expect("valid FULLRESYNC frame");
-            assert_eq!(parsed.offset.get(), expected_offset, "{reply:?}");
+            assert_eq!(
+                parsed.offset,
+                FullResyncOffset::Explicit(offset(expected_offset)),
+                "{reply:?}"
+            );
         }
 
         for reply in [
@@ -530,7 +550,7 @@ mod tests {
             format!("+FULLRESYNC {valid_replid}0 0"),
             "+FULLRESYNC 0123456789abcdef0123456789abcdef0123456g 0".to_string(),
             format!("+FULLRESYNC {valid_replid} nope"),
-            format!("+FULLRESYNC {valid_replid} -1"),
+            format!("+FULLRESYNC {valid_replid} -2"),
             format!("+FULLRESYNC {valid_replid} {}", i64::MAX),
             format!("+FULLRESYNC {valid_replid} 9223372036854775808"),
             format!("+FULLRESYNC {valid_replid} 0 trailing"),
@@ -547,6 +567,18 @@ mod tests {
         ] {
             assert!(parse_fullresync(reply.as_bytes()).is_none(), "{reply:?}");
         }
+    }
+
+    #[test]
+    fn fullresync_minus_one_is_an_rdb_metadata_request_not_a_live_offset() {
+        let frame = b"+FULLRESYNC 0123456789abcdef0123456789abcdef01234567 -1";
+        assert_eq!(
+            parse_fullresync(frame).unwrap().offset,
+            FullResyncOffset::FromRdb
+        );
+        assert!(
+            parse_end_offset(b"$ENDOFF:-1 0123456789abcdef0123456789abcdef01234567 0 1").is_none()
+        );
     }
 
     #[test]

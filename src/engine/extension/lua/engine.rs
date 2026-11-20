@@ -1,4 +1,5 @@
 use mlua::prelude::*;
+use std::cell::Cell;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::engine::extension::script::{
@@ -17,6 +18,18 @@ pub struct LuaEngine;
 pub static LUA_ENGINE: LuaEngine = LuaEngine;
 
 const FUNCTION_RESTORE_BACKUP_REGISTRY_KEY: &str = "__valkey_function_restore_backup_v1";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RestoreBeginCleanup {
+    PopFrame,
+    PreserveOuter,
+}
+
+thread_local! {
+    // Registry cleanup calls rollback even when begin fails before publishing a frame.
+    static RESTORE_BEGIN_CLEANUP: Cell<RestoreBeginCleanup> =
+        const { Cell::new(RestoreBeginCleanup::PopFrame) };
+}
 
 fn collect_function_garbage(lua: &Lua) {
     // mlua can require a second cycle when deletion occurs during an active GC cycle.
@@ -529,6 +542,8 @@ impl ScriptEngine for LuaEngine {
         let (body, func_flags, _) = parse_shebang(code, flags)?;
         with_lua_runtime(false, |runtime| {
             let lua = &runtime.lua;
+            let _hook = super::timeout::ScriptHookGuard::enter(lua)
+                .map_err(|error| ScriptError::Compile(error.to_string()))?;
             let globals = lua.globals();
             globals
                 .raw_set(super::REGISTERED_FUNCS_PENDING_TABLE, LuaValue::Nil)
@@ -764,16 +779,12 @@ impl ScriptEngine for LuaEngine {
     }
 
     fn begin_function_restore_transaction(&self) -> Result<(), ScriptError> {
+        RESTORE_BEGIN_CLEANUP.with(|cleanup| cleanup.set(RestoreBeginCleanup::PreserveOuter));
         with_lua_runtime(false, |runtime| {
             let lua = &runtime.lua;
-            let transaction_state = lua
-                .named_registry_value::<LuaValue>(FUNCTION_RESTORE_BACKUP_REGISTRY_KEY)
+            let parent = lua
+                .named_registry_value::<Option<LuaTable>>(FUNCTION_RESTORE_BACKUP_REGISTRY_KEY)
                 .map_err(|error| ScriptError::Runtime(error.to_string()))?;
-            if !matches!(transaction_state, LuaValue::Nil) {
-                return Err(ScriptError::Runtime(
-                    "Function restore transaction is already active".to_string(),
-                ));
-            }
 
             let globals = lua.globals();
             let active = globals
@@ -791,6 +802,19 @@ impl ScriptEngine for LuaEngine {
                     active
                 }
             };
+            let frame = lua
+                .create_table()
+                .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+            frame
+                .raw_set("callbacks", active.clone())
+                .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+            frame
+                .raw_set("parent", parent)
+                .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+            lua.set_named_registry_value(FUNCTION_RESTORE_BACKUP_REGISTRY_KEY, frame)
+                .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+            RESTORE_BEGIN_CLEANUP.with(|cleanup| cleanup.set(RestoreBeginCleanup::PopFrame));
+
             let working = lua
                 .create_table()
                 .map_err(|error| ScriptError::Runtime(error.to_string()))?;
@@ -801,17 +825,9 @@ impl ScriptEngine for LuaEngine {
                     .map_err(|error| ScriptError::Runtime(error.to_string()))?;
             }
 
-            lua.set_named_registry_value(FUNCTION_RESTORE_BACKUP_REGISTRY_KEY, active.clone())
+            globals
+                .raw_set(super::REGISTERED_FUNCS_TABLE, working)
                 .map_err(|error| ScriptError::Runtime(error.to_string()))?;
-            if let Err(activate_error) = globals.raw_set(super::REGISTERED_FUNCS_TABLE, working) {
-                return match lua.unset_named_registry_value(FUNCTION_RESTORE_BACKUP_REGISTRY_KEY) {
-                    Ok(()) => Err(ScriptError::Runtime(activate_error.to_string())),
-                    Err(cleanup_error) => Err(ScriptError::Runtime(format!(
-                        "Failed to activate the function restore working table: {activate_error}; \
-                         failed to clear the function restore backup: {cleanup_error}"
-                    ))),
-                };
-            }
             Ok(())
         })
     }
@@ -819,10 +835,18 @@ impl ScriptEngine for LuaEngine {
     fn commit_function_restore_transaction(&self) -> Result<(), ScriptError> {
         with_lua_runtime(false, |runtime| {
             let lua = &runtime.lua;
+            let frame = lua
+                .named_registry_value::<Option<LuaTable>>(FUNCTION_RESTORE_BACKUP_REGISTRY_KEY)
+                .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+            let parent = frame
+                .map(|frame| frame.raw_get::<Option<LuaTable>>("parent"))
+                .transpose()
+                .map_err(|error| ScriptError::Runtime(error.to_string()))?
+                .flatten();
             lua.globals()
                 .raw_set(super::REGISTERED_FUNCS_PENDING_TABLE, LuaValue::Nil)
                 .map_err(|error| ScriptError::Runtime(error.to_string()))?;
-            lua.unset_named_registry_value(FUNCTION_RESTORE_BACKUP_REGISTRY_KEY)
+            lua.set_named_registry_value(FUNCTION_RESTORE_BACKUP_REGISTRY_KEY, parent)
                 .map_err(|error| ScriptError::Runtime(error.to_string()))?;
             // Do not force a full-heap garbage collection on every committed
             // FUNCTION LOAD/RESTORE. The Lua runtime runs incremental GC by
@@ -833,35 +857,34 @@ impl ScriptEngine for LuaEngine {
     }
 
     fn rollback_function_restore_transaction(&self) -> Result<(), ScriptError> {
+        if RESTORE_BEGIN_CLEANUP.with(|cleanup| cleanup.replace(RestoreBeginCleanup::PopFrame))
+            == RestoreBeginCleanup::PreserveOuter
+        {
+            return Ok(());
+        }
         with_lua_runtime(false, |runtime| {
             let lua = &runtime.lua;
-            let backup = lua
+            let frame = lua
                 .named_registry_value::<Option<LuaTable>>(FUNCTION_RESTORE_BACKUP_REGISTRY_KEY)
                 .map_err(|error| ScriptError::Runtime(error.to_string()))?;
-            let Some(backup) = backup else {
+            let Some(frame) = frame else {
                 return Ok(());
             };
+            let backup = frame
+                .raw_get::<LuaTable>("callbacks")
+                .map_err(|error| ScriptError::Runtime(error.to_string()))?;
+            let parent = frame
+                .raw_get::<Option<LuaTable>>("parent")
+                .map_err(|error| ScriptError::Runtime(error.to_string()))?;
             let globals = lua.globals();
             globals
                 .raw_set(super::REGISTERED_FUNCS_PENDING_TABLE, LuaValue::Nil)
                 .map_err(|error| ScriptError::Runtime(error.to_string()))?;
-            lua.unset_named_registry_value(FUNCTION_RESTORE_BACKUP_REGISTRY_KEY)
+            globals
+                .raw_set(super::REGISTERED_FUNCS_TABLE, backup)
                 .map_err(|error| ScriptError::Runtime(error.to_string()))?;
-            if let Err(restore_error) =
-                globals.raw_set(super::REGISTERED_FUNCS_TABLE, backup.clone())
-            {
-                return match lua
-                    .set_named_registry_value(FUNCTION_RESTORE_BACKUP_REGISTRY_KEY, backup)
-                {
-                    Ok(()) => Err(ScriptError::Runtime(format!(
-                        "Failed to restore the function callback table: {restore_error}"
-                    ))),
-                    Err(recovery_error) => Err(ScriptError::Runtime(format!(
-                        "Failed to restore the function callback table: {restore_error}; \
-                         failed to preserve the function restore backup: {recovery_error}"
-                    ))),
-                };
-            }
+            lua.set_named_registry_value(FUNCTION_RESTORE_BACKUP_REGISTRY_KEY, parent)
+                .map_err(|error| ScriptError::Runtime(error.to_string()))?;
             collect_function_garbage(lua);
             Ok(())
         })

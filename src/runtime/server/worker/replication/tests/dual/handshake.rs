@@ -174,6 +174,8 @@ fn rdb_open_reports_pairing_failure_and_rolls_back_connection() {
         .expect_err("conflicting role must reject RDB pairing");
 
     assert_eq!(error.stage(), ReplicaRdbOpenStage::Pair);
+    assert_eq!(backend.priority_connections, 0);
+    assert_eq!(backend.ctx.stats().connected_priority_clients, 0);
     assert!(backend.replication_runtime.replica_rdb_link().is_none());
     assert!(backend
         .replication_runtime

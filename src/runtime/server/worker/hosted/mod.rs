@@ -21,6 +21,7 @@ use crate::runtime::server::worker::ServerWorkerState;
 
 mod debugger;
 mod module;
+mod rdb;
 
 #[derive(Clone, Copy, Default)]
 pub(crate) struct HostTaskScope {
@@ -106,9 +107,13 @@ impl ServerWorkerState {
                 task.finish(result, connection, &mut self.ctx)
             }
             crate::framework::host_tasks::PreparedHostTask::DebugRdb(mut task) => {
-                let result = self
-                    .with_host_dispatcher(HostTaskScope::client(token), |dispatcher| {
-                        task.run(dispatcher)
+                let result = task
+                    .begin_function_rollback(&self.ctx)
+                    .map_err(crate::framework::host_tasks::RdbTaskError::Host)
+                    .and_then(|()| {
+                        self.with_host_dispatcher(HostTaskScope::client(token), |dispatcher| {
+                            task.run(dispatcher)
+                        })
                     });
                 task.finish(result, &mut self.ctx)
             }
@@ -295,6 +300,23 @@ impl ServerWorkerState {
         match request {
             HostRequest::ExecuteCommand {
                 args,
+                origin:
+                    HostCommandOrigin::RdbReplay {
+                        db,
+                        dataset,
+                        function_codes,
+                        function_policy,
+                    },
+            } => self.dispatch_rdb_inline_command(
+                scope,
+                db,
+                args,
+                dataset,
+                function_codes,
+                function_policy,
+            ),
+            HostRequest::ExecuteCommand {
+                args,
                 origin: HostCommandOrigin::AofReplay,
             } => self
                 .apply_aof_command(replay_conn, args.clone(), scope)
@@ -333,6 +355,9 @@ impl ServerWorkerState {
             HostRequest::Yield(HostYield::ScriptCheckpoint { run }) => {
                 self.dispatch_script_checkpoint(scope, run)
             }
+            HostRequest::Yield(HostYield::ScriptDebugStop { .. }) => Err(HostError::Invariant(
+                "debugger stop reached the replay dispatcher",
+            )),
             HostRequest::Yield(HostYield::RdbProgress {
                 progress,
                 visible_dataset,
@@ -529,6 +554,19 @@ impl ServerWorkerState {
                 HostCommandOrigin::AofReplay => Err(HostError::Runtime(
                     "AOF replay host is not installed yet".to_string(),
                 )),
+                HostCommandOrigin::RdbReplay {
+                    db,
+                    dataset,
+                    function_codes,
+                    function_policy,
+                } => self.dispatch_rdb_inline_command(
+                    scope,
+                    db,
+                    args,
+                    dataset,
+                    function_codes,
+                    function_policy,
+                ),
             },
             HostRequest::CheckAcl { args } => {
                 let token = scope.protected_client.ok_or_else(|| {
@@ -555,6 +593,9 @@ impl ServerWorkerState {
             HostRequest::Yield(HostYield::ScriptCheckpoint { run }) => {
                 self.dispatch_script_checkpoint(scope, run)
             }
+            HostRequest::Yield(HostYield::ScriptDebugStop { .. }) => Err(HostError::Invariant(
+                "debugger stop reached the ordinary host dispatcher",
+            )),
             HostRequest::Yield(HostYield::RdbProgress {
                 progress,
                 visible_dataset,
@@ -678,6 +719,312 @@ mod tests {
     use bytes::Bytes;
 
     use super::HostTaskScope;
+
+    #[test]
+    fn hosted_lua_first_time_after_sleep_keeps_execution_unit_entry() {
+        use crate::engine::extension::config::server::ProtectedAction;
+        use crate::engine::host::{HostRequest, HostYield};
+        use crate::foundation::io::sys::time::{
+            enter_command_time_snapshot, enter_command_time_snapshot_lazy, mstime,
+        };
+        use crate::framework::capabilities::io::Token;
+        use crate::framework::host_tasks::{prepare_lua_task, PreparedHostTask};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        for is_lazy in [false, true] {
+            let mut runtime = ServerWorkerState::new(1).unwrap();
+            crate::framework::commands::register_all(&mut runtime.registry);
+            runtime.ctx.set_command_registry_snapshot(&runtime.registry);
+            runtime.ctx.config_mut().server.enable_debug_command = ProtectedAction::Yes;
+            let token = Token(42);
+            let mut connection = Connection::new_fake();
+            connection.set_token_for_test(token);
+            runtime.connection_registry.insert(connection);
+            let args = CommandArgs::from_parts(vec![
+                Bytes::from_static(b"EVAL"),
+                Bytes::from_static(
+                    br"
+                    redis.call('SET', KEYS[1], 'value', 'PX', 1000)
+                    redis.call('DEBUG', 'SLEEP', 0.05)
+                    local first = redis.call('TIME')
+                    return {first, redis.call('PEXPIRETIME', KEYS[1]),
+                            redis.call('PTTL', KEYS[1]), redis.call('TIME')}
+                    ",
+                ),
+                Bytes::from_static(b"1"),
+                Bytes::from_static(b"first-time-ttl"),
+            ]);
+            let PreparedHostTask::Lua(mut task) = prepare_lua_task(
+                &mut runtime.connection_registry[token],
+                &args,
+                &mut runtime.ctx,
+            )
+            .unwrap() else {
+                panic!("EVAL must prepare a Lua task");
+            };
+            let before_us = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_micros();
+            let _snapshot = if is_lazy {
+                enter_command_time_snapshot_lazy()
+            } else {
+                enter_command_time_snapshot(1_000)
+            };
+            let after_us = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_micros();
+            let mut checkpoints = 0;
+            let control = task.control();
+            runtime.ctx.enter_script(control);
+            let result = runtime.with_host_dispatcher(HostTaskScope::client(token), |dispatcher| {
+                task.run(&mut |request| {
+                    if matches!(
+                        &request,
+                        HostRequest::Yield(HostYield::ScriptCheckpoint { .. })
+                    ) {
+                        checkpoints += 1;
+                    }
+                    dispatcher(request)
+                })
+            });
+            runtime.ctx.leave_script();
+            let result = task.finish(
+                result,
+                &mut runtime.connection_registry[token],
+                &mut runtime.ctx,
+            );
+            assert_eq!(checkpoints, 0, "sleep must not service script events");
+            let Value::Array(parts) = result else {
+                panic!("EVAL must return TIME and expiry results: {result:?}");
+            };
+            assert_eq!(parts.len(), 4);
+            assert_eq!(parts[0], parts[3], "TIME stays cached without servicing");
+            assert_eq!(parts[1], Value::Integer(mstime() + 1_000));
+            assert_eq!(parts[2], Value::Integer(1_000));
+            let Value::Array(time) = &parts[0] else {
+                panic!("TIME must return seconds and microseconds");
+            };
+            assert_eq!(time.len(), 2);
+            let numbers: Vec<u128> = time
+                .iter()
+                .map(|part| {
+                    let Value::Bulk(bytes) = part else {
+                        panic!("TIME components must be bulk strings");
+                    };
+                    std::str::from_utf8(bytes).unwrap().parse().unwrap()
+                })
+                .collect();
+            assert!(numbers[1] < 1_000_000);
+            let first_us = numbers[0] * 1_000_000 + numbers[1];
+            assert!(
+                (before_us..=after_us).contains(&first_us),
+                "first TIME must use execution unit entry before DEBUG SLEEP: \
+                 is_lazy={is_lazy}, entry={before_us}..={after_us}, first={first_us}"
+            );
+            if is_lazy {
+                assert_eq!(parts[1], Value::Integer((first_us / 1_000) as i64 + 1_000));
+            }
+        }
+    }
+
+    #[test]
+    fn hosted_script_time_uses_wall_clock_without_thawing_expiry_snapshot() {
+        use crate::engine::extension::script::ScriptRunCtx;
+        use crate::engine::host::{dispatch_command, HostCommandOrigin, ScriptCallMode};
+        use crate::foundation::io::sys::time::{enter_command_time_snapshot, mstime, ustime};
+        use crate::framework::capabilities::io::Token;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let mut runtime = ServerWorkerState::new(1).unwrap();
+        crate::framework::commands::register_all(&mut runtime.registry);
+        runtime.ctx.set_command_registry_snapshot(&runtime.registry);
+        let token = Token(42);
+        let mut connection = Connection::new_fake();
+        connection.set_token_for_test(token);
+        runtime.connection_registry.insert(connection);
+        let args = CommandArgs::from_parts(vec![Bytes::from_static(b"TIME")]);
+        let mut run = ScriptRunCtx::new_eval_detached(false, true, true, false);
+        let before_us = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_micros();
+        let _snapshot = enter_command_time_snapshot(1_000);
+
+        let reply = runtime
+            .with_host_dispatcher(HostTaskScope::client(token), |dispatcher| {
+                dispatch_command(
+                    dispatcher,
+                    &args,
+                    HostCommandOrigin::Script {
+                        run: &mut run,
+                        mode: ScriptCallMode::Call,
+                    },
+                )
+            })
+            .unwrap();
+
+        let after_us = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_micros();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let repeated_reply = runtime
+            .with_host_dispatcher(HostTaskScope::client(token), |dispatcher| {
+                dispatch_command(
+                    dispatcher,
+                    &args,
+                    HostCommandOrigin::Script {
+                        run: &mut run,
+                        mode: ScriptCallMode::Call,
+                    },
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            repeated_reply, reply,
+            "TIME stays cached before a checkpoint"
+        );
+        let Value::Array(parts) = reply else {
+            panic!("TIME must return seconds and microseconds");
+        };
+        assert_eq!(parts.len(), 2);
+        let numbers: Vec<u128> = parts
+            .iter()
+            .map(|part| {
+                let Value::Bulk(bytes) = part else {
+                    panic!("TIME components must be bulk strings");
+                };
+                std::str::from_utf8(bytes).unwrap().parse().unwrap()
+            })
+            .collect();
+        assert!(numbers[1] < 1_000_000);
+        let reply_us = numbers[0] * 1_000_000 + numbers[1];
+        assert!(
+            (before_us..=after_us).contains(&reply_us),
+            "TIME must observe the wall clock, not the outer command snapshot: {reply_us}"
+        );
+        assert_eq!(mstime(), 1_000);
+        assert_eq!(ustime(), 1_000_000);
+    }
+
+    #[test]
+    fn hosted_lua_time_loop_finishes_after_instruction_checkpoint() {
+        use crate::engine::host::{HostRequest, HostYield};
+        use crate::foundation::io::sys::time::{enter_command_time_snapshot, mstime};
+        use crate::framework::capabilities::io::Token;
+        use crate::framework::host_tasks::{prepare_lua_task, PreparedHostTask};
+        use std::time::Duration;
+
+        for (memory_limit, cap_us, expected_reason) in [
+            ("0", "3000000", "memory"),
+            ("18446744073709551615", "10000", "cap"),
+        ] {
+            let mut runtime = ServerWorkerState::new(1).unwrap();
+            crate::framework::commands::register_all(&mut runtime.registry);
+            runtime.ctx.set_command_registry_snapshot(&runtime.registry);
+            let token = Token(42);
+            let mut connection = Connection::new_fake();
+            connection.set_token_for_test(token);
+            runtime.connection_registry.insert(connection);
+            runtime.refresh_all_client_memory_usage();
+            let _snapshot = enter_command_time_snapshot(1_000);
+            let args = CommandArgs::from_parts(vec![
+                Bytes::from_static(b"EVAL"),
+                Bytes::from_static(
+                    br"
+                    redis.call('SET', 'yield-ttl', 'value', 'PX', 30000)
+                    local t0 = redis.call('TIME')
+                    local start = t0[1] * 1000000 + t0[2]
+                    local last = start
+                    local reason
+                    for attempt = 1, 400 do
+                        for _ = 1, 1000 do end
+                        local t = redis.call('TIME')
+                        local now = t[1] * 1000000 + t[2]
+                        if now - start > tonumber(ARGV[2]) then
+                            reason = 'cap'
+                            break
+                        end
+                        if now - last > 10000 then
+                            last = now
+                            local mem = string.match(redis.call('INFO', 'memory'),
+                                                     'mem_clients_normal:(%d+)')
+                            if tonumber(mem) > tonumber(ARGV[1]) then
+                                reason = 'memory'
+                                break
+                            end
+                        end
+                    end
+                    if not reason then return redis.error_reply('TIME did not advance') end
+                    local info = redis.call('INFO', 'stats')
+                    redis.call('SET', 'evicted_during_script',
+                               string.match(info, 'evicted_clients:(%d+)'))
+                    return {reason, redis.call('PTTL', 'yield-ttl')}
+                    ",
+                ),
+                Bytes::from_static(b"0"),
+                Bytes::copy_from_slice(memory_limit.as_bytes()),
+                Bytes::copy_from_slice(cap_us.as_bytes()),
+            ]);
+            let PreparedHostTask::Lua(mut task) = prepare_lua_task(
+                &mut runtime.connection_registry[token],
+                &args,
+                &mut runtime.ctx,
+            )
+            .unwrap() else {
+                panic!("EVAL must prepare a Lua task");
+            };
+            let control = task.control();
+            control.mark_timed_out();
+            runtime.ctx.enter_script(control);
+            let mut checkpoints = 0;
+
+            let result = runtime.with_host_dispatcher(HostTaskScope::client(token), |dispatcher| {
+                task.run(&mut |request| {
+                    if matches!(
+                        &request,
+                        HostRequest::Yield(HostYield::ScriptCheckpoint { .. })
+                    ) {
+                        checkpoints += 1;
+                        if checkpoints == 1 {
+                            // Ensure elapsed wall time without depending on VM speed.
+                            std::thread::sleep(Duration::from_millis(20));
+                        }
+                    }
+                    dispatcher(request)
+                })
+            });
+
+            runtime.ctx.leave_script();
+            let result = task.finish(
+                result,
+                &mut runtime.connection_registry[token],
+                &mut runtime.ctx,
+            );
+            assert!(checkpoints > 0, "the real Lua instruction hook must fire");
+            assert_eq!(
+                result,
+                Value::Array(vec![
+                    Value::bulk(Bytes::copy_from_slice(expected_reason.as_bytes())),
+                    Value::Integer(30_000),
+                ])
+            );
+            assert!(!runtime.ctx.is_script_busy());
+            assert_eq!(mstime(), 1_000);
+            assert_eq!(
+                runtime
+                    .ctx
+                    .db(0)
+                    .unwrap()
+                    .get_no_expire(b"evicted_during_script")
+                    .unwrap()
+                    .as_bytes(),
+                b"0"
+            );
+        }
+    }
 
     thread_local! {
         static DISCONNECT_SOCKET: std::cell::RefCell<Option<(

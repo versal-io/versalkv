@@ -32,6 +32,7 @@ pub struct ReplicaLink {
     connection_id: ConnectionId,
     master: MasterInfo,
     state: ReplicaLinkState,
+    primary_connection_error: Option<String>,
     #[allow(dead_code)] // Wired into dual-channel negotiation in a later slice.
     rdb_channel_state: ReplicaRdbChannelState,
     rdb_transfer_failed: bool,
@@ -43,6 +44,10 @@ pub struct ReplicaLink {
     main_wire_active: bool,
     rdb_wire_active: bool,
     pending_stream_decompression_error: bool,
+    /// Raw wire bytes rejected by the streaming compression decoder while the
+    /// dual RDB load still owns framing. C counts these bytes in the pending
+    /// replication buffer INFO field even though they decode only at replay.
+    pending_stream_error_bytes: usize,
     rdb_input: Vec<u8>,
     rdb_framing_state: Option<RdbFramingState>,
     rdb_eof_holdback: Vec<u8>,
@@ -80,6 +85,9 @@ pub struct ReplicaLink {
     failover_accepted: bool,
     partial_resync_accepted: bool,
     full_resync_accepted: bool,
+    full_resync_offset: Option<protocol::FullResyncOffset>,
+    pre_psync: bool,
+    inband_replication_enabled: bool,
     pending_primary_replid_change: Option<String>,
     cluster_node_id: Option<String>,
 }
@@ -92,6 +100,7 @@ impl ReplicaLink {
             connection_id,
             master,
             state: ReplicaLinkState::Connecting,
+            primary_connection_error: None,
             rdb_channel_state: ReplicaRdbChannelState::None,
             rdb_transfer_failed: false,
             dual_main_psync_paused: false,
@@ -102,6 +111,7 @@ impl ReplicaLink {
             main_wire_active: false,
             rdb_wire_active: false,
             pending_stream_decompression_error: false,
+            pending_stream_error_bytes: 0,
             rdb_input: Vec::new(),
             rdb_framing_state: None,
             rdb_eof_holdback: Vec::new(),
@@ -131,6 +141,9 @@ impl ReplicaLink {
             failover_accepted: false,
             partial_resync_accepted: false,
             full_resync_accepted: false,
+            full_resync_offset: None,
+            pre_psync: false,
+            inband_replication_enabled: false,
             pending_primary_replid_change: None,
             cluster_node_id: None,
         }
@@ -210,6 +223,10 @@ impl ReplicaLink {
         self.dual_channel_enabled = enabled;
     }
 
+    pub fn set_inband_replication_enabled(&mut self, enabled: bool) {
+        self.inband_replication_enabled = enabled;
+    }
+
     pub fn set_compression_mode(&mut self, mode: &str) {
         self.compression_mode = mode.to_string();
         self.compression_decoder =
@@ -232,6 +249,12 @@ impl ReplicaLink {
 
     pub fn has_stream_decompression_error(&self) -> bool {
         self.pending_stream_decompression_error
+    }
+
+    /// Raw wire bytes currently withheld because the streaming decoder
+    /// rejected them; surfaced through the replica pending-buffer INFO metric.
+    pub fn pending_stream_error_bytes(&self) -> usize {
+        self.pending_stream_error_bytes
     }
 
     pub fn prepare_rdb_snapshot_options(
@@ -393,10 +416,13 @@ impl ReplicaLink {
                             announce_ip,
                         )));
                     }
-                    actions.push(ReplicaAction::Send(protocol::build_replconf_capabilities(
-                        self.dual_channel_enabled,
-                        &self.compression_mode,
-                    )));
+                    actions.push(ReplicaAction::Send(
+                        protocol::build_replconf_capabilities_with_inband(
+                            self.dual_channel_enabled,
+                            &self.compression_mode,
+                            self.inband_replication_enabled,
+                        ),
+                    ));
                     if let Some(node_id) = &self.cluster_node_id {
                         actions.push(ReplicaAction::Send(protocol::build_replconf_version()));
                         actions.push(ReplicaAction::Send(
@@ -414,7 +440,14 @@ impl ReplicaLink {
                     let Some(line) = take_line(&mut self.input) else {
                         break;
                     };
-                    if !line.starts_with(b"+") {
+                    let initial_remaining = 2
+                        + usize::from(!announce_ip.is_empty())
+                        + usize::from(self.cluster_node_id.is_some()) * 2;
+                    let is_version_reply = usize::from(remaining) == initial_remaining
+                        || (self.cluster_node_id.is_some() && remaining == 2);
+                    let is_unsupported_version =
+                        is_version_reply && line == b"-ERR Unrecognized REPLCONF option: version";
+                    if !line.starts_with(b"+") && !is_unsupported_version {
                         return Err(LinkError::Protocol);
                     }
                     match remaining.checked_sub(1) {
@@ -508,9 +541,18 @@ impl ReplicaLink {
                         self.begin_rdb()?;
                         self.full_resync_accepted = true;
                         self.master_replid = Some(fullresync.replid);
-                        self.requested_offset = Some(fullresync.offset);
-                        self.received_offset = fullresync.offset;
-                        self.decoded_offset = fullresync.offset;
+                        self.full_resync_offset = Some(fullresync.offset);
+                        self.ack_enabled_after_rdb_commit = false;
+                        match fullresync.offset {
+                            protocol::FullResyncOffset::Explicit(offset) => {
+                                self.requested_offset = Some(offset);
+                                self.received_offset = offset;
+                                self.decoded_offset = offset;
+                            }
+                            protocol::FullResyncOffset::FromRdb => {
+                                self.requested_offset = None;
+                            }
+                        }
                         // C records primary_initial_offset separately from
                         // the live or cached primary's processed position.
                         // Publish this snapshot only after the RDB commits.
@@ -559,6 +601,22 @@ impl ReplicaLink {
                             String::from_utf8_lossy(&line)
                         );
                         return Err(LinkError::TryLater);
+                    } else if line.starts_with(b"-ERR") {
+                        crate::server_log!(
+                            notice,
+                            "Primary does not support PSYNC. Retrying with SYNC"
+                        );
+                        self.pre_psync = true;
+                        self.full_resync_offset = None;
+                        self.master_replid = None;
+                        let zero = ReplicationOffset::ZERO;
+                        self.requested_offset = Some(zero);
+                        self.received_offset = zero;
+                        self.decoded_offset = zero;
+                        self.selected_db = 0;
+                        self.ack_enabled_after_rdb_commit = false;
+                        actions.push(ReplicaAction::Send(protocol::encode_command(&[b"SYNC"])));
+                        self.state = ReplicaLinkState::ReceivingRdbHeader;
                     } else {
                         return Err(LinkError::Protocol);
                     }
@@ -617,15 +675,18 @@ impl ReplicaLink {
                     }
                 }
                 ReplicaLinkState::Streaming => {
+                    if self.requires_rdb_offset() && self.rdb_receive.is_some() {
+                        break;
+                    }
                     let is_dual = self.rdb_channel_state != ReplicaRdbChannelState::None;
                     if self.pending_stream_decompression_error {
                         self.input.clear();
                         break;
                     }
                     if let Some(decoder) = self.compression_decoder.as_mut() {
-                        match decoder
-                            .feed(&std::mem::take(&mut self.input), REPLICATION_BATCH_BYTES)
-                        {
+                        let input_bytes = std::mem::take(&mut self.input);
+                        let rejected_bytes = input_bytes.len();
+                        match decoder.feed(&input_bytes, REPLICATION_BATCH_BYTES) {
                             Ok(decoded) => self.input = decoded,
                             Err(_)
                                 if self.rdb_receive.is_some()
@@ -634,6 +695,9 @@ impl ReplicaLink {
                                             != ReplicaRdbChannelState::RdbLoaded) =>
                             {
                                 self.pending_stream_decompression_error = true;
+                                self.pending_stream_error_bytes = self
+                                    .pending_stream_error_bytes
+                                    .saturating_add(rejected_bytes);
                                 self.compression_decoder = None;
                                 break;
                             }
@@ -1085,10 +1149,47 @@ impl ReplicaLink {
         self.requested_offset.ok_or(LinkError::Protocol)
     }
 
+    pub fn requires_rdb_offset(&self) -> bool {
+        self.full_resync_offset == Some(protocol::FullResyncOffset::FromRdb)
+            && !self.is_dual_rdb_mode_active()
+    }
+
+    pub fn prevalidate_rdb_commit_position(
+        &self,
+        repl_id: Option<&str>,
+        repl_offset: Option<i64>,
+    ) -> Result<ReplicationOffset, LinkError> {
+        if !self.requires_rdb_offset() {
+            return self.prevalidate_rdb_apply_position();
+        }
+        let invalid = || {
+            crate::server_log!(
+                warning,
+                "PRIMARY <-> REPLICA sync: the RDB doesn't carry a valid offset for replication ID {}",
+                self.master_replid.as_deref().unwrap_or("")
+            );
+            LinkError::Protocol
+        };
+        if repl_id.is_none() || repl_id != self.master_replid.as_deref() {
+            return Err(invalid());
+        }
+        let offset =
+            ReplicationOffset::try_from(repl_offset.ok_or_else(invalid)?).map_err(|_| invalid())?;
+        offset.checked_next_request().ok_or_else(invalid)?;
+        Ok(offset)
+    }
+
     pub fn finish_rdb_apply(&mut self, apply_position: ReplicationOffset) {
-        debug_assert_eq!(self.requested_offset, Some(apply_position));
+        if self.requires_rdb_offset() {
+            self.requested_offset = Some(apply_position);
+            self.received_offset = apply_position;
+            self.decoded_offset = apply_position;
+            self.acked_offset = apply_position;
+        } else {
+            debug_assert_eq!(self.requested_offset, Some(apply_position));
+        }
         self.applied_offset = apply_position;
-        self.ack_enabled_after_rdb_commit = !self.is_dual_rdb_mode_active();
+        self.ack_enabled_after_rdb_commit = !self.is_dual_rdb_mode_active() && !self.pre_psync;
         // Classic full sync arms the first periodic ACK immediately. Dual
         // channel keeps the gate closed until `acknowledge_applied` emits the
         // terminal ACK after pending replay and LOADING both finish. This is
@@ -1104,7 +1205,17 @@ impl ReplicaLink {
     }
 
     pub fn can_ack_primary(&self) -> bool {
-        self.ack_enabled_after_rdb_commit
+        self.ack_enabled_after_rdb_commit && self.primary_connection_error.is_none()
+    }
+
+    pub(crate) fn record_primary_connection_error(&mut self, error: String) {
+        if self.primary_connection_error.is_none() {
+            self.primary_connection_error = Some(error);
+        }
+    }
+
+    pub(crate) fn primary_connection_error(&self) -> Option<&str> {
+        self.primary_connection_error.as_deref()
     }
 
     pub fn finish_command_apply(&mut self, end_offset: ReplicationOffset) -> Result<(), LinkError> {
@@ -1267,8 +1378,7 @@ impl ReplicaLink {
         now_ms: i64,
         aof_offset: Option<ReplicationOffset>,
     ) -> Option<ReplicaAction> {
-        if !matches!(self.state, ReplicaLinkState::Streaming) || !self.ack_enabled_after_rdb_commit
-        {
+        if !matches!(self.state, ReplicaLinkState::Streaming) || !self.can_ack_primary() {
             return None;
         }
         const PERIODIC_ACK_INTERVAL_MS: i64 = 1_000;

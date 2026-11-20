@@ -82,6 +82,7 @@ impl ServerWorkerState {
             return;
         };
         if event.readable
+            && !event.read_hup
             && !event.error
             && self
                 .pending_replication_replay

@@ -69,6 +69,25 @@ impl ServerWorkerState {
         protected_token: Token,
         first_poll_timeout: Option<Duration>,
     ) {
+        let owner = self
+            .connection_registry
+            .get(protected_token)
+            .map(|connection| connection.session_id());
+        if let Some(session) = owner {
+            self.blocked_events.push_command_owner(session);
+        }
+        self.process_command_blocked_events(protected_token, first_poll_timeout);
+        if let Some(session) = owner {
+            let restored = self.blocked_events.pop_command_owner();
+            debug_assert_eq!(restored, Some(session));
+        }
+    }
+
+    fn process_command_blocked_events(
+        &mut self,
+        protected_token: Token,
+        first_poll_timeout: Option<Duration>,
+    ) {
         let _command_time = crate::foundation::io::sys::time::enter_fresh_command_time_snapshot();
         self.writes.ordinary.begin_turn();
         for round in 0..4 {
@@ -261,6 +280,7 @@ mod tests {
     use std::collections::HashSet;
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::time::Duration;
 
     fn offset(value: i64) -> ReplicationOffset {
         ReplicationOffset::try_from(value).expect("valid test offset")
@@ -375,6 +395,102 @@ mod tests {
             peer_addr,
         });
         (client, peer.token)
+    }
+
+    #[test]
+    fn yielding_script_caller_survives_client_eviction_until_script_finishes() {
+        use crate::engine::command::CommandArgs;
+        use crate::engine::extension::script::ScriptRunCtx;
+        use crate::engine::host::{
+            dispatch_command, yield_script, HostCommandOrigin, HostControl, ScriptCallMode,
+        };
+        use crate::foundation::io::protocol::Value;
+        use crate::framework::capabilities::connection::{Connection, ConnectionState};
+        use crate::runtime::server::worker::hosted::HostTaskScope;
+        use bytes::Bytes;
+
+        let mut backend = ServerWorkerState::new(1).unwrap();
+        crate::framework::commands::register_all(&mut backend.registry);
+        backend.ctx.set_command_registry_snapshot(&backend.registry);
+        backend.ctx.config_mut().server.maxmemory_clients = "128kb".to_string();
+        let caller = Token(42);
+        let mut connection = Connection::new(caller, ([127, 0, 0, 1], 6379).into(), false);
+        connection.queue_reply(vec![b'x'; 200 * 1024]);
+        backend.connection_registry.insert(connection);
+        let (mut pusher, pusher_token) = connected_client(&mut backend);
+        pusher
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        backend.refresh_all_client_memory_usage();
+        let caller_memory = backend.connection_registry[caller].accounted_normal_memory();
+        let mut run = ScriptRunCtx::new_eval_detached(false, true, true, false);
+        run.control.mark_timed_out();
+        backend.ctx.enter_script(run.control.clone());
+
+        for _ in 0..2 {
+            pusher.write_all(b"PING\r\n").unwrap();
+            backend.transport.wait_readable_for_test(pusher_token);
+            backend
+                .transport
+                .queue_test_pending_data_event(pusher_token);
+            backend.transport.queue_test_transport_event_batch(&[]);
+            assert_eq!(
+                backend.with_host_dispatcher(HostTaskScope::client(caller), |dispatcher| {
+                    yield_script(dispatcher, &mut run)
+                }),
+                Ok(HostControl::Continue)
+            );
+            let mut reply = [0_u8; 5];
+            pusher.read_exact(&mut reply).unwrap();
+            assert_eq!(&reply, b"-BUSY");
+            let connection = &backend.connection_registry[caller];
+            assert_eq!(connection.state, ConnectionState::Connected);
+            assert!(!connection.is_async_close_pending);
+            assert_eq!(connection.accounted_normal_memory(), caller_memory);
+            assert!(backend.connection_registry.contains(pusher_token));
+            assert_eq!(backend.ctx.stats().evicted_clients, 0);
+            // Discard the rest of this BUSY line before the next checkpoint.
+            let mut byte = [0_u8; 1];
+            while byte[0] != b'\n' {
+                pusher.read_exact(&mut byte).unwrap();
+            }
+        }
+
+        let args = CommandArgs::from_parts(vec![
+            Bytes::from_static(b"SET"),
+            Bytes::from_static(b"evicted_during_script"),
+            Bytes::from_static(b"0"),
+        ]);
+        assert_eq!(
+            backend.with_host_dispatcher(HostTaskScope::client(caller), |dispatcher| {
+                dispatch_command(
+                    dispatcher,
+                    &args,
+                    HostCommandOrigin::Script {
+                        run: &mut run,
+                        mode: ScriptCallMode::Call,
+                    },
+                )
+            }),
+            Ok(Value::ok())
+        );
+        backend.ctx.leave_script();
+        backend.ctx.clear_script_busy();
+        backend.evict_clients();
+
+        assert!(!backend.connection_registry.contains(caller));
+        assert!(backend.connection_registry.contains(pusher_token));
+        assert_eq!(backend.ctx.stats().evicted_clients, 1);
+        assert_eq!(
+            backend
+                .ctx
+                .db(0)
+                .unwrap()
+                .get_no_expire(b"evicted_during_script")
+                .unwrap()
+                .as_bytes(),
+            b"0"
+        );
     }
 
     fn bind_runtime_listener(backend: &mut ServerWorkerState) -> (Token, SocketAddr) {

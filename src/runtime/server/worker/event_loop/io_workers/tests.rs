@@ -1162,11 +1162,22 @@ fn ordinary_read_runs_on_worker_and_dispatches_on_main() {
 
 #[test]
 fn sync_admission_waits_for_threaded_output_settlement() {
+    let _fork_guard = crate::framework::commands::server::save::diskless_fork_test_guard();
     let pending_output_error = b"-ERR SYNC and PSYNC are invalid with pending output\r\n";
     for settle_before_read in [true, false] {
         for request in [b"PSYNC ? -1\r\n".as_slice(), b"SYNC\r\n".as_slice()] {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let directory = std::env::temp_dir().join(format!(
+                "versal-threaded-sync-{}",
+                crate::engine::distributed::replication::protocol::generate_replid()
+            ));
+            std::fs::create_dir(&directory).unwrap();
             let mut runtime = crate::runtime::server::worker::ServerWorkerState::new(1).unwrap();
+            runtime.ctx.config_mut().persistence.dir = directory.to_string_lossy().into_owned();
+            runtime.ctx.db_mut(0).unwrap().set(
+                b"sync-key".to_vec(),
+                crate::foundation::io::store::Robj::string("sync-value"),
+            );
             crate::framework::commands::register_all(&mut runtime.registry);
             runtime.ctx.set_command_registry_snapshot(&runtime.registry);
             runtime.ctx.config_mut().replication.repl_diskless_sync = true;
@@ -1238,13 +1249,42 @@ fn sync_admission_waits_for_threaded_output_settlement() {
                         crate::framework::distributed::replication::ConnectionId(peer.token.0),
                     )
                     .is_some());
-                let mut header = Vec::new();
-                while !header.ends_with(b"\r\n") {
-                    let mut byte = [0_u8; 1];
-                    client.read_exact(&mut byte).unwrap();
-                    header.push(byte[0]);
-                    assert!(header.len() < 128);
+                // The file producer and replication writes progress on main
+                // thread turns, not inside complete_io_read.
+                runtime.register_server_cron();
+                client.set_nonblocking(true).unwrap();
+                let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                let mut wire = Vec::new();
+                loop {
+                    runtime.run_background_tasks();
+                    runtime.run_one_turn_for_test().unwrap();
+                    let mut buffer = [0; 4096];
+                    loop {
+                        match client.read(&mut buffer) {
+                            Ok(0) => panic!("accepted full sync closed before output"),
+                            Ok(count) => wire.extend_from_slice(&buffer[..count]),
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                                continue
+                            }
+                            Err(error) => panic!("read full-sync output: {error}"),
+                        }
+                    }
+                    if !runtime.ctx.persistence().has_active_child()
+                        && runtime.full_sync.disk_sync_batch.is_none()
+                        && !wire.is_empty()
+                    {
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "main-thread full sync did not complete"
+                    );
                 }
+                client.set_nonblocking(false).unwrap();
+                let header_end = wire.windows(2).position(|bytes| bytes == b"\r\n").unwrap() + 2;
+                assert!(header_end < 128);
+                let header = &wire[..header_end];
                 assert!(
                     if request.starts_with(b"PSYNC") {
                         header.starts_with(b"+FULLRESYNC ")
@@ -1253,6 +1293,41 @@ fn sync_admission_waits_for_threaded_output_settlement() {
                     },
                     "accepted sync must send its transfer header: {header:?}"
                 );
+                let bulk = if request.starts_with(b"PSYNC") {
+                    &wire[header_end..]
+                } else {
+                    &wire[..]
+                };
+                let bulk_header_end = bulk.windows(2).position(|bytes| bytes == b"\r\n").unwrap();
+                let length =
+                    std::str::from_utf8(bulk[..bulk_header_end].strip_prefix(b"$").unwrap())
+                        .unwrap()
+                        .parse::<usize>()
+                        .unwrap();
+                let payload = &bulk[bulk_header_end + 2..];
+                assert!(
+                    payload.len() >= length,
+                    "real file producer truncated the RDB"
+                );
+                let (body, tail) = payload.split_at(length);
+                // File framing starts the command stream immediately. The
+                // real cron may append its initial replication keepalive.
+                if !tail.is_empty() {
+                    assert_eq!(tail, b"*1\r\n$4\r\nPING\r\n");
+                }
+                let mut dbs = crate::foundation::io::store::kv_engine::DbSet::new(1);
+                let (loaded, consumed, expired, functions) =
+                    crate::foundation::io::persistence::rdb::load_rdb_bytes_checked_with_functions(
+                        body, &mut dbs, true,
+                    )
+                    .unwrap();
+                assert_eq!((loaded, consumed, expired), (1, body.len(), 0));
+                assert!(functions.is_empty());
+                assert_eq!(
+                    dbs.get_mut(0).unwrap().get(b"sync-key").unwrap().as_bytes(),
+                    b"sync-value"
+                );
+                runtime.remove_connection(peer.token.0);
             } else {
                 let snapshot =
                     runtime.connection_registry[peer.token].take_threaded_write_snapshot();
@@ -1295,6 +1370,8 @@ fn sync_admission_waits_for_threaded_output_settlement() {
                     0
                 );
             }
+            drop(runtime);
+            std::fs::remove_dir_all(directory).unwrap();
         }
     }
 }

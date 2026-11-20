@@ -163,7 +163,7 @@ pub(crate) struct ServerWorkerState {
     /// flush, and prevents client-side-caching invalidation traffic from
     /// compounding into an eviction feedback loop.
     pub(in crate::runtime::server) command_eviction_ran_this_turn: bool,
-    pub(crate) priority_subnets_generation: u64,
+    pub(crate) priority_connections: usize,
     pub(crate) priority_command_token: Option<Token>,
     pub(crate) priority_command_is_nested: bool,
     pub(crate) command_execution_depth: usize,
@@ -346,7 +346,7 @@ impl ServerWorkerState {
             event_loop_cycle_start: None,
             cycle_time_guard: None,
             command_eviction_ran_this_turn: false,
-            priority_subnets_generation: 0,
+            priority_connections: 0,
             priority_command_token: None,
             priority_command_is_nested: false,
             command_execution_depth: 0,
@@ -665,6 +665,13 @@ impl ServerWorkerState {
             .replication_runtime
             .replica_link()
             .is_none_or(|link| link.connection_id() != main)
+        {
+            return false;
+        }
+        if self
+            .replication_runtime
+            .replica_link()
+            .is_some_and(|link| link.primary_connection_error().is_some())
         {
             return false;
         }

@@ -27,6 +27,18 @@ pub enum HostCommandOrigin<'a> {
         mode: ScriptCallMode,
     },
     AofReplay,
+    RdbReplay {
+        db: u32,
+        dataset: &'a mut DbSet,
+        function_codes: Option<&'a [Vec<u8>]>,
+        function_policy: FunctionLoadPolicy,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FunctionLoadPolicy {
+    Replace,
+    Merge,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,6 +56,11 @@ pub enum HostYield<'a> {
     ScriptCheckpoint {
         run: &'a mut ScriptRunCtx,
     },
+    ScriptDebugStop {
+        run: &'a mut ScriptRunCtx,
+        line: usize,
+        reason: ScriptDebugStopReason,
+    },
     RdbProgress {
         progress: LoadProgress,
         visible_dataset: Option<&'a mut DbSet>,
@@ -55,6 +72,18 @@ pub enum HostYield<'a> {
     ReplicationReplay {
         processed_bytes: u64,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScriptDebugStopReason {
+    Breakpoint,
+    StepOver,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScriptDebugResume {
+    Continue,
+    Step,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

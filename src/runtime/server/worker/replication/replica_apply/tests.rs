@@ -20,6 +20,49 @@ fn offset(value: i64) -> ReplicationOffset {
 }
 
 #[test]
+fn forkless_direct_commit_adopts_the_validated_backlog_boundary() {
+    let mut backend = ServerWorkerState::new(1).unwrap();
+    let replid = "0123456789abcdef0123456789abcdef01234567";
+    let mut link = ReplicaLink::new(
+        ConnectionId(3),
+        MasterInfo {
+            host: "127.0.0.1".to_string(),
+            port: 6379,
+        },
+    );
+    link.connected(None, None);
+    link.on_bytes(
+        format!("+PONG\r\n+OK\r\n+OK\r\n+FULLRESYNC {replid} -1\r\n").as_bytes(),
+        6380,
+    )
+    .unwrap();
+    assert!(link.requires_rdb_offset());
+    let position = link
+        .prevalidate_rdb_commit_position(Some(replid), Some(40))
+        .unwrap();
+    let boundary = ReplicationBacklog::rdb_snapshot_boundary(position).unwrap();
+    let mut prepared = PreparedRdbCommit {
+        functions_applied: false,
+        function_codes: Vec::new(),
+        aux_fields: Vec::new(),
+        repl_stream_db: 0,
+        disk_backed: false,
+        raw: None,
+        swapped: None,
+    };
+
+    backend.install_prepared_dataset(&link, &mut prepared, boundary);
+
+    assert_eq!(backend.ctx.replication().backlog.replid(), replid);
+    assert_eq!(
+        backend.ctx.replication().backlog.snapshot_boundary(),
+        boundary
+    );
+    assert!(!link.can_ack_primary());
+    assert_eq!(link.applied_position(), offset(0));
+}
+
+#[test]
 fn paused_dual_handoff_keeps_new_socket_bytes_until_local_replay_finishes() {
     let mut backend = ServerWorkerState::new(1).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -523,6 +566,196 @@ fn loaded_replay_link(main: ConnectionId, received_offset: i64) -> ReplicaLink {
 }
 
 #[test]
+fn paused_dual_main_failure_waits_for_local_replay_before_aborting() {
+    use crate::runtime::server::worker::event_loop::ReadyEvent;
+
+    for (readable, read_hup, error) in [
+        (false, true, false),
+        (true, true, false),
+        (false, false, true),
+    ] {
+        let mut backend = ServerWorkerState::new(1).unwrap();
+        crate::framework::commands::register_all(&mut backend.registry);
+        backend.ctx.replication_mut().switch_to_replica();
+        backend.ctx.config_mut().replication.master_link_status = "sync".to_string();
+        backend.ctx.set_loading(true);
+        let (token, main, _peer) = add_live_replay_connection(&mut backend);
+        let link = loaded_replay_link(main, 101);
+        let session_id = link.session_id();
+        backend.replication_runtime.set_replica_link(link);
+        let mut pending = PendingReplicationBuffer::new(1 << 20, offset(100), 0);
+        pending
+            .push(ReplicaEvent::Apply {
+                apply: ReplicationApply::Command(CommandArgs::from_parts(vec![
+                    Bytes::from_static(b"SET"),
+                    Bytes::from_static(b"must-not-apply"),
+                    Bytes::from_static(b"value"),
+                ])),
+                end_offset: offset(101),
+            })
+            .unwrap();
+        let _ = backend
+            .replication_runtime
+            .set_replica_pending_buffer(session_id, pending);
+        backend.pause_replica_main_reads(token).unwrap();
+
+        backend.dispatch_transport_event(
+            ReadyEvent {
+                token: Token(token),
+                readable,
+                writable: false,
+                read_hup,
+                error,
+            },
+            false,
+        );
+
+        assert!(
+            backend.ctx.is_loading(),
+            "a paused main must not abort RDB loading"
+        );
+        assert!(backend.connection_registry.contains(Token(token)));
+        assert!(backend
+            .replication_runtime
+            .replica_pending_buffer()
+            .is_some());
+        let link = backend.replication_runtime.replica_link_mut().unwrap();
+        assert!(
+            !link.can_ack_primary(),
+            "a broken session must not acknowledge success"
+        );
+        assert!(link.take_periodic_ack(i64::MAX, None).is_none());
+        backend.ctx.set_loading(false);
+        backend.pending_replication_replay = Some(PendingReplayContinuation::new_for_test(
+            main,
+            session_id,
+            MonotonicInstant::now().as_millis() as i64,
+        ));
+        backend.drive_one_pending_replication_replay();
+
+        assert!(!backend.connection_registry.contains(Token(token)));
+        assert!(backend
+            .replication_runtime
+            .replica_pending_buffer()
+            .is_none());
+        assert!(backend.pending_replication_replay.is_none());
+        assert_eq!(backend.ctx.config().replication.master_link_status, "down");
+        assert!(backend
+            .ctx
+            .db(0)
+            .unwrap()
+            .get_no_expire(b"must-not-apply")
+            .is_none());
+    }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn paused_dual_main_failure_stops_real_poll_notifications() {
+    use crate::runtime::server::worker::event_loop::ReadyEvent;
+    use std::time::Duration;
+
+    let mut backend = ServerWorkerState::new(1).unwrap();
+    backend.ctx.set_loading(true);
+    let (token, main, _peer) = add_live_replay_connection(&mut backend);
+    let link = loaded_replay_link(main, 101);
+    let session_id = link.session_id();
+    backend.replication_runtime.set_replica_link(link);
+    backend.pause_replica_main_reads(token).unwrap();
+    backend.transport.shutdown(Token(token)).unwrap();
+    let ready = backend
+        .transport
+        .poll_events(Some(Duration::from_millis(100)))
+        .unwrap()
+        .into_iter()
+        .find(|ready| ready.token == Token(token))
+        .expect("a fully closed socket must report terminal readiness");
+    backend.dispatch_transport_event(
+        ReadyEvent {
+            token: ready.token,
+            readable: ready.readable,
+            writable: ready.writable,
+            read_hup: ready.read_hup,
+            error: ready.error,
+        },
+        false,
+    );
+    assert!(backend.ctx.is_loading());
+    assert!(backend.connection_registry.contains(Token(token)));
+    assert_eq!(
+        backend
+            .replication_runtime
+            .replica_link()
+            .unwrap()
+            .session_id(),
+        session_id
+    );
+    for _ in 0..3 {
+        assert!(
+            backend
+                .transport
+                .poll_events(Some(Duration::ZERO))
+                .unwrap()
+                .iter()
+                .all(|ready| ready.token != Token(token)),
+            "a retained failed session must not keep waking the Linux poller"
+        );
+    }
+}
+
+#[test]
+fn paused_dual_main_write_failure_waits_for_replay_before_cleanup() {
+    let mut backend = ServerWorkerState::new(1).unwrap();
+    backend.ctx.replication_mut().switch_to_replica();
+    backend.ctx.config_mut().replication.master_link_status = "sync".to_string();
+    backend.ctx.set_loading(true);
+    let (token, main, _peer) = add_live_replay_connection(&mut backend);
+    let link = loaded_replay_link(main, 101);
+    let session_id = link.session_id();
+    backend.replication_runtime.set_replica_link(link);
+    let _ = backend.replication_runtime.set_replica_pending_buffer(
+        session_id,
+        PendingReplicationBuffer::new(1 << 20, offset(100), 0),
+    );
+    backend.pause_replica_main_reads(token).unwrap();
+    backend.connection_registry[Token(token)].queue_reply(b"\n".to_vec());
+    backend.transport.shutdown(Token(token)).unwrap();
+    backend.dispatch_client_write(Token(token));
+
+    assert!(
+        backend.ctx.is_loading(),
+        "failed keepalive must not abort the active RDB load"
+    );
+    assert!(backend.connection_registry.contains(Token(token)));
+    assert_eq!(
+        backend.connection_registry[Token(token)].pending_reply_bytes(),
+        0
+    );
+    assert_eq!(
+        backend.connection_registry[Token(token)].pending_output_memory_usage(),
+        0
+    );
+    assert!(!backend
+        .replication_runtime
+        .replica_link()
+        .unwrap()
+        .can_ack_primary());
+    backend.ctx.set_loading(false);
+    backend.pending_replication_replay = Some(PendingReplayContinuation::new_for_test(
+        main,
+        session_id,
+        MonotonicInstant::now().as_millis() as i64,
+    ));
+    backend.drive_one_pending_replication_replay();
+    assert!(!backend.connection_registry.contains(Token(token)));
+    assert!(backend
+        .replication_runtime
+        .replica_pending_buffer()
+        .is_none());
+    assert_eq!(backend.ctx.config().replication.master_link_status, "down");
+}
+
+#[test]
 fn full_sync_deletes_received_rdb_when_persistence_is_disabled() {
     let dir = std::env::temp_dir().join(format!(
         "valkey-rdb-del-sync-files-{}-{:?}",
@@ -555,6 +788,9 @@ fn full_sync_deletes_received_rdb_when_persistence_is_disabled() {
         function_codes: Vec::new(),
         aux_fields: Vec::new(),
         repl_stream_db: 0,
+        repl_id: None,
+        repl_offset: None,
+        functions_applied: false,
         diskless: true,
         disk_backed: true,
         raw: Some(raw),
@@ -579,6 +815,99 @@ fn received_sync_rdb_deletion_requires_all_persistence_to_be_disabled() {
 
     backend.ctx.config_mut().persistence.aof_enabled = true;
     assert!(!backend.should_delete_received_sync_rdb());
+}
+
+#[test]
+fn pending_replay_initializes_tracking_import_database_once() {
+    use crate::engine::distributed::cluster::node::key_hash_slot;
+    let mut backend =
+        ServerWorkerState::new_with_slot_router(3, 14, |key| key_hash_slot(key) as usize).unwrap();
+    crate::framework::commands::register_all(&mut backend.registry);
+    backend.ctx.replication_mut().switch_to_replica();
+    *backend.ctx.cluster_state_mut() = Some(Box::new(ClusterState::new("127.0.0.1", 6380, 16_380)));
+    let key = b"{atomic}pending";
+    let slot = key_hash_slot(key);
+    backend
+        .ctx
+        .db_mut(2)
+        .unwrap()
+        .set(key.to_vec(), Robj::string("7"));
+    backend.ctx.replace_slot_imports_from_rdb_aux(&[(
+        b"cluster-slot-imports".to_vec(),
+        format!(
+            "v1|cccccccccccccccccccccccccccccccccccccccc|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb|{slot}-{slot}"
+        ).into_bytes(),
+    )]).unwrap();
+    backend
+        .ctx
+        .cluster_state_mut()
+        .as_deref_mut()
+        .unwrap()
+        .migrations
+        .fail_tracking_imports_after_swap("full sync", 1);
+    let (token, main, _peer) = add_live_replay_connection(&mut backend);
+    let mut link = loaded_replay_link(main, 106);
+    let mut continuation = PendingReplayContinuation::new_for_test(
+        main,
+        link.session_id(),
+        MonotonicInstant::now().as_millis() as i64,
+    );
+    let mut pending = PendingReplicationBuffer::new(1 << 20, offset(100), 2);
+    for (index, parts) in [
+        vec![b"INCR".as_slice(), key],
+        vec![b"MULTI".as_slice()],
+        vec![b"SELECT".as_slice(), b"1"],
+        vec![b"INCR".as_slice(), key],
+        vec![b"EXEC".as_slice()],
+        vec![b"INCR".as_slice(), key],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        pending
+            .push(ReplicaEvent::Apply {
+                apply: ReplicationApply::Command(CommandArgs::from_parts(
+                    parts.into_iter().map(Bytes::copy_from_slice).collect(),
+                )),
+                end_offset: offset(101 + index as i64),
+            })
+            .unwrap();
+    }
+    // Yield after every entry so a continuation cannot reset the player's DB
+    // or break a transaction that spans replay turns.
+    backend
+        .ctx
+        .config_mut()
+        .persistence
+        .loading_process_events_interval_bytes = 1;
+    while !pending.is_empty() {
+        backend
+            .apply_pending_replay_entries(token, &mut link, &mut pending, &mut continuation)
+            .unwrap();
+    }
+    let hidden = backend.ctx.slot_import_dbs();
+    assert_eq!(hidden.len(), 1);
+    assert_eq!(hidden[0].db_size(0), 0);
+    assert_eq!(
+        hidden[0]
+            .get(2)
+            .unwrap()
+            .get_allow_expired(key)
+            .unwrap()
+            .as_bytes(),
+        b"8"
+    );
+    assert_eq!(
+        hidden[0]
+            .get(1)
+            .unwrap()
+            .get_allow_expired(key)
+            .unwrap()
+            .as_bytes(),
+        b"2"
+    );
+    assert_eq!(link.applied_position(), offset(106));
+    assert_eq!(link.selected_db(), 1);
 }
 
 #[test]
@@ -1420,6 +1749,9 @@ fn disk_backed_rdb_commit_keeps_old_data_when_snapshot_rename_fails() {
         function_codes: Vec::new(),
         aux_fields: Vec::new(),
         repl_stream_db: 0,
+        repl_id: None,
+        repl_offset: None,
+        functions_applied: false,
         diskless: true,
         disk_backed: true,
         raw: Some(raw),
@@ -1487,6 +1819,9 @@ fn invalid_aux_keeps_full_sync_commit_state_unpublished() {
         function_codes: Vec::new(),
         aux_fields: vec![(b"cluster-slot-states".to_vec(), b"8>short,".to_vec())],
         repl_stream_db: 0,
+        repl_id: None,
+        repl_offset: None,
+        functions_applied: false,
         diskless: true,
         disk_backed: true,
         raw: Some(b"new-rdb".to_vec()),
@@ -1557,6 +1892,9 @@ fn invalid_function_keeps_full_sync_dataset_and_registry_unpublished() {
         function_codes: vec![b"not a function library".to_vec()],
         aux_fields: Vec::new(),
         repl_stream_db: 0,
+        repl_id: None,
+        repl_offset: None,
+        functions_applied: false,
         diskless: true,
         disk_backed: false,
         raw: None,

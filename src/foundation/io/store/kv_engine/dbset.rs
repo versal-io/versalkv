@@ -181,6 +181,17 @@ impl DbSet {
             return;
         }
         self.dbs.swap(idx1 as usize, idx2 as usize);
+        // WATCH subscriptions belong to logical database IDs, not swapped data.
+        let (lower, upper) = if idx1 < idx2 {
+            (idx1, idx2)
+        } else {
+            (idx2, idx1)
+        };
+        let (before, after) = self.dbs.split_at_mut(upper as usize);
+        std::mem::swap(
+            &mut before[lower as usize].watch_epochs,
+            &mut after[0].watch_epochs,
+        );
         self.dbs[idx1 as usize].db_id = idx1;
         self.dbs[idx2 as usize].db_id = idx2;
     }

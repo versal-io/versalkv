@@ -6,10 +6,10 @@ use crate::framework::commands::command_runtime::CommandRuntime;
 
 use super::runtime_support::read_path_hash;
 
-#[command("PHEXISTS", runtime)]
-pub fn phexists(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> CommandOutcome {
+#[command("PHPATHEXISTS", runtime)]
+pub fn phpathexists(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> CommandOutcome {
     let [key, path] = args.args.as_slice() else {
-        return CommandOutcome::reply(CommandError::wrong_arity("phexists"));
+        return CommandOutcome::reply(CommandError::wrong_arity("phpathexists"));
     };
     let tree = match read_path_hash(runtime, key) {
         Ok(tree) => tree,

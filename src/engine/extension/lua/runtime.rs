@@ -120,12 +120,33 @@ pub(super) fn with_lua_host<R>(
                             Ok(LuaValue::Boolean(true))
                         }
                     }
+                    6 => {
+                        let line = match values.pop_front() {
+                            Some(LuaValue::Integer(line)) if line > 0 => line as usize,
+                            _ => return Err(mlua::Error::external("Invalid debugger line")),
+                        };
+                        let reason = match values.pop_front() {
+                            Some(LuaValue::Integer(0)) => {
+                                crate::engine::host::ScriptDebugStopReason::Breakpoint
+                            }
+                            Some(LuaValue::Integer(1)) => {
+                                crate::engine::host::ScriptDebugStopReason::StepOver
+                            }
+                            _ => return Err(mlua::Error::external("Invalid debugger stop reason")),
+                        };
+                        dispatcher(crate::engine::host::HostRequest::Yield(
+                            crate::engine::host::HostYield::ScriptDebugStop { run, line, reason },
+                        ))
+                        .map_err(mlua::Error::external)?;
+                        Ok(LuaValue::Boolean(true))
+                    }
                     _ => Err(mlua::Error::external("Unknown script host operation")),
                 }
             },
         )?;
         let _slot = LuaHostSlotGuard::install(lua, callback.clone())?;
         let _bindings = LuaHostBindingsGuard::install(lua, &callback)?;
+        let _hook = super::timeout::ScriptHookGuard::enter(lua)?;
         invoke()
     })
 }

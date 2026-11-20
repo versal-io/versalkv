@@ -63,6 +63,10 @@ impl ZSetSl {
     pub fn dict(&self) -> &HashTable<f64> {
         &self.0.dict
     }
+
+    pub fn random_entry(&mut self) -> Option<(Bytes, f64)> {
+        self.0.dict.fair_random_entry()
+    }
     pub fn into_dict(self) -> HashTable<f64> {
         self.0.dict
     }
@@ -125,7 +129,7 @@ impl ZSetSl {
     }
 
     pub fn pop_min(&mut self, count: usize) -> Vec<(Bytes, f64)> {
-        let result = self.0.zsl.pop_min(count);
+        let result = self.0.zsl.pop_min_with_leaf_compaction(count);
         for (member, _score) in &result {
             self.0.dict.remove(member);
         }
@@ -133,7 +137,7 @@ impl ZSetSl {
     }
 
     pub fn pop_max(&mut self, count: usize) -> Vec<(Bytes, f64)> {
-        let result = self.0.zsl.pop_max(count);
+        let result = self.0.zsl.pop_max_with_leaf_compaction(count);
         for (member, _score) in &result {
             self.0.dict.remove(member);
         }
@@ -145,7 +149,7 @@ impl ZSetSl {
         let c = items.len();
         self.0.dict.pause_auto_shrink();
         for (member, score) in items {
-            self.0.zsl.delete(score, &member);
+            self.0.zsl.delete_with_leaf_compaction(score, &member);
             self.0.dict.remove(&member);
         }
         self.0.dict.resume_auto_shrink();
@@ -157,7 +161,7 @@ impl ZSetSl {
         let c = items.len();
         self.0.dict.pause_auto_shrink();
         for (member, score) in items {
-            self.0.zsl.delete(score, &member);
+            self.0.zsl.delete_with_leaf_compaction(score, &member);
             self.0.dict.remove(&member);
         }
         self.0.dict.resume_auto_shrink();
@@ -175,7 +179,7 @@ impl ZSetSl {
         let c = items.len();
         self.0.dict.pause_auto_shrink();
         for (member, score) in items {
-            self.0.zsl.delete(score, &member);
+            self.0.zsl.delete_with_leaf_compaction(score, &member);
             self.0.dict.remove(&member);
         }
         self.0.dict.resume_auto_shrink();
@@ -210,7 +214,7 @@ impl ZSetOps for ZSetSl {
                     return Ok(false);
                 }
                 dict.insert(member_bytes.clone(), score);
-                zsl.delete(old_score, member);
+                zsl.delete_with_leaf_compaction(old_score, member);
                 zsl.insert(score, member_bytes);
                 Ok(false)
             }
@@ -228,7 +232,7 @@ impl ZSetOps for ZSetSl {
         let (dict, zsl) = (&mut repr.dict, &mut repr.zsl);
         match dict.remove(member) {
             Some(score) => {
-                zsl.delete(score, member);
+                zsl.delete_with_leaf_compaction(score, member);
                 Ok(true)
             }
             None => Ok(false),

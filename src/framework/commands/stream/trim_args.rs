@@ -112,6 +112,74 @@ mod tests {
         assert_eq!(rewritten[4], Bytes::from(StreamID::max().fmt_id()));
         assert_eq!(rewritten.len(), 5);
     }
+
+    #[test]
+    fn approximate_add_rewrite_strips_all_option_limits_and_preserves_fields() {
+        let mut stream = ValkeyStream::new();
+        for ms in 1..=3 {
+            stream
+                .append(StreamID::new(ms, 0), vec![], true, false, 0)
+                .unwrap();
+        }
+        let raw = parts(&[
+            b"s",
+            b"LIMIT",
+            b"5",
+            b"MAXLEN",
+            b"~",
+            b"55",
+            b"limit",
+            b"6",
+            b"LIMIT",
+            b"30",
+            b"NOMKSTREAM",
+            b"*",
+            b"LIMIT",
+            b"LIMIT",
+            b"limit",
+            b"v",
+        ]);
+        let parsed = parse_add_trim_args(&raw, true, false).unwrap();
+        assert_eq!(parsed.limit, Some(30));
+        assert_eq!(
+            parsed.propagation(b"XADD", &raw, &stream, Some(StreamID::new(4, 0))),
+            parts(&[
+                b"XADD",
+                b"s",
+                b"MAXLEN",
+                b"=",
+                b"3",
+                b"NOMKSTREAM",
+                b"4-0",
+                b"LIMIT",
+                b"LIMIT",
+                b"limit",
+                b"v",
+            ])
+        );
+    }
+
+    #[test]
+    fn approximate_trim_rewrite_strips_limits_before_and_after_strategy() {
+        let mut stream = ValkeyStream::new();
+        stream
+            .append(StreamID::new(1, 0), vec![], true, false, 0)
+            .unwrap();
+        for (strategy, threshold, expected) in [
+            (b"MAXLEN".as_slice(), b"55".as_slice(), b"1".as_slice()),
+            (b"MINID".as_slice(), b"2-0".as_slice(), b"1-0".as_slice()),
+        ] {
+            let raw = parts(&[
+                b"s", b"LIMIT", b"5", strategy, b"~", threshold, b"limit", b"6", b"LIMIT", b"30",
+            ]);
+            let parsed = parse_add_trim_args(&raw, false, false).unwrap();
+            assert_eq!(parsed.limit, Some(30));
+            assert_eq!(
+                parsed.propagation(b"XTRIM", &raw, &stream, None),
+                parts(&[b"XTRIM", b"s", strategy, b"=", expected])
+            );
+        }
+    }
 }
 
 #[derive(Default)]
@@ -244,10 +312,22 @@ impl AddTrimArgs {
                 parts[self.id_index] = Bytes::from(id.fmt_id());
             }
         }
-        if self.approx {
-            if let Some(index) = self.limit_indices.last() {
-                parts.drain(*index..*index + 2);
-            }
+        if self.approx && !self.limit_indices.is_empty() {
+            // Compact every parsed option pair once; fields may also be named LIMIT.
+            let mut limits = self.limit_indices.iter().copied().peekable();
+            let mut index = 0;
+            parts.retain(|_| {
+                let current_index = index;
+                index += 1;
+                match limits.peek().copied() {
+                    Some(limit_index) if current_index == limit_index => false,
+                    Some(limit_index) if current_index == limit_index + 1 => {
+                        limits.next();
+                        false
+                    }
+                    _ => true,
+                }
+            });
         }
         parts.insert(0, Bytes::from_static(command));
         parts

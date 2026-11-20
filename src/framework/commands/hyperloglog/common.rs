@@ -14,6 +14,41 @@ pub const HLL_REGISTERS: usize = 16_384;
 pub const HLL_ACTIVE_REGISTERS: usize = 16_384;
 pub const HLL_SAMPLE_REGISTERS: usize = 512;
 
+#[path = "common/c_format.rs"]
+pub mod c_format;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HllFormat {
+    Legacy,
+    Standard,
+}
+
+pub fn hll_format(data: &[u8]) -> Result<HllFormat, HllError> {
+    if data.len() < HLL_HDR_SIZE || &data[..4] != HLL_MAGIC {
+        return Err(HllError::WrongType);
+    }
+    match data[4] {
+        HLL_DENSE if data.len() == HLL_HDR_SIZE + HLL_REGISTERS => Ok(HllFormat::Legacy),
+        HLL_DENSE if data.len() == c_format::DENSE_SIZE => Ok(HllFormat::Standard),
+        HLL_DENSE => Err(HllError::WrongType),
+        HLL_SPARSE => {
+            // The unversioned formats can overlap. Reserve exact legacy
+            // framing for the legacy parser, including malformed entries;
+            // never retry a failed legacy parse as standard bytecode.
+            let mut pos = HLL_HDR_SIZE;
+            let has_legacy_shape = read_u32(data, &mut pos).is_some_and(|count| {
+                count as usize <= HLL_REGISTERS && data.len() == pos + count as usize * 3
+            });
+            Ok(if has_legacy_shape {
+                HllFormat::Legacy
+            } else {
+                HllFormat::Standard
+            })
+        }
+        _ => Err(HllError::WrongType),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HllEncoding {
     Sparse,
@@ -30,6 +65,7 @@ pub enum HllError {
 pub struct HllState {
     pub encoding: HllEncoding,
     registers: Vec<u8>,
+    pub format: HllFormat,
 }
 
 impl HllState {
@@ -37,11 +73,15 @@ impl HllState {
         Self {
             encoding: HllEncoding::Sparse,
             registers: vec![0; HLL_ACTIVE_REGISTERS],
+            format: HllFormat::Legacy,
         }
     }
 
     pub fn add(&mut self, value: &[u8]) -> bool {
-        let (index, rank) = register_for(value);
+        let (index, rank) = match self.format {
+            HllFormat::Legacy => register_for(value),
+            HllFormat::Standard => c_format::register_for(value),
+        };
         if rank > self.registers[index] {
             self.registers[index] = rank;
             true
@@ -59,6 +99,9 @@ impl HllState {
     }
 
     pub fn cardinality(&self) -> i64 {
+        if self.format == HllFormat::Standard {
+            return c_format::cardinality(&self.registers);
+        }
         let mut sum = 0.0;
         let mut zeros = 0usize;
         for reg in &self.registers {
@@ -91,6 +134,17 @@ pub fn empty_hll() -> Vec<u8> {
 }
 
 pub fn parse_hll(data: &[u8]) -> Result<HllState, HllError> {
+    if hll_format(data)? == HllFormat::Standard {
+        return Ok(HllState {
+            encoding: if data[4] == HLL_DENSE {
+                HllEncoding::Dense
+            } else {
+                HllEncoding::Sparse
+            },
+            registers: c_format::decode(data)?,
+            format: HllFormat::Standard,
+        });
+    }
     if data.len() < HLL_HDR_SIZE || &data[..4] != HLL_MAGIC {
         return Err(HllError::WrongType);
     }
@@ -129,10 +183,14 @@ pub fn parse_hll(data: &[u8]) -> Result<HllState, HllError> {
     Ok(HllState {
         encoding,
         registers,
+        format: HllFormat::Legacy,
     })
 }
 
 pub fn cardinality_from_bytes(data: &[u8]) -> Result<i64, HllError> {
+    if hll_format(data)? == HllFormat::Standard {
+        return Ok(c_format::cardinality(&c_format::decode(data)?));
+    }
     if data.len() < HLL_HDR_SIZE || &data[..4] != HLL_MAGIC {
         return Err(HllError::WrongType);
     }
@@ -194,6 +252,9 @@ pub fn register_for(value: &[u8]) -> (usize, u8) {
 }
 
 pub fn is_dense_hll(data: &[u8]) -> Result<bool, HllError> {
+    if hll_format(data)? == HllFormat::Standard {
+        return Ok(data[4] == HLL_DENSE);
+    }
     if data.len() < HLL_HDR_SIZE || &data[..4] != HLL_MAGIC {
         return Err(HllError::WrongType);
     }
@@ -214,6 +275,9 @@ pub fn is_dense_hll(data: &[u8]) -> Result<bool, HllError> {
 }
 
 pub fn cached_observed_count(data: &[u8]) -> Option<u64> {
+    if hll_format(data).ok()? != HllFormat::Legacy {
+        return None;
+    }
     if data.get(14).copied().unwrap_or(0) & HLL_NON_INTEGER_INPUTS == 0 {
         return None;
     }
@@ -236,6 +300,12 @@ pub fn looks_like_integer(value: &[u8]) -> bool {
 }
 
 pub fn merge_bytes_into(data: &[u8], registers: &mut [u8]) -> Result<(), HllError> {
+    if hll_format(data)? == HllFormat::Standard {
+        for (dst, rank) in registers.iter_mut().zip(c_format::decode(data)?) {
+            *dst = (*dst).max(rank);
+        }
+        return Ok(());
+    }
     if data.len() < HLL_HDR_SIZE || &data[..4] != HLL_MAGIC {
         return Err(HllError::WrongType);
     }
@@ -338,6 +408,17 @@ pub fn merge_sampled_bytes_into(data: &[u8], registers: &mut [u8]) -> Result<(),
 }
 
 pub fn serialize_hll(state: &HllState, sparse_max_bytes: i64, dirty_cache: bool) -> Vec<u8> {
+    if state.format == HllFormat::Standard {
+        let mut data = c_format::encode(
+            &state.registers,
+            state.encoding == HllEncoding::Dense,
+            sparse_max_bytes,
+        );
+        if dirty_cache {
+            data[15] |= 0x80;
+        }
+        return data;
+    }
     let encoding = state.choose_encoding(sparse_max_bytes);
     serialize_hll_as_min_len(state, encoding, dirty_cache)
 }
@@ -345,6 +426,13 @@ pub fn serialize_hll(state: &HllState, sparse_max_bytes: i64, dirty_cache: bool)
 // TODO(dead_code): PFDEBUG selects an explicit encoding only in the native command facade.
 #[allow(dead_code)]
 pub fn serialize_hll_as(state: &HllState, encoding: HllEncoding, dirty_cache: bool) -> Vec<u8> {
+    if state.format == HllFormat::Standard {
+        let mut data = c_format::encode(&state.registers, encoding == HllEncoding::Dense, i64::MAX);
+        if dirty_cache {
+            data[15] |= 0x80;
+        }
+        return data;
+    }
     serialize_hll_as_min_len(state, encoding, dirty_cache)
 }
 
@@ -371,9 +459,13 @@ fn serialize_hll_as_min_len(state: &HllState, encoding: HllEncoding, dirty_cache
 }
 
 pub fn clear_cache_dirty(data: &[u8]) -> Result<Vec<u8>, HllError> {
-    parse_hll(data)?;
+    let state = parse_hll(data)?;
     let mut out = data.to_vec();
-    out[15] = 0;
+    if state.format == HllFormat::Standard {
+        out[8..16].copy_from_slice(&(state.cardinality() as u64).to_le_bytes());
+    } else {
+        out[15] = 0;
+    }
     Ok(out)
 }
 
@@ -484,3 +576,7 @@ fn read_u16(data: &[u8], pos: &mut usize) -> Option<u16> {
 #[cfg(test)]
 #[path = "common/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "common/compatibility_tests.rs"]
+mod compatibility_tests;

@@ -555,7 +555,9 @@ fn pending_replay_yields_while_command_time_is_frozen() {
         fixture.runtime.pending_replication_replay.is_some(),
         "real elapsed time must yield replay before the next buffered command"
     );
-    assert!(fixture.runtime.ctx.is_loading());
+    // Upstream #5417 clears loading when the RDB load finishes, before the
+    // buffered command stream starts replaying.
+    assert!(!fixture.runtime.ctx.is_loading());
     fixture.runtime.drive_one_pending_replication_replay();
     assert!(fixture.runtime.pending_replication_replay.is_none());
     assert!(!fixture.runtime.ctx.is_loading());

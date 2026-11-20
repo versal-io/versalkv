@@ -790,6 +790,9 @@ impl ServerWorkerState {
 
     fn dispatch_client_write_error(&mut self, context: &WritableContext, error: &std::io::Error) {
         crate::server_log!(warning, "{}", writable_failure_log_message(context, error));
+        if self.defer_paused_dual_main_failure(context.token, error.to_string()) {
+            return;
+        }
         if context.is_replica_rdb() {
             crate::server_log!(
                 warning,
@@ -1007,7 +1010,9 @@ impl ServerWorkerState {
     }
 
     pub(crate) fn reap_bgsave_child(&mut self) {
-        let forkless_outcome = if self.ctx.persistence().forkless_save_in_progress() {
+        let forkless_outcome = if self.ctx.persistence().forkless_save_purpose()
+            == Some(crate::engine::persistence::ForklessSavePurpose::Persistence)
+        {
             self.ctx
                 .poll_forkless_save(crate::foundation::io::sys::time::mstime() / 1_000)
         } else {

@@ -15,8 +15,8 @@ pub struct PathHashView {
     pub paths: OrderedPaths,
 }
 
-/// Ordered paths remain present only while their payload has fields. An empty
-/// outer object is valid and retains the owning key's metadata.
+/// Ordered paths remain present only while their payload has fields. The DB
+/// removes the owning key when the last path is deleted.
 #[derive(Debug, Clone, Default)]
 pub struct PathHash {
     view: PathHashView,

@@ -313,6 +313,7 @@ struct ParsedCmd {
     summary: String,
     since: String,
     group: String,
+    arguments: Vec<serde_json::Value>,
 }
 
 fn compute_movable_keys(cmd: &serde_json::Value) -> bool {
@@ -537,6 +538,88 @@ fn string_slice_expr(values: &[String]) -> String {
     format!("&[{}]", items.join(", "))
 }
 
+fn command_arguments_expr(arguments: &[serde_json::Value]) -> String {
+    let items = arguments
+        .iter()
+        .map(command_argument_expr)
+        .collect::<Vec<_>>();
+    format!("&[{}]", items.join(", "))
+}
+
+fn command_argument_expr(argument: &serde_json::Value) -> String {
+    let name = argument
+        .get("name")
+        .and_then(|value| value.as_str())
+        .expect("command argument name must be a string")
+        .to_ascii_lowercase();
+    let arg_type = argument
+        .get("type")
+        .and_then(|value| value.as_str())
+        .expect("command argument type must be a string");
+    // The upstream C generator treats field/member as string arguments.
+    let arg_type = match arg_type {
+        "field" | "member" => "string",
+        "string" | "integer" | "double" | "key" | "pattern" | "unix-time" | "pure-token"
+        | "oneof" | "block" => arg_type,
+        other => panic!("unknown command argument type: {other}"),
+    };
+    let is_composite = matches!(arg_type, "oneof" | "block");
+    let display_text = if is_composite {
+        None
+    } else {
+        Some(
+            argument
+                .get("display")
+                .and_then(|value| value.as_str())
+                .unwrap_or(&name)
+                .to_ascii_lowercase(),
+        )
+    };
+    let key_spec_index = argument
+        .get("key_spec_index")
+        .and_then(|value| value.as_i64())
+        .filter(|index| *index != -1);
+    let optional_text = |field| {
+        argument
+            .get(field)
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+    };
+    let token = optional_text("token").map(str::to_ascii_uppercase);
+    let flags = ["optional", "multiple", "multiple_token"]
+        .into_iter()
+        // The upstream Python generator accepts truthy JSON values, including "true".
+        .filter(|flag| match argument.get(*flag) {
+            None | Some(serde_json::Value::Null) => false,
+            Some(serde_json::Value::Bool(value)) => *value,
+            Some(serde_json::Value::Number(value)) => value.as_f64() != Some(0.0),
+            Some(serde_json::Value::String(value)) => !value.is_empty(),
+            Some(serde_json::Value::Array(value)) => !value.is_empty(),
+            Some(serde_json::Value::Object(value)) => !value.is_empty(),
+        })
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let arguments = if is_composite {
+        command_arguments_expr(
+            argument
+                .get("arguments")
+                .and_then(|value| value.as_array())
+                .expect("composite command arguments must be an array"),
+        )
+    } else {
+        "&[]".to_string()
+    };
+    format!(
+        "CommandArgMeta {{ name: {name:?}, arg_type: {arg_type:?}, display_text: {display_text:?}, \
+         key_spec_index: {key_spec_index:?}, token: {token:?}, summary: {:?}, since: {:?}, \
+         deprecated_since: {:?}, flags: {}, arguments: {arguments} }}",
+        optional_text("summary"),
+        optional_text("since"),
+        optional_text("deprecated_since"),
+        string_slice_expr(&flags),
+    )
+}
+
 fn command_subcommand_name<'a>(cmd: &'a ParsedCmd, container: &str) -> &'a str {
     cmd.name
         .strip_prefix(&format!("{}-", container.to_ascii_lowercase()))
@@ -642,11 +725,24 @@ fn generate_command_metadata(all_cmds: &[ParsedCmd], generated_root: &Path) {
     }
     catalog.push_str("];\n\n");
     catalog.push_str(
-        "pub struct CommandDocMeta {\n\
+        "pub struct CommandArgMeta {\n\
+             pub name: &'static str,\n\
+             pub arg_type: &'static str,\n\
+             pub display_text: Option<&'static str>,\n\
+             pub key_spec_index: Option<i64>,\n\
+             pub token: Option<&'static str>,\n\
+             pub summary: Option<&'static str>,\n\
+             pub since: Option<&'static str>,\n\
+             pub deprecated_since: Option<&'static str>,\n\
+             pub flags: &'static [&'static str],\n\
+             pub arguments: &'static [CommandArgMeta],\n\
+         }\n\n\
+         pub struct CommandDocMeta {\n\
              pub name: &'static str,\n\
              pub summary: &'static str,\n\
              pub since: &'static str,\n\
              pub group: &'static str,\n\
+             pub arguments: &'static [CommandArgMeta],\n\
          }\n\n\
          pub const COMMAND_DOC_META: &[CommandDocMeta] = &[\n",
     );
@@ -660,8 +756,8 @@ fn generate_command_metadata(all_cmds: &[ParsedCmd], generated_root: &Path) {
             None => cmd.lookup_name.to_ascii_lowercase(),
         };
         catalog.push_str(&format!(
-            "    CommandDocMeta {{ name: {name:?}, summary: {:?}, since: {:?}, group: {:?} }},\n",
-            cmd.summary, cmd.since, cmd.group,
+            "    CommandDocMeta {{ name: {name:?}, summary: {:?}, since: {:?}, group: {:?}, arguments: {} }},\n",
+            cmd.summary, cmd.since, cmd.group, command_arguments_expr(&cmd.arguments),
         ));
     }
     catalog.push_str("];\n\n");
@@ -926,6 +1022,15 @@ fn main() {
                 .unwrap_or("")
                 .to_string(),
             group,
+            arguments: cmd
+                .get("arguments")
+                .map(|value| {
+                    value
+                        .as_array()
+                        .unwrap_or_else(|| panic!("{}: arguments must be an array", path.display()))
+                        .clone()
+                })
+                .unwrap_or_default(),
         });
     }
 

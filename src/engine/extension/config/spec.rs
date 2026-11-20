@@ -354,7 +354,7 @@ mod tests {
         assert_eq!((spec.get)(&rcfg).as_str(), "AE");
 
         (spec.set)(&mut rcfg, &ConfigValue::String("nmAE".to_string())).unwrap();
-        assert_eq!((spec.get)(&rcfg).as_str(), "AEm");
+        assert_eq!((spec.get)(&rcfg).as_str(), "AnEm");
 
         assert!((spec.set)(&mut rcfg, &ConfigValue::String("K?".to_string())).is_err());
 

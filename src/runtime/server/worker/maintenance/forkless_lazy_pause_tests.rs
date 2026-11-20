@@ -137,7 +137,7 @@ impl Fixture {
             }
         }
         assert!(now_ms() < expire_at_ms, "save must start before expiration");
-        crate::framework::commands::server::save::start_bgsave(&mut runtime.ctx).unwrap();
+        crate::framework::commands::server::save::start_forkless_bgsave(&mut runtime.ctx).unwrap();
         assert!(runtime.ctx.persistence().forkless_capture_in_progress());
         assert!(runtime
             .ctx
@@ -295,6 +295,7 @@ fn forkless_lazy_pause_dispatch_preserves_snapshot_and_crc() {
             RdbStep::RecordApplied => {}
             RdbStep::Finished(_) => break,
             RdbStep::NeedInput => panic!("complete snapshot requested more input"),
+            RdbStep::InlineCommand { .. } => panic!("snapshot has no inline commands"),
         }
     }
     assert_eq!(decoder.consumed_bytes(), bytes.len());
