@@ -943,6 +943,9 @@ impl ServerWorkerState {
             return;
         }
         self.replication_runtime.set_replica_link(link);
+        if self.pending_replication_replay.is_none() {
+            self.reconcile_replication_compression();
+        }
     }
 
     fn abort_pending_replication_replay(

@@ -166,10 +166,6 @@ impl ServerWorkerState {
                 }
             });
         if let Some((sync_mode, replica)) = promotion {
-            if sync_mode == "dual" && !self.ctx.config().server.debug_pause_after_fork {
-                self.replication_runtime
-                    .clear_grace_psync_wait_for_main(connection_id);
-            }
             if let Some(replica_id) = self
                 .replication_runtime
                 .replica_id_for_connection(connection_id)
@@ -202,6 +198,7 @@ impl ServerWorkerState {
         }
         self.refresh_replication_view();
         self.check_wait_replica_wakeups();
+        self.reconcile_replication_compression();
         self.ctx.end_cmd("replconf", false);
         false
     }
@@ -211,6 +208,10 @@ impl ServerWorkerState {
         connection_token: usize,
         promotion: ReplconfPromotion,
     ) {
+        if promotion.sync_mode == "dual" && !self.ctx.config().server.debug_pause_after_fork {
+            self.replication_runtime
+                .clear_grace_psync_wait_for_main(promotion.connection_id);
+        }
         crate::server_log!(
             notice,
             "replica terminal ACK promoted {} replica={} connection={} offset={}",
@@ -252,6 +253,38 @@ impl ServerWorkerState {
         if !tail.is_empty() {
             self.queue_promoted_replica_tail(connection_token, tail);
         }
+    }
+
+    pub(crate) fn finish_pending_dual_promotions(&mut self) {
+        let promotions = self.replication_runtime.take_dual_promotions();
+        if promotions.is_empty() {
+            return;
+        }
+        for replica_id in promotions {
+            // Replica identities are monotonic; a reused transport slot must
+            // never consume an earlier session's completion edge.
+            let Some(link) = self.replication_runtime.primary_link(replica_id) else {
+                continue;
+            };
+            let connection_id = link.connection_id();
+            let Some(offset) = link.last_ack_position() else {
+                continue;
+            };
+            let replica = link.replica().display_name();
+            self.finish_replconf_ack_promotion(
+                connection_id.0,
+                ReplconfPromotion {
+                    connection_id,
+                    replica_id,
+                    offset,
+                    sync_mode: "dual",
+                    replica,
+                },
+            );
+        }
+        self.refresh_replication_view();
+        self.check_wait_replica_wakeups();
+        self.reconcile_replication_compression();
     }
 
     fn queue_promoted_replica_tail(&mut self, connection_token: usize, tail: Vec<u8>) {

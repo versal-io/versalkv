@@ -221,6 +221,10 @@ impl ServerWorkerState {
     }
 
     pub(crate) fn schedule_eviction(&mut self) {
+        self.schedule_eviction_after(Duration::ZERO);
+    }
+
+    pub(crate) fn schedule_eviction_after(&mut self, delay: Duration) {
         self.ctx.set_needs_eviction(false);
         let kind = TimerEvent::EvictionContinuation;
         if self
@@ -232,7 +236,7 @@ impl ServerWorkerState {
             return;
         }
         self.time_events
-            .schedule_unique(MonotonicInstant::now(), Duration::ZERO, kind);
+            .schedule_unique(MonotonicInstant::now(), delay, kind);
     }
 
     pub(crate) fn cancel_eviction_timer(&mut self) {

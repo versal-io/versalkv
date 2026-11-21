@@ -159,10 +159,17 @@ pub struct PersistenceState {
     forkless_feed: Option<ForklessFeed>,
     forkless_keys: HashSet<ForklessItemId>,
     forkless_captured_keys: HashSet<ForklessItemId>,
+    forkless_eviction_keys: HashMap<u32, CapturedEvictionKeys>,
     forkless_current_to_original_db: HashMap<u32, u32>,
     forkless_original_to_current_db: HashMap<u32, u32>,
     bgsave_scheduled: Option<BgsaveMethod>,
     aof_rewrite_scheduled: bool,
+}
+
+#[derive(Default)]
+struct CapturedEvictionKeys {
+    keys: Vec<Vec<u8>>,
+    cursor: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -221,6 +228,7 @@ impl PersistenceState {
             forkless_feed: None,
             forkless_keys: HashSet::new(),
             forkless_captured_keys: HashSet::new(),
+            forkless_eviction_keys: HashMap::new(),
             forkless_current_to_original_db: HashMap::new(),
             forkless_original_to_current_db: HashMap::new(),
             bgsave_scheduled: None,
@@ -420,6 +428,7 @@ impl PersistenceState {
             })
             .collect();
         self.forkless_captured_keys.clear();
+        self.forkless_eviction_keys.clear();
         self.forkless_current_to_original_db.clear();
         self.forkless_original_to_current_db.clear();
         self.forkless_feed = feed;
@@ -447,12 +456,12 @@ impl PersistenceState {
         if let Some(feed) = self.forkless_feed.as_mut() {
             feed.drive(primary, additional_datasets, 128);
             self.forkless_keys.extend(feed.take_queued_keys());
-            self.forkless_captured_keys
-                .extend(feed.take_captured_keys());
+            let captured = feed.take_captured_keys();
             released_any |= !feed.take_resolved_keys().is_empty();
             if feed.is_finished() {
                 self.forkless_feed = None;
             }
+            self.record_forkless_captured_keys(captured);
         }
         released_any
     }
@@ -471,6 +480,53 @@ impl PersistenceState {
             db_id: self.forkless_original_db(db_id),
             key: key.to_vec(),
         })
+    }
+
+    fn record_forkless_captured_keys(&mut self, items: Vec<ForklessItemId>) {
+        for item in items {
+            if self.forkless_captured_keys.contains(&item) {
+                continue;
+            }
+            if item.dataset_id.is_none() {
+                self.forkless_eviction_keys
+                    .entry(item.db_id)
+                    .or_default()
+                    .keys
+                    .push(item.key.clone());
+            }
+            self.forkless_captured_keys.insert(item);
+        }
+    }
+
+    /// Visit at most `budget` historical captures in the current primary DB.
+    /// Missing live keys still consume budget; unrelated DBs are never scanned.
+    pub(crate) fn forkless_eviction_candidates(
+        &self,
+        db_id: u32,
+        budget: usize,
+    ) -> impl Iterator<Item = &[u8]> {
+        let (keys, start) = self
+            .forkless_eviction_keys
+            .get(&self.forkless_original_db(db_id))
+            .map_or((&[][..], 0), |index| (index.keys.as_slice(), index.cursor));
+        keys[start..]
+            .iter()
+            .chain(keys[..start].iter())
+            .take(budget)
+            .map(Vec::as_slice)
+    }
+
+    pub(crate) fn advance_forkless_eviction_candidates(&mut self, db_id: u32, budget: usize) {
+        let original_db = self.forkless_original_db(db_id);
+        if let Some(index) = self.forkless_eviction_keys.get_mut(&original_db) {
+            let count = budget.min(index.keys.len());
+            let remaining = index.keys.len() - index.cursor;
+            index.cursor = if count < remaining {
+                index.cursor + count
+            } else {
+                count - remaining
+            };
+        }
     }
 
     pub fn prioritize_forkless_keys(
@@ -624,6 +680,7 @@ impl PersistenceState {
         let (mut task, dirty_at_start) = self.forkless.take()?;
         self.forkless_feed = None;
         self.forkless_captured_keys.clear();
+        self.forkless_eviction_keys.clear();
         let outcome = task.finish();
         let original_to_current = &self.forkless_original_to_current_db;
         for mut item in self.forkless_keys.drain() {
@@ -990,6 +1047,174 @@ impl Default for PersistenceState {
 #[cfg(test)]
 mod tests {
     use super::{OperationStatus, PersistenceChild, PersistenceState, StateError};
+
+    #[test]
+    fn forkless_eviction_candidates_count_stale_entries_and_exclude_other_datasets() {
+        use crate::foundation::io::persistence::rdb::frozen::ForklessItemId;
+        use crate::foundation::io::store::kv_engine::{Db, EvictionPolicy};
+        use crate::foundation::io::store::Robj;
+        use bytes::Bytes;
+
+        let mut state = PersistenceState::new();
+        let item = |db_id, key: &[u8], dataset_id| ForklessItemId {
+            db_id,
+            key: key.to_vec(),
+            dataset_id,
+        };
+        state.record_forkless_captured_keys(vec![
+            item(0, b"stale-0", None),
+            item(0, b"stale-1", None),
+            item(0, b"safe", None),
+            item(0, b"safe", None),
+        ]);
+        state.record_forkless_captured_keys(
+            (0..2_048)
+                .flat_map(|index| {
+                    let key = format!("unrelated-{index}");
+                    [
+                        item(1, key.as_bytes(), None),
+                        item(0, key.as_bytes(), Some(b"module".to_vec())),
+                    ]
+                })
+                .collect(),
+        );
+        let mut db = Db::new();
+        db.set(
+            b"safe".to_vec(),
+            Robj::string_raw(Bytes::from_static(b"value")),
+        );
+        let mut checked = 0;
+        let candidates: Vec<_> = state
+            .forkless_eviction_candidates(0, 2)
+            .inspect(|_| checked += 1)
+            .filter_map(|key| db.eviction_candidate_for_key(key, EvictionPolicy::AllkeysLru))
+            .collect();
+        assert!(candidates.is_empty());
+        assert_eq!(
+            checked, 2,
+            "stale entries must consume the inspection budget"
+        );
+        state.advance_forkless_eviction_candidates(0, 2);
+        assert_eq!(
+            state.forkless_eviction_candidates(0, 2).collect::<Vec<_>>(),
+            vec![b"safe".as_slice(), b"stale-0".as_slice()]
+        );
+        assert!(state.forkless_eviction_candidates(0, 0).next().is_none());
+        assert_eq!(state.forkless_eviction_candidates(0, usize::MAX).count(), 3);
+        assert_eq!(state.forkless_eviction_candidates(2, usize::MAX).count(), 0);
+        db.del(b"safe");
+        assert!(state.forkless_key_captured(0, b"safe"));
+        state.advance_forkless_eviction_candidates(0, usize::MAX);
+        assert_eq!(
+            state.forkless_eviction_candidates(0, 1).next(),
+            Some(b"safe".as_slice())
+        );
+        eprintln!("bounded capture lookup: inspected=2, stale=2, unrelated_captures=4096, primary_index=3");
+    }
+
+    #[test]
+    fn forkless_eviction_index_tracks_swaps_and_save_lifecycle() {
+        use crate::foundation::io::persistence::rdb::compression::{
+            RdbCompression, RdbSnapshotOptions,
+        };
+        use crate::foundation::io::persistence::rdb::frozen::FrozenRdb;
+        use crate::foundation::io::persistence::rdb::RdbSerializeOptions;
+        use crate::foundation::io::persistence::snapshot::background::BackgroundRdbSave;
+        use crate::foundation::io::store::kv_engine::DbSet;
+        use crate::foundation::io::store::Robj;
+        use bytes::Bytes;
+
+        let mut state = PersistenceState::new();
+        let mut primary = DbSet::new(2);
+        primary.get_mut(0).unwrap().set(
+            b"first".to_vec(),
+            Robj::string_raw(Bytes::from_static(b"original-0")),
+        );
+        primary.get_mut(1).unwrap().set(
+            b"second".to_vec(),
+            Robj::string_raw(Bytes::from_static(b"original-1")),
+        );
+        let dir = std::env::temp_dir().join(format!(
+            "versal-captured-eviction-index-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        for should_abort in [true, false] {
+            let frozen = FrozenRdb::capture_header(
+                &primary,
+                &[],
+                &[],
+                None,
+                RdbSerializeOptions {
+                    compression: false,
+                    checksum: true,
+                },
+            );
+            let (task, feeder) = BackgroundRdbSave::start_incremental(
+                frozen.total_keys(),
+                dir.clone(),
+                "dump.rdb".into(),
+                1,
+                i64::MAX,
+                false,
+                RdbSnapshotOptions {
+                    compression: RdbCompression::No,
+                    checksum: true,
+                },
+            )
+            .unwrap();
+            let feed = frozen.into_incremental_feed(
+                feeder,
+                crate::foundation::io::store::kv_engine::now_ms(),
+                false,
+            );
+            state
+                .begin_forkless_save(task, 0, Vec::new(), Some(feed))
+                .unwrap();
+            assert!(state.forkless_eviction_keys.is_empty());
+            assert!(state.forkless_captured_keys.is_empty());
+            assert!(state.forkless_current_to_original_db.is_empty());
+            state.drive_forkless_feed(&mut primary, &mut []);
+            assert_eq!(
+                state.forkless_eviction_candidates(0, 1).next(),
+                Some(b"first".as_slice())
+            );
+            primary.swap(0, 1);
+            state.swap_forkless_databases(0, 1);
+            assert_eq!(
+                state.forkless_eviction_candidates(0, 1).next(),
+                Some(b"second".as_slice())
+            );
+            assert_eq!(
+                state.forkless_eviction_candidates(1, 1).next(),
+                Some(b"first".as_slice())
+            );
+            assert!(state.forkless_key_captured(1, b"first"));
+            assert!(primary.get(1).unwrap().get_no_expire(b"first").is_some());
+            state.advance_forkless_eviction_candidates(1, 1);
+            primary.swap(0, 1);
+            state.swap_forkless_databases(0, 1);
+            assert_eq!(
+                state.forkless_eviction_candidates(0, 1).next(),
+                Some(b"first".as_slice())
+            );
+            if should_abort {
+                state.abort_forkless_save(0, &mut primary, &mut []);
+            } else {
+                state.set_forkless_key_delay(0);
+                assert!(matches!(
+                    state.finish_primary_forkless_save_for_test(&mut primary),
+                    Some(crate::foundation::io::persistence::snapshot::background::RdbSaveOutcome::Saved)
+                ));
+            }
+            assert!(state.forkless_eviction_keys.is_empty());
+            assert!(state.forkless_captured_keys.is_empty());
+            assert!(state.forkless_current_to_original_db.is_empty());
+            assert!(state.forkless_original_to_current_db.is_empty());
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     mod child_compaction_lifecycle {
         use super::{PersistenceChild, PersistenceState, StateError};

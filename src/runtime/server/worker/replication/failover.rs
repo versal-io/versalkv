@@ -138,6 +138,8 @@ impl ServerWorkerState {
             self.ctx.client_pause_mut().reason = "none";
             self.ctx.set_pending_unpause(true);
         }
+        // Acceptance cleanup reaches this path; do not re-enter event consumption.
+        self.reconcile_deferred_replication_compression();
     }
 
     pub(crate) fn clear_accepted_failover(&mut self) {

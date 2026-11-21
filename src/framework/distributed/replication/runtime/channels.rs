@@ -188,9 +188,7 @@ impl ReplicationRuntime {
             .get(&rdb_connection_id)
             .is_some_and(|record| record.rdb_snapshot_complete)
         {
-            if let Some(link) = self.primary_for_connection_mut(main_connection_id) {
-                link.mark_dual_rdb_complete();
-            }
+            self.complete_dual_rdb_for_main(main_connection_id);
         }
         Ok(())
     }
@@ -208,12 +206,32 @@ impl ReplicationRuntime {
         if let Some(record) = self.channel_records.get_mut(&rdb) {
             record.rdb_snapshot_complete = true;
         }
-        if let Some(link) = self
+        if let Some(main) = self
             .replica_id_for_connection(rdb)
-            .and_then(|id| self.primary_link_mut(id))
+            .and_then(|id| self.primary_link(id))
+            .map(PrimaryLink::connection_id)
         {
-            link.mark_dual_rdb_complete();
+            self.complete_dual_rdb_for_main(main);
         }
+    }
+
+    /// Completion facts can arrive in either order. Queue the one online edge
+    /// for L5 to settle transport effects after releasing the link borrow.
+    pub(crate) fn complete_dual_rdb_for_main(&mut self, main: ConnectionId) {
+        let Some(id) = self.replica_id_for_connection(main) else {
+            return;
+        };
+        let Some(link) = self.primary_link_mut(id) else {
+            return;
+        };
+        link.mark_dual_rdb_complete();
+        if link.promote_dual_replica_on_ack() {
+            self.pending_dual_promotions.push(id);
+        }
+    }
+
+    pub(crate) fn take_dual_promotions(&mut self) -> Vec<ReplicaId> {
+        std::mem::take(&mut self.pending_dual_promotions)
     }
 
     pub(crate) fn has_completed_unpaired_rdb_snapshot(&self, rdb: ConnectionId) -> bool {

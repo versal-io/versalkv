@@ -1080,11 +1080,12 @@ impl ServerWorkerState {
                 .and_then(|connection_token| self.connection_registry.get(connection_token))
                 .map(|connection| connection.token());
             if !relay.complete_full_resync {
-                if let Some(link) = self
+                if let Some(main) = self
                     .diskless_target_replica_id(id)
-                    .and_then(|replica_id| self.replication_runtime.primary_link_mut(replica_id))
+                    .and_then(|replica_id| self.replication_runtime.primary_link(replica_id))
+                    .map(|link| link.connection_id())
                 {
-                    link.mark_dual_rdb_complete();
+                    self.replication_runtime.complete_dual_rdb_for_main(main);
                 }
             }
             let Some(main_connection_token) = self.diskless_main_target_token(id) else {
@@ -1102,6 +1103,7 @@ impl ServerWorkerState {
                     .ok();
             }
         }
+        self.finish_pending_dual_promotions();
         self.refresh_replication_view();
     }
 
@@ -1222,16 +1224,20 @@ impl ServerWorkerState {
                 self.replication_runtime
                     .mark_rdb_snapshot_complete(connection_id);
             }
-        } else if let Some(link) = self
-            .diskless_target_replica_id(target)
-            .and_then(|id| self.replication_runtime.primary_link_mut(id))
-        {
+        } else if let Some(id) = self.diskless_target_replica_id(target) {
             if complete_full_resync {
-                link.finish_full_resync();
-            } else {
-                link.mark_dual_rdb_complete();
+                if let Some(link) = self.replication_runtime.primary_link_mut(id) {
+                    link.finish_full_resync();
+                }
+            } else if let Some(main) = self
+                .replication_runtime
+                .primary_link(id)
+                .map(|link| link.connection_id())
+            {
+                self.replication_runtime.complete_dual_rdb_for_main(main);
             }
         }
+        self.finish_pending_dual_promotions();
     }
 
     /// Pump a diskless child's pipe into replica output queues. On EOF, append

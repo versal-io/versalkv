@@ -9,6 +9,7 @@ use crate::engine::command::CommandArgs;
 use crate::foundation::io::protocol::Value;
 use crate::framework::capabilities::connection::ConnectionCommandEffects;
 use crate::framework::capabilities::io::Token;
+use crate::framework::context::{PostCommandApplyOutcome, ReplicationCompressionReconcileRoute};
 use crate::framework::spec::CommandExecutor;
 use crate::runtime::server::worker::command::runtime_command::execute_runtime_command;
 
@@ -77,6 +78,36 @@ impl ServerWorkerState {
     }
 
     pub(crate) fn apply_post_command_intents(
+        &mut self,
+        origin: CommandOrigin,
+        connection_token: usize,
+        connection_effects: Option<&mut ConnectionCommandEffects>,
+        mut reply: Value,
+    ) -> Value {
+        // Preserve handler errors while still resolving intents left by an EXEC item.
+        let handler_error =
+            matches!(reply, Value::Error(_)).then(|| std::mem::replace(&mut reply, Value::Null));
+        let reply = self.apply_runtime_post_command_intents(
+            origin,
+            connection_token,
+            connection_effects,
+            reply,
+        );
+        let reply = handler_error.unwrap_or(reply);
+        let outcome = match &reply {
+            Value::Error(_) => PostCommandApplyOutcome::Failed,
+            _ => PostCommandApplyOutcome::Succeeded,
+        };
+        match self.ctx.settle_replication_compression(outcome) {
+            ReplicationCompressionReconcileRoute::Skip => {}
+            ReplicationCompressionReconcileRoute::Reconcile => {
+                self.reconcile_replication_compression();
+            }
+        }
+        reply
+    }
+
+    fn apply_runtime_post_command_intents(
         &mut self,
         origin: CommandOrigin,
         connection_token: usize,

@@ -49,6 +49,10 @@ pub struct Db {
     lfu_decay_time: u16,
     slot_router: SlotRouter,
     pub(super) db_id: u32,
+    #[cfg(test)]
+    eviction_sample_calls: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    eviction_sample_keys: Option<Vec<Vec<u8>>>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -285,6 +289,10 @@ impl Db {
             lazy_expired_hash_fields: 0,
             slot_router,
             db_id: 0,
+            #[cfg(test)]
+            eviction_sample_calls: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            eviction_sample_keys: None,
         }
     }
 
@@ -1556,20 +1564,55 @@ impl Db {
         }
     }
 
+    /// Validate a supplied key without changing the live dataset or metadata.
+    pub(crate) fn eviction_candidate_for_key(
+        &self,
+        key: &[u8],
+        policy: EvictionPolicy,
+    ) -> Option<EvictionCandidate> {
+        let slot = self.key_slot(key);
+        if policy == EvictionPolicy::NoEviction
+            || self.is_importing_slot_key(key)
+            || !self.data.contains_key_in_slot_bytes(slot, key)
+            || (policy.is_volatile() && !self.expires.contains_key_in_slot_bytes(slot, key))
+        {
+            return None;
+        }
+        Some(EvictionCandidate {
+            key: key.to_vec(),
+            score: self.eviction_score(key, policy),
+        })
+    }
+
     pub fn sample_eviction_candidate(
         &self,
         policy: EvictionPolicy,
         samples: usize,
     ) -> Option<EvictionCandidate> {
+        #[cfg(test)]
+        self.eviction_sample_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if policy == EvictionPolicy::NoEviction {
             return None;
         }
         let mut best: Option<EvictionCandidate> = None;
-        for _ in 0..samples.max(1) {
-            let key = if policy.is_volatile() {
-                self.random_eviction_expire_key()
-            } else {
-                self.random_eviction_key()
+        for sample_index in 0..samples.max(1) {
+            let random_key = || {
+                if policy.is_volatile() {
+                    self.random_eviction_expire_key()
+                } else {
+                    self.random_eviction_key()
+                }
+            };
+            #[cfg(test)]
+            let key = match &self.eviction_sample_keys {
+                Some(keys) => Some(keys[sample_index % keys.len()].clone()),
+                None => random_key(),
+            }?;
+            #[cfg(not(test))]
+            let key = {
+                let _ = sample_index;
+                random_key()
             }?;
             let score = self.eviction_score(&key, policy);
             if policy.is_random() {
@@ -1583,6 +1626,18 @@ impl Db {
             }
         }
         best
+    }
+
+    #[cfg(test)]
+    pub(crate) fn eviction_sample_calls(&self) -> usize {
+        self.eviction_sample_calls
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_eviction_sample_keys_for_test(&mut self, keys: Vec<Vec<u8>>) {
+        assert!(!keys.is_empty());
+        self.eviction_sample_keys = Some(keys);
     }
 
     pub fn keys_in_slot(&self, slot: usize) -> Vec<Vec<u8>> {
@@ -2085,5 +2140,74 @@ impl Db {
 
     pub fn for_each_entry_including_expired<F: FnMut(&[u8], &Robj, Option<u64>)>(&self, mut f: F) {
         self.for_each_entry_including_expired_with_hash_field_expires(|k, v, e, _| f(k, v, e));
+    }
+}
+
+#[cfg(test)]
+mod eviction_candidate_tests {
+    use super::{Db, EvictionPolicy, Robj};
+    use bytes::Bytes;
+
+    #[test]
+    fn supplied_eviction_candidates_recheck_live_policy_ttl_and_import_eligibility() {
+        let mut db = Db::new_with_slot_router(14, |_| 16_383);
+        let key = b"candidate";
+        db.set(key.to_vec(), Robj::string_raw(Bytes::from_static(b"value")));
+        db.set_lru_idle(key, 100);
+        assert!(db
+            .eviction_candidate_for_key(b"missing", EvictionPolicy::AllkeysLru)
+            .is_none());
+        assert!(db
+            .eviction_candidate_for_key(key, EvictionPolicy::NoEviction)
+            .is_none());
+        for policy in [
+            EvictionPolicy::VolatileRandom,
+            EvictionPolicy::VolatileLru,
+            EvictionPolicy::VolatileLfu,
+            EvictionPolicy::VolatileTtl,
+        ] {
+            assert!(db.eviction_candidate_for_key(key, policy).is_none());
+        }
+        db.set_expire(key, u64::MAX);
+        for policy in [
+            EvictionPolicy::AllkeysRandom,
+            EvictionPolicy::AllkeysLru,
+            EvictionPolicy::AllkeysLfu,
+            EvictionPolicy::VolatileRandom,
+            EvictionPolicy::VolatileLru,
+            EvictionPolicy::VolatileLfu,
+            EvictionPolicy::VolatileTtl,
+        ] {
+            let candidate = db.eviction_candidate_for_key(key, policy).unwrap();
+            assert_eq!(candidate.key, key);
+            assert_eq!(candidate.score, db.eviction_score(key, policy));
+        }
+        db.set_expire(key, 0);
+        assert!(db
+            .eviction_candidate_for_key(key, EvictionPolicy::VolatileTtl)
+            .is_some());
+        assert!(
+            db.get_allow_expired(key).is_some(),
+            "candidate checks must not expire live entries"
+        );
+        db.set_slot_importing(16_383, true);
+        assert!(db
+            .eviction_candidate_for_key(key, EvictionPolicy::AllkeysLru)
+            .is_none());
+        assert!(db
+            .eviction_candidate_for_key(key, EvictionPolicy::VolatileTtl)
+            .is_none());
+        db.set_slot_importing(16_383, false);
+        db.remove_expire(key);
+        assert!(db
+            .eviction_candidate_for_key(key, EvictionPolicy::VolatileTtl)
+            .is_none());
+        assert!(db
+            .eviction_candidate_for_key(key, EvictionPolicy::AllkeysLru)
+            .is_some());
+        db.del(key);
+        assert!(db
+            .eviction_candidate_for_key(key, EvictionPolicy::AllkeysLru)
+            .is_none());
     }
 }

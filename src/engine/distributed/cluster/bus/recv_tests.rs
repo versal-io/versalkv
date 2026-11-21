@@ -206,6 +206,260 @@ fn inbound_ping_does_not_confirm_pending_explicit_meet() {
 }
 
 #[test]
+fn temporary_outbound_ping_retires_duplicate_after_gossip_discovers_sender() {
+    use crate::engine::distributed::cluster::action::ReplicationSwitchMode;
+    use crate::engine::distributed::cluster::state::PendingReplicationSwitch;
+    use crate::engine::distributed::cluster::ClusterLinkDirection;
+
+    let mut state = ClusterState::new("127.0.0.1", 6379, 16379);
+    let mut manager = ClusterBusManager::new();
+    let mut sender = ClusterNode::new(
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        "127.0.0.1".to_string(),
+        6380,
+        16380,
+        true,
+    );
+    sender.flags &= !CLUSTER_NODE_MYSELF;
+    manager.register_incoming(Token(29), "127.0.0.1:26380".parse().unwrap());
+    let meet = msg::encode_msg(ClusterMsgType::Meet, &sender, 0, &[]);
+    assert!(!manager.process_read_bytes(&mut state, 29, &meet, 100));
+    let handshake_id = manager.connections[&29].handshake_node_name.clone();
+    assert!(state.nodes[&handshake_id].has_flag(CLUSTER_NODE_HANDSHAKE));
+    assert!(!state.nodes[&handshake_id].meet_pending);
+    state.replicate(handshake_id.as_bytes()).unwrap();
+    state.set_pending_replication_switch(PendingReplicationSwitch {
+        node_id: handshake_id.clone(),
+        mode: ReplicationSwitchMode::ForceFull,
+    });
+    let mut sibling = ClusterNode::new(
+        "cccccccccccccccccccccccccccccccccccccccc".to_string(),
+        "127.0.0.1".to_string(),
+        6382,
+        16382,
+        false,
+    );
+    sibling.flags &= !CLUSTER_NODE_MYSELF;
+    sibling.replicaof = handshake_id.clone();
+    let sibling_id = sibling.name.clone();
+    state.insert_node(sibling);
+
+    // The runtime registers temporary PING reconnects under node_name.
+    manager.register_outgoing_for_node(
+        Token(30),
+        "127.0.0.1:16380".parse().unwrap(),
+        false,
+        handshake_id.clone(),
+    );
+    manager.queue_initial_handshake(&mut state, 30);
+    assert_eq!(
+        msg::parse_msg(&manager.connections[&30].write_buf)
+            .unwrap()
+            .0
+            .msg_type,
+        ClusterMsgType::Ping
+    );
+    assert!(manager.connections[&30].handshake_node_name.is_empty());
+
+    let mut gossip_sender = ClusterNode::new(
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+        "127.0.0.1".to_string(),
+        6381,
+        16381,
+        true,
+    );
+    gossip_sender.flags &= !CLUSTER_NODE_MYSELF;
+    state.insert_node(gossip_sender.clone());
+    manager.register_incoming(Token(31), "127.0.0.1:26381".parse().unwrap());
+    let gossip = GossipEntry {
+        node_id: sender.name.clone(),
+        flags: CLUSTER_NODE_PRIMARY,
+        ping_sent: 0,
+        pong_received: 0,
+        ip: sender.ip().to_string(),
+        port: sender.port(),
+        tls_port: 0,
+        bus_port: sender.cport(),
+        config_epoch: 0,
+    };
+    let gossip_ping = msg::encode_msg(ClusterMsgType::Ping, &gossip_sender, 0, &[gossip]);
+    assert!(!manager.process_read_bytes(&mut state, 31, &gossip_ping, 150));
+    assert!(state.nodes.contains_key(&sender.name));
+    assert!(state.nodes.contains_key(&handshake_id));
+    let known_sender = state.nodes.get_mut(&sender.name).unwrap();
+    known_sender.ping_sent = 140;
+    known_sender.pong_received = 130;
+
+    // C deletes the duplicate and returns before PONG slot/liveness handling.
+    sender.config_epoch = 9;
+    sender.slots[7] = true;
+    sender.numslots = 1;
+    let pong = msg::encode_msg(ClusterMsgType::Pong, &sender, 9, &[]);
+    assert!(
+        manager.process_read_bytes(&mut state, 30, &pong, 200),
+        "a temporary PING link must close when gossip already identified its sender"
+    );
+    assert!(!state.nodes.contains_key(&handshake_id));
+    assert!(state.myself.replicaof.is_empty());
+    assert!(state.myself.is_replica());
+    assert!(state.nodes[&sibling_id].replicaof.is_empty());
+    assert!(state.pending_replication_switch.is_none());
+    assert_eq!(state.nodes[&sender.name].ping_sent, 140);
+    assert_eq!(state.nodes[&sender.name].pong_received, 130);
+    assert!(!state.nodes[&sender.name].slots[7]);
+    assert_eq!(
+        state.pending_link_closes,
+        vec![(handshake_id, ClusterLinkDirection::All)]
+    );
+}
+
+#[test]
+fn temporary_outbound_ping_confirms_unknown_sender_by_link_identity() {
+    use crate::engine::distributed::cluster::action::ReplicationSwitchMode;
+    use crate::engine::distributed::cluster::state::PendingReplicationSwitch;
+
+    let mut state = ClusterState::new("127.0.0.1", 6379, 16379);
+    let mut manager = ClusterBusManager::new();
+    let mut sender = ClusterNode::new(
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        "127.0.0.1".to_string(),
+        6380,
+        16380,
+        true,
+    );
+    sender.flags &= !CLUSTER_NODE_MYSELF;
+    manager.register_incoming(Token(29), "127.0.0.1:26380".parse().unwrap());
+    let meet = msg::encode_msg(ClusterMsgType::Meet, &sender, 0, &[]);
+    assert!(!manager.process_read_bytes(&mut state, 29, &meet, 100));
+    let handshake_id = manager.connections[&29].handshake_node_name.clone();
+    state.replicate(handshake_id.as_bytes()).unwrap();
+    state.set_pending_replication_switch(PendingReplicationSwitch {
+        node_id: handshake_id.clone(),
+        mode: ReplicationSwitchMode::TryPartial,
+    });
+    manager.register_outgoing_for_node(
+        Token(30),
+        "127.0.0.1:16380".parse().unwrap(),
+        false,
+        handshake_id.clone(),
+    );
+    manager.queue_initial_handshake(&mut state, 30);
+    let pending_inbound_reply = manager.connections[&29].write_buf.clone();
+    sender
+        .endpoints
+        .update_bus_address("127.0.0.1".to_string(), 6380, 16381);
+    let pong = msg::encode_msg(ClusterMsgType::Pong, &sender, 0, &[]);
+
+    assert!(!manager.process_read_bytes(&mut state, 30, &pong, 200));
+    assert_eq!(
+        state.myself.replicaof, sender.name,
+        "temporary PING confirmation must use its owner even if the endpoint changes"
+    );
+    assert!(!state.nodes.contains_key(&handshake_id));
+    assert_eq!(
+        state.pending_replication_switch,
+        Some(PendingReplicationSwitch {
+            node_id: sender.name.clone(),
+            mode: ReplicationSwitchMode::TryPartial,
+        })
+    );
+    assert_eq!(manager.connections[&30].node_name, sender.name);
+    assert_eq!(manager.connections[&29].node_name, sender.name);
+    assert!(manager.connections[&29].handshake_node_name.is_empty());
+    assert_eq!(manager.connections[&29].write_buf, pending_inbound_reply);
+    assert!(state.pending_link_closes.is_empty());
+}
+
+#[test]
+fn known_inbound_ping_preserves_explicit_meet_until_outbound_response() {
+    use crate::engine::distributed::cluster::action::ReplicationSwitchMode;
+    use crate::engine::distributed::cluster::state::PendingReplicationSwitch;
+    use crate::engine::distributed::cluster::ClusterLinkDirection;
+
+    let mut state = ClusterState::new("127.0.0.1", 6379, 16379);
+    let mut manager = ClusterBusManager::new();
+    let mut sender = ClusterNode::new(
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        "127.0.0.1".to_string(),
+        6380,
+        16380,
+        true,
+    );
+    sender.flags &= !CLUSTER_NODE_MYSELF;
+    state.insert_node(sender.clone());
+    state.queue_meet(("127.0.0.1".to_string(), 6380, 16380));
+    let handshake_id = state
+        .nodes
+        .values()
+        .find(|node| node.has_flag(CLUSTER_NODE_HANDSHAKE))
+        .unwrap()
+        .name
+        .clone();
+    state.replicate(handshake_id.as_bytes()).unwrap();
+    let pending_switch = PendingReplicationSwitch {
+        node_id: handshake_id.clone(),
+        mode: ReplicationSwitchMode::ForceFull,
+    };
+    state.set_pending_replication_switch(pending_switch.clone());
+    manager.register_outgoing_for_handshake(
+        Token(29),
+        "127.0.0.1:16380".parse().unwrap(),
+        handshake_id.clone(),
+    );
+    manager.queue_initial_handshake(&mut state, 29);
+    let pending_meet = manager.connections[&29].write_buf.clone();
+    assert_eq!(
+        msg::parse_msg(&pending_meet).unwrap().0.msg_type,
+        ClusterMsgType::Meet
+    );
+    manager.register_incoming(Token(30), "127.0.0.1:26380".parse().unwrap());
+
+    sender.config_epoch = 9;
+    sender.slots[7] = true;
+    sender.numslots = 1;
+    let ping = msg::encode_msg(ClusterMsgType::Ping, &sender, 9, &[]);
+    for now_ms in [150, 160] {
+        assert!(!manager.process_read_bytes(&mut state, 30, &ping, now_ms));
+        assert!(
+            state.nodes.contains_key(&handshake_id),
+            "a known sender's ordinary inbound PING must not retire an explicit MEET"
+        );
+        assert!(state.nodes[&handshake_id].meet_pending);
+        assert_eq!(state.myself.replicaof, handshake_id);
+        assert_eq!(
+            state.pending_replication_switch,
+            Some(pending_switch.clone())
+        );
+        assert_eq!(manager.connections[&29].handshake_node_name, handshake_id);
+        assert_eq!(manager.connections[&29].write_buf, pending_meet);
+        assert!(state.pending_link_closes.is_empty());
+        assert!(state.nodes[&sender.name].slots[7]);
+        assert_eq!(manager.connections[&30].node_name, sender.name);
+    }
+    let (reply, reply_len) = msg::parse_msg(&manager.connections[&30].write_buf).unwrap();
+    assert_eq!(reply.msg_type, ClusterMsgType::Pong);
+    assert_eq!(
+        msg::parse_msg(&manager.connections[&30].write_buf[reply_len..])
+            .unwrap()
+            .0
+            .msg_type,
+        ClusterMsgType::Pong
+    );
+
+    let pong = msg::encode_msg(ClusterMsgType::Pong, &sender, 9, &[]);
+    assert!(manager.process_read_bytes(&mut state, 29, &pong, 200));
+    assert!(!state.nodes.contains_key(&handshake_id));
+    assert!(state.myself.replicaof.is_empty());
+    assert!(state.myself.is_replica());
+    assert!(state.pending_replication_switch.is_none());
+    assert_eq!(manager.connections[&30].node_name, sender.name);
+    assert_eq!(
+        state.pending_link_closes,
+        vec![(handshake_id, ClusterLinkDirection::All)]
+    );
+}
+
+#[test]
 fn separate_inbound_confirmation_preserves_installed_replication_identity() {
     for message_type in [
         ClusterMsgType::Ping,

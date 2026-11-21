@@ -120,6 +120,8 @@ impl ServerContext {
             pending_tcp_rebind: None,
             pending_tls_reconfigure: None,
             pending_io_threads_reconfigure: None,
+            pending_replication_compression: None,
+            deferred_replication_compression: None,
             pending_server_restart: None,
             startup_args: Vec::new(),
             listener_fds: Vec::new(),

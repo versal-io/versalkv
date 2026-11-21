@@ -10,6 +10,16 @@ use crate::engine::distributed::cluster::state::ClusterState;
 
 use super::types::ClusterBusManager;
 
+enum HandshakeIdentityOutcome {
+    ProcessPacket,
+    RetireLink,
+}
+
+enum EndpointHandshakeCleanup {
+    PreserveExplicitMeet,
+    RetireAll,
+}
+
 #[cfg(test)]
 thread_local! {
     static SNAPSHOT_COPY_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -165,9 +175,12 @@ impl ClusterBusManager {
                         }
                     }
 
-                    if self.confirm_handshake_identity(state, &cluster_msg, token_value, now) {
-                        should_close = true;
-                        break;
+                    match self.confirm_handshake_identity(state, &cluster_msg, token_value, now) {
+                        HandshakeIdentityOutcome::ProcessPacket => {}
+                        HandshakeIdentityOutcome::RetireLink => {
+                            should_close = true;
+                            break;
+                        }
                     }
                     self.handle_message(state, &cluster_msg, token_value, now);
                     self.propagate_gossip_failure_quorum(state, &cluster_msg, now);
@@ -216,30 +229,41 @@ impl ClusterBusManager {
         should_close
     }
 
-    /// Return true only when the current handshake link must be retired.
+    /// Confirm the link owner's identity before packet-specific handling.
     fn confirm_handshake_identity(
         &mut self,
         state: &mut ClusterState,
         message: &ClusterMsg,
         token_value: usize,
         now_ms: i64,
-    ) -> bool {
+    ) -> HandshakeIdentityOutcome {
         if !matches!(
             message.msg_type,
             ClusterMsgType::Ping | ClusterMsgType::Pong | ClusterMsgType::Meet
         ) {
-            return false;
+            return HandshakeIdentityOutcome::ProcessPacket;
         }
         let Some(connection) = self.connections.get(&token_value) else {
-            return false;
+            return HandshakeIdentityOutcome::ProcessPacket;
         };
-        let linked_handshake = connection.is_outgoing
-            && state
-                .nodes
-                .get(&connection.handshake_node_name)
-                .is_some_and(|node| node.has_flag(CLUSTER_NODE_HANDSHAKE));
-        let handshake_id = if linked_handshake {
-            Some(connection.handshake_node_name.clone())
+        let linked_handshake_id = if connection.is_outgoing {
+            // Explicit MEET owns handshake_node_name; temporary PING reconnects
+            // own node_name. Both identify the outbound handshake node in C.
+            [&connection.handshake_node_name, &connection.node_name]
+                .into_iter()
+                .find(|node_id| {
+                    node_id.as_str() != message.sender_id
+                        && state
+                            .nodes
+                            .get(*node_id)
+                            .is_some_and(|node| node.has_flag(CLUSTER_NODE_HANDSHAKE))
+                })
+                .cloned()
+        } else {
+            None
+        };
+        let handshake_id = if linked_handshake_id.is_some() {
+            linked_handshake_id
         } else if connection.handshake_node_name.is_empty()
             && !state.nodes.contains_key(&message.sender_id)
         {
@@ -262,7 +286,7 @@ impl ClusterBusManager {
             None
         };
         let Some(handshake_id) = handshake_id else {
-            return false;
+            return HandshakeIdentityOutcome::ProcessPacket;
         };
         if state.nodes.contains_key(&message.sender_id) {
             // C deletes a duplicate node and its link; it does not transfer
@@ -307,10 +331,10 @@ impl ClusterBusManager {
             ));
             state.remove_handshake_node(&handshake_id);
             state.request_config_save();
-            return true;
+            return HandshakeIdentityOutcome::RetireLink;
         }
         if !state.rename_handshake_node(&handshake_id, &message.sender_id) {
-            return true;
+            return HandshakeIdentityOutcome::RetireLink;
         }
         // Temporary records can own both directional sockets. Preserve these
         // owners, buffers and pending PONGs just as C preserves node links.
@@ -333,7 +357,7 @@ impl ClusterBusManager {
                 & (crate::engine::distributed::cluster::node::CLUSTER_NODE_PRIMARY
                     | crate::engine::distributed::cluster::node::CLUSTER_NODE_REPLICA);
         }
-        false
+        HandshakeIdentityOutcome::ProcessPacket
     }
 
     fn propagate_gossip_failure_quorum(
@@ -924,7 +948,12 @@ impl ClusterBusManager {
         sender.is_replica() != incoming_replica || (incoming_primary && !sender.is_primary())
     }
 
-    fn close_endpoint_handshake_links(&self, state: &mut ClusterState, msg: &ClusterMsg) {
+    fn close_endpoint_handshake_links(
+        &self,
+        state: &mut ClusterState,
+        msg: &ClusterMsg,
+        cleanup: EndpointHandshakeCleanup,
+    ) {
         let placeholders: Vec<String> = self
             .connections
             .values()
@@ -938,6 +967,12 @@ impl ClusterBusManager {
                                 && node.ip == msg.sender_ip
                                 && node.port == msg.port
                                 && node.cport == msg.bus_port
+                                && match cleanup {
+                                    EndpointHandshakeCleanup::PreserveExplicitMeet => {
+                                        !node.meet_pending
+                                    }
+                                    EndpointHandshakeCleanup::RetireAll => true,
+                                }
                         })
             })
             .map(|connection| connection.handshake_node_name.clone())
@@ -1178,7 +1213,13 @@ impl ClusterBusManager {
             slot_claims_changed || sender_role_changed,
         );
         state.complete_node_meet(&msg.sender_id);
-        self.close_endpoint_handshake_links(state, msg);
+        // An unrelated inbound PING is not a response to our outbound MEET.
+        let cleanup = if on_inbound_link {
+            EndpointHandshakeCleanup::PreserveExplicitMeet
+        } else {
+            EndpointHandshakeCleanup::RetireAll
+        };
+        self.close_endpoint_handshake_links(state, msg, cleanup);
 
         if let Some(connection) = self.connections.get_mut(&token_value) {
             connection.node_name = msg.sender_id.clone();
@@ -1301,7 +1342,7 @@ impl ClusterBusManager {
             ));
             state.remove_handshake_node(handshake_id);
         }
-        self.close_endpoint_handshake_links(state, msg);
+        self.close_endpoint_handshake_links(state, msg, EndpointHandshakeCleanup::RetireAll);
         let stale_endpoint_handshakes: Vec<String> = state
             .nodes
             .values()

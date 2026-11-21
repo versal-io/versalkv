@@ -91,6 +91,8 @@ pub struct ServerContext {
     pending_tcp_rebind: Option<PendingTcpRebind>,
     pending_tls_reconfigure: Option<PendingTlsReconfigure>,
     pending_io_threads_reconfigure: Option<PendingIoThreadsReconfigure>,
+    pending_replication_compression: Option<PendingReplicationCompression>,
+    deferred_replication_compression: Option<String>,
     pending_server_restart: Option<RestartIntent>,
     startup_args: Vec<std::ffi::OsString>,
     /// Raw fds of all listening sockets (TCP / Unix / cluster bus). Recorded at
@@ -122,6 +124,21 @@ pub(crate) struct PendingTlsReconfigure {
 pub(crate) struct PendingIoThreadsReconfigure {
     pub(crate) previous: RuntimeConfig,
     pub(crate) requested: usize,
+}
+
+pub(crate) struct PendingReplicationCompression {
+    previous: String,
+    requested: String,
+}
+
+pub(crate) enum PostCommandApplyOutcome {
+    Succeeded,
+    Failed,
+}
+
+pub(crate) enum ReplicationCompressionReconcileRoute {
+    Skip,
+    Reconcile,
 }
 
 /// Pending in-place process replacement requested by DEBUG RESTART /

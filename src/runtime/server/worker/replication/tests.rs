@@ -18,6 +18,7 @@ use std::net::{TcpListener, TcpStream};
 
 mod codec_fix_tests;
 mod rdb_cohort;
+mod state_convergence;
 
 fn offset(value: i64) -> ReplicationOffset {
     ReplicationOffset::try_from(value).expect("valid test offset")

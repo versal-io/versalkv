@@ -1,5 +1,6 @@
 use super::{
-    ClientPauseState, PendingIoThreadsReconfigure, PendingTcpRebind, PendingTlsReconfigure,
+    ClientPauseState, PendingIoThreadsReconfigure, PendingReplicationCompression, PendingTcpRebind,
+    PendingTlsReconfigure, PostCommandApplyOutcome, ReplicationCompressionReconcileRoute,
     RestartIntent, ServerContext,
 };
 use crate::engine::command::SessionId;
@@ -157,6 +158,68 @@ impl ServerContext {
     ) -> Option<PendingIoThreadsReconfigure> {
         self.pending_io_threads_reconfigure.take()
     }
+    pub(crate) fn stage_replication_compression(
+        &self,
+        previous: &str,
+    ) -> Option<PendingReplicationCompression> {
+        let requested = &self.rconfig.replication.repl_compression;
+        if requested == previous {
+            return None;
+        }
+        let previous = self
+            .pending_replication_compression
+            .as_ref()
+            .map_or_else(|| previous.to_string(), |pending| pending.previous.clone());
+        Some(PendingReplicationCompression {
+            previous,
+            requested: requested.clone(),
+        })
+    }
+
+    pub(crate) fn record_replication_compression(
+        &mut self,
+        candidate: PendingReplicationCompression,
+    ) {
+        self.pending_replication_compression = Some(candidate);
+    }
+
+    /// Commit only after every runtime apply result is known. An EXEC item
+    /// leaves the I/O resolver to a later direct boundary.
+    pub(crate) fn settle_replication_compression(
+        &mut self,
+        outcome: PostCommandApplyOutcome,
+    ) -> ReplicationCompressionReconcileRoute {
+        if matches!(outcome, PostCommandApplyOutcome::Succeeded)
+            && self.pending_io_threads_reconfigure.is_some()
+        {
+            return ReplicationCompressionReconcileRoute::Skip;
+        }
+        let Some(pending) = self.pending_replication_compression.take() else {
+            return ReplicationCompressionReconcileRoute::Skip;
+        };
+        match outcome {
+            PostCommandApplyOutcome::Failed => {
+                self.rconfig.replication.repl_compression = pending.previous;
+                ReplicationCompressionReconcileRoute::Skip
+            }
+            PostCommandApplyOutcome::Succeeded if pending.previous == pending.requested => {
+                ReplicationCompressionReconcileRoute::Skip
+            }
+            PostCommandApplyOutcome::Succeeded => {
+                self.deferred_replication_compression = Some(pending.requested);
+                ReplicationCompressionReconcileRoute::Reconcile
+            }
+        }
+    }
+
+    pub(crate) fn deferred_replication_compression(&self) -> Option<&str> {
+        self.deferred_replication_compression.as_deref()
+    }
+
+    pub(crate) fn clear_deferred_replication_compression(&mut self) {
+        self.deferred_replication_compression = None;
+    }
+
     pub(crate) fn request_server_restart(&mut self, intent: RestartIntent) {
         self.pending_server_restart = Some(intent);
     }

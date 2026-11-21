@@ -491,9 +491,16 @@ pub fn config_set(
     if cluster_config_changed && !listener_changed {
         if let Err(error) = apply_cluster_config_snapshot(ctx) {
             ctx.config_mut().server = server_snapshot;
+            ctx.config_mut().replication.repl_compression =
+                runtime_config_snapshot.replication.repl_compression.clone();
             ctx.sync_eviction_policy();
             return Value::error(error);
         }
+    }
+    if let Some(candidate) =
+        ctx.stage_replication_compression(&runtime_config_snapshot.replication.repl_compression)
+    {
+        ctx.record_replication_compression(candidate);
     }
     if io_threads_changed {
         ctx.request_io_threads_reconfigure(runtime_config_snapshot.clone(), requested_io_threads);

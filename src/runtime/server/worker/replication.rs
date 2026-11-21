@@ -844,6 +844,7 @@ impl ServerWorkerState {
         };
         let events = link.take_deferred_events();
         let connection_id = link.connection_id();
+        let has_pending_sync = link.is_dual_rdb_mode_active();
         if events.is_empty() {
             let Some(connection_token) = self
                 .connection_registry
@@ -865,6 +866,9 @@ impl ServerWorkerState {
                 return;
             }
             self.replication_runtime.set_replica_link(link);
+            if has_pending_sync {
+                self.reconcile_replication_compression();
+            }
             return;
         }
         let Some(connection_token) = self
@@ -906,6 +910,9 @@ impl ServerWorkerState {
             return;
         }
         self.replication_runtime.set_replica_link(link);
+        if has_pending_sync {
+            self.reconcile_replication_compression();
+        }
     }
 
     /// Returns how many grace-held wait-PSYNC members were released. C derives

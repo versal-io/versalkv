@@ -16,6 +16,10 @@ pub struct KVStore<K, V> {
     resize_budget: ResizeBudget,
     allocated_slots: BTreeSet<usize>,
     resize_cursor: usize,
+    #[cfg(test)]
+    random_entry_slot_visits: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    random_entry_test_slot: Option<usize>,
 }
 
 impl<K: Eq + Hash, V> KVStore<K, V> {
@@ -37,6 +41,10 @@ impl<K: Eq + Hash, V> KVStore<K, V> {
             resize_budget,
             allocated_slots: BTreeSet::new(),
             resize_cursor: 0,
+            #[cfg(test)]
+            random_entry_slot_visits: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            random_entry_test_slot: None,
         }
     }
 
@@ -351,9 +359,10 @@ impl<K: Eq + Hash, V> KVStore<K, V> {
     }
 
     /// Return a pseudo-random (key, value) pair, skipping importing slots.
-    /// O(1) amortized; used by eviction / RANDOMKEY so the event loop is not
-    /// blocked by `keys().collect()` on large datasets (mirrors C's
-    /// `kvstoreGetFairRandomHashtableIndex` + `kvstoreHashtableRandomEntry`).
+    /// Tries at most 16 random slots before visiting allocated slot dictionaries.
+    /// Eviction and RANDOMKEY avoid collecting keys or scanning unallocated slots.
+    /// Mirrors C's `kvstoreGetFairRandomHashtableIndex` and
+    /// `kvstoreHashtableRandomEntry`.
     pub fn random_entry(&self) -> Option<(&K, &V)> {
         // Importing keys are invisible to sampling even though the raw store
         // is nonempty. Avoid a full slot-directory scan when none are eligible.
@@ -368,6 +377,11 @@ impl<K: Eq + Hash, V> KVStore<K, V> {
         let tries = n.min(16);
         for _ in 0..tries {
             let slot = fast_random_idx(n);
+            #[cfg(test)]
+            let slot = self.random_entry_test_slot.unwrap_or(slot);
+            #[cfg(test)]
+            self.random_entry_slot_visits
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if self.importing_slots.contains(&slot) {
                 continue;
             }
@@ -377,8 +391,11 @@ impl<K: Eq + Hash, V> KVStore<K, V> {
                 }
             }
         }
-        // Fallback: scan for the first non-empty non-importing slot.
-        for slot in 0..n {
+        // Fallback: visit only allocated non-importing slot dictionaries.
+        for &slot in &self.allocated_slots {
+            #[cfg(test)]
+            self.random_entry_slot_visits
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if self.importing_slots.contains(&slot) {
                 continue;
             }
@@ -560,6 +577,67 @@ mod tests {
 
     fn standalone() -> KVStore<Vec<u8>, u64> {
         KVStore::new(0)
+    }
+
+    #[test]
+    fn random_entry_sparse_fallback_visits_only_allocated_slots() {
+        let mut kv: KVStore<Vec<u8>, u64> = KVStore::new(14);
+        kv.insert_in_slot(16_383, b"visible".to_vec(), 1);
+        // Force the bounded random probes to miss without relying on chance.
+        kv.random_entry_test_slot = Some(0);
+
+        assert_eq!(
+            kv.random_entry()
+                .map(|(key, value)| (key.as_slice(), *value)),
+            Some((b"visible".as_slice(), 1))
+        );
+        let visits = kv
+            .random_entry_slot_visits
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            visits <= 16 + kv.allocated_slots.len(),
+            "sparse sampling visited {visits} slots for {} allocated slots",
+            kv.allocated_slots.len()
+        );
+    }
+
+    #[test]
+    fn random_entry_sparse_fallback_skips_importing_slots_with_bounded_work() {
+        let mut kv: KVStore<Vec<u8>, u64> = KVStore::new(14);
+        kv.insert_in_slot(16_382, b"importing".to_vec(), 1);
+        kv.insert_in_slot(16_383, b"visible".to_vec(), 2);
+        kv.set_slot_importing(16_382);
+        kv.random_entry_test_slot = Some(0);
+
+        assert_eq!(
+            kv.random_entry()
+                .map(|(key, value)| (key.as_slice(), *value)),
+            Some((b"visible".as_slice(), 2))
+        );
+        let visits = kv
+            .random_entry_slot_visits
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            visits <= 16 + kv.allocated_slots.len(),
+            "import-aware sparse sampling visited {visits} slots for {} allocated slots",
+            kv.allocated_slots.len()
+        );
+
+        kv.set_slot_importing(16_383);
+        kv.random_entry_slot_visits
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        assert!(kv.random_entry().is_none());
+        assert_eq!(
+            kv.random_entry_slot_visits
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "an importing-only store must not probe any slot"
+        );
+        kv.unset_slot_importing(16_383);
+        assert_eq!(
+            kv.random_entry().map(|(key, _)| key.as_slice()),
+            Some(b"visible".as_slice())
+        );
     }
 
     #[test]

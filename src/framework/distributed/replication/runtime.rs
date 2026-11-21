@@ -78,6 +78,7 @@ impl ReplicaRdbLink {
 
 pub struct ReplicationRuntime {
     primary_links: HashMap<ReplicaId, PrimaryLink>,
+    pending_dual_promotions: Vec<ReplicaId>,
     replica_link: Option<ReplicaLink>,
     replica_rdb_link: Option<ReplicaRdbLink>,
     replica_pending_buffer: Option<ReplicaPendingBuffer>,
@@ -120,6 +121,7 @@ impl ReplicationRuntime {
     pub fn new() -> Self {
         Self {
             primary_links: HashMap::new(),
+            pending_dual_promotions: Vec::new(),
             replica_link: None,
             replica_rdb_link: None,
             replica_pending_buffer: None,
@@ -1368,6 +1370,137 @@ mod tests {
         assert!(runtime
             .take_endoff_for_rdb_candidate_if_unambiguous(second_rdb, true, &mut backlog,)
             .is_some());
+    }
+
+    #[test]
+    fn state_convergence_dual_rdb_last_promotes_without_another_ack() {
+        let mut runtime = ReplicationRuntime::new();
+        let main = ConnectionId(41);
+        let rdb = ConnectionId(42);
+        let id = runtime.register_primary(main, replica_info(6380));
+        let backlog = ReplicationBacklog::new("current".to_string(), 1);
+        runtime
+            .primary_link_mut(id)
+            .unwrap()
+            .transition_to_waiting_for_rdb_channel()
+            .unwrap();
+        associate_waiting_rdb_channel(&mut runtime, main, rdb);
+        runtime
+            .finalize_dual_channel_rdb_association(main, rdb)
+            .unwrap();
+        let link = runtime.primary_link_mut(id).unwrap();
+        assert!(link.complete_dual_channel_main_psync("current", request(1), &backlog));
+        link.acknowledge(offset(0), 1_000);
+        assert!(!link.promote_dual_replica_on_ack());
+        runtime.mark_rdb_snapshot_complete(rdb);
+        assert_eq!(
+            runtime.primary_link(id).unwrap().dual_state(),
+            PrimaryDualChannelState::Online
+        );
+        runtime.mark_rdb_snapshot_complete(rdb);
+        assert!(!runtime
+            .primary_link_mut(id)
+            .unwrap()
+            .promote_dual_replica_on_ack());
+    }
+
+    #[test]
+    fn state_convergence_unpaired_completion_survives_association() {
+        let mut runtime = ReplicationRuntime::new();
+        let main = ConnectionId(41);
+        let rdb = ConnectionId(42);
+        let id = runtime.register_primary(main, replica_info(6380));
+        let backlog = ReplicationBacklog::new("current".to_string(), 1);
+        runtime
+            .primary_link_mut(id)
+            .unwrap()
+            .transition_to_waiting_for_rdb_channel()
+            .unwrap();
+        runtime.register_rdb_candidate(rdb).unwrap();
+        runtime.insert_unpaired_rdb_psync_wait_for_test(rdb, backlog.snapshot_boundary());
+        runtime.mark_rdb_snapshot_complete(rdb);
+        assert_ne!(
+            runtime.primary_link(id).unwrap().dual_state(),
+            PrimaryDualChannelState::Online
+        );
+        runtime.associate_rdb_channel(main, rdb).unwrap();
+        runtime
+            .finalize_dual_channel_rdb_association(main, rdb)
+            .unwrap();
+        let link = runtime.primary_link_mut(id).unwrap();
+        assert!(link.complete_dual_channel_main_psync("current", request(1), &backlog));
+        assert!(!link.promote_dual_replica_on_ack());
+        link.acknowledge(offset(0), 1_000);
+        assert!(link.promote_dual_replica_on_ack());
+        assert!(!link.promote_dual_replica_on_ack());
+    }
+
+    #[test]
+    fn state_convergence_dual_rdb_first_waits_for_ack_and_ignores_duplicate_completion() {
+        let mut runtime = ReplicationRuntime::new();
+        let main = ConnectionId(41);
+        let rdb = ConnectionId(42);
+        let id = runtime.register_primary(main, replica_info(6380));
+        let backlog = ReplicationBacklog::new("current".to_string(), 1);
+        runtime
+            .primary_link_mut(id)
+            .unwrap()
+            .transition_to_waiting_for_rdb_channel()
+            .unwrap();
+        associate_waiting_rdb_channel(&mut runtime, main, rdb);
+        runtime
+            .finalize_dual_channel_rdb_association(main, rdb)
+            .unwrap();
+        assert!(runtime
+            .primary_link_mut(id)
+            .unwrap()
+            .complete_dual_channel_main_psync("current", request(1), &backlog));
+        runtime.mark_rdb_snapshot_complete(rdb);
+        runtime.mark_rdb_snapshot_complete(rdb);
+        assert_eq!(
+            runtime.primary_link(id).unwrap().dual_state(),
+            PrimaryDualChannelState::WaitingForReplicaAck
+        );
+        assert!(runtime.take_dual_promotions().is_empty());
+        let link = runtime.primary_link_mut(id).unwrap();
+        link.acknowledge(offset(0), 1_000);
+        assert!(link.promote_dual_replica_on_ack());
+        runtime.mark_rdb_snapshot_complete(rdb);
+        assert!(runtime.take_dual_promotions().is_empty());
+    }
+
+    #[test]
+    fn state_convergence_invalid_and_retired_rdb_channels_cannot_complete_a_new_session() {
+        let mut runtime = ReplicationRuntime::new();
+        let main = ConnectionId(41);
+        let rdb = ConnectionId(42);
+        let old_id = runtime.register_primary(main, replica_info(6380));
+        runtime
+            .primary_link_mut(old_id)
+            .unwrap()
+            .transition_to_waiting_for_rdb_channel()
+            .unwrap();
+        associate_waiting_rdb_channel(&mut runtime, main, rdb);
+        runtime
+            .finalize_dual_channel_rdb_association(main, rdb)
+            .unwrap();
+        runtime.remove_connection(main);
+        let id = runtime.register_primary(main, replica_info(6380));
+        let backlog = ReplicationBacklog::new("current".to_string(), 1);
+        let link = runtime.primary_link_mut(id).unwrap();
+        link.transition_to_waiting_for_rdb_channel().unwrap();
+        link.transition_to_waiting_for_main_psync().unwrap();
+        link.record_dual_channel_endoff_boundary(backlog.snapshot_boundary());
+        assert!(link.complete_dual_channel_main_psync("current", request(1), &backlog));
+        link.acknowledge(offset(0), 1_000);
+        for invalid in [main, rdb, ConnectionId(999)] {
+            runtime.mark_rdb_snapshot_complete(invalid);
+        }
+        assert_eq!(
+            runtime.primary_link(id).unwrap().dual_state(),
+            PrimaryDualChannelState::WaitingForReplicaAck
+        );
+        assert!(runtime.take_dual_promotions().is_empty());
     }
 
     #[test]

@@ -75,46 +75,88 @@ impl ServerWorkerState {
         self.disconnect_timedout_replicas_at(now_ms, now_sec);
     }
 
-    fn reconcile_replication_compression(&mut self) {
+    pub(crate) fn reconcile_replication_compression(&mut self) {
+        // Acceptance belongs to the live link and must survive its retirement.
+        self.clear_accepted_failover();
+        self.reconcile_deferred_replication_compression();
+    }
+
+    pub(super) fn reconcile_deferred_replication_compression(&mut self) {
+        if self.ctx.pause_cron() != 0 {
+            return;
+        }
+        let Some(mode) = self
+            .ctx
+            .deferred_replication_compression()
+            .map(str::to_owned)
+        else {
+            return;
+        };
         if self.ctx.replication().failover_state != "no-failover" {
             return;
         }
-        let mode = self.ctx.config().replication.repl_compression.clone();
+        let mut is_deferred = false;
         let downstream = self
             .replication_runtime
             .primary_links()
             .values()
-            .find(|link| {
-                link.state() == PrimaryLinkState::Streaming
+            .filter_map(|link| {
+                if crate::engine::distributed::replication::protocol::negotiate_lz4(
+                    &mode,
+                    &link.replica().capability,
+                ) == link.is_compressed()
+                {
+                    return None;
+                }
+                if link.state() == PrimaryLinkState::Streaming
                     && matches!(
                         link.dual_state(),
                         PrimaryDualChannelState::Disabled | PrimaryDualChannelState::Online
                     )
-                    && crate::engine::distributed::replication::protocol::negotiate_lz4(
-                        &mode,
-                        &link.replica().capability,
-                    ) != link.is_compressed()
+                {
+                    Some(link.connection_id().0)
+                } else {
+                    is_deferred = true;
+                    None
+                }
             })
-            .map(|link| link.connection_id().0);
-        if let Some(token) = downstream {
+            .collect::<Vec<_>>();
+        for token in downstream {
             self.remove_connection(token);
         }
-        let upstream = self
-            .replication_runtime
-            .replica_link()
-            .filter(|link| {
-                link.is_streaming()
-                    && !link.has_pending_rdb_receive()
-                    && !(mode == "no" && link.compression_is_plaintext())
-                    && crate::engine::distributed::replication::protocol::compression_is_lz4(
-                        link.advertised_compression_mode(),
-                    ) != crate::engine::distributed::replication::protocol::compression_is_lz4(
-                        &mode,
-                    )
-            })
-            .map(|link| link.connection_id().0);
+        let upstream = self.replication_runtime.replica_link().and_then(|link| {
+            let needs_reconnect = !(mode == "no" && link.compression_is_plaintext())
+                && crate::engine::distributed::replication::protocol::compression_is_lz4(
+                    link.advertised_compression_mode(),
+                ) != crate::engine::distributed::replication::protocol::compression_is_lz4(
+                    &mode,
+                );
+            if !needs_reconnect {
+                return None;
+            }
+            if link.is_streaming()
+                && !link.has_pending_rdb_receive()
+                && link.rdb_channel_state()
+                    == crate::framework::distributed::replication::ReplicaRdbChannelState::None
+                && !self.ctx.is_loading()
+                && !self.ctx.replication().async_loading
+                && self.pending_replication_replay.is_none()
+                && self
+                    .replication_runtime
+                    .replica_pending_buffer_for(link.session_id())
+                    .is_none()
+            {
+                Some(link.connection_id().0)
+            } else {
+                is_deferred = true;
+                None
+            }
+        });
         if let Some(token) = upstream {
             self.tear_down_master_link(token);
+        }
+        if !is_deferred {
+            self.ctx.clear_deferred_replication_compression();
         }
     }
 

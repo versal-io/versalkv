@@ -166,9 +166,9 @@ impl ReplicationRuntime {
         };
         main_link.record_dual_channel_endoff_boundary(boundary);
         main_link.transition_to_waiting_for_main_psync()?;
-        main_link.mark_dual_rdb_complete();
         main_link.rdb_channel_wait_deadline_ms = Some(deadline_ms);
         main_link.merge_output_buffer_soft_limit_reached_at(soft_limit_reached_at);
+        self.complete_dual_rdb_for_main(main_connection_id);
         self.retained_rdb_psync_waits
             .get_mut(&public_client_id)
             .expect("validated retained RDB wait must remain present")

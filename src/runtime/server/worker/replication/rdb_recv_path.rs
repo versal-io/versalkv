@@ -479,6 +479,7 @@ impl ServerWorkerState {
             self.ctx.config_mut().replication.master_link_status = "up".to_string();
             self.ctx.replication_mut().mark_failover_complete();
             self.replication_runtime.reset_master_reconnect_backoff();
+            self.reconcile_replication_compression();
         }
         if result.peer_closed {
             if is_loading {
@@ -696,6 +697,7 @@ impl ServerWorkerState {
         if let ResumeDecision::Resume(link) = self.drive_replica_rdb_decode(link, rdb.0, operation)
         {
             self.replication_runtime.set_replica_link(link);
+            self.reconcile_replication_compression();
         }
     }
 
@@ -1064,6 +1066,9 @@ impl ServerWorkerState {
         let Some(mut link) = self.replication_runtime.take_replica_link() else {
             return;
         };
+        let has_pending_sync = link.is_dual_rdb_mode_active()
+            || link.has_pending_rdb_receive()
+            || !link.is_streaming();
         let decoded =
             link.on_bytes_with_announce_ip(&read_data, listening_port, &replica_announce_ip);
         self.account_replica_wire_input(&mut link);
@@ -1147,6 +1152,9 @@ impl ServerWorkerState {
             self.ctx.config_mut().replication.master_link_status = "up".to_string();
             self.ctx.replication_mut().mark_failover_complete();
             self.replication_runtime.reset_master_reconnect_backoff();
+            if has_pending_sync {
+                self.reconcile_replication_compression();
+            }
         }
         if close {
             self.remove_connection(token_value);
@@ -1284,6 +1292,7 @@ impl ServerWorkerState {
                     ))
             else {
                 self.replication_runtime.set_replica_link(link);
+                self.reconcile_replication_compression();
                 return;
             };
             let read_data = match self.read_bounded_rdb_chunk(conn.token()) {
@@ -1314,6 +1323,7 @@ impl ServerWorkerState {
             }
         }
         self.replication_runtime.set_replica_link(link);
+        self.reconcile_replication_compression();
     }
 
     pub(crate) fn recv_dual_main_while_rdb_loading(
@@ -1428,6 +1438,7 @@ impl ServerWorkerState {
             self.tear_down_master_link(token_value);
             return Err(());
         }
+        self.reconcile_replication_compression();
         Ok(())
     }
 

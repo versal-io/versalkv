@@ -779,3 +779,108 @@ fn disk_backed_decode_continuation_rejects_a_stale_session() {
     assert_eq!(link.rdb_receive_mut().unwrap().loaded(), loaded);
     assert_eq!(fixture.runtime.ctx.is_loading(), was_loading);
 }
+
+fn change_compression(fixture: &mut ReplayFixture) {
+    let (client, _peer) = connect_peer(&mut fixture.runtime);
+    let args = crate::engine::command::CommandArgs::from_parts(
+        ["CONFIG", "SET", "repl-compression", "lz4"]
+            .into_iter()
+            .map(|value| bytes::Bytes::from_static(value.as_bytes()))
+            .collect(),
+    );
+    let reply = crate::framework::commands::server::config::config_set(
+        &mut fixture.runtime.connection_registry[Token(client)],
+        &args,
+        &mut fixture.runtime.ctx,
+    );
+    let reply = fixture.runtime.apply_post_command_intents(
+        crate::runtime::server::worker::command::invocation::CommandOrigin::Direct,
+        client,
+        None,
+        reply,
+    );
+    assert_eq!(reply, crate::foundation::io::protocol::Value::ok());
+    assert!(fixture
+        .runtime
+        .connection_registry
+        .contains(Token(fixture.main)));
+    assert_eq!(
+        fixture.runtime.ctx.deferred_replication_compression(),
+        Some("lz4")
+    );
+}
+
+#[test]
+fn state_convergence_compression_waits_for_replay_and_reconnects_without_cron() {
+    let mut fixture = ReplayFixture::new(false, "compression-replay");
+    let prefix = protocol::encode_command(&[b"SET", b"replayed", b"value"]);
+    fixture.publish_prefix(&prefix);
+    fixture.load_first_turn();
+    let link = fixture
+        .runtime
+        .replication_runtime
+        .take_replica_link()
+        .unwrap();
+    fixture.runtime.apply_streaming_loading_gate(&link);
+    fixture.runtime.replication_runtime.set_replica_link(link);
+    assert!(fixture.runtime.ctx.is_loading());
+    change_compression(&mut fixture);
+    fixture.finish_decode_with_local(&[]);
+    assert!(!fixture.runtime.ctx.is_loading());
+    assert!(fixture.runtime.pending_replication_replay.is_some());
+    assert!(fixture
+        .runtime
+        .connection_registry
+        .contains(Token(fixture.main)));
+    assert_eq!(
+        fixture.runtime.ctx.deferred_replication_compression(),
+        Some("lz4")
+    );
+    fixture.runtime.drive_one_pending_replication_replay();
+    assert_eq!(
+        fixture
+            .runtime
+            .ctx
+            .db(0)
+            .unwrap()
+            .get_no_expire(b"replayed")
+            .unwrap()
+            .as_bytes(),
+        b"value"
+    );
+    assert!(fixture.runtime.pending_replication_replay.is_none());
+    assert!(!fixture
+        .runtime
+        .connection_registry
+        .contains(Token(fixture.main)));
+    assert!(fixture
+        .runtime
+        .ctx
+        .deferred_replication_compression()
+        .is_none());
+}
+
+#[test]
+fn state_convergence_compression_rechecks_after_scheduled_rdb_decode() {
+    let mut fixture = ReplayFixture::new(false, "compression-local-decode");
+    fixture.load_first_turn();
+    change_compression(&mut fixture);
+    let session = fixture
+        .runtime
+        .replication_runtime
+        .replica_link()
+        .unwrap()
+        .session_id();
+    fixture.runtime.drive_pending_replica_rdb_decode(session);
+    assert_eq!(fixture.runtime.ctx.db(0).unwrap().dbsize(), 1536);
+    assert!(!fixture.runtime.ctx.is_loading());
+    assert!(!fixture
+        .runtime
+        .connection_registry
+        .contains(Token(fixture.main)));
+    assert!(fixture
+        .runtime
+        .ctx
+        .deferred_replication_compression()
+        .is_none());
+}
