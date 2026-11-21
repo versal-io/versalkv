@@ -94,8 +94,25 @@ impl Parser {
         self.has_pending_data() || self.state != State::DetectType || !self.args.is_empty()
     }
 
+    /// Whether the already decoded bulk length still needs payload or its CRLF.
+    pub(crate) fn has_incomplete_bulk_payload(&self) -> bool {
+        match self.state {
+            State::MultiBulkBody { bulk_len, .. } => {
+                self.pending_len() < bulk_len.saturating_add(2)
+            }
+            _ => false,
+        }
+    }
+
     pub fn pending_len(&self) -> usize {
         self.buf.len().saturating_sub(self.pos)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn snapshot_copy_bytes_for_test(&self) -> usize {
+        self.buf
+            .len()
+            .saturating_add(self.args.len().saturating_mul(std::mem::size_of::<Bytes>()))
     }
 
     /// Returns an upper bound for bytes that can contribute to commands not

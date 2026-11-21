@@ -82,7 +82,7 @@ pub(crate) fn prepare_module_task(
     let previous_busy_reply = ctx.module_registry().busy_reply.clone();
     let previous_yield_clients = ctx.module_registry().yield_clients;
     let argv = module_argv(args, ctx.module_registry());
-    let invocation = ModuleInvocationScope::new(
+    let mut invocation = ModuleInvocationScope::new(
         ctx,
         &entry.module_name,
         &command_name,
@@ -91,6 +91,9 @@ pub(crate) fn prepare_module_task(
         Some(conn.username()),
         argv,
     );
+    invocation.set_block_origin(crate::framework::capabilities::module::module_block_origin(
+        conn, args, ctx,
+    ));
     Ok(PreparedHostTask::Module(ModuleTask {
         invocation,
         command_func: entry.func,
@@ -131,7 +134,7 @@ impl ModuleTask {
                 ret
             );
         }
-        self.invocation.take_reply()
+        self.invocation.take_reply(&mut *self.conn)
     }
 
     pub(crate) fn finish(
@@ -141,6 +144,10 @@ impl ModuleTask {
         ctx: &mut ServerContext,
     ) -> Value {
         self.restore_busy_state(ctx);
+        if let Some(blocked) = self.conn.blocked.take() {
+            conn.set_blocked(Some(blocked));
+            conn.set_skip_propagate(true);
+        }
         conn.set_selected_db(self.conn.selected_db);
         conn.set_resp_version(self.conn.resp_version);
         conn.set_username(self.conn.username.clone());

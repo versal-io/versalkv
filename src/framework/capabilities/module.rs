@@ -3,12 +3,23 @@ use libc::{c_int, c_void};
 use std::ffi::CString;
 use std::ptr::NonNull;
 
+#[path = "module_notifications.rs"]
+mod notifications;
+#[path = "module_thread.rs"]
+mod thread;
 use crate::engine::command::context::CommandConn;
 use crate::engine::command::CommandArgs;
 use crate::engine::extension::module::api::{
-    ActiveModuleContextScope, ActiveModuleRegistryScope, ReplyBuilder,
+    ActiveModuleContextScope, ActiveModuleRegistryScope, ModuleReplyFrame, ReplyBuilder,
 };
 use crate::engine::extension::module::capability::{ActiveModuleRuntimeScope, ModuleRuntimeHandle};
+pub(crate) use notifications::{
+    dispatch_module_keyspace_notifications, finish_module_post_notification_jobs,
+};
+pub(crate) use thread::{
+    execute_module_thread_call, invoke_native_module_callback, module_thread_context_flags,
+    NativeModuleCallback,
+};
 
 #[cfg(test)]
 #[path = "module_command_info_tests.rs"]
@@ -29,6 +40,8 @@ pub(crate) struct ModuleInvocationScope {
     argv: Vec<*mut ValkeyModuleString>,
     registry: NonNull<ModuleRegistry>,
     runtime_handle: Box<ModuleRuntimeHandle>,
+    invocation_identity:
+        Option<std::sync::Arc<crate::engine::extension::module::thread_bridge::ModuleIdentity>>,
 }
 
 impl ModuleInvocationScope {
@@ -42,7 +55,7 @@ impl ModuleInvocationScope {
         argv: Vec<*mut ValkeyModuleString>,
     ) -> Self {
         let registry = NonNull::from(ctx.module_registry_mut());
-        let (module_ref_ptr, module_options) = {
+        let (module_ref_ptr, module_options, module_identity) = {
             // SAFETY: registry points into ctx. The shared lookup only copies
             // an identity token and options owner before invoking external code.
             unsafe { registry.as_ref() }
@@ -51,10 +64,25 @@ impl ModuleInvocationScope {
                     (
                         (module as *const ModuleRef).cast_mut().cast::<c_void>(),
                         Some(module.options.clone()),
+                        module.identity.clone(),
                     )
                 })
-                .unwrap_or((std::ptr::null_mut(), None))
+                .unwrap_or((std::ptr::null_mut(), None, None))
         };
+        let invocation_identity = module_identity.clone().and_then(|identity| {
+            match identity.invocations.try_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |count| count.checked_add(1),
+            ) {
+                Ok(_) => Some(identity),
+                Err(_) => {
+                    // Keep the saturated count as a permanent unload barrier.
+                    ctx.set_shutdown_requested(true);
+                    None
+                }
+            }
+        });
         let mut runtime_handle = Box::new(ModuleRuntimeHandle::new(ctx));
         let mut internal_ctx = create_module_cmd_ctx(
             module_name,
@@ -63,6 +91,9 @@ impl ModuleInvocationScope {
             (&mut *runtime_handle as *mut ModuleRuntimeHandle).cast(),
         );
         internal_ctx.module_options = module_options;
+        internal_ctx.module_identity = module_identity;
+        // SAFETY: registry is owned by ctx and the lookup ends before native code.
+        internal_ctx.thread_bridge = unsafe { registry.as_ref() }.thread_bridge.clone();
         if let Some(username) = username {
             if !internal_ctx.username.is_null() {
                 // SAFETY: create_module_cmd_ctx allocated this CString and the
@@ -88,11 +119,20 @@ impl ModuleInvocationScope {
             argv,
             registry,
             runtime_handle,
+            invocation_identity,
         }
     }
 
     pub(crate) fn module_ctx(&self) -> *mut ValkeyModuleCtx {
         self.module_ctx.as_ptr()
+    }
+
+    pub(crate) fn set_block_origin(
+        &mut self,
+        origin: crate::engine::extension::module::thread_bridge::ModuleBlockOrigin,
+    ) {
+        // SAFETY: this invocation uniquely owns its internal context.
+        unsafe { (*self.module_ctx.as_ref().internal).block_origin = Some(origin) };
     }
 
     pub(crate) fn argv(&self) -> *mut *mut ValkeyModuleString {
@@ -111,19 +151,56 @@ impl ModuleInvocationScope {
         self.registry.as_ptr()
     }
 
-    pub(crate) fn take_reply(&mut self) -> Value {
+    pub(crate) fn take_reply_frames(&mut self) -> Vec<ModuleReplyFrame> {
         // SAFETY: module_ctx and its internal reply pointer are owned by this
         // invocation; clearing reply_ptr transfers the builder exactly once.
         unsafe {
             let internal = self.module_ctx.as_ref().internal;
             if internal.is_null() || (*internal).reply_ptr.is_null() {
-                return Value::Null;
+                return Vec::new();
             }
             let builder = Box::from_raw((*internal).reply_ptr as *mut ReplyBuilder);
             (*internal).reply_ptr = std::ptr::null_mut();
-            builder.into_value()
+            builder.into_frames()
         }
     }
+
+    pub(crate) fn take_reply(&mut self, conn: &mut dyn CommandConn) -> Value {
+        let mut frames = self.take_reply_frames();
+        if frames.len() == 1 && matches!(frames.first(), Some(ModuleReplyFrame::Value(_))) {
+            if let Some(ModuleReplyFrame::Value(value)) = frames.pop() {
+                return value;
+            }
+        }
+        if frames.is_empty() {
+            return Value::Null;
+        }
+        queue_module_reply_frames(conn, frames);
+        Value::Null
+    }
+}
+
+pub(crate) fn queue_module_reply_frames(conn: &mut dyn CommandConn, frames: Vec<ModuleReplyFrame>) {
+    for frame in frames {
+        let bytes = match frame {
+            ModuleReplyFrame::Raw(proto) => proto.to_vec(),
+            ModuleReplyFrame::Value(value) => {
+                let mut bytes = Vec::new();
+                if conn.resp_version() == 3 {
+                    crate::foundation::io::protocol::serializer::serialize_resp3(
+                        &value, &mut bytes,
+                    );
+                } else {
+                    crate::foundation::io::protocol::serializer::serialize_resp2(
+                        &value, &mut bytes,
+                    );
+                }
+                bytes
+            }
+        };
+        conn.queue_reply(bytes);
+    }
+    conn.set_custom_reply(true);
 }
 
 impl Drop for ModuleInvocationScope {
@@ -134,7 +211,27 @@ impl Drop for ModuleInvocationScope {
             free_argv(&mut self.argv);
             free_module_ctx(self.module_ctx.as_ptr());
         }
+        if let Some(identity) = self.invocation_identity.take() {
+            identity
+                .invocations
+                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        }
     }
+}
+
+pub(crate) fn query_module_key_positions(
+    entry: &crate::engine::extension::module::registry::ModuleCmdEntry,
+    native_library_handle: *mut libc::c_void,
+    command_name: &[u8],
+    args: &[Bytes],
+) -> Option<Vec<(usize, Vec<&'static str>)>> {
+    let _conn_scope = ModuleCommandConnScope::suspend();
+    crate::engine::extension::module::api::query_module_key_positions(
+        entry,
+        native_library_handle,
+        command_name,
+        args,
+    )
 }
 
 pub fn module_cmd_dispatcher(
@@ -171,6 +268,7 @@ pub fn module_cmd_dispatcher(
         Some(conn.username()),
         argv,
     );
+    invocation.set_block_origin(module_block_origin(conn, args, ctx));
     let module_ctx = invocation.module_ctx();
     let argv = invocation.argv();
     let argc = invocation.argc();
@@ -185,7 +283,7 @@ pub fn module_cmd_dispatcher(
             .expect("module registry pointer is non-null");
         command_func(module_ctx, argv, argc)
     };
-    let reply = invocation.take_reply();
+    let reply = invocation.take_reply(conn);
     if ret != VALKEYMODULE_OK {
         log::warn!(
             "Module command '{}' returned error code {}",
@@ -196,6 +294,31 @@ pub fn module_cmd_dispatcher(
     reply
 }
 
+pub(crate) fn module_block_origin(
+    conn: &dyn CommandConn,
+    args: &CommandArgs,
+    ctx: &ServerContext,
+) -> crate::engine::extension::module::thread_bridge::ModuleBlockOrigin {
+    use crate::engine::extension::module::thread_bridge::{ModuleBlockOrigin, ModuleContextKind};
+    ModuleBlockOrigin {
+        session: conn.session_id(),
+        token: conn.token(),
+        command_seq: conn.command_seq(),
+        args: args.clone(),
+        request_bytes: conn.req_bytes_curr_cmd(),
+        db_idx: conn.selected_db(),
+        resp_version: conn.resp_version(),
+        username: conn.username().to_string(),
+        kind: if conn.file_descriptor() < 0 && !conn.in_transaction() && !ctx.has_running_script() {
+            ModuleContextKind::InternalCall
+        } else {
+            ModuleContextKind::Synchronous
+        },
+        is_multi: conn.in_transaction(),
+        is_script: ctx.has_running_script(),
+        deny_blocking: conn.deny_blocking(),
+    }
+}
 pub(crate) fn module_dispatch_name(
     cmd_name: &str,
     args: &CommandArgs,
@@ -249,6 +372,37 @@ fn free_argv(argv: &mut Vec<*mut ValkeyModuleString>) {
     }
 }
 
+fn finish_module_callback_unit(
+    ctx: &mut ServerContext,
+    effects: Vec<crate::engine::extension::module::api::call::pending::ModuleCallEffects>,
+) -> crate::engine::extension::module::api::call::pending::ModuleCallEffects {
+    use crate::engine::extension::module::api::call::pending::{
+        ModuleCallEffectScope, ModuleCallEffects,
+    };
+    let mut unit = ModuleCallEffects::default();
+    for effect in effects {
+        if unit.append(effect).is_err() {
+            ctx.set_shutdown_requested(true);
+            if let Some(bridge) = &ctx.module_registry().thread_bridge {
+                bridge.close();
+            }
+        }
+    }
+    if !ModuleCallEffectScope::is_active()
+        && crate::engine::extension::module::capability::with_current_module_conn(|_| ()).is_none()
+    {
+        for effect in finish_module_post_notification_jobs(ctx) {
+            if unit.append(effect).is_err() {
+                ctx.set_shutdown_requested(true);
+                if let Some(bridge) = &ctx.module_registry().thread_bridge {
+                    bridge.close();
+                }
+            }
+        }
+    }
+    unit
+}
+
 pub(crate) fn invoke_module_timer(
     timer: crate::engine::extension::module::registry::ModuleTimer,
     ctx: &mut ServerContext,
@@ -274,13 +428,28 @@ pub(crate) fn invoke_module_timer(
     let module_ctx = invocation.module_ctx();
     let runtime_handle = invocation.runtime_handle();
     let registry = invocation.registry();
-    let _conn_scope = ModuleCommandConnScope::enter(&mut module_conn);
-    let _ctx_scope = ActiveModuleContextScope::enter(module_ctx);
-    let _runtime_scope =
-        ActiveModuleRuntimeScope::enter(runtime_handle).expect("runtime handle is non-null");
-    let _registry_scope =
-        ActiveModuleRegistryScope::enter(registry).expect("module registry pointer is non-null");
-    callback(module_ctx, data);
+    let collected =
+        crate::engine::extension::module::api::call::pending::ModuleCallEffectScope::enter();
+    {
+        let _conn_scope = ModuleCommandConnScope::enter(&mut module_conn);
+        let _ctx_scope = ActiveModuleContextScope::enter(module_ctx);
+        let _runtime_scope =
+            ActiveModuleRuntimeScope::enter(runtime_handle).expect("runtime handle is non-null");
+        let _registry_scope = ActiveModuleRegistryScope::enter(registry)
+            .expect("module registry pointer is non-null");
+        callback(module_ctx, data);
+    }
+    drop(invocation);
+    let mut effects = collected.finish();
+    effects.push(module_conn.take_recorded_effects());
+    effects.push(dispatch_module_keyspace_notifications(
+        &mut module_conn,
+        ctx,
+    ));
+    let unit = finish_module_callback_unit(ctx, effects);
+    crate::engine::extension::module::capability::ModuleRuntime::apply_module_call_effects(
+        ctx, unit,
+    );
 }
 
 pub(crate) fn fire_module_event_loop(ctx: &mut ServerContext, subevent: u64) {
@@ -290,12 +459,10 @@ pub(crate) fn fire_module_event_loop(ctx: &mut ServerContext, subevent: u64) {
     let listeners = ctx
         .module_registry()
         .server_event_listeners(crate::engine::extension::module::VALKEYMODULE_EVENT_EVENTLOOP);
+    // Retain every callback owner across the entire copied listener batch.
+    let mut invocations = Vec::with_capacity(listeners.len());
     for listener in listeners {
-        let mut module_conn =
-            crate::engine::extension::module::api::call::call_conn::ModuleCallConn::with_tracking(
-                0, None,
-            );
-        let mut invocation = ModuleInvocationScope::new(
+        let invocation = ModuleInvocationScope::new(
             ctx,
             &listener.module_name,
             "module.eventloop",
@@ -304,20 +471,47 @@ pub(crate) fn fire_module_event_loop(ctx: &mut ServerContext, subevent: u64) {
             None,
             Vec::new(),
         );
+        invocations.push((listener, invocation));
+    }
+    for (listener, mut invocation) in invocations {
+        let mut module_conn =
+            crate::engine::extension::module::api::call::call_conn::ModuleCallConn::with_tracking(
+                0, None,
+            );
         let module_ctx = invocation.module_ctx();
         let runtime_handle = invocation.runtime_handle();
         let registry = invocation.registry();
-        let _conn_scope = ModuleCommandConnScope::enter(&mut module_conn);
-        let _ctx_scope = ActiveModuleContextScope::enter(module_ctx);
-        let _runtime_scope =
-            ActiveModuleRuntimeScope::enter(runtime_handle).expect("runtime handle is non-null");
-        let _registry_scope = ActiveModuleRegistryScope::enter(registry)
-            .expect("module registry pointer is non-null");
-        (listener.callback)(module_ctx, listener.event, subevent, std::ptr::null_mut());
+        let collected =
+            crate::engine::extension::module::api::call::pending::ModuleCallEffectScope::enter();
+        {
+            let _conn_scope = ModuleCommandConnScope::enter(&mut module_conn);
+            let _ctx_scope = ActiveModuleContextScope::enter(module_ctx);
+            let _runtime_scope = ActiveModuleRuntimeScope::enter(runtime_handle)
+                .expect("runtime handle is non-null");
+            let _registry_scope = ActiveModuleRegistryScope::enter(registry)
+                .expect("module registry pointer is non-null");
+            (listener.callback)(module_ctx, listener.event, subevent, std::ptr::null_mut());
+        }
+        drop(invocation);
+        let mut effects = collected.finish();
+        effects.push(module_conn.take_recorded_effects());
+        effects.push(dispatch_module_keyspace_notifications(
+            &mut module_conn,
+            ctx,
+        ));
+        let unit = finish_module_callback_unit(ctx, effects);
+        crate::engine::extension::module::capability::ModuleRuntime::apply_module_call_effects(
+            ctx, unit,
+        );
     }
 }
 
 pub(crate) fn poll_pending_module_calls(ctx: &mut ServerContext) {
+    if crate::engine::extension::module::api::call::pending::ModuleCallEffectScope::is_active()
+        || crate::engine::extension::module::capability::with_current_module_conn(|_| ()).is_some()
+    {
+        return;
+    }
     let ids: Vec<usize> = ctx
         .module_registry()
         .pending_calls
@@ -458,6 +652,7 @@ pub(crate) fn complete_pending_module_call(
     call.conn.set_blocked(None);
     let is_success = !matches!(result, Value::Error(_))
         && (is_forkless || (!is_timed_out && !matches!(result, Value::Null | Value::NullArray)));
+    let events = call.conn.take_module_keyspace_events();
     let completed_effects = call.conn.take_call_effects(
         &call.command,
         &blocked.orig_args,
@@ -482,31 +677,39 @@ pub(crate) fn complete_pending_module_call(
         crate::engine::extension::module::api::call::call_conn::ModuleCallConn::with_tracking(
             db_idx, None,
         );
+    let collected =
+        crate::engine::extension::module::api::call::pending::ModuleCallEffectScope::enter();
     {
         let _conn_scope = ModuleCommandConnScope::enter(&mut callback_conn);
         let _ctx_scope = ActiveModuleContextScope::enter(invocation.module_ctx());
         let _runtime_scope = ActiveModuleRuntimeScope::enter(invocation.runtime_handle());
         let _registry_scope = ActiveModuleRegistryScope::enter(invocation.registry());
-        if is_forkless {
-            // SAFETY: invocation owns the live module context for this callback scope.
-            unsafe {
-                crate::engine::extension::module::api::call::dispatch_module_keyspace_event(
-                    invocation.module_ctx(),
-                    call.command.name.as_str().as_bytes(),
-                    &blocked.orig_args,
-                    &result,
-                );
-            }
+        // SAFETY: the runtime execution borrow ended and this fresh callback scope is live.
+        unsafe {
+            crate::engine::extension::module::api::notifications::dispatch_module_keyspace_events(
+                invocation.module_ctx(),
+                events,
+            );
         }
         // SAFETY: the fresh invocation and copied callbacks remain live until completion ends.
         unsafe { call.complete(invocation.module_ctx(), result) };
     }
     drop(invocation);
+    effects.extend(collected.finish());
     let callback_effects = callback_conn.take_recorded_effects();
     if !callback_effects.is_empty() {
         effects.push(callback_effects);
     }
-    effects
+    effects.push(dispatch_module_keyspace_notifications(
+        &mut callback_conn,
+        ctx,
+    ));
+    let unit = finish_module_callback_unit(ctx, effects);
+    if unit.is_empty() {
+        Vec::new()
+    } else {
+        vec![unit]
+    }
 }
 
 pub(crate) fn load_module(
@@ -514,6 +717,7 @@ pub(crate) fn load_module(
     args: &[&[u8]],
     ctx: &mut ServerContext,
 ) -> Result<String, crate::engine::extension::module::registry::ModuleError> {
+    ctx.module_registry_mut().ensure_thread_bridge()?;
     let _host_scope =
         crate::engine::extension::module::capability::ActiveModuleHostScope::enter(None);
     let registry = NonNull::from(ctx.module_registry_mut());
@@ -572,6 +776,7 @@ pub(crate) fn unload_module(
             ));
         }
     }
+    let should_pin = ctx.module_registry().should_pin_native_library(name);
     let module = { ctx.module_registry_mut().finish_unload(name)? };
     for command_name in &module.commands {
         <ServerContext as ModuleRuntime>::unregister_module_command(ctx, command_name);
@@ -579,7 +784,12 @@ pub(crate) fn unload_module(
     if !module.is_static && !module.handle.is_null() {
         // SAFETY: all callbacks have returned, invocation resources and
         // registrations are gone, and module owns this live dlopen handle.
-        unsafe { libc::dlclose(module.handle) };
+        unsafe {
+            crate::engine::extension::module::native_library::retire_native_library(
+                module.handle,
+                should_pin,
+            )
+        };
     }
     Ok(())
 }

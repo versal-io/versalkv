@@ -3,6 +3,15 @@ use crate::engine::distributed::sentinel::{
 };
 use crate::framework::context::ServerContext;
 
+fn instance_event_message(role: InstanceRole, name: &str, addr: &str) -> String {
+    let kind = match role {
+        InstanceRole::Master => "master",
+        InstanceRole::Replica => "slave",
+        InstanceRole::Sentinel => "sentinel",
+    };
+    format!("{kind} {name} {addr}")
+}
+
 pub fn check_sdown(ctx: &mut ServerContext, id: SentinelInstanceId, now: i64) {
     let state = ctx.sentinel_state_mut();
     let (
@@ -13,6 +22,7 @@ pub fn check_sdown(ctx: &mut ServerContext, id: SentinelInstanceId, now: i64) {
         reported_role,
         role_reported_time,
         link_down_since_time,
+        role,
         name,
         addr,
     ) = {
@@ -28,6 +38,7 @@ pub fn check_sdown(ctx: &mut ServerContext, id: SentinelInstanceId, now: i64) {
             inst.role_reported,
             inst.role_reported_time,
             inst.link_down_since_time,
+            inst.role,
             inst.name.clone(),
             inst.addr.clone(),
         )
@@ -69,7 +80,7 @@ pub fn check_sdown(ctx: &mut ServerContext, id: SentinelInstanceId, now: i64) {
                 inst.sdown_since_time = now;
                 inst.sdown_time = now;
             }
-            let event_msg = format!("sentinel instance {} {}", name, addr);
+            let event_msg = instance_event_message(role, &name, &addr);
             let event_inst = state.registry.instances().get(&id).cloned();
             crate::engine::distributed::sentinel::event::sentinel_event(
                 &mut state.script_engine,
@@ -90,7 +101,7 @@ pub fn check_sdown(ctx: &mut ServerContext, id: SentinelInstanceId, now: i64) {
             inst.sdown_since_time = 0;
             inst.sdown_time = 0;
         }
-        let event_msg = format!("sentinel instance {} {}", name, addr);
+        let event_msg = instance_event_message(role, &name, &addr);
         let event_inst = state.registry.instances().get(&id).cloned();
         crate::engine::distributed::sentinel::event::sentinel_event(
             &mut state.script_engine,
@@ -117,7 +128,7 @@ pub fn check_sdown(ctx: &mut ServerContext, id: SentinelInstanceId, now: i64) {
                 inst.sdown_since_time = now;
                 inst.sdown_time = now;
             }
-            let event_msg = format!("{} {} (reboot)", name, addr);
+            let event_msg = format!("{} (reboot)", instance_event_message(role, &name, &addr));
             let event_inst = state.registry.instances().get(&id).cloned();
             crate::engine::distributed::sentinel::event::sentinel_event(
                 &mut state.script_engine,
@@ -228,11 +239,27 @@ pub(super) fn check_odown(ctx: &mut ServerContext, master_id: SentinelInstanceId
 
 #[cfg(test)]
 mod tests {
-    use super::{check_odown, check_sdown};
+    use super::{check_odown, check_sdown, instance_event_message};
     use crate::engine::distributed::sentinel::{
         DownState, InstanceRole, SentinelInstance, SentinelPeerMasterState,
     };
     use crate::framework::context::ServerContext;
+
+    #[test]
+    fn sdown_event_messages_use_valkey_instance_role_names() {
+        for (role, expected) in [
+            (InstanceRole::Master, "master primary 127.0.0.1:6379"),
+            (InstanceRole::Replica, "slave replica 127.0.0.1:6380"),
+            (InstanceRole::Sentinel, "sentinel peer 127.0.0.1:26380"),
+        ] {
+            let (name, addr) = match role {
+                InstanceRole::Master => ("primary", "127.0.0.1:6379"),
+                InstanceRole::Replica => ("replica", "127.0.0.1:6380"),
+                InstanceRole::Sentinel => ("peer", "127.0.0.1:26380"),
+            };
+            assert_eq!(instance_event_message(role, name, addr), expected);
+        }
+    }
 
     #[test]
     fn odown_uses_down_reports_for_the_current_master_only() {

@@ -19,6 +19,8 @@ pub(crate) struct ModuleCallConn {
     raw_reply: Vec<u8>,
     has_custom_reply: bool,
     pending_notifications: Vec<(Bytes, Bytes)>,
+    module_keyspace_events:
+        Vec<crate::engine::extension::module::notifications::ModuleKeyspaceEvent>,
     pending_shard_notifications: Vec<(Bytes, Bytes)>,
     pending_cluster_notifications: Vec<(Bytes, Bytes)>,
     pending_cluster_shard_notifications: Vec<(Bytes, Bytes)>,
@@ -50,6 +52,7 @@ impl ModuleCallConn {
             raw_reply: Vec::new(),
             has_custom_reply: false,
             pending_notifications: Vec::new(),
+            module_keyspace_events: Vec::new(),
             pending_shard_notifications: Vec::new(),
             pending_cluster_notifications: Vec::new(),
             pending_cluster_shard_notifications: Vec::new(),
@@ -451,6 +454,17 @@ impl CommandConn for ModuleCallConn {
     }
     fn record_notification(&mut self, notification: (Bytes, Bytes)) {
         self.pending_notifications.push(notification);
+    }
+    fn record_module_keyspace_event(
+        &mut self,
+        event: crate::engine::extension::module::notifications::ModuleKeyspaceEvent,
+    ) {
+        self.module_keyspace_events.push(event);
+    }
+    fn take_module_keyspace_events(
+        &mut self,
+    ) -> Vec<crate::engine::extension::module::notifications::ModuleKeyspaceEvent> {
+        std::mem::take(&mut self.module_keyspace_events)
     }
     fn record_shard_notification(&mut self, notification: (Bytes, Bytes)) {
         self.pending_shard_notifications.push(notification);

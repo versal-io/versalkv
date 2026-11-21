@@ -18,6 +18,47 @@ pub struct ModuleCmdEntry {
     pub func: ValkeyModuleCmdFunc,
     pub module_name: String,
     pub info: Option<ModuleCommandInfo>,
+    pub(crate) arguments: Option<Vec<super::api::command_args::ModuleCommandArg>>,
+}
+
+impl ModuleCmdEntry {
+    fn merge_command_info(&mut self, info: ModuleCommandInfo) -> bool {
+        if let Some(existing) = &mut self.info {
+            if !info.key_specs.is_empty() && !existing.key_specs.is_empty() {
+                return false;
+            }
+            if info.summary.is_some() {
+                existing.summary = info.summary;
+            }
+            if info.since.is_some() {
+                existing.since = info.since;
+            }
+            if !info.key_specs.is_empty() {
+                existing.key_specs = info.key_specs;
+            }
+            if !info.acl_categories.is_empty() {
+                existing.acl_categories = info.acl_categories;
+            }
+            if info.legacy_keys.is_some() {
+                existing.legacy_keys = info.legacy_keys;
+            }
+            existing.getkeys_api |= info.getkeys_api;
+            if info.arity.is_some() {
+                existing.arity = info.arity;
+            }
+            return true;
+        }
+        if info.key_specs.is_empty()
+            && info.legacy_keys.is_none()
+            && info.acl_categories.is_empty()
+            && info.summary.is_none()
+            && info.since.is_none()
+        {
+            return false;
+        }
+        self.info = Some(info);
+        true
+    }
 }
 
 pub struct ModuleCommandHandle {
@@ -130,6 +171,7 @@ pub struct ModuleRef {
     pub ver: i32,
     pub is_static: bool,
     pub options: ModuleOptions,
+    pub(crate) identity: Option<std::sync::Arc<super::thread_bridge::ModuleIdentity>>,
     pub commands: Vec<String>,
     pub types: Vec<&'static ValkeyModuleType>,
     pub onunload: Option<ModuleUnloadFunc>,
@@ -146,6 +188,7 @@ impl ModuleRef {
             ver,
             is_static,
             options: ModuleOptions::default(),
+            identity: None,
             commands: Vec::new(),
             types: Vec::new(),
             onunload: None,
@@ -209,13 +252,31 @@ pub struct ModuleRegistry {
     timers: HashMap<u64, ModuleTimer>,
     server_event_listeners: Vec<ModuleServerEventListener>,
     next_timer_id: u64,
+    pub(crate) thread_bridge: Option<super::thread_bridge::ModuleThreadBridgeHandle>,
+    pub(crate) native_blocks:
+        HashMap<super::thread_bridge::ModuleBlockedId, super::blocking::NativeModuleBlock>,
     pub(crate) pending_calls: HashMap<usize, super::api::call::pending::PendingModuleCall>,
     pub(crate) busy_reply: Option<String>,
     pub(crate) yield_clients: bool,
     pub(crate) pending_effects: Vec<super::api::call::pending::ModuleCallEffects>,
+    pub(crate) notifications: super::notifications::ModuleNotificationState,
 }
 
 impl ModuleRegistry {
+    pub(crate) fn ensure_thread_bridge(&mut self) -> Result<(), ModuleError> {
+        if self.thread_bridge.is_none() {
+            let bridge =
+                super::thread_bridge::ModuleThreadBridgeHandle::new().map_err(|errno| {
+                    ModuleError::InitFailed(format!(
+                        "module thread bridge initialization failed: {errno}"
+                    ))
+                })?;
+            super::thread_bridge::register_process_bridge(&bridge);
+            self.thread_bridge = Some(bridge);
+        }
+        Ok(())
+    }
+
     pub fn new() -> Self {
         Self {
             modules: HashMap::new(),
@@ -227,18 +288,25 @@ impl ModuleRegistry {
             timers: HashMap::new(),
             server_event_listeners: Vec::new(),
             next_timer_id: 1,
+            thread_bridge: None,
+            native_blocks: HashMap::new(),
             pending_calls: HashMap::new(),
             busy_reply: None,
             yield_clients: false,
             pending_effects: Vec::new(),
+            notifications: super::notifications::ModuleNotificationState::default(),
         }
     }
 
-    pub fn register(&mut self, module_ref: ModuleRef) -> Result<(), ModuleError> {
+    pub fn register(&mut self, mut module_ref: ModuleRef) -> Result<(), ModuleError> {
         let name = module_ref.name.clone();
         if self.modules.contains_key(&name) {
             return Err(ModuleError::NameBusy(name));
         }
+        module_ref.identity = Some(
+            super::thread_bridge::ModuleIdentity::new(name.clone(), module_ref.options.clone())
+                .map_err(|_| ModuleError::InitFailed("module identity exhausted".to_string()))?,
+        );
         self.load_order.push(name.clone());
         self.modules.insert(name, Box::new(module_ref));
         Ok(())
@@ -260,6 +328,35 @@ impl ModuleRegistry {
             .modules
             .get(name)
             .ok_or_else(|| ModuleError::NotFound(name.to_string()))?;
+        if self.thread_bridge.as_ref().is_some_and(|bridge| {
+            bridge.has_active_thread_work() || bridge.has_unbound_thread_contexts()
+        }) {
+            return Err(ModuleError::InitFailed(
+                "the server has active native thread work, can't unload".to_string(),
+            ));
+        }
+        if self.notifications.protects_module(name) {
+            return Err(ModuleError::InitFailed(
+                "the module has active notifications or post-notification jobs, can't unload"
+                    .to_string(),
+            ));
+        }
+        if module.identity.as_ref().is_some_and(|identity| {
+            identity.has_active_threads()
+                || identity
+                    .invocations
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    != 0
+        }) || self
+            .native_blocks
+            .values()
+            .any(|block| block.shared.module.name == name)
+        {
+            return Err(ModuleError::InitFailed(
+                "the module has active native blocked clients or thread contexts, can't unload"
+                    .to_string(),
+            ));
+        }
         if !module.types.is_empty() {
             return Err(ModuleError::InitFailed(
                 "the module exports one or more module-side data types, can't unload".to_string(),
@@ -284,10 +381,20 @@ impl ModuleRegistry {
 
     /// Remove registrations after OnUnload succeeds; the caller owns dlclose.
     pub fn finish_unload(&mut self, name: &str) -> Result<Box<ModuleRef>, ModuleError> {
+        self.prepare_unload(name)?;
+        self.remove_module_registrations(name)
+    }
+
+    fn remove_module_registrations(&mut self, name: &str) -> Result<Box<ModuleRef>, ModuleError> {
         let module = self
             .modules
             .remove(name)
             .ok_or_else(|| ModuleError::NotFound(name.to_string()))?;
+        if let Some(identity) = &module.identity {
+            identity
+                .is_active
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
         self.load_order.retain(|entry| entry != name);
         for cmd_name in &module.commands {
             self.module_cmds.remove(&normalize_command_name(cmd_name));
@@ -333,8 +440,25 @@ impl ModuleRegistry {
     /// Roll back a module whose OnLoad returned an error. The loader owns the
     /// dlopen handle and closes it after this registry-only cleanup.
     pub fn abort_load(&mut self, name: &str) -> Result<(), ModuleError> {
-        self.finish_unload(name)?;
+        self.notifications.cancel_module_jobs(name);
+        // Failed OnLoad invalidates the logical identity even when exported
+        // thread contexts remain. The loader must preserve its code mapping.
+        self.remove_module_registrations(name)?;
         Ok(())
+    }
+
+    pub(crate) fn should_pin_native_library(&self, name: &str) -> bool {
+        self.lookup(name)
+            .and_then(|module| module.identity.as_ref())
+            .is_some_and(|identity| {
+                identity
+                    .exported_threads
+                    .load(std::sync::atomic::Ordering::Acquire)
+            })
+            || self
+                .thread_bridge
+                .as_ref()
+                .is_some_and(|bridge| bridge.has_unbound_thread_exports())
     }
 
     pub fn lookup(&self, name: &str) -> Option<&ModuleRef> {
@@ -381,6 +505,7 @@ impl ModuleRegistry {
                 func,
                 module_name: module_name.to_string(),
                 info: None,
+                arguments: None,
             },
         );
 
@@ -399,41 +524,49 @@ impl ModuleRegistry {
         let Some(entry) = self.module_cmds.get_mut(&normalize_command_name(name)) else {
             return false;
         };
-        if let Some(existing) = &mut entry.info {
-            if !info.key_specs.is_empty() && !existing.key_specs.is_empty() {
-                return false;
-            }
-            if info.summary.is_some() {
-                existing.summary = info.summary;
-            }
-            if info.since.is_some() {
-                existing.since = info.since;
-            }
-            if !info.key_specs.is_empty() {
-                existing.key_specs = info.key_specs;
-            }
-            if !info.acl_categories.is_empty() {
-                existing.acl_categories = info.acl_categories;
-            }
-            if info.legacy_keys.is_some() {
-                existing.legacy_keys = info.legacy_keys;
-            }
-            existing.getkeys_api |= info.getkeys_api;
-            if info.arity.is_some() {
-                existing.arity = info.arity;
-            }
-            return true;
-        }
-        if info.key_specs.is_empty()
-            && info.legacy_keys.is_none()
-            && info.acl_categories.is_empty()
-            && info.summary.is_none()
-            && info.since.is_none()
+        entry.merge_command_info(info)
+    }
+
+    pub(crate) fn prepare_command_metadata(
+        &self,
+        name: &str,
+        info: ModuleCommandInfo,
+        arguments: Option<Vec<super::api::command_args::ModuleCommandArg>>,
+    ) -> Option<ModuleCmdEntry> {
+        let mut entry = self.lookup_cmd_func(name)?.clone();
+        if entry.arguments.is_some()
+            || entry.info.as_ref().is_some_and(|existing| {
+                existing.summary.is_some()
+                    || existing.since.is_some()
+                    || !(existing.key_specs.is_empty()
+                        || (existing.key_specs.len() == 1
+                            && matches!(
+                                existing.key_specs[0].begin_search,
+                                ModuleKeyBeginSearch::Index { .. }
+                            )
+                            && matches!(
+                                existing.key_specs[0].find_keys,
+                                ModuleKeyFindKeys::Range { .. }
+                            )))
+            })
         {
-            return false;
+            return None;
         }
-        entry.info = Some(info);
-        true
+        // Merge in an isolated entry so rejected updates never alter live metadata.
+        if entry.info.is_none() {
+            entry.info = Some(info);
+        } else if !entry.merge_command_info(info) {
+            return None;
+        }
+        if arguments.is_some() {
+            entry.arguments = arguments;
+        }
+        Some(entry)
+    }
+
+    pub(crate) fn commit_command_metadata(&mut self, name: &str, entry: ModuleCmdEntry) {
+        // Preparation checks existence; no module callback runs before this commit.
+        self.module_cmds.insert(normalize_command_name(name), entry);
     }
 
     pub fn set_legacy_command_info(
@@ -587,26 +720,37 @@ impl ModuleRegistry {
 
     pub(crate) fn keyspace_callbacks(
         &self,
-        module_name: &str,
         event_type: c_int,
-    ) -> Vec<(String, *mut c_void, super::ValkeyModuleNotificationFunc)> {
-        self.modules
-            .get(module_name)
-            .into_iter()
+    ) -> Vec<super::notifications::ModuleNotificationSubscriber> {
+        self.load_order
+            .iter()
+            .filter_map(|name| self.modules.get(name))
             .flat_map(|module| {
                 module
                     .notifications
                     .iter()
-                    .filter(|notification| notification.types & event_type != 0)
-                    .map(|notification| {
-                        (
-                            module.name.clone(),
-                            module.as_ref() as *const ModuleRef as *mut c_void,
-                            notification.callback,
-                        )
+                    .enumerate()
+                    .filter(|(_, notification)| notification.types & event_type != 0)
+                    .map(|(subscription, notification)| {
+                        super::notifications::ModuleNotificationSubscriber {
+                            module_name: module.name.clone(),
+                            subscription,
+                            module_ref: module.as_ref() as *const ModuleRef as *mut c_void,
+                            options: module.options.clone(),
+                            callback: notification.callback,
+                        }
                     })
             })
             .collect()
+    }
+
+    pub(crate) fn has_keyspace_subscribers(&self, event_type: c_int) -> bool {
+        self.modules.values().any(|module| {
+            module
+                .notifications
+                .iter()
+                .any(|notification| notification.types & event_type != 0)
+        })
     }
 
     pub fn stop_timer(&mut self, module_name: &str, id: u64) -> Option<*mut c_void> {
@@ -711,6 +855,16 @@ fn normalize_command_name(name: &str) -> String {
 
 impl Drop for ModuleRegistry {
     fn drop(&mut self) {
+        if let Some(bridge) = &self.thread_bridge {
+            bridge.close();
+        }
+        for module in self.modules.values() {
+            if let Some(identity) = &module.identity {
+                identity
+                    .is_active
+                    .store(false, std::sync::atomic::Ordering::Release);
+            }
+        }
         for ctx_ptr in &self.internal_ctxs {
             let ptr = ctx_ptr.0;
             if !ptr.is_null() {

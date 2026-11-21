@@ -1,8 +1,10 @@
-use crate::framework::{CommandError, CommandRegistry};
+use crate::foundation::io::protocol::Value;
 use crate::framework::context::ServerContext;
 use crate::framework::generated::commands::SUBCOMMAND_NAMES;
-use crate::foundation::io::protocol::Value;
+use crate::framework::{CommandError, CommandRegistry};
 use bytes::Bytes;
+
+type CommandKeys<'a> = Vec<(&'a [u8], Vec<&'static str>)>;
 
 fn has_keys_via_subcommand(spec: &crate::framework::CommandSpec) -> bool {
     if spec.get_keys.is_some() {
@@ -19,7 +21,12 @@ fn has_module_keys(spec: &crate::framework::CommandSpec, ctx: &ServerContext) ->
         .lookup_cmd_func(spec.name.as_str())
         .and_then(|entry| entry.info.as_ref())
         .is_some_and(|info| {
-            !info.key_specs.is_empty() || info.legacy_keys.is_some_and(|(first, _, _)| first > 0)
+            info.getkeys_api
+                || info
+                    .key_specs
+                    .iter()
+                    .any(|spec| !spec.flags.contains(&"not_key"))
+                || info.legacy_keys.is_some_and(|(first, _, _)| first > 0)
         })
 }
 
@@ -27,27 +34,14 @@ fn registry(ctx: &ServerContext) -> &CommandRegistry {
     ctx.command_registry()
 }
 
-pub(crate) fn command_getkeys(
-    reg: &CommandRegistry,
-    ctx: &ServerContext,
-    args: &[Bytes],
-) -> Value {
+pub(crate) fn command_getkeys(reg: &CommandRegistry, ctx: &ServerContext, args: &[Bytes]) -> Value {
     if args.is_empty() {
         return CommandError::wrong_arity("command");
     }
-    let cmd_name = match std::str::from_utf8(&args[0]) {
-        Ok(s) => s.to_ascii_lowercase(),
-        Err(_) => return CommandError::unknown(&args[0]),
+    let keys = match command_key_result(reg, ctx, args) {
+        Ok(keys) => keys,
+        Err(error) => return error,
     };
-    let key_args = &args[1..];
-    let spec = match reg.lookup(cmd_name.as_bytes()) {
-        Some(s) => s,
-        None => return Value::error("ERR The command has no key arguments"),
-    };
-    if spec.first_key == 0 && !has_keys_via_subcommand(spec) && !has_module_keys(spec, ctx) {
-        return Value::error("ERR The command has no key arguments");
-    }
-    let keys = extract_command_keys(&cmd_name, key_args, ctx);
     let result: Vec<Value> = keys
         .iter()
         .map(|(k, _)| Value::bulk(Bytes::copy_from_slice(k)))
@@ -63,19 +57,10 @@ pub(crate) fn command_getkeysandflags(
     if args.is_empty() {
         return CommandError::wrong_arity("command");
     }
-    let cmd_name = match std::str::from_utf8(&args[0]) {
-        Ok(s) => s.to_ascii_lowercase(),
-        Err(_) => return CommandError::unknown(&args[0]),
+    let keys = match command_key_result(reg, ctx, args) {
+        Ok(keys) => keys,
+        Err(error) => return error,
     };
-    let key_args = &args[1..];
-    let spec = match reg.lookup(cmd_name.as_bytes()) {
-        Some(s) => s,
-        None => return Value::error("ERR The command has no key arguments"),
-    };
-    if spec.first_key == 0 && !has_keys_via_subcommand(spec) && !has_module_keys(spec, ctx) {
-        return Value::error("ERR The command has no key arguments");
-    }
-    let keys = extract_command_keys(&cmd_name, key_args, ctx);
     let result: Vec<Value> = keys
         .iter()
         .map(|(k, flags)| {
@@ -92,26 +77,92 @@ pub(crate) fn command_getkeysandflags(
     Value::Array(result)
 }
 
+fn command_key_result<'a>(
+    reg: &CommandRegistry,
+    ctx: &ServerContext,
+    args: &'a [Bytes],
+) -> Result<CommandKeys<'a>, Value> {
+    let cmd_name = std::str::from_utf8(&args[0]).map_err(|_| CommandError::unknown(&args[0]))?;
+    let spec = reg
+        .lookup(cmd_name.as_bytes())
+        .ok_or_else(|| Value::error("ERR The command has no key arguments"))?;
+    if spec.first_key == 0 && !has_keys_via_subcommand(spec) && !has_module_keys(spec, ctx) {
+        return Err(Value::error("ERR The command has no key arguments"));
+    }
+    let argc = i64::try_from(args.len())
+        .map_err(|_| Value::error("ERR Invalid number of arguments specified for command"))?;
+    let arity = i64::from(spec.arity);
+    if (arity > 0 && argc != arity) || (arity < 0 && argc < -arity) {
+        return Err(Value::error(
+            "ERR Invalid number of arguments specified for command",
+        ));
+    }
+    let keys = extract_command_keys_result(cmd_name, &args[1..], ctx).unwrap_or_default();
+    if keys.is_empty() && spec.flags & crate::engine::command::CMD_NO_MANDATORY_KEYS == 0 {
+        return Err(Value::error("ERR Invalid arguments specified for command"));
+    }
+    Ok(keys)
+}
+
 pub(crate) fn extract_command_keys<'a>(
     cmd_name: &str,
     key_args: &'a [Bytes],
     ctx: &ServerContext,
-) -> Vec<(&'a [u8], Vec<&'static str>)> {
+) -> CommandKeys<'a> {
+    extract_command_keys_result(cmd_name, key_args, ctx).unwrap_or_default()
+}
+
+fn extract_command_keys_result<'a>(
+    cmd_name: &str,
+    key_args: &'a [Bytes],
+    ctx: &ServerContext,
+) -> Result<CommandKeys<'a>, ()> {
     let reg = registry(ctx);
     let spec = match reg.lookup(cmd_name.as_bytes()) {
         Some(s) => s,
-        None => return Vec::new(),
+        None => return Err(()),
     };
-    if let Some(info) = ctx
-        .module_registry()
-        .lookup_cmd_func(spec.name.as_str())
-        .and_then(|entry| entry.info.as_ref())
-    {
-        return extract_module_keys(info, key_args);
+    if let Some(entry) = ctx.module_registry().lookup_cmd_func(spec.name.as_str()) {
+        let Some(info) = entry.info.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let has_static_keys = info
+            .key_specs
+            .iter()
+            .any(|spec| !spec.flags.contains(&"not_key"));
+        let has_variable_flags = info
+            .key_specs
+            .iter()
+            .any(|spec| spec.flags.contains(&"variable_flags"));
+        if !has_variable_flags && (has_static_keys || !info.getkeys_api) {
+            if let Ok(keys) = extract_module_keys(info, key_args) {
+                return Ok(keys);
+            }
+        }
+        if !info.getkeys_api {
+            return Err(());
+        }
+        let positions = crate::framework::capabilities::module::query_module_key_positions(
+            entry,
+            ctx.module_registry()
+                .lookup(&entry.module_name)
+                .ok_or(())?
+                .handle,
+            cmd_name.as_bytes(),
+            key_args,
+        )
+        .ok_or(())?;
+        return positions
+            .into_iter()
+            .map(|(pos, flags)| {
+                let index = pos.checked_sub(1).ok_or(())?;
+                Ok((key_args.get(index).ok_or(())?.as_ref(), flags))
+            })
+            .collect();
     }
 
     if let Some(get_keys) = spec.get_keys {
-        return get_keys(key_args);
+        return Ok(get_keys(key_args));
     }
 
     let first = spec.first_key as usize;
@@ -120,7 +171,7 @@ pub(crate) fn extract_command_keys<'a>(
     let default_flags: Vec<&'static str> = spec.key_flags.to_vec();
 
     if first == 0 || first > key_args.len() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     let mut result = Vec::new();
@@ -145,31 +196,31 @@ pub(crate) fn extract_command_keys<'a>(
         }
         i += step;
     }
-    result
+    Ok(result)
 }
 
 fn extract_module_keys<'a>(
     info: &crate::engine::extension::module::ModuleCommandInfo,
     args: &'a [Bytes],
-) -> Vec<(&'a [u8], Vec<&'static str>)> {
+) -> Result<CommandKeys<'a>, ()> {
     let specs = if info.key_specs.is_empty() {
         let Some((first, last, step)) = info.legacy_keys else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         if first <= 0 {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         vec![crate::engine::extension::module::ModuleKeySpec {
-            flags: if info.getkeys_api {
-                vec!["RO", "access"]
-            } else {
-                vec!["RW", "access", "update"]
-            },
+            flags: vec!["RW", "access", "update"],
             begin_search: crate::engine::extension::module::ModuleKeyBeginSearch::Index {
                 pos: first,
             },
             find_keys: crate::engine::extension::module::ModuleKeyFindKeys::Range {
-                last_key: last,
+                last_key: if last < 0 {
+                    last
+                } else {
+                    last.checked_sub(first).ok_or(())?
+                },
                 key_step: step,
                 limit: 0,
             },
@@ -178,73 +229,126 @@ fn extract_module_keys<'a>(
         info.key_specs.clone()
     };
     let mut keys = Vec::new();
+    let argc = i64::try_from(args.len())
+        .map_err(|_| ())?
+        .checked_add(1)
+        .ok_or(())?;
     for spec in &specs {
-        let begin = match &spec.begin_search {
+        if spec.flags.contains(&"not_key") {
+            continue;
+        }
+        let is_incomplete = spec.flags.contains(&"incomplete");
+        let mut first = match &spec.begin_search {
             crate::engine::extension::module::ModuleKeyBeginSearch::Index { pos } => {
-                pos.saturating_sub(1) as usize
+                let first = i64::from(*pos);
+                if first <= 0 {
+                    return Err(());
+                }
+                if first >= argc {
+                    if is_incomplete {
+                        return Err(());
+                    }
+                    continue;
+                }
+                first
             }
             crate::engine::extension::module::ModuleKeyBeginSearch::Keyword {
                 keyword,
                 start_from,
             } => {
-                let start = if *start_from >= 0 {
-                    start_from.saturating_sub(1) as usize
+                let mut index = if *start_from > 0 {
+                    i64::from(*start_from)
                 } else {
-                    args.len().saturating_sub(start_from.unsigned_abs() as usize)
+                    argc.checked_add(i64::from(*start_from)).ok_or(())?
                 };
-                match (start..args.len())
-                    .find(|index| args[*index].eq_ignore_ascii_case(keyword.as_bytes()))
-                {
-                    Some(index) => index + 1,
+                let end = if *start_from > 0 { argc - 1 } else { 1 };
+                let direction = if index <= end { 1 } else { -1 };
+                let mut found = None;
+                while index != end && index > 0 && index < argc {
+                    let arg_index = usize::try_from(index - 1).map_err(|_| ())?;
+                    if args[arg_index].eq_ignore_ascii_case(keyword.as_bytes()) {
+                        found = Some(index.checked_add(1).ok_or(())?);
+                        break;
+                    }
+                    index = index.checked_add(direction).ok_or(())?;
+                }
+                match found {
+                    Some(first) => first,
                     None => continue,
                 }
             }
-            crate::engine::extension::module::ModuleKeyBeginSearch::Unknown => continue,
+            crate::engine::extension::module::ModuleKeyBeginSearch::Unknown => return Err(()),
         };
-        let flags = spec.flags.clone();
-        match &spec.find_keys {
+        let (last, step) = match &spec.find_keys {
             crate::engine::extension::module::ModuleKeyFindKeys::Range {
                 last_key,
                 key_step,
-                ..
+                limit,
             } => {
-                if *key_step == 0 {
-                    continue;
-                }
-                let end = if *last_key < 0 {
-                    (args.len() as i32 + *last_key + 1).max(begin as i32) as usize
+                let last = if *last_key >= 0 {
+                    first.checked_add(i64::from(*last_key)).ok_or(())?
+                } else if *limit == 0 {
+                    argc.checked_add(i64::from(*last_key)).ok_or(())?
                 } else {
-                    (begin as i32 + *last_key + 1).max(begin as i32) as usize
+                    if *limit < 0 || *last_key != -1 {
+                        return Err(());
+                    }
+                    first
+                        .checked_add((argc - first) / i64::from(*limit))
+                        .and_then(|last| last.checked_sub(1))
+                        .ok_or(())?
                 };
-                let mut index = begin;
-                while index < args.len() && index < end {
-                    keys.push((args[index].as_ref(), flags.clone()));
-                    index = index.saturating_add(key_step.unsigned_abs() as usize);
-                }
+                (last, i64::from(*key_step))
             }
             crate::engine::extension::module::ModuleKeyFindKeys::KeyNum {
                 key_num_idx,
                 first_key,
                 key_step,
             } => {
-                let Some(count) = args
-                    .get((begin as i32 + *key_num_idx) as usize)
-                    .and_then(|value| std::str::from_utf8(value).ok()?.parse::<usize>().ok())
-                else {
-                    continue;
-                };
-                let mut index = (begin as i32 + *first_key).max(0) as usize;
-                for _ in 0..count {
-                    if let Some(key) = args.get(index) {
-                        keys.push((key.as_ref(), flags.clone()));
-                    }
-                    index = index.saturating_add(key_step.unsigned_abs() as usize);
+                let count_pos = first.checked_add(i64::from(*key_num_idx)).ok_or(())?;
+                if count_pos <= 0 || count_pos >= argc {
+                    return Err(());
                 }
+                let count_index = usize::try_from(count_pos - 1).map_err(|_| ())?;
+                let count = parse_key_count(&args[count_index]).ok_or(())?;
+                first = first.checked_add(i64::from(*first_key)).ok_or(())?;
+                let step = i64::from(*key_step);
+                let last = count
+                    .checked_sub(1)
+                    .and_then(|count| count.checked_mul(step))
+                    .and_then(|offset| first.checked_add(offset))
+                    .ok_or(())?;
+                if i32::try_from(last).is_err() {
+                    return Err(());
+                }
+                (last, step)
             }
-            crate::engine::extension::module::ModuleKeyFindKeys::Unknown => {}
+            crate::engine::extension::module::ModuleKeyFindKeys::Unknown => return Err(()),
+        };
+        if step <= 0 || first <= 0 || first >= argc || last < first || last >= argc {
+            return Err(());
+        }
+        let mut index = first;
+        while index <= last {
+            let arg_index = usize::try_from(index - 1).map_err(|_| ())?;
+            keys.push((args[arg_index].as_ref(), spec.flags.clone()));
+            index = index.checked_add(step).ok_or(())?;
+        }
+        if is_incomplete {
+            return Err(());
         }
     }
-    keys
+    Ok(keys)
+}
+
+fn parse_key_count(value: &[u8]) -> Option<i64> {
+    if value.is_empty()
+        || (value.len() > 1 && value[0] == b'0')
+        || !value.iter().all(u8::is_ascii_digit)
+    {
+        return None;
+    }
+    std::str::from_utf8(value).ok()?.parse().ok()
 }
 
 #[cfg(test)]

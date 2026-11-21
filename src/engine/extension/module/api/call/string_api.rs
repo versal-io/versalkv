@@ -1,6 +1,8 @@
 #![allow(non_snake_case)]
 
-use super::super::super::auto_memory::{create_auto_string, internal_owner, remove_string};
+use super::super::super::auto_memory::{
+    create_auto_string, internal_owner, register_held_string, remove_string,
+};
 use libc::{c_char, c_int, size_t};
 
 use super::super::super::{
@@ -70,6 +72,24 @@ pub unsafe extern "C" fn ValkeyModule_RetainString(
                 ValkeyModuleString::incr_ref(str_);
             }
         }
+    }
+    str_
+}
+
+// SAFETY: ctx is null or live; str_ is null or a live dynamically allocated string.
+pub unsafe extern "C" fn ValkeyModule_HoldString(
+    ctx: *mut ValkeyModuleCtx,
+    str_: *mut ValkeyModuleString,
+) -> *mut ValkeyModuleString {
+    if str_.is_null() {
+        return str_;
+    }
+    // SAFETY: every module string is dynamically allocated, so acquiring a
+    // reference needs no static-object copy. Registration never removes the
+    // original automatic reference, unlike RetainString.
+    unsafe {
+        ValkeyModuleString::incr_ref(str_);
+        register_held_string(ctx, str_);
     }
     str_
 }

@@ -239,6 +239,15 @@ impl ServerWorkerState {
         let Some(token) = invocation.target.resolve(self) else {
             return CommandDisposition::ConnectionGone;
         };
+        let notification_effects =
+            crate::framework::capabilities::module::dispatch_module_keyspace_notifications(
+                &mut self.connection_registry[token],
+                &mut self.ctx,
+            );
+        self.connection_registry[token].record_module_notification_effects(notification_effects);
+        let Some(token) = invocation.target.resolve(self) else {
+            return CommandDisposition::ConnectionGone;
+        };
         let connection_token = token.0;
         let is_blocked = self.connection_registry[token].blocked.is_some();
         let mut connection_effects = if is_blocked {

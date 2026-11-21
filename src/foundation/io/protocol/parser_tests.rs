@@ -515,3 +515,20 @@ fn inline_escape_sequences_are_processed() {
     let r = p.try_parse().unwrap().unwrap();
     assert_eq!(r[0], Bytes::from_static(b"a\nb"));
 }
+
+#[test]
+fn large_frame_snapshot_count_includes_partial_arguments() {
+    let mut parser = Parser::new();
+    assert_eq!(parser.snapshot_copy_bytes_for_test(), 0);
+    let frame = b"*3\r\n$7\r\nPUBLISH\r\n$7\r\nchannel\r\n$1048576\r\nbinary\0";
+    parser.feed(frame);
+    assert_eq!(parser.snapshot_copy_bytes_for_test(), frame.len());
+    assert_eq!(parser.try_parse_limited(0, 0).unwrap(), None);
+    assert_eq!(
+        parser.snapshot_copy_bytes_for_test(),
+        frame.len() + 2 * std::mem::size_of::<Bytes>()
+    );
+    assert_eq!(parser.undecoded_len(), frame.len());
+    parser.reset();
+    assert_eq!(parser.snapshot_copy_bytes_for_test(), 0);
+}

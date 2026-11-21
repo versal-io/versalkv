@@ -52,6 +52,92 @@ fn sender(node_id: &str) -> ClusterNode {
 }
 
 #[test]
+fn large_frame_tcp_publish_preserves_payload_with_linear_snapshot_cost() {
+    use bytes::Bytes;
+    use std::io::Write;
+    use std::net::{TcpListener, TcpStream};
+    use std::time::Duration;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut writer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (mut reader, address) = listener.accept().unwrap();
+    writer.set_nodelay(true).unwrap();
+    writer
+        .set_write_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    reader
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut manager = ClusterBusManager::new();
+    let mut state = ClusterState::new("127.0.0.1", 6379, 16379);
+    let token = Token(27);
+    let sender_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let sender = sender(sender_id);
+    state.nodes.insert(sender_id.to_string(), sender.clone());
+    manager.register_incoming(token, address);
+    let channel = Bytes::from_static(b"channel\0binary");
+    let payload = Bytes::from(
+        (0..20 * 1024 * 1024)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>(),
+    );
+    let frame = msg::ClusterBusMessage::from_node(
+        ClusterMsgType::Publish,
+        &sender,
+        1,
+        msg::ClusterBusBody::Publish(msg::ClusterPublish::new(
+            channel.clone(),
+            payload.clone(),
+            false,
+        )),
+    )
+    .encode()
+    .unwrap();
+    ClusterBusManager::take_snapshot_copy_bytes_for_test();
+    let mut received_bytes = 0usize;
+    let mut copied_bytes = 0usize;
+    for chunk in frame.chunks(64 * 1024) {
+        writer.write_all(chunk).unwrap();
+        let mut received = vec![0; chunk.len()];
+        reader.read_exact(&mut received).unwrap();
+        received_bytes += received.len();
+        assert!(!manager.process_read_bytes(&mut state, token.0, &received, 100));
+        copied_bytes += ClusterBusManager::take_snapshot_copy_bytes_for_test();
+        assert_eq!(ClusterBusManager::take_snapshot_copy_bytes_for_test(), 0);
+        assert_eq!(
+            manager.connections[&token.0].bytes_received,
+            received_bytes as u64
+        );
+        if received_bytes < frame.len() {
+            assert!(manager.pending_publishes.is_empty());
+            assert_eq!(manager.connections[&token.0].read_buf.len(), received_bytes);
+        }
+    }
+    assert_eq!(received_bytes, frame.len());
+    assert!(manager.connections[&token.0].read_buf.is_empty());
+    assert_eq!(manager.pending_publishes.len(), 1);
+    let received = &manager.pending_publishes[0];
+    assert_eq!(received.channel, channel);
+    assert!(!received.shard);
+    assert!(
+        received.payload == payload,
+        "the complete binary publish payload must be preserved"
+    );
+    assert!(!manager.process_read_bytes(&mut state, token.0, &[], 101));
+    assert_eq!(manager.pending_publishes.len(), 1);
+    copied_bytes += ClusterBusManager::take_snapshot_copy_bytes_for_test();
+    eprintln!(
+        "cluster frame_bytes={} snapshot_copy_bytes={copied_bytes}",
+        frame.len()
+    );
+    assert!(
+        copied_bytes <= 2 * frame.len(),
+        "snapshot copied {copied_bytes} bytes for a {}-byte frame",
+        frame.len()
+    );
+}
+
+#[test]
 fn third_party_update_keeps_new_primary_slots_after_old_primary_replicates() {
     use crate::engine::distributed::cluster::msg::{
         slots_to_bytes, ClusterBusBody, ClusterBusMessage, SlotOwnershipUpdate,

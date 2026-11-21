@@ -8,6 +8,45 @@ static ValkeyModuleString *notified_key;
 static int callback_count;
 static void (*cleanup_probe)(void);
 
+static int initialize_fixture(ValkeyModuleCtx *ctx) {
+    /* Only the synchronous APIs exercised here escape into this fixture. */
+    ValkeyModule_GetApi = (int (*)(const char *, void *))(uintptr_t)((void **)ctx)[0];
+    if (ValkeyModule_GetApi == NULL) return VALKEYMODULE_ERR;
+#define LOAD_FIXTURE_API(name) \
+    if (ValkeyModule_GetApi("ValkeyModule_" #name, &ValkeyModule_##name) != VALKEYMODULE_OK) \
+        return VALKEYMODULE_ERR
+    LOAD_FIXTURE_API(SetModuleAttribs);
+    LOAD_FIXTURE_API(IsModuleNameBusy);
+    LOAD_FIXTURE_API(AutoMemory);
+    LOAD_FIXTURE_API(CreateString);
+    LOAD_FIXTURE_API(CreateStringFromLongLong);
+    LOAD_FIXTURE_API(CreateStringPrintf);
+    LOAD_FIXTURE_API(StringPtrLen);
+    LOAD_FIXTURE_API(RetainString);
+    LOAD_FIXTURE_API(FreeString);
+    LOAD_FIXTURE_API(StringAppendBuffer);
+    LOAD_FIXTURE_API(Call);
+    LOAD_FIXTURE_API(CallReplyType);
+    LOAD_FIXTURE_API(CallReplyArrayElement);
+    LOAD_FIXTURE_API(FreeCallReply);
+    LOAD_FIXTURE_API(CreateStringFromCallReply);
+    LOAD_FIXTURE_API(OpenKey);
+    LOAD_FIXTURE_API(CloseKey);
+    LOAD_FIXTURE_API(ListGet);
+    LOAD_FIXTURE_API(Replicate);
+    LOAD_FIXTURE_API(ReplyWithError);
+    LOAD_FIXTURE_API(ReplyWithString);
+    LOAD_FIXTURE_API(ReplyWithSimpleString);
+    LOAD_FIXTURE_API(WrongArity);
+    LOAD_FIXTURE_API(CreateTimer);
+    LOAD_FIXTURE_API(CreateCommand);
+    LOAD_FIXTURE_API(SubscribeToKeyspaceEvents);
+#undef LOAD_FIXTURE_API
+    if (ValkeyModule_IsModuleNameBusy("auto-memory-lifecycle")) return VALKEYMODULE_ERR;
+    ValkeyModule_SetModuleAttribs(ctx, "auto-memory-lifecycle", 1, VALKEYMODULE_APIVER_1);
+    return VALKEYMODULE_OK;
+}
+
 __attribute__((destructor))
 static void observe_unload(void) {
     if (cleanup_probe != NULL) cleanup_probe();
@@ -124,7 +163,7 @@ static int schedule_timer(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int a
 }
 
 int ValkeyModule_OnLoad(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
-    if (ValkeyModule_Init(ctx, "auto-memory-lifecycle", 1, VALKEYMODULE_APIVER_1) != VALKEYMODULE_OK)
+    if (initialize_fixture(ctx) != VALKEYMODULE_OK)
         return VALKEYMODULE_ERR;
     ValkeyModule_AutoMemory(ctx);
     ValkeyModule_CreateString(ctx, "load-one", 8);

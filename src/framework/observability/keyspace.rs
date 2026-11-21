@@ -37,6 +37,31 @@ pub fn notify_keyspace_event(
         NOTIFY_KEY_MISS => 'm',
         _ => return,
     };
+    let module_type = match event_char {
+        'g' => 1 << 2,
+        '$' => 1 << 3,
+        'l' => 1 << 4,
+        's' => 1 << 5,
+        'h' => 1 << 6,
+        'z' => 1 << 7,
+        'x' => 1 << 8,
+        'e' => 1 << 9,
+        't' => 1 << 10,
+        'm' => 1 << 11,
+        'n' => 1 << 14,
+        'p' => 1 << 15,
+        _ => return,
+    };
+    if ctx.module_registry().has_keyspace_subscribers(module_type) {
+        conn.record_module_keyspace_event(
+            crate::engine::extension::module::notifications::ModuleKeyspaceEvent {
+                event_type: module_type,
+                event: event.to_string(),
+                db_idx,
+                key: bytes::Bytes::copy_from_slice(key),
+            },
+        );
+    }
     let mut notifications = Vec::new();
     crate::engine::distributed::pubsub::PubSubState::publish_keyspace_event(
         ctx.config(),

@@ -1047,7 +1047,9 @@ pub(crate) fn execute_script_command(
         return error;
     }
     let outcome = run_script_command(&invocation, script_ctx, conn, runtime, stats_name);
-    commit_script_outcome(&invocation, outcome, script_ctx, conn, runtime)
+    let result = commit_script_outcome(&invocation, outcome, script_ctx, conn, runtime);
+    runtime.finish_script_command(conn, script_ctx);
+    result
 }
 
 #[cfg(test)]

@@ -125,7 +125,17 @@ impl ServerWorkerState {
                 })
         });
 
-        let is_timeout_able_blocked = effective_cmd.map(cmd_may_timeout).unwrap_or(false);
+        let is_timeout_able_blocked = effective_cmd
+            .map(|cmd| match cmd {
+                BlockedCmd::Module { id } => self
+                    .ctx
+                    .module_registry()
+                    .native_blocks
+                    .get(id)
+                    .is_some_and(|block| block.callbacks.timeout.is_some()),
+                cmd => cmd_may_timeout(cmd),
+            })
+            .unwrap_or(false);
         let ok = exists && is_timeout_able_blocked;
 
         if ok {

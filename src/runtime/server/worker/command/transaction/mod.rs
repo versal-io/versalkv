@@ -422,6 +422,15 @@ impl ServerWorkerState {
             Some(reply) => reply,
             None => self.invoke_command_executor(state.token, spec.executor, args),
         };
+        if let Some(token) = state.target.resolve(self) {
+            let notification_effects =
+                crate::framework::capabilities::module::dispatch_module_keyspace_notifications(
+                    &mut self.connection_registry[token],
+                    &mut self.ctx,
+                );
+            self.connection_registry[token]
+                .record_module_notification_effects(notification_effects);
+        }
         self.refresh_connection_priorities();
         let Some(token) = state.target.resolve(self) else {
             return false;

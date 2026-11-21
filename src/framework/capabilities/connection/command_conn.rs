@@ -503,6 +503,17 @@ impl CommandConn for Connection {
     fn record_notification(&mut self, notification: (Bytes, Bytes)) {
         Connection::record_notification(self, notification);
     }
+    fn record_module_keyspace_event(
+        &mut self,
+        event: crate::engine::extension::module::notifications::ModuleKeyspaceEvent,
+    ) {
+        Connection::record_module_keyspace_event(self, event);
+    }
+    fn take_module_keyspace_events(
+        &mut self,
+    ) -> Vec<crate::engine::extension::module::notifications::ModuleKeyspaceEvent> {
+        Connection::take_module_keyspace_events(self)
+    }
 
     fn extend_notifications(&mut self, notifications: Vec<(Bytes, Bytes)>) {
         Connection::extend_notifications(self, notifications);

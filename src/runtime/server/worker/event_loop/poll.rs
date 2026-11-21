@@ -70,7 +70,34 @@ impl ServerWorkerState {
             crate::engine::extension::module::VALKEYMODULE_SUBEVENT_EVENTLOOP_BEFORE_SLEEP,
         );
         self.apply_pending_module_effects();
-        let (mut events, deferred_io_completions) = self.poll_with_io_threads(poll_timeout)?;
+        self.service_module_thread_leases();
+        let bridge = self.ctx.module_registry().thread_bridge.clone();
+        if let Some(bridge) = &bridge {
+            while !bridge.prepare_sleep() {
+                if bridge.is_closing() {
+                    self.close_module_thread_bridge();
+                    self.ctx.set_shutdown_requested(true);
+                    self.exit_if_shutdown_requested();
+                    return Ok(None);
+                }
+                self.service_module_thread_leases();
+            }
+        }
+        let polled = self.poll_with_io_threads(poll_timeout);
+        if polled.is_err() {
+            self.close_module_thread_bridge();
+        }
+        let (mut events, deferred_io_completions) = polled?;
+        if let Some(bridge) = bridge {
+            while !bridge.resume_main() && !bridge.is_closing() {
+                self.service_module_thread_leases();
+            }
+        }
+        self.service_module_thread_leases();
+        if self.exit_if_shutdown_requested() {
+            self.close_module_thread_bridge();
+            return Ok(None);
+        }
         // Snapshot read ownership before completions can release the lease.
         // An ordinary LT read already in flight covers this observation; unread
         // or newly arrived bytes remain visible to the next poll or continuation.

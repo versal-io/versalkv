@@ -2,12 +2,16 @@
 
 pub mod api;
 mod auto_memory;
+pub mod blocking;
 pub mod capability;
 mod context;
 #[cfg(test)]
 pub(crate) mod lifecycle_test_support;
 pub mod loader;
+pub(crate) mod native_library;
+pub mod notifications;
 pub mod registry;
+pub mod thread_bridge;
 mod types;
 
 use libc::c_int;

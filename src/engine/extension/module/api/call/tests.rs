@@ -18,7 +18,6 @@ use bytes::Bytes;
 struct TrackingRuntime {
     dbs: DbSet,
     tracked: Vec<(usize, Bytes)>,
-    raw_replies: Vec<Vec<u8>>,
     published: Vec<(Bytes, Bytes, bool)>,
     is_oom: bool,
     has_enough_replicas_to_write: bool,
@@ -139,11 +138,6 @@ impl ModuleRuntime for TrackingRuntime {
         }
     }
 
-    fn reply_module_raw(&mut self, reply: Vec<u8>) -> bool {
-        self.raw_replies.push(reply);
-        true
-    }
-
     fn list_max_listpack_size(&self) -> i64 {
         -2
     }
@@ -235,13 +229,32 @@ impl ModuleRuntime for TrackingRuntime {
                     args.args[0].to_vec(),
                     crate::foundation::io::store::Robj::string(args.args[1].clone()),
                 );
+                conn.record_module_keyspace_event(
+                    crate::engine::extension::module::notifications::ModuleKeyspaceEvent {
+                        event_type: 1 << 3,
+                        event: "set".into(),
+                        db_idx: conn.selected_db(),
+                        key: args.args[0].clone(),
+                    },
+                );
                 return Value::ok();
             }
-            return db
+            let value = db
                 .get_no_expire(&args.args[0])
                 .map_or(Value::Null, |value| {
                     Value::bulk(Bytes::copy_from_slice(value.as_bytes()))
                 });
+            if matches!(value, Value::Null) {
+                conn.record_module_keyspace_event(
+                    crate::engine::extension::module::notifications::ModuleKeyspaceEvent {
+                        event_type: 1 << 11,
+                        event: "keymiss".into(),
+                        db_idx: conn.selected_db(),
+                        key: args.args[0].clone(),
+                    },
+                );
+            }
+            return value;
         }
         if args
             .args
@@ -264,6 +277,21 @@ impl ModuleRuntime for TrackingRuntime {
                 args,
                 0,
             );
+        }
+        if name.eq_ignore_ascii_case(b"set") {
+            self.dbs.get_mut(conn.selected_db()).unwrap().set(
+                args.args[0].to_vec(),
+                crate::foundation::io::store::Robj::string(args.args[1].clone()),
+            );
+            conn.record_module_keyspace_event(
+                crate::engine::extension::module::notifications::ModuleKeyspaceEvent {
+                    event_type: 1 << 3,
+                    event: "set".into(),
+                    db_idx: conn.selected_db(),
+                    key: args.args[0].clone(),
+                },
+            );
+            return Value::ok();
         }
         Value::bulk(Bytes::from_static(b"value"))
     }
@@ -357,7 +385,6 @@ fn lifecycle_runtime() -> TrackingRuntime {
     TrackingRuntime {
         dbs: DbSet::new(2),
         tracked: Vec::new(),
-        raw_replies: Vec::new(),
         published: Vec::new(),
         is_oom: false,
         has_enough_replicas_to_write: true,
@@ -777,8 +804,9 @@ fn lifecycle_call_registers_all_nonempty_exits_and_balances_shim_slots() {
         ValkeyModule_FreeCallReply(large);
         free_module_ctx(ctx);
     }
-    // Nine command/argument temporaries, one raw keymiss host key, and the automatic string.
-    assert_eq!(snapshot().strings - before.strings, 11);
+    // Nine command/argument temporaries and the automatic string. A raw reply
+    // does not synthesize a keymiss event without an actual missing-key lookup.
+    assert_eq!(snapshot().strings - before.strings, 10);
     assert_eq!(snapshot().replies - before.replies, 6);
 }
 
@@ -792,7 +820,8 @@ struct NotificationObservation {
     reentered: bool,
     db_idx: i32,
     resp_version: i32,
-    wrong_module_calls: usize,
+    matching_subscriber_calls: usize,
+    is_notification: bool,
 }
 
 thread_local! {
@@ -818,8 +847,8 @@ extern "C" fn lifecycle_notification(
         ValkeyModule_AutoMemory(ctx);
         ValkeyModule_CreateString(ctx, b"temporary".as_ptr().cast(), 9);
         super::ValkeyModule_RetainString(ctx, key);
-        let wrong_module_calls =
-            NOTIFICATION_OBSERVATION.with(|observed| observed.get().wrong_module_calls);
+        let matching_subscriber_calls =
+            NOTIFICATION_OBSERVATION.with(|observed| observed.get().matching_subscriber_calls);
         NOTIFICATION_OBSERVATION.with(|observed| {
             observed.set(NotificationObservation {
                 ctx: ctx as usize,
@@ -830,23 +859,32 @@ extern "C" fn lifecycle_notification(
                 is_normal: (*internal).onload == 0,
                 db_idx: (*internal).db_idx,
                 resp_version: (*internal).resp_version,
-                wrong_module_calls,
+                matching_subscriber_calls,
+                is_notification: (*internal).kind
+                    == crate::engine::extension::module::thread_bridge::ModuleContextKind::Notification,
             })
         });
     }
     0
 }
 
-extern "C" fn wrong_module_notification(
+extern "C" fn matching_module_notification(
     _ctx: *mut crate::engine::extension::module::ValkeyModuleCtx,
-    _event_type: libc::c_int,
+    event_type: libc::c_int,
     _event: *const libc::c_char,
     _key: *mut ValkeyModuleString,
 ) -> libc::c_int {
     NOTIFICATION_OBSERVATION.with(|observed| {
         let mut value = observed.get();
-        value.wrong_module_calls += 1;
+        value.matching_subscriber_calls += 1;
         observed.set(value);
+    });
+    NOTIFICATION_CALL_ORDER.with(|order| {
+        order.borrow_mut().push(if event_type == 1 << 3 {
+            "subscriber-set"
+        } else {
+            "subscriber-keymiss"
+        });
     });
     0
 }
@@ -870,7 +908,7 @@ fn lifecycle_notification_isolated_context_preserves_filter_and_retained_host_ke
     let mut other = ModuleRef::new("other", std::ptr::null_mut(), 1, true);
     other.notifications.push(ModuleNotification {
         types: 1 << 3,
-        callback: wrong_module_notification,
+        callback: matching_module_notification,
     });
     registry.register(other).unwrap();
     let mut argv = [b"SET".as_slice(), b"key", b"value"]
@@ -882,12 +920,18 @@ fn lifecycle_notification_isolated_context_preserves_filter_and_retained_host_ke
         (*(*ctx).internal).resp_version = 3;
         let _registry = super::super::ActiveModuleRegistryScope::enter(&mut registry).unwrap();
         let reply = VM_CallWithReply(ctx, argv.as_mut_ptr(), 3, 0);
+        assert!(!reply.is_null());
+        assert_eq!(
+            std::slice::from_raw_parts((*reply).str_data.cast::<u8>(), (*reply).str_len),
+            b"OK"
+        );
         let observed = NOTIFICATION_OBSERVATION.with(std::cell::Cell::get);
         assert_ne!(observed.ctx, ctx as usize);
         assert!(!observed.was_enabled);
         assert!(observed.is_normal && observed.has_identity && observed.reentered);
+        assert!(observed.is_notification);
         assert_eq!((observed.db_idx, observed.resp_version), (1, 3));
-        assert_eq!(observed.wrong_module_calls, 0);
+        assert_eq!(observed.matching_subscriber_calls, 1);
         assert!(!(*(*ctx).internal).auto_memory.is_enabled);
         assert_eq!(snapshot().strings - before.strings, 1);
         let retained = observed.key as *mut ValkeyModuleString;
@@ -900,6 +944,17 @@ fn lifecycle_notification_isolated_context_preserves_filter_and_retained_host_ke
         }
         free_module_ctx(ctx);
     }
+    drop(handle);
+    assert_eq!(
+        runtime
+            .dbs
+            .get_mut(1)
+            .unwrap()
+            .get_no_expire(b"key")
+            .unwrap()
+            .as_bytes(),
+        b"value"
+    );
     assert_eq!(snapshot().strings - before.strings, 5);
 }
 
@@ -1009,7 +1064,7 @@ fn lifecycle_notification_nested_call_preserves_outer_tracking_and_resources() {
         let mut other = ModuleRef::new("other", std::ptr::null_mut(), 1, true);
         other.notifications.push(ModuleNotification {
             types: (1 << 11) | (1 << 3),
-            callback: wrong_module_notification,
+            callback: matching_module_notification,
         });
         registry.register(other).unwrap();
         let before = snapshot();
@@ -1043,7 +1098,7 @@ fn lifecycle_notification_nested_call_preserves_outer_tracking_and_resources() {
             let observed = NOTIFICATION_CALL_OBSERVATION.with(std::cell::Cell::get);
             assert_eq!(
                 observed.calls, 1,
-                "nested SET must not dispatch another notification"
+                "the active subscription must not reenter itself"
             );
             assert!(observed.is_keymiss && observed.nested_ok && observed.has_identity);
             assert!(!observed.was_enabled);
@@ -1060,8 +1115,9 @@ fn lifecycle_notification_nested_call_preserves_outer_tracking_and_resources() {
                 "shim must release its borrowed host-key slot"
             );
             assert_eq!(
-                NOTIFICATION_OBSERVATION.with(|observed| observed.get().wrong_module_calls),
-                0
+                NOTIFICATION_OBSERVATION.with(|observed| observed.get().matching_subscriber_calls),
+                2,
+                "the other subscription receives nested SET and outer keymiss"
             );
             assert_eq!((*(*ctx).internal).auto_memory.is_enabled, is_outer_auto);
             assert_eq!(
@@ -1070,7 +1126,7 @@ fn lifecycle_notification_nested_call_preserves_outer_tracking_and_resources() {
             );
             assert_eq!(ValkeyModuleString::ref_count(outer), 1);
             assert_eq!((*outer).as_bytes(), b"outer");
-            assert_eq!(snapshot().strings - before.strings, 2);
+            assert_eq!(snapshot().strings - before.strings, 3);
             assert_eq!(snapshot().keys - before.keys, 1);
             assert_eq!(snapshot().replies - before.replies, 1);
             if !is_outer_auto {
@@ -1109,7 +1165,7 @@ fn lifecycle_notification_nested_call_preserves_outer_tracking_and_resources() {
                 .as_bytes(),
             b"inner-value"
         );
-        assert_eq!(snapshot().strings - before.strings, 6);
+        assert_eq!(snapshot().strings - before.strings, 7);
         assert_eq!(snapshot().keys - before.keys, 1);
         assert_eq!(snapshot().replies - before.replies, 2);
         NOTIFICATION_CALL_ORDER.with(|order| {
@@ -1121,9 +1177,11 @@ fn lifecycle_notification_nested_call_preserves_outer_tracking_and_resources() {
                     "callback-start",
                     "execute-set",
                     "monitor-set",
+                    "subscriber-set",
                     "publish-inner",
                     "publish-inner-shard",
                     "callback-end",
+                    "subscriber-keymiss",
                     "publish-outer",
                     "publish-outer-shard",
                     "track-outer",
@@ -1220,7 +1278,6 @@ fn module_call_tracks_read_keys_for_the_outer_client() {
     let mut runtime = TrackingRuntime {
         dbs: DbSet::new(1),
         tracked: Vec::new(),
-        raw_replies: Vec::new(),
         published: Vec::new(),
         is_oom: false,
         has_enough_replicas_to_write: true,
@@ -1267,7 +1324,6 @@ fn reply_raw_forwards_the_exact_protocol_bytes() {
     let mut runtime = TrackingRuntime {
         dbs: DbSet::new(1),
         tracked: Vec::new(),
-        raw_replies: Vec::new(),
         published: Vec::new(),
         is_oom: false,
         has_enough_replicas_to_write: true,
@@ -1296,12 +1352,28 @@ fn reply_raw_forwards_the_exact_protocol_bytes() {
         )
     };
 
+    // SAFETY: this test still exclusively owns the live context and its reply builder.
+    let frames = unsafe {
+        let builder = &mut *(*(*ctx).internal)
+            .reply_ptr
+            .cast::<crate::engine::extension::module::api::ReplyBuilder>();
+        std::mem::replace(
+            builder,
+            crate::engine::extension::module::api::ReplyBuilder::new(),
+        )
+        .into_frames()
+    };
+
     // SAFETY: ctx was allocated above and is no longer used after this call.
     unsafe { free_module_ctx(ctx) };
     drop(handle);
 
     assert_eq!(result, crate::engine::extension::module::VALKEYMODULE_OK);
-    assert_eq!(runtime.raw_replies, vec![protocol.to_vec()]);
+    assert!(matches!(
+        frames.as_slice(),
+        [crate::engine::extension::module::api::ModuleReplyFrame::Raw(bytes)]
+            if bytes.as_ref() == protocol.as_slice()
+    ));
 }
 
 #[test]
@@ -1338,7 +1410,6 @@ fn module_call_forwards_pending_publish_to_the_outer_client() {
     let mut runtime = TrackingRuntime {
         dbs: DbSet::new(1),
         tracked: Vec::new(),
-        raw_replies: Vec::new(),
         published: Vec::new(),
         is_oom: false,
         has_enough_replicas_to_write: true,
@@ -1393,7 +1464,6 @@ fn module_call_respects_deny_oom_flag_before_invoking_handler() {
     let mut runtime = TrackingRuntime {
         dbs: DbSet::new(1),
         tracked: Vec::new(),
-        raw_replies: Vec::new(),
         published: Vec::new(),
         is_oom: true,
         has_enough_replicas_to_write: true,
@@ -1451,7 +1521,6 @@ fn module_call_script_mode_rejects_writes_without_enough_replicas() {
     let mut runtime = TrackingRuntime {
         dbs: DbSet::new(1),
         tracked: Vec::new(),
-        raw_replies: Vec::new(),
         published: Vec::new(),
         is_oom: false,
         has_enough_replicas_to_write: false,
@@ -1509,7 +1578,6 @@ fn module_call_script_mode_rejects_writes_on_readonly_replica() {
     let mut runtime = TrackingRuntime {
         dbs: DbSet::new(1),
         tracked: Vec::new(),
-        raw_replies: Vec::new(),
         published: Vec::new(),
         is_oom: false,
         has_enough_replicas_to_write: true,
@@ -1567,7 +1635,6 @@ fn module_call_script_mode_rejects_commands_on_stale_replica() {
     let mut runtime = TrackingRuntime {
         dbs: DbSet::new(1),
         tracked: Vec::new(),
-        raw_replies: Vec::new(),
         published: Vec::new(),
         is_oom: false,
         has_enough_replicas_to_write: true,
@@ -1624,7 +1691,6 @@ fn module_call_script_mode_rejects_writes_after_bgsave_error() {
     let mut runtime = TrackingRuntime {
         dbs: DbSet::new(1),
         tracked: Vec::new(),
-        raw_replies: Vec::new(),
         published: Vec::new(),
         is_oom: false,
         has_enough_replicas_to_write: true,
@@ -1682,7 +1748,6 @@ fn module_call_dry_run_returns_no_reply_without_invoking_handler() {
     let mut runtime = TrackingRuntime {
         dbs: DbSet::new(1),
         tracked: Vec::new(),
-        raw_replies: Vec::new(),
         published: Vec::new(),
         is_oom: false,
         has_enough_replicas_to_write: true,
@@ -1728,7 +1793,6 @@ fn module_call_argv_dry_run_succeeds_without_invoking_handler() {
     let mut runtime = TrackingRuntime {
         dbs: DbSet::new(1),
         tracked: Vec::new(),
-        raw_replies: Vec::new(),
         published: Vec::new(),
         is_oom: false,
         has_enough_replicas_to_write: true,
@@ -1783,7 +1847,6 @@ fn module_call_argv_dry_run_does_not_invoke_reply_callback() {
     let mut runtime = TrackingRuntime {
         dbs: DbSet::new(1),
         tracked: Vec::new(),
-        raw_replies: Vec::new(),
         published: Vec::new(),
         is_oom: false,
         has_enough_replicas_to_write: true,
@@ -1842,7 +1905,6 @@ fn module_call_dry_run_as_user_returns_acl_error_without_invoking_handler() {
     let mut runtime = TrackingRuntime {
         dbs: DbSet::new(1),
         tracked: Vec::new(),
-        raw_replies: Vec::new(),
         published: Vec::new(),
         is_oom: false,
         has_enough_replicas_to_write: true,

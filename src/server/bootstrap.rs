@@ -20,7 +20,14 @@ impl Server {
 
     pub(super) fn normalize_paths(&mut self, backend: &mut ServerWorkerState) {
         if !self.config.config_file.is_empty() {
-            if let Ok(abs_cfg) = std::fs::canonicalize(&self.config.config_file) {
+            let absolute_config = if self.config.sentinel {
+                // Save capability and rewrite must use the supplied directory,
+                // including the identity of any config file symlink.
+                std::path::absolute(&self.config.config_file)
+            } else {
+                std::fs::canonicalize(&self.config.config_file)
+            };
+            if let Ok(abs_cfg) = absolute_config {
                 self.config.config_file = abs_cfg.to_string_lossy().to_string();
             }
         }

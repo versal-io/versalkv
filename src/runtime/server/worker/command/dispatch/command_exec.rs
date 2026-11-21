@@ -768,13 +768,19 @@ impl ServerWorkerState {
             rejected,
         );
         let offset_before = self.ctx.replication().primary_repl_offset();
-        let capture = self.capture_command_propagation(
+        let mut capture = self.capture_command_propagation(
             connection_token,
             &plan,
             PropagationCaptureMode::Direct,
             connection_effects,
             fx,
         );
+        if self.command_execution_depth == 0 {
+            // Preserve the direct source command before jobs add script propagation.
+            capture
+                .operations
+                .extend(self.collect_module_post_notification_effects(fx));
+        }
         let expired_ops = self.collect_expired_propagation(fx);
         let units = arrange_propagation_units(capture.operations, expired_ops, &plan);
         let migration_ops = units.iter().flatten().cloned().collect::<Vec<_>>();
@@ -789,6 +795,37 @@ impl ServerWorkerState {
         }
         self.queue_slot_migration_mutations(&migration_ops);
         capture.swapdb
+    }
+
+    pub(crate) fn collect_module_post_notification_effects(
+        &mut self,
+        fx: &mut CommandEffects,
+    ) -> Vec<PropagationOp> {
+        let effects = crate::framework::capabilities::module::finish_module_post_notification_jobs(
+            &mut self.ctx,
+        );
+        self.collect_module_notification_effects(effects, fx)
+    }
+
+    fn collect_module_notification_effects(
+        &mut self,
+        effects: Vec<crate::engine::extension::module::api::call::pending::ModuleCallEffects>,
+        fx: &mut CommandEffects,
+    ) -> Vec<PropagationOp> {
+        let mut operations = Vec::new();
+        for effect in effects {
+            if let Some(delta) = effect.dirty_delta {
+                self.ctx.persistence_mut().add_dirty(delta);
+            }
+            fx.watch_dirty.extend(effect.dirty_keys);
+            fx.publish.extend(effect.notifications);
+            fx.publish_shard.extend(effect.shard_notifications);
+            fx.cluster_publish.extend(effect.cluster_notifications);
+            fx.cluster_publish_shard
+                .extend(effect.cluster_shard_notifications);
+            operations.extend(effect.propagation);
+        }
+        operations
     }
 
     pub(crate) fn capture_transaction_item_propagation(
@@ -827,8 +864,12 @@ impl ServerWorkerState {
             &mut connection_effects,
             effects,
         );
-        let operations =
+        let mut operations =
             self.take_command_propagation_ops(plan, &state, &mut connection_effects, effects, mode);
+        operations.extend(self.collect_module_notification_effects(
+            connection_effects.take_module_notification_effects(),
+            effects,
+        ));
         effects
             .publish
             .extend(connection_effects.take_notifications());

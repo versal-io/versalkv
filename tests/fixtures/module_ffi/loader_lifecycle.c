@@ -10,6 +10,30 @@ static int should_refuse;
 static void *private_buffer;
 static void (*probe)(int);
 
+static int initialize_fixture(ValkeyModuleCtx *ctx) {
+    /* This synchronous loader fixture does not export thread context APIs. */
+#define LOAD_FIXTURE_API(name) \
+    if (ValkeyModule_GetApi("ValkeyModule_" #name, &ValkeyModule_##name) != VALKEYMODULE_OK) \
+        return VALKEYMODULE_ERR
+    LOAD_FIXTURE_API(SetModuleAttribs);
+    LOAD_FIXTURE_API(IsModuleNameBusy);
+    LOAD_FIXTURE_API(SetModuleOptions);
+    LOAD_FIXTURE_API(AutoMemory);
+    LOAD_FIXTURE_API(CreateString);
+    LOAD_FIXTURE_API(CreateCommand);
+    LOAD_FIXTURE_API(CreateDataType);
+    LOAD_FIXTURE_API(CreateTimer);
+    LOAD_FIXTURE_API(ReplyWithSimpleString);
+    LOAD_FIXTURE_API(GetSelectedDb);
+    LOAD_FIXTURE_API(OpenKey);
+    LOAD_FIXTURE_API(Call);
+    LOAD_FIXTURE_API(CallReplyType);
+#undef LOAD_FIXTURE_API
+    if (ValkeyModule_IsModuleNameBusy(module_name)) return VALKEYMODULE_ERR;
+    ValkeyModule_SetModuleAttribs(ctx, module_name, 1, VALKEYMODULE_APIVER_1);
+    return VALKEYMODULE_OK;
+}
+
 __attribute__((destructor))
 static void library_closed(void) {
     if (probe != NULL) probe(private_buffer == NULL ? 3 : 4);
@@ -46,7 +70,7 @@ int LOADER_ONLOAD(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
         ValkeyModule_GetApi("ValkeyModule_StringPtrLen", &ValkeyModule_StringPtrLen) != VALKEYMODULE_OK)
         return VALKEYMODULE_ERR;
     snprintf(module_name, sizeof(module_name), "%s", ValkeyModule_StringPtrLen(argv[0], NULL));
-    if (ValkeyModule_Init(ctx, module_name, 1, VALKEYMODULE_APIVER_1) != VALKEYMODULE_OK)
+    if (initialize_fixture(ctx) != VALKEYMODULE_OK)
         return VALKEYMODULE_ERR;
     /* Return a safe error if the host has not implemented this required API. */
     if (ValkeyModule_SetModuleOptions == NULL) return VALKEYMODULE_ERR;

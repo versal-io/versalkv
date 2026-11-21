@@ -10,7 +10,17 @@ use crate::engine::distributed::cluster::state::ClusterState;
 
 use super::types::ClusterBusManager;
 
+#[cfg(test)]
+thread_local! {
+    static SNAPSHOT_COPY_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl ClusterBusManager {
+    #[cfg(test)]
+    pub(crate) fn take_snapshot_copy_bytes_for_test() -> usize {
+        SNAPSHOT_COPY_BYTES.with(|bytes| bytes.replace(0))
+    }
+
     fn maximum_claimed_slot_epoch(state: &ClusterState, claimed_slots: &[u8]) -> u64 {
         if claimed_slots.len() != msg::SLOT_BYTES {
             return u64::MAX;
@@ -91,28 +101,30 @@ impl ClusterBusManager {
         token_value: usize,
         now: i64,
     ) -> bool {
-        let buf = match self.connections.get(&token_value) {
-            Some(c) => c.read_buf.clone(),
-            None => return false,
-        };
-
         let mut processed = 0;
         let mut should_close = false;
         loop {
-            let remaining = &buf[processed..];
-            if remaining.len() < msg::CLUSTER_BUS_PREFIX_LEN {
-                break;
-            }
-            if let Err(error) = msg::validate_packet_prefix(remaining) {
-                crate::server_log!(warning, "Invalid cluster packet header: {}", error);
-                should_close = true;
-                break;
-            }
-            if remaining.len() < msg::CLUSTER_BUS_HEADER_LEN {
-                break;
-            }
-
-            match msg::parse_msg(remaining) {
+            let parsed = {
+                let Some(connection) = self.connections.get(&token_value) else {
+                    break;
+                };
+                let remaining = &connection.read_buf[processed..];
+                if remaining.len() < msg::CLUSTER_BUS_PREFIX_LEN {
+                    break;
+                }
+                if let Err(error) = msg::validate_packet_prefix(remaining) {
+                    crate::server_log!(warning, "Invalid cluster packet header: {}", error);
+                    should_close = true;
+                    break;
+                }
+                if remaining.len() < msg::CLUSTER_BUS_HEADER_LEN {
+                    break;
+                }
+                // Decoding yields an owned message. End the buffer borrow
+                // before dispatch without copying an incomplete frame.
+                msg::parse_msg(remaining)
+            };
+            match parsed {
                 Ok((cluster_msg, total_len)) => {
                     processed += total_len;
                     state.record_bus_message_received(cluster_msg.msg_type);
@@ -165,6 +177,10 @@ impl ClusterBusManager {
                 }
                 Err(error) if error.is_incomplete() => break,
                 Err(msg::ClusterProtocolError::UnsupportedVersion(version)) => {
+                    let Some(connection) = self.connections.get(&token_value) else {
+                        break;
+                    };
+                    let remaining = &connection.read_buf[processed..];
                     state.record_bus_message_received_from_header(remaining);
                     crate::server_log!(
                         debug,
@@ -180,6 +196,10 @@ impl ClusterBusManager {
                     processed += frame_len;
                 }
                 Err(e) => {
+                    let Some(connection) = self.connections.get(&token_value) else {
+                        break;
+                    };
+                    let remaining = &connection.read_buf[processed..];
                     state.record_bus_message_received_from_header(remaining);
                     crate::server_log!(debug, "Cluster msg parse error: {}", e);
                     should_close = true;

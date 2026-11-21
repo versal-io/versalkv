@@ -248,6 +248,25 @@ fn module_pause_replicate_and_verbatim_reject_before_propagation() {
         let expected = if action == PauseAction::None { 0 } else { 1 };
         assert_eq!(result, expected);
         assert_eq!(verbatim, expected);
-        assert_eq!(conn.custom_propagation().len(), usize::from(expected == 0));
+        let operations = conn.script_propagation();
+        if expected == 0 {
+            assert_eq!(operations.len(), 1);
+            assert_eq!(operations[0].db_id, 0);
+            assert_eq!(
+                operations[0].targets,
+                crate::engine::extension::script::PropagationTargets::Both
+            );
+            assert_eq!(
+                operations[0].bytes,
+                crate::engine::distributed::replication::protocol::encode_command(&[
+                    b"SET",
+                    b"paused-key",
+                    b"value",
+                ])
+            );
+        } else {
+            assert!(operations.is_empty());
+        }
+        assert!(conn.custom_propagation().is_empty());
     }
 }

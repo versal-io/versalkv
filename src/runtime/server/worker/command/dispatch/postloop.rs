@@ -84,6 +84,11 @@ impl ServerWorkerState {
 
     fn process_pending_unblock(&mut self, client_id: usize, is_error: bool) {
         let token = Token(client_id);
+        let forced_reply =
+            is_error.then(|| Value::error("UNBLOCKED client unblocked via CLIENT UNBLOCK"));
+        if self.timeout_native_module_client(token, forced_reply) {
+            return;
+        }
         let Some(connection_token) = self
             .connection_registry
             .contains(crate::framework::capabilities::io::Token(client_id))

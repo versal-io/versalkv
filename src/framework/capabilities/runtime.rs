@@ -1,5 +1,4 @@
 use bytes::Bytes;
-use std::cell::Cell;
 
 use crate::engine::command::context::CommandConn;
 use crate::engine::command::{
@@ -14,42 +13,9 @@ use crate::foundation::io::protocol::Value;
 use crate::framework::context::ServerContext;
 use crate::framework::CommandSpec;
 
-#[derive(Clone, Copy)]
-struct ModuleCommandConnPtr(*mut dyn CommandConn);
-
-thread_local! {
-    static MODULE_COMMAND_CONN: Cell<Option<ModuleCommandConnPtr>> = const { Cell::new(None) };
-}
-
-pub(crate) struct ModuleCommandConnScope {
-    previous: Option<ModuleCommandConnPtr>,
-}
-
-pub(crate) fn with_current_module_conn<R>(
-    callback: impl FnOnce(&mut dyn CommandConn) -> R,
-) -> Option<R> {
-    MODULE_COMMAND_CONN.with(|slot| {
-        let conn = slot.get()?;
-        // SAFETY: The scope owns this pointer for the synchronous callback.
-        Some(unsafe { callback(&mut *conn.0) })
-    })
-}
-
-impl ModuleCommandConnScope {
-    pub(crate) fn enter(conn: &mut dyn CommandConn) -> Self {
-        MODULE_COMMAND_CONN.with(|slot| {
-            let previous = slot.get();
-            slot.set(Some(ModuleCommandConnPtr(erase_conn_lifetime(conn))));
-            Self { previous }
-        })
-    }
-}
-
-impl Drop for ModuleCommandConnScope {
-    fn drop(&mut self) {
-        MODULE_COMMAND_CONN.with(|slot| slot.set(self.previous));
-    }
-}
+pub(crate) use crate::engine::extension::module::capability::{
+    with_current_module_conn, ModuleCommandConnScope, MODULE_COMMAND_CONN,
+};
 
 fn lookup_command(ctx: &ServerContext, name: &[u8]) -> Option<CommandDescriptor> {
     ctx.command_registry()
@@ -84,6 +50,29 @@ fn execute_command(
         .lookup(name)
         .expect("command was looked up before execution");
     executor.executor.execute(conn, args, ctx)
+}
+
+fn apply_module_effects_to_conn(
+    conn: &mut dyn CommandConn,
+    effects: &mut crate::engine::extension::module::api::call::pending::ModuleCallEffects,
+) {
+    if let Some(delta) = effects.dirty_delta.take() {
+        conn.record_dirty_delta(delta);
+    }
+    for key in effects.dirty_keys.drain(..) {
+        conn.record_dirty_key(key);
+    }
+    conn.extend_script_propagation(std::mem::take(&mut effects.propagation));
+    conn.extend_notifications(std::mem::take(&mut effects.notifications));
+    for notification in effects.shard_notifications.drain(..) {
+        conn.record_shard_notification(notification);
+    }
+    for notification in effects.cluster_notifications.drain(..) {
+        conn.record_cluster_notification(notification);
+    }
+    for notification in effects.cluster_shard_notifications.drain(..) {
+        conn.record_cluster_shard_notification(notification);
+    }
 }
 
 fn module_acl_error(
@@ -302,6 +291,18 @@ impl ScriptRuntime for ServerContext {
         execute_script_command(self, command, conn, args)
     }
 
+    fn finish_script_command(
+        &mut self,
+        conn: &mut dyn CommandConn,
+        run: &mut crate::engine::extension::script::ScriptRunCtx,
+    ) {
+        let mut effects = super::module::dispatch_module_keyspace_notifications(conn, self);
+        // LuaTask appends the script stream only at completion. Keep callbacks
+        // behind this command's captured source, not in the parent call collector.
+        run.propagation_ops.append(&mut effects.propagation);
+        apply_module_effects_to_conn(conn, &mut effects);
+    }
+
     fn num_dbs(&self) -> usize {
         self.num_dbs()
     }
@@ -431,6 +432,103 @@ impl ScriptRuntime for ServerContext {
 }
 
 impl ModuleRuntime for ServerContext {
+    fn module_thread_bridge(
+        &self,
+    ) -> Option<crate::engine::extension::module::thread_bridge::ModuleThreadBridgeHandle> {
+        self.module_registry().thread_bridge.clone()
+    }
+
+    fn block_module_client(
+        &mut self,
+        module: std::sync::Arc<crate::engine::extension::module::thread_bridge::ModuleIdentity>,
+        origin: crate::engine::extension::module::thread_bridge::ModuleBlockOrigin,
+        callbacks: crate::engine::extension::module::blocking::ModuleBlockCallbacks,
+        timeout_ms: i64,
+    ) -> Result<
+        std::sync::Arc<crate::engine::extension::module::blocking::ModuleBlockedShared>,
+        libc::c_int,
+    > {
+        use crate::engine::extension::module::blocking::{
+            ModuleBlockStage, ModuleBlockedShared, NativeModuleBlock,
+        };
+        use crate::engine::extension::module::thread_bridge::{
+            lock, next_id, ModuleBlockedId, ModuleContextKind,
+        };
+        if origin.kind != ModuleContextKind::Synchronous {
+            return Err(libc::EINVAL);
+        }
+        let bridge = self.module_thread_bridge().ok_or(libc::ENOTSUP)?;
+        if bridge.is_closing() {
+            return Err(libc::ESHUTDOWN);
+        }
+        let timeout_ms = u64::try_from(timeout_ms).map_err(|_| libc::EINVAL)?;
+        let timeout_ms = if callbacks.timeout.is_some() {
+            timeout_ms
+        } else {
+            0
+        };
+        let now_ms = crate::foundation::io::sys::time::mstime();
+        let _deadline_ms = now_ms
+            .checked_add(i64::try_from(timeout_ms).map_err(|_| libc::EOVERFLOW)?)
+            .ok_or(libc::EOVERFLOW)?;
+        let id = ModuleBlockedId(next_id()?);
+        let shared = ModuleBlockedShared::new(id, module, bridge, origin.clone())?;
+        let is_illegal_context = origin.is_multi || origin.is_script;
+        let result = with_current_module_conn(|conn| {
+            if conn.blocked().is_some() {
+                return Err(libc::ENOTSUP);
+            }
+            if conn.sub_channel_count() != 0
+                || conn.psub_channel_count() != 0
+                || conn.ssub_channel_count() != 0
+            {
+                return Err(libc::ENOTSUP);
+            }
+            if is_illegal_context {
+                let reply = Value::error(if origin.is_script {
+                    "ERR Blocking module command called from Lua script"
+                } else {
+                    "ERR Blocking module command called from transaction"
+                });
+                let frame = if conn.resp_version() == 3 {
+                    crate::foundation::io::protocol::serializer::serialize_to_vec_resp3(&reply)
+                } else {
+                    crate::foundation::io::protocol::serializer::serialize_to_vec_resp2(&reply)
+                };
+                conn.queue_reply(frame);
+                conn.set_custom_reply(true);
+                lock(&shared.lifecycle).stage = ModuleBlockStage::DetachedTimeout;
+                return Ok(());
+            }
+            if origin.deny_blocking {
+                return Err(libc::ENOTSUP);
+            }
+            conn.enter_blocking(
+                crate::engine::command::context::BlockedCmd::Module { id },
+                Vec::new(),
+                timeout_ms,
+                &origin.args,
+                origin.request_bytes,
+            );
+            if conn.blocked().is_none() {
+                return Err(libc::ENOTSUP);
+            }
+            conn.set_skip_propagate(true);
+            Ok(())
+        })
+        .ok_or(libc::EINVAL)?;
+        result?;
+        self.module_registry_mut().native_blocks.insert(
+            id,
+            NativeModuleBlock {
+                shared: shared.clone(),
+                callbacks,
+                active_time_usec: 0,
+            },
+        );
+        Ok(shared)
+    }
+
     fn effective_command_flags(
         &self,
         command: &CommandDescriptor,
@@ -451,66 +549,86 @@ impl ModuleRuntime for ServerContext {
         db_idx: u32,
     ) -> bool {
         let flags = self.effective_command_flags(command, args);
-        if !crate::engine::command::command_may_mutate_dataset(command.name.as_str(), flags) {
-            return false;
-        }
-        if command.name.as_str().eq_ignore_ascii_case("swapdb") {
-            return false;
-        }
-        let is_capture_control = matches!(
-            command.name.as_str(),
-            "bgsave" | "save" | "flushdb" | "flushall" | "shutdown"
-        );
-        let key_targets = crate::framework::spec::normalize_forkless_key_targets(
-            command.name.as_str(),
-            args,
-            db_idx,
-            command
-                .extract_keys(args)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|key| (db_idx, key.to_vec()))
-                .collect(),
-        );
-        if key_targets
-            .iter()
-            .any(|(target_db, _)| *target_db as usize >= self.num_dbs())
-        {
-            return false;
-        }
-        (!is_capture_control && self.persistence().forkless_capture_in_progress())
-            || key_targets
-                .iter()
-                .any(|(target_db, key)| self.persistence().forkless_key_blocked(*target_db, key))
+        let mut command = command.clone();
+        command.flags = flags;
+        !matches!(
+            super::module_call_snapshot::plan_module_call_snapshot(self, &command, args, db_idx),
+            super::module_call_snapshot::ModuleCallSnapshotPlan::Ready
+        )
+    }
+
+    fn prepare_module_call_snapshot(
+        &mut self,
+        command: &CommandDescriptor,
+        args: &CommandArgs,
+        db_idx: u32,
+    ) -> bool {
+        super::module_call_snapshot::prepare_module_call_snapshot(self, command, args, db_idx)
+    }
+
+    fn take_module_call_expiration_effects(
+        &mut self,
+    ) -> crate::engine::extension::module::api::call::pending::ModuleCallEffects {
+        ServerContext::take_module_call_expiration_effects(self)
     }
 
     fn apply_module_call_effects(
         &mut self,
-        mut effects: crate::engine::extension::module::api::call::pending::ModuleCallEffects,
+        effects: crate::engine::extension::module::api::call::pending::ModuleCallEffects,
     ) {
-        if with_current_module_conn(|conn| {
-            if let Some(delta) = effects.dirty_delta.take() {
-                conn.record_dirty_delta(delta);
-            }
-            for key in effects.dirty_keys.drain(..) {
-                conn.record_dirty_key(key);
-            }
-            conn.extend_script_propagation(std::mem::take(&mut effects.propagation));
-            conn.extend_notifications(std::mem::take(&mut effects.notifications));
-            for notification in effects.shard_notifications.drain(..) {
-                conn.record_shard_notification(notification);
-            }
-            for notification in effects.cluster_notifications.drain(..) {
-                conn.record_cluster_notification(notification);
-            }
-            for notification in effects.cluster_shard_notifications.drain(..) {
-                conn.record_cluster_shard_notification(notification);
-            }
-        })
-        .is_none()
+        let Some(mut effects) =
+            crate::engine::extension::module::api::call::pending::ModuleCallEffectScope::collect(
+                effects,
+            )
+        else {
+            return;
+        };
+        if with_current_module_conn(|conn| apply_module_effects_to_conn(conn, &mut effects))
+            .is_none()
         {
             self.module_registry_mut().pending_effects.push(effects);
         }
+    }
+    fn publish_module_keyspace_event(
+        &mut self,
+        event: &crate::engine::extension::module::notifications::ModuleKeyspaceEvent,
+    ) {
+        let classes = [
+            (1 << 2, 'g'),
+            (1 << 3, '$'),
+            (1 << 4, 'l'),
+            (1 << 5, 's'),
+            (1 << 6, 'h'),
+            (1 << 7, 'z'),
+            (1 << 8, 'x'),
+            (1 << 9, 'e'),
+            (1 << 10, 't'),
+            (1 << 11, 'm'),
+            (1 << 13, 'd'),
+            (1 << 14, 'n'),
+            (1 << 15, 'p'),
+        ];
+        let Some((_, class)) = classes
+            .iter()
+            .find(|(mask, _)| event.event_type & *mask != 0)
+        else {
+            return;
+        };
+        let mut notifications = Vec::new();
+        crate::engine::distributed::pubsub::PubSubState::publish_keyspace_event(
+            self.config(),
+            &mut notifications,
+            event.db_idx,
+            &event.key,
+            *class,
+            &event.event,
+        );
+        self.apply_module_call_effects(
+            crate::engine::extension::module::api::call::pending::ModuleCallEffects {
+                notifications,
+                ..Default::default()
+            },
+        );
     }
     fn module_server_info(&mut self, section: Option<&str>) -> String {
         let args = CommandArgs {
@@ -585,6 +703,10 @@ impl ModuleRuntime for ServerContext {
 
     fn has_persistence_write_error(&self) -> bool {
         <ServerContext as ScriptRuntime>::has_persistence_write_error(self)
+    }
+
+    fn is_loading(&self) -> bool {
+        ServerContext::is_loading(self)
     }
 
     fn context_flags(&self) -> libc::c_int {
@@ -716,19 +838,6 @@ impl ModuleRuntime for ServerContext {
     fn remember_module_tracked_key(&mut self, client_id: usize, key: &[u8]) {
         self.tracking_mut()
             .remember_key(client_id, &Bytes::copy_from_slice(key));
-    }
-
-    fn reply_module_raw(&mut self, reply: Vec<u8>) -> bool {
-        MODULE_COMMAND_CONN.with(|slot| {
-            let Some(conn) = slot.get() else {
-                return false;
-            };
-            // SAFETY: the scope keeps the connection live and exclusive.
-            let conn = unsafe { &mut *conn.0 };
-            conn.queue_reply(reply);
-            conn.set_custom_reply(true);
-            true
-        })
     }
 
     fn list_max_listpack_size(&self) -> i64 {
@@ -946,15 +1055,22 @@ impl ModuleRuntime for ServerContext {
     }
 
     fn propagate_module_command(&mut self, frame: Vec<u8>) -> bool {
-        MODULE_COMMAND_CONN.with(|slot| {
-            let Some(conn) = slot.get() else {
-                return false;
-            };
-            // SAFETY: ModuleCommandConnScope installs this pointer only for the
-            // synchronous duration of a module command callback on this thread.
-            unsafe { &mut *conn.0 }.record_custom_propagation(frame);
-            true
-        })
+        let Some(db_idx) = with_current_module_conn(|conn| conn.selected_db()) else {
+            return false;
+        };
+        self.propagate_module_command_in_db(db_idx, frame)
+    }
+
+    fn propagate_module_command_in_db(&mut self, db_idx: u32, frame: Vec<u8>) -> bool {
+        self.apply_module_call_effects(
+            crate::engine::extension::module::api::call::pending::ModuleCallEffects {
+                propagation: vec![crate::engine::extension::script::PropagationOp::both(
+                    db_idx, frame,
+                )],
+                ..Default::default()
+            },
+        );
+        true
     }
 }
 
@@ -985,13 +1101,6 @@ pub(crate) fn unregister_pending_module_call(ctx: &mut ServerContext, conn: &dyn
         ctx.blocking_registry_mut()
             .unregister_client(conn.selected_db(), &blocked.keys, &session);
     }
-}
-
-fn erase_conn_lifetime(conn: &mut dyn CommandConn) -> *mut dyn CommandConn {
-    // SAFETY: ModuleCommandConnPtr is installed only inside
-    // ModuleCommandConnScope and restored before the borrowed connection can be
-    // released.
-    unsafe { std::mem::transmute::<&mut dyn CommandConn, *mut dyn CommandConn>(conn) }
 }
 
 #[cfg(test)]

@@ -256,6 +256,16 @@ pub trait CommandConn {
         drop(object);
     }
     fn record_notification(&mut self, notification: (Bytes, Bytes));
+    fn record_module_keyspace_event(
+        &mut self,
+        _event: crate::engine::extension::module::notifications::ModuleKeyspaceEvent,
+    ) {
+    }
+    fn take_module_keyspace_events(
+        &mut self,
+    ) -> Vec<crate::engine::extension::module::notifications::ModuleKeyspaceEvent> {
+        Vec::new()
+    }
     fn extend_notifications(&mut self, notifications: Vec<(Bytes, Bytes)>) {
         for notification in notifications {
             self.record_notification(notification);

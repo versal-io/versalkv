@@ -83,6 +83,7 @@ impl ServerWorkerState {
     pub(crate) fn run_before_poll_phase(&mut self) -> std::io::Result<LoopControl> {
         #[cfg(test)]
         self.trace_turn_for_test(TurnTracePoint::BeforePoll);
+        self.service_module_thread_leases();
         self.poll_cluster_config_saves();
         self.register_active_persistence_child();
         self.collect_child_completion_events();
@@ -189,6 +190,7 @@ impl ServerWorkerState {
         let action = match due.kind {
             RuntimeTimeEvent::ModuleTimer => {
                 self.ctx.run_expired_module_timers(now);
+                self.apply_pending_module_effects();
                 TimeEventAction::Delete
             }
             RuntimeTimeEvent::ServerCron => {

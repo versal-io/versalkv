@@ -12,11 +12,20 @@ pub fn create_module_internal_ctx(name: &str, module_ref: *mut c_void) -> Box<Mo
         onload: 1,
         reply_ptr: std::ptr::null_mut(),
         runtime_handle: std::ptr::null_mut(),
+        native_library_handle: std::ptr::null_mut(),
         db_idx: 0,
         resp_version: 2,
         username: CString::new("default").unwrap().into_raw(),
         module_auth_user: std::ptr::null_mut(),
         current_command_name: std::ptr::null_mut(),
+        key_position_request: None,
+        kind: Default::default(),
+        module_identity: None,
+        thread_bridge: None,
+        thread_context: None,
+        block_origin: None,
+        blocked_client: None,
+        blocked_private_data: std::ptr::null_mut(),
         auto_memory: Default::default(),
     })
 }
@@ -39,13 +48,41 @@ pub fn create_module_cmd_ctx(
         onload: 0,
         reply_ptr,
         runtime_handle,
+        native_library_handle: std::ptr::null_mut(),
         db_idx: 0,
         resp_version: 2,
         username: CString::new("default").unwrap().into_raw(),
         module_auth_user: std::ptr::null_mut(),
         current_command_name: command_name.into_raw(),
+        key_position_request: None,
+        kind: Default::default(),
+        module_identity: None,
+        thread_bridge: None,
+        thread_context: None,
+        block_origin: None,
+        blocked_client: None,
+        blocked_private_data: std::ptr::null_mut(),
         auto_memory: Default::default(),
     })
+}
+
+pub(crate) fn create_module_key_position_ctx(
+    name: &str,
+    command_name: &str,
+    argc: usize,
+) -> Box<ModuleInternalCtx> {
+    let mut internal = create_module_internal_ctx(name, std::ptr::null_mut());
+    internal.onload = 0;
+    internal.kind = super::thread_bridge::ModuleContextKind::KeyPosition;
+    internal.current_command_name = CString::new(command_name)
+        .unwrap_or_else(|_| CString::new("unknown").expect("static name has no NUL"))
+        .into_raw();
+    internal.key_position_request = Some(super::ModuleKeyPositionRequest {
+        argc,
+        positions: Vec::new(),
+        is_valid: true,
+    });
+    internal
 }
 
 // SAFETY: The caller must ensure that `internal` is either null or points to a

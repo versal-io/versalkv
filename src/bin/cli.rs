@@ -16,6 +16,8 @@ use std::time::Duration;
 mod cluster_manager;
 #[path = "cli/conn.rs"]
 mod conn;
+#[path = "cli/hints.rs"]
+mod hints;
 #[path = "cli/json.rs"]
 mod json;
 #[path = "cli/repl.rs"]
@@ -54,20 +56,34 @@ fn mptcp_supported() -> bool {
     }
 }
 
+fn startup_args(args: &[String]) -> Vec<String> {
+    let mut startup = Vec::new();
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        if arg == "--test_hint" {
+            let _ = args.next();
+        } else {
+            startup.push(arg.clone());
+        }
+    }
+    startup
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    let startup = startup_args(&args[1..]);
 
-    if args.iter().any(|a| a == "--help") {
+    if startup.iter().any(|a| a == "--help") {
         print_help();
         return;
     }
 
-    if args.iter().any(|a| a == "--version" || a == "-v") {
+    if startup.iter().any(|a| a == "--version" || a == "-v") {
         println!("versal-cli {}", env!("CARGO_PKG_VERSION"));
         return;
     }
 
-    if cluster_manager::execute_if_requested(&args[1..]) {
+    if cluster_manager::execute_if_requested(&startup) {
         return;
     }
 
@@ -88,6 +104,14 @@ fn main() {
     // diagnostic written to stderr as the command result.
     if opts.quoted_input && !quoted_input_is_valid(&opts.cmd) {
         std::process::exit(1);
+    }
+
+    if let Some(ref input) = opts.test_hint {
+        if let Err(error) = run_hint_mode(&opts, input) {
+            eprintln!("Error: {error}");
+            std::process::exit(1);
+        }
+        return;
     }
 
     if opts.test_hint_file {
@@ -217,6 +241,7 @@ struct CliOptions {
     rdb: Option<String>,
     functions_rdb: Option<String>,
     no_auth_warning: bool,
+    test_hint: Option<String>,
     test_hint_file: bool,
     mptcp: bool,
 }
@@ -273,6 +298,7 @@ fn parse_cli_args(args: &[String]) -> Result<CliOptions, String> {
         rdb: None,
         functions_rdb: None,
         no_auth_warning: false,
+        test_hint: None,
         test_hint_file: false,
         mptcp: false,
     };
@@ -493,6 +519,13 @@ fn parse_cli_args(args: &[String]) -> Result<CliOptions, String> {
             "--no-auth-warning" => {
                 opts.no_auth_warning = true;
                 i += 1;
+            }
+            "--test_hint" => {
+                let input = args
+                    .get(i + 1)
+                    .ok_or_else(|| "Missing argument for --test_hint".to_string())?;
+                opts.test_hint = Some(input.clone());
+                i += 2;
             }
             "--test_hint_file" if i + 1 < args.len() => {
                 opts.test_hint_file = true;
@@ -759,6 +792,22 @@ fn connect_with_opts(opts: &CliOptions) -> Result<Connection, String> {
         conn.switch_to_resp3(required)?;
     }
     Ok(conn)
+}
+
+fn run_hint_mode(opts: &CliOptions, input: &str) -> Result<(), String> {
+    let words = hints::completed_words(input);
+    let hint = if let Some(command) = words.as_ref().and_then(|words| words.first()) {
+        let mut conn = connect_with_opts(opts)?;
+        let docs = conn.send_command(&[b"COMMAND", b"DOCS", command])?;
+        hints::hint_for_input(&docs, input)?
+    } else {
+        None
+    };
+    let mut stdout = io::stdout().lock();
+    stdout
+        .write_all(hint.as_deref().unwrap_or(b"(null)"))
+        .and_then(|()| stdout.write_all(b"\n"))
+        .map_err(|error| format!("Write error: {error}"))
 }
 
 fn requested_resp3(opts: &CliOptions) -> Option<bool> {
@@ -1450,7 +1499,7 @@ mod tests {
     use super::json::escape_json_bytes;
     use super::{
         parse_cli_args, parse_cluster_redirect, quoted_input_is_valid, repl_from_options,
-        requested_resp3,
+        requested_resp3, startup_args,
     };
     use crate::repl::parse_inline_command;
 
@@ -1478,6 +1527,43 @@ mod tests {
         assert_eq!(parse_inline_command("\"one\" \"two\"").unwrap().len(), 2);
         assert!(!quoted_input_is_valid(&["\"unterminated".to_string()]));
         assert!(!quoted_input_is_valid(&["\"one\" \"two\"".to_string()]));
+    }
+
+    #[test]
+    fn test_hint_option_is_consumed_locally() {
+        for input in [
+            "CONTROL ACTION ",
+            "",
+            "--help",
+            "--version",
+            "-v",
+            "--cluster",
+        ] {
+            let args = [
+                "--test_hint".to_string(),
+                input.to_string(),
+                "-p".to_string(),
+                "26379".to_string(),
+            ];
+            let options = parse_cli_args(&args).unwrap();
+            assert_eq!(options.test_hint.as_deref(), Some(input));
+            assert!(!options.has_cmd);
+            assert!(options.cmd.is_empty());
+            assert_eq!(options.port, 26379);
+            assert_eq!(
+                startup_args(&args),
+                vec!["-p".to_string(), "26379".to_string()]
+            );
+        }
+        assert_eq!(
+            startup_args(&[
+                "--test_hint".to_string(),
+                "--version".to_string(),
+                "--help".to_string()
+            ]),
+            vec!["--help".to_string()]
+        );
+        assert!(parse_cli_args(&["--test_hint".to_string()]).is_err());
     }
 
     #[test]

@@ -69,7 +69,7 @@ pub(super) unsafe fn create_string_for_owner(
     unsafe {
         if is_enabled(owner) {
             if let Some(owner) = owner {
-                ValkeyModuleString::set_auto_owner(string, Some(owner));
+                ValkeyModuleString::add_auto_owner(string, owner);
                 register(
                     owner,
                     AutoMemoryEntry::String(NonNull::new_unchecked(string)),
@@ -78,6 +78,26 @@ pub(super) unsafe fn create_string_for_owner(
         }
     }
     string
+}
+
+// SAFETY: ctx is null or live; string owns a newly acquired reference.
+pub(super) unsafe fn register_held_string(
+    ctx: *mut ValkeyModuleCtx,
+    string: *mut ValkeyModuleString,
+) {
+    // SAFETY: explicit context lookup preserves NULL-context manual ownership.
+    let owner = unsafe { internal_owner(ctx) };
+    let (Some(owner), Some(string)) = (owner, NonNull::new(string)) else {
+        return;
+    };
+    // SAFETY: the live enabled scope takes only the new reference. Existing
+    // entries and the string's original reverse owner must remain unchanged.
+    unsafe {
+        if is_enabled(Some(owner)) {
+            ValkeyModuleString::add_auto_owner(string.as_ptr(), owner);
+            register(owner, AutoMemoryEntry::String(string));
+        }
+    }
 }
 
 // SAFETY: string and owner, if present, are live.
@@ -91,7 +111,7 @@ pub(super) unsafe fn remove_string(
     // SAFETY: both pointers are live; removing a queue entry does not release it.
     unsafe {
         if remove(owner, AutoMemoryEntry::String(string_ptr)) {
-            ValkeyModuleString::set_auto_owner(string, None);
+            ValkeyModuleString::remove_auto_owner(string, owner);
             true
         } else {
             false
@@ -160,7 +180,10 @@ pub(super) unsafe fn collect(internal: *mut ModuleInternalCtx) {
         unsafe {
             match entry {
                 AutoMemoryEntry::String(string) => {
-                    ValkeyModuleString::set_auto_owner(string.as_ptr(), None);
+                    ValkeyModuleString::remove_auto_owner(
+                        string.as_ptr(),
+                        NonNull::new_unchecked(internal),
+                    );
                     ValkeyModuleString::release(string.as_ptr());
                 }
                 AutoMemoryEntry::Key(key) => {

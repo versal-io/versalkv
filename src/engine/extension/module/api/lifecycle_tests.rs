@@ -424,12 +424,22 @@ fn detached_context_starts_with_an_independent_disabled_scope() {
         ValkeyModule_FreeThreadSafeContext, ValkeyModule_GetDetachedThreadSafeContext,
     };
     let source = new_context();
+    let bridge =
+        crate::engine::extension::module::thread_bridge::ModuleThreadBridgeHandle::new().unwrap();
+    let identity = crate::engine::extension::module::thread_bridge::ModuleIdentity::new(
+        "lifecycle".into(),
+        crate::engine::extension::module::registry::ModuleOptions::default(),
+    )
+    .unwrap();
     let before = snapshot();
     // SAFETY: detached owns a separate context and allocations from source.
     unsafe {
+        (*(*source).internal).thread_bridge = Some(bridge);
+        (*(*source).internal).module_identity = Some(identity);
         ValkeyModule_AutoMemory(source);
         ValkeyModule_CreateString(source, b"a".as_ptr().cast(), 1);
         let detached = ValkeyModule_GetDetachedThreadSafeContext(source);
+        assert!(!detached.is_null());
         assert!(!(*(*detached).internal).auto_memory.is_enabled);
         assert_eq!(entry_count((*detached).internal), 0);
         ValkeyModule_AutoMemory(detached);

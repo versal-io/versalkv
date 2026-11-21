@@ -3,5 +3,6 @@
 pub mod connection;
 pub mod io;
 pub mod module;
+pub(crate) mod module_call_snapshot;
 pub(crate) mod process;
 mod runtime;

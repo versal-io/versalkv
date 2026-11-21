@@ -32,6 +32,14 @@ pub trait ScriptRuntime {
         conn: &mut dyn CommandConn,
         args: &CommandArgs,
     ) -> Value;
+    /// Finish synchronous observations after capturing this command's source effects.
+    /// The host retains propagation and must not run outer execution-unit jobs here.
+    fn finish_script_command(
+        &mut self,
+        _conn: &mut dyn CommandConn,
+        _run: &mut super::ScriptRunCtx,
+    ) {
+    }
     fn num_dbs(&self) -> usize;
     fn has_maxmemory_limit(&self) -> bool;
     fn has_enough_replicas_to_write(&self) -> bool;

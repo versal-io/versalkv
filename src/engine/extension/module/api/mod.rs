@@ -1,5 +1,5 @@
 //! # Submodules
-//! - `block` — blocking operations (placeholder)
+//! - `block` — native blocked client ownership
 //! - `ctx` — context management and command registration
 //! - `call` — call, reply, and string API implementations
 //! - `active_registry` — thread-local module registry scope management
@@ -19,6 +19,7 @@ pub mod block;
 pub mod call;
 mod client_api;
 mod cluster_slot_api;
+pub(crate) mod command_args;
 mod command_info_api;
 pub mod ctx;
 mod datatype_api;
@@ -26,10 +27,12 @@ mod get_api;
 mod hash_api;
 mod key_api;
 mod key_eviction_api;
+mod key_position;
 #[cfg(test)]
 mod lifecycle_tests;
 mod list_api;
 mod memory_api;
+pub(crate) mod notifications;
 mod pubsub_api;
 mod reply_api;
 mod reply_builder;
@@ -52,15 +55,15 @@ pub(crate) use command_info_api::{
 pub(crate) use get_api::module_get_api_impl;
 #[cfg(test)]
 pub(crate) use key_api::{ValkeyModule_CloseKey, ValkeyModule_OpenKey};
+pub(crate) use key_position::query_module_key_positions;
 use libc::{c_char, c_int, size_t};
-pub(crate) use reply_builder::ReplyBuilder;
+pub(crate) use reply_builder::{ModuleReplyFrame, ReplyBuilder};
 #[cfg(test)]
 pub(crate) use scan::{
     ValkeyModuleScanCursor, ValkeyModule_ScanKey, ValkeyModule_ScanKeyRawBorrowed,
 };
 
 use super::{ValkeyModuleCtx, VALKEYMODULE_ERR, VALKEYMODULE_OK};
-use crate::engine::extension::module::capability::runtime_from_opaque;
 
 // SAFETY: Called by C module code via direct symbol reference; ctx is a valid
 // ValkeyModuleCtx pointer and proto points to proto_len readable bytes.
@@ -74,19 +77,12 @@ pub unsafe extern "C" fn VM_ReplyRaw(
         if ctx.is_null() || (proto.is_null() && proto_len != 0) {
             return VALKEYMODULE_ERR;
         }
-        let internal = (*ctx).internal;
-        if internal.is_null() {
-            return VALKEYMODULE_OK;
-        }
-        let Some(runtime) = runtime_from_opaque((*internal).runtime_handle) else {
-            return VALKEYMODULE_OK;
-        };
         let reply = if proto_len == 0 {
-            Vec::new()
+            bytes::Bytes::new()
         } else {
-            std::slice::from_raw_parts(proto.cast::<u8>(), proto_len).to_vec()
+            bytes::Bytes::copy_from_slice(std::slice::from_raw_parts(proto.cast::<u8>(), proto_len))
         };
-        if runtime.reply_module_raw(reply) {
+        if reply_api::with_reply_builder(ctx, |builder| builder.add_raw(reply)) == Some(true) {
             VALKEYMODULE_OK
         } else {
             VALKEYMODULE_ERR

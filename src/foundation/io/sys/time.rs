@@ -248,6 +248,17 @@ pub fn enter_fresh_command_time_snapshot() -> CommandTimeSnapshotGuard {
     })
 }
 
+/// Give an independent execution unit a fresh sample and restore both caches.
+/// Unlike nested event servicing, a native lease must not advance outer TIME.
+pub fn enter_isolated_command_time_snapshot() -> CommandTimeSnapshotGuard {
+    let wall_time_us = real_ustime();
+    CommandTimeSnapshotGuard {
+        previous: COMMAND_TIME_MS.with(|cell| cell.replace(Some(wall_time_us / 1_000))),
+        previous_wall_time: WALL_TIME_US.with(|cell| cell.replace(Some(wall_time_us))),
+        should_restore_wall_time: true,
+    }
+}
+
 fn command_time_ms() -> Option<i64> {
     COMMAND_TIME_MS.with(Cell::get)
 }
@@ -414,6 +425,24 @@ mod tests {
             assert_ne!(mstime(), 1000);
         }
         assert_eq!(mstime(), 1000);
+    }
+
+    #[test]
+    fn thread_runtime_review_isolated_time_restores_both_outer_snapshots() {
+        let _outer = enter_command_time_snapshot(1_000);
+        WALL_TIME_US.with(|cell| cell.set(Some(12_345)));
+        {
+            let _lease = enter_isolated_command_time_snapshot();
+            let lease_us = cached_wall_ustime();
+            assert_ne!(mstime(), 1_000);
+            assert_ne!(lease_us, 12_345);
+            assert_eq!(mstime(), lease_us / 1_000);
+            let _call = enter_command_time_snapshot_lazy();
+            assert_eq!(cached_wall_ustime(), lease_us);
+            assert_eq!(mstime(), lease_us / 1_000);
+        }
+        assert_eq!(mstime(), 1_000);
+        assert_eq!(cached_wall_ustime(), 12_345);
     }
 
     #[test]

@@ -4,6 +4,7 @@ use bytes::Bytes;
 use libc::c_int;
 
 use super::super::super::{ValkeyModuleCtx, VALKEYMODULE_ERR, VALKEYMODULE_OK};
+use super::super::reply_api::with_reply_builder;
 use super::super::ReplyBuilder;
 
 use super::call_reply::{CallReplyKind, CallReplyNode, ValkeyModuleCallReply};
@@ -21,7 +22,7 @@ pub unsafe extern "C" fn ValkeyModule_ReplyWithCallReply(
             return VALKEYMODULE_ERR;
         }
         let internal = (*ctx).internal;
-        if internal.is_null() || (*internal).reply_ptr.is_null() {
+        if internal.is_null() {
             return VALKEYMODULE_ERR;
         }
         let node = CallReplyNode::from_reply(&*reply);
@@ -29,11 +30,21 @@ pub unsafe extern "C" fn ValkeyModule_ReplyWithCallReply(
         if (*internal).resp_version < 3 && resp3_only {
             return VALKEYMODULE_ERR;
         }
-        let builder = &mut *((*internal).reply_ptr as *mut ReplyBuilder);
-
-        // Recursively append CallReply to builder
-        append_call_reply_to_builder(reply, builder);
-        VALKEYMODULE_OK
+        if node.kind() == CallReplyKind::Unknown {
+            let Some(proto) = (*reply).raw_proto() else {
+                return VALKEYMODULE_ERR;
+            };
+            return if with_reply_builder(ctx, |builder| {
+                builder.add_raw(Bytes::copy_from_slice(proto))
+            }) == Some(true)
+            {
+                VALKEYMODULE_OK
+            } else {
+                VALKEYMODULE_ERR
+            };
+        }
+        with_reply_builder(ctx, |builder| append_call_reply_to_builder(reply, builder))
+            .map_or(VALKEYMODULE_ERR, |()| VALKEYMODULE_OK)
     }
 }
 

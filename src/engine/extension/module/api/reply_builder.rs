@@ -12,20 +12,25 @@ enum ContainerType {
 
 pub struct ReplyBuilder {
     stack: Vec<(Vec<Value>, Option<usize>, ContainerType)>,
-    result: Option<Value>,
+    frames: Vec<ModuleReplyFrame>,
+}
+
+pub enum ModuleReplyFrame {
+    Value(Value),
+    Raw(Bytes),
 }
 
 impl ReplyBuilder {
     pub fn new() -> Self {
         ReplyBuilder {
             stack: Vec::new(),
-            result: None,
+            frames: Vec::new(),
         }
     }
 
     fn append(&mut self, value: Value) {
         if self.stack.is_empty() {
-            self.result = Some(value);
+            self.frames.push(ModuleReplyFrame::Value(value));
             return;
         }
         // Push to topmost container
@@ -42,7 +47,7 @@ impl ReplyBuilder {
             }
             let built = Self::build_container(elements, ctype);
             if self.stack.is_empty() {
-                self.result = Some(built);
+                self.frames.push(ModuleReplyFrame::Value(built));
                 return;
             } else {
                 self.stack.last_mut().unwrap().0.push(built);
@@ -77,7 +82,9 @@ impl ReplyBuilder {
     }
 
     pub fn add_array(&mut self, len: i32) {
-        if len < 0 {
+        if len == 0 {
+            self.append(Value::Array(Vec::new()));
+        } else if len < 0 {
             self.stack.push((Vec::new(), None, ContainerType::Array));
         } else {
             self.stack.push((
@@ -91,6 +98,8 @@ impl ReplyBuilder {
     pub fn add_map(&mut self, len: i32) {
         if len < 0 {
             self.append(Value::Null);
+        } else if len == 0 {
+            self.append(Value::Map(Vec::new()));
         } else {
             self.stack.push((
                 Vec::with_capacity((len * 2) as usize),
@@ -103,6 +112,8 @@ impl ReplyBuilder {
     pub fn add_set(&mut self, len: i32) {
         if len < 0 {
             self.append(Value::Null);
+        } else if len == 0 {
+            self.append(Value::Set(Vec::new()));
         } else {
             self.stack.push((
                 Vec::with_capacity(len as usize),
@@ -185,19 +196,39 @@ impl ReplyBuilder {
         self.append(Value::NullArray);
     }
 
-    pub fn into_value(mut self) -> Value {
+    pub fn add_raw(&mut self, proto: Bytes) -> bool {
+        if !self.stack.is_empty() {
+            return false;
+        }
+        self.frames.push(ModuleReplyFrame::Raw(proto));
+        true
+    }
+
+    pub fn into_frames(mut self) -> Vec<ModuleReplyFrame> {
         // If there are unfinished containers, build them as-is
         while let Some((elements, _, container_type)) = self.stack.pop() {
             let value = Self::build_container(elements, container_type);
             if self.stack.is_empty() {
-                self.result = Some(value);
+                self.frames.push(ModuleReplyFrame::Value(value));
             } else {
                 if let Some((container, _, _)) = self.stack.last_mut() {
                     container.push(value);
                 }
             }
         }
-        self.result.unwrap_or(Value::Null)
+        self.frames
+    }
+
+    #[cfg(test)]
+    pub fn into_value(self) -> Value {
+        self.into_frames()
+            .into_iter()
+            .rev()
+            .find_map(|frame| match frame {
+                ModuleReplyFrame::Value(value) => Some(value),
+                ModuleReplyFrame::Raw(_) => None,
+            })
+            .unwrap_or(Value::Null)
     }
 }
 

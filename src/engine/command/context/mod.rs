@@ -17,6 +17,9 @@ pub enum ConnectionState {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BlockedCmd {
+    Module {
+        id: crate::engine::extension::module::thread_bridge::ModuleBlockedId,
+    },
     Blpop,
     Brpop,
     Brpoplpush {

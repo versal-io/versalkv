@@ -103,7 +103,7 @@ pub fn get_master_addr_by_name(
     let state = ctx.sentinel_state();
     let master = match state.registry.master(name.as_ref()) {
         Some(master) => master,
-        None => return Value::Null,
+        None => return Value::NullArray,
     };
     let endpoint = match split_sentinel_endpoint(&master.addr) {
         Some(endpoint) => endpoint,
@@ -337,9 +337,37 @@ pub fn help(_conn: &mut dyn CommandConn, _args: &CommandArgs, _ctx: &mut ServerC
         Value::bulk(Bytes::from_static(b"  FLUSHCONFIG")),
         Value::bulk(Bytes::from_static(b"  INFO-CACHE")),
         Value::bulk(Bytes::from_static(b"  PENDING-SCRIPTS")),
-        Value::bulk(Bytes::from_static(b"  SIMULATE-FAILURE <flag>")),
+        Value::bulk(Bytes::from_static(
+            b"  SIMULATE-FAILURE (CRASH-AFTER-ELECTION|CRASH-AFTER-PROMOTION|HELP) [(CRASH-AFTER-ELECTION|CRASH-AFTER-PROMOTION|HELP) ...]",
+        )),
         Value::bulk(Bytes::from_static(b"  DEBUG <subcommand>")),
         Value::bulk(Bytes::from_static(b"  HELP")),
     ];
     Value::Array(help_text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::foundation::io::protocol::serializer::{
+        serialize_to_vec_resp2, serialize_to_vec_resp3,
+    };
+    use crate::framework::capabilities::connection::Connection;
+
+    #[test]
+    fn unknown_primary_address_preserves_null_array_wire_type() {
+        for subcommand in ["get-master-addr-by-name", "get-primary-addr-by-name"] {
+            let mut ctx = ServerContext::new(1);
+            let mut conn = Connection::new_fake();
+            let args = CommandArgs::from_parts(vec![
+                Bytes::from_static(b"SENTINEL"),
+                Bytes::copy_from_slice(subcommand.as_bytes()),
+                Bytes::from_static(b"nosuchprimary"),
+            ]);
+            let reply = get_master_addr_by_name(&mut conn, &args, &mut ctx);
+            assert_eq!(reply, Value::NullArray);
+            assert_eq!(serialize_to_vec_resp2(&reply), b"*-1\r\n");
+            assert_eq!(serialize_to_vec_resp3(&reply), b"_\r\n");
+        }
+    }
 }

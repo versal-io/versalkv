@@ -58,10 +58,36 @@ pub unsafe extern "C" fn ValkeyModule_Strdup(s: *const c_char) -> *mut c_char {
     }
 }
 
-// SAFETY: Called by C module code; count and size are valid allocation parameters for libc::calloc
+// SAFETY: Called by C module code; successful allocations are returned to the
+// module, which must release them using the module allocator API.
 pub unsafe extern "C" fn ValkeyModule_Calloc(count: size_t, size: size_t) -> *mut c_void {
+    let Some(bytes) = count.checked_mul(size) else {
+        crate::server_panic!("ValkeyModule_Calloc({}, {}) overflows", count, size);
+    };
+    // SAFETY: the product was checked above; libc owns allocation bookkeeping.
+    let allocation = unsafe { ValkeyModule_TryCalloc(count, size) };
+    if allocation.is_null() {
+        crate::server_panic!(
+            "Out of memory allocating {} bytes in ValkeyModule_Calloc",
+            bytes
+        );
+    }
+    allocation
+}
+
+// SAFETY: Called by C module code; successful allocations are returned to the
+// module, which must release them using the module allocator API.
+pub unsafe extern "C" fn ValkeyModule_TryCalloc(count: size_t, size: size_t) -> *mut c_void {
+    let Some(bytes) = count.checked_mul(size) else {
+        return std::ptr::null_mut();
+    };
+    // Match the allocator's representable-size guard before calling libc.
+    if bytes >= usize::MAX / 2 {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: the allocation size cannot overflow; libc reports failure as NULL.
     unsafe {
-        log::trace!("ValkeyModule_Calloc({}, {}) called", count, size);
+        log::trace!("ValkeyModule_TryCalloc({}, {}) called", count, size);
         libc::calloc(count, size)
     }
 }
@@ -90,6 +116,85 @@ mod tests {
     use super::*;
     use crate::foundation::io::sys::os;
     use crate::foundation::memory::{external::lock_external_memory, util_alloc};
+
+    #[test]
+    fn ordinary_calloc_terminates_on_non_overflow_allocation_failure() {
+        const CHILD_ENV: &str = "VERSAL_TEST_CALLOC_ALLOCATION_FAILURE";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            // SAFETY: this is a dedicated subprocess testing the allocator's
+            // fatal failure policy; the product is valid and cannot be allocated.
+            unsafe { ValkeyModule_Free(ValkeyModule_Calloc(usize::MAX / 2, 1)) };
+            return;
+        }
+        let test = format!(
+            "{}::ordinary_calloc_terminates_on_non_overflow_allocation_failure",
+            module_path!().trim_start_matches("versal::")
+        );
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &test, "--nocapture"])
+            .env(CHILD_ENV, "1")
+            .output()
+            .unwrap();
+        assert!(
+            !result.status.success(),
+            "ordinary Calloc must terminate on failure"
+        );
+        let diagnostics = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            diagnostics.contains("ValkeyModule_Calloc") && diagnostics.contains("Out of memory"),
+            "the allocator must diagnose the fatal allocation failure: {diagnostics}"
+        );
+    }
+
+    #[test]
+    fn calloc_apis_have_distinct_overflow_contracts_and_zeroed_allocations() {
+        use std::ffi::CString;
+
+        let mut addresses = [std::ptr::null_mut(); 2];
+        for (index, name) in ["ValkeyModule_Calloc", "ValkeyModule_TryCalloc"]
+            .into_iter()
+            .enumerate()
+        {
+            let name = CString::new(name).unwrap();
+            // SAFETY: the NUL-terminated name and writable result slot remain
+            // live throughout this synchronous API lookup.
+            assert_eq!(
+                unsafe { super::super::module_get_api_impl(name.as_ptr(), &mut addresses[index]) },
+                VALKEYMODULE_OK
+            );
+        }
+        assert_eq!(addresses[0], ValkeyModule_Calloc as *mut c_void);
+        assert_eq!(addresses[1], ValkeyModule_TryCalloc as *mut c_void);
+        assert_ne!(addresses[0], addresses[1]);
+        // SAFETY: the API entries above were checked against functions with
+        // exactly this two-size allocation ABI.
+        let functions = unsafe {
+            addresses.map(|address| {
+                std::mem::transmute::<
+                    *mut c_void,
+                    unsafe extern "C" fn(size_t, size_t) -> *mut c_void,
+                >(address)
+            })
+        };
+        for (count, size) in [(usize::MAX, 2), (2, usize::MAX), (usize::MAX / 2 + 1, 2)] {
+            // SAFETY: TryCalloc accepts overflow inputs and returns NULL; this
+            // test intentionally never calls the fatal Calloc overflow path.
+            assert!(unsafe { functions[1](count, size) }.is_null());
+        }
+        for allocate in functions {
+            // SAFETY: 8 * 4 is a valid small allocation, the returned storage is
+            // read only after the NULL check, and is freed exactly once.
+            unsafe {
+                let allocation = allocate(8, 4);
+                assert!(!allocation.is_null());
+                assert_eq!(
+                    std::slice::from_raw_parts(allocation.cast::<u8>(), 32),
+                    &[0; 32]
+                );
+                ValkeyModule_Free(allocation);
+            }
+        }
+    }
 
     #[test]
     fn module_external_memory_c_api_range_errors_preserve_accounting_and_errno() {

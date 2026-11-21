@@ -215,6 +215,7 @@ impl ServerWorkerState {
     }
 
     pub(crate) fn discard_blocked_client(&mut self, token: Token) -> bool {
+        self.disconnect_native_module_client(token);
         if self
             .detach_blocked_client(token, BlockedDetachOutcome::Discard)
             .is_none()
@@ -275,7 +276,10 @@ impl ServerWorkerState {
         self.ctx.forkless_clients_mut().shift_remove(&token);
         if matches!(
             blocked.cmd,
-            BlockedCmd::Wait { .. } | BlockedCmd::WaitAof { .. } | BlockedCmd::SetSlot { .. }
+            BlockedCmd::Wait { .. }
+                | BlockedCmd::WaitAof { .. }
+                | BlockedCmd::SetSlot { .. }
+                | BlockedCmd::Module { .. }
         ) {
             self.ctx
                 .blocking_registry_mut()
@@ -301,6 +305,7 @@ impl ServerWorkerState {
         if matches!(
             blocked.cmd,
             BlockedCmd::Paused
+                | BlockedCmd::Module { .. }
                 | BlockedCmd::Forkless
                 | BlockedCmd::Throttled
                 | BlockedCmd::SlotMigration(_)
@@ -613,6 +618,9 @@ impl ServerWorkerState {
             }
         }
         for token in to_timeout {
+            if self.timeout_native_module_client(token, None) {
+                continue;
+            }
             // C `unblockClientOnTimeout` maps a BLOCKED_WAIT `CLUSTER SETSLOT`
             // to `NOREPLICAS`; unlike C, the Rust continuation does not
             // requeue the client, so the command body never runs twice.

@@ -73,6 +73,14 @@ fn module_doc(ctx: &ServerContext, command_name: &str, module_name: &str) -> Val
             Value::bulk(Bytes::copy_from_slice(module_name.as_bytes())),
         ),
     ];
+    if let Some(arguments) = ctx
+        .module_registry()
+        .lookup_cmd_func(command_name)
+        .and_then(|entry| entry.arguments.as_ref())
+        .filter(|arguments| !arguments.is_empty())
+    {
+        fields.push((bulk("arguments"), module_argument_docs(arguments)));
+    }
     let subcommands: Vec<_> = ctx
         .module_registry()
         .subcommand_names(command_name)
@@ -94,6 +102,65 @@ fn module_doc(ctx: &ServerContext, command_name: &str, module_name: &str) -> Val
         fields.push((bulk("subcommands"), Value::Array(subcommands)));
     }
     Value::Map(fields)
+}
+
+fn module_argument_docs(
+    arguments: &[crate::engine::extension::module::api::command_args::ModuleCommandArg],
+) -> Value {
+    Value::Array(
+        arguments
+            .iter()
+            .map(|argument| {
+                let mut fields = vec![
+                    (bulk("name"), Value::bulk(argument.name.clone())),
+                    (bulk("type"), bulk(argument.arg_type)),
+                ];
+                let is_container = matches!(argument.arg_type, "oneof" | "block");
+                if !is_container {
+                    fields.push((
+                        bulk("display_text"),
+                        Value::bulk(
+                            argument.display_text.as_ref().unwrap_or(&argument.name).clone(),
+                        ),
+                    ));
+                }
+                if let Some(index) = argument.key_spec_index {
+                    fields.push((bulk("key_spec_index"), Value::integer(i64::from(index))));
+                }
+                for (name, value) in [
+                    ("token", argument.token.as_ref()),
+                    ("summary", argument.summary.as_ref()),
+                    ("since", argument.since.as_ref()),
+                    ("deprecated_since", argument.deprecated_since.as_ref()),
+                ] {
+                    if let Some(value) = value {
+                        fields.push((bulk(name), Value::bulk(value.clone())));
+                    }
+                }
+                if !argument.flags.is_empty() {
+                    fields.push((
+                        bulk("flags"),
+                        Value::set(
+                            argument
+                                .flags
+                                .iter()
+                                .map(|flag| {
+                                    Value::SimpleString(Bytes::from_static(flag.as_bytes()))
+                                })
+                                .collect(),
+                        ),
+                    ));
+                }
+                if is_container {
+                    fields.push((
+                        bulk("arguments"),
+                        module_argument_docs(&argument.arguments),
+                    ));
+                }
+                Value::Map(fields)
+            })
+            .collect(),
+    )
 }
 
 fn bulk(value: &'static str) -> Value {
@@ -359,6 +426,147 @@ mod tests {
             STATIC_COMMAND_CATALOG.docs(&[Bytes::from_static(b"cluster|setslot")]),
             Value::Null
         );
+    }
+
+    #[test]
+    fn command_metadata_docs_preserve_binary_argument_fields() {
+        use crate::engine::extension::module::api::command_args::test_support::copied_binary_tree;
+        use crate::foundation::io::protocol::serializer::{
+            serialize_to_vec_resp2, serialize_to_vec_resp3,
+        };
+
+        fn binary(value: &'static [u8]) -> Value {
+            Value::bulk(Bytes::from_static(value))
+        }
+
+        let copied = copied_binary_tree();
+        let rendered = module_argument_docs(&copied);
+        let Value::Array(args) = &rendered else {
+            panic!("expected an argument array");
+        };
+        assert_eq!(field(&args[0], "display_text"), Some(&binary(b"\xff")));
+        assert_eq!(field(&args[0], "token"), Some(&binary(b"T\xfe")));
+        assert_eq!(
+            rendered,
+            Value::Array(vec![
+                Value::Map(vec![
+                    (bulk("name"), binary(b"value\xff")),
+                    (bulk("type"), bulk("string")),
+                    (bulk("display_text"), binary(b"\xff")),
+                    (bulk("token"), binary(b"T\xfe")),
+                    (bulk("summary"), binary(b"S\xfd")),
+                    (bulk("since"), binary(b"1.\xfc")),
+                    (bulk("deprecated_since"), binary(b"0.\xfb")),
+                    (
+                        bulk("flags"),
+                        Value::set(vec![
+                            Value::SimpleString(Bytes::from_static(b"optional")),
+                            Value::SimpleString(Bytes::from_static(b"multiple")),
+                            Value::SimpleString(Bytes::from_static(b"multiple_token")),
+                        ]),
+                    ),
+                ]),
+                Value::Map(vec![
+                    (bulk("name"), binary(b"fallback\xfa")),
+                    (bulk("type"), bulk("string")),
+                    (bulk("display_text"), binary(b"fallback\xfa")),
+                ]),
+                Value::Map(vec![
+                    (bulk("name"), binary(b"group\xf9")),
+                    (bulk("type"), bulk("block")),
+                    (
+                        bulk("arguments"),
+                        Value::Array(vec![Value::Map(vec![
+                            (bulk("name"), binary(b"choice\xf8")),
+                            (bulk("type"), bulk("pure-token")),
+                            (bulk("display_text"), binary(b"\xf3")),
+                            (bulk("token"), binary(b"\xf7")),
+                            (bulk("summary"), binary(b"child\xf6")),
+                            (bulk("since"), binary(b"\xf5")),
+                            (bulk("deprecated_since"), binary(b"\xf4")),
+                        ])]),
+                    ),
+                ]),
+            ])
+        );
+        let display = field(&args[0], "display_text").unwrap();
+        let token = field(&args[0], "token").unwrap();
+        assert_eq!(serialize_to_vec_resp2(display), b"$1\r\n\xff\r\n");
+        assert_eq!(serialize_to_vec_resp3(display), b"$1\r\n\xff\r\n");
+        assert_eq!(serialize_to_vec_resp2(token), b"$2\r\nT\xfe\r\n");
+        assert_eq!(serialize_to_vec_resp3(token), b"$2\r\nT\xfe\r\n");
+    }
+
+    #[test]
+    fn command_metadata_docs_keep_argument_tree_after_acl_updates() {
+        use crate::engine::extension::module::api::command_args::ModuleCommandArg;
+
+        let mut ctx = ServerContext::new(1);
+        ctx.module_registry_mut()
+            .register(ModuleRef::new("docs-probe", std::ptr::null_mut(), 1, true))
+            .unwrap();
+        ctx.module_registry_mut()
+            .register_command("docs-probe", "docs-probe.command", None)
+            .unwrap();
+        let info = ModuleCommandInfo {
+            summary: Some("Reads a payload.".into()),
+            since: Some("1.0.0".into()),
+            key_specs: Vec::new(),
+            acl_categories: Vec::new(),
+            legacy_keys: None,
+            getkeys_api: false,
+            arity: Some(-2),
+        };
+        let tree = vec![ModuleCommandArg {
+            name: "payload".into(),
+            arg_type: "string",
+            key_spec_index: None,
+            token: None,
+            summary: None,
+            since: None,
+            flags: vec!["optional"],
+            deprecated_since: None,
+            arguments: Vec::new(),
+            display_text: None,
+        }];
+        let prepared = ctx.module_registry()
+            .prepare_command_metadata("docs-probe.command", info, Some(tree.clone()))
+            .unwrap();
+        ctx.module_registry_mut()
+            .commit_command_metadata("docs-probe.command", prepared);
+        let expected = Value::Map(vec![
+            (bulk("summary"), bulk("Reads a payload.")),
+            (bulk("since"), bulk("1.0.0")),
+            (bulk("group"), bulk("module")),
+            (bulk("module"), bulk("docs-probe")),
+            (
+                bulk("arguments"),
+                Value::Array(vec![Value::Map(vec![
+                    (bulk("name"), bulk("payload")),
+                    (bulk("type"), bulk("string")),
+                    (bulk("display_text"), bulk("payload")),
+                    (bulk("flags"), optional_flags()),
+                ])]),
+            ),
+        ]);
+        assert_eq!(module_doc(&ctx, "docs-probe.command", "docs-probe"), expected);
+        assert!(ctx.module_registry_mut().set_command_info(
+            "docs-probe.command",
+            ModuleCommandInfo {
+                summary: None,
+                since: None,
+                key_specs: Vec::new(),
+                acl_categories: vec!["write".into()],
+                legacy_keys: None,
+                getkeys_api: false,
+                arity: None,
+            },
+        ));
+        assert_eq!(module_doc(&ctx, "docs-probe.command", "docs-probe"), expected);
+        let stored = ctx.module_registry().lookup_cmd_func("docs-probe.command").unwrap();
+        assert_eq!(stored.arguments.as_ref(), Some(&tree));
+        assert_eq!(stored.info.as_ref().unwrap().acl_categories, ["write"]);
+        assert_eq!(stored.info.as_ref().unwrap().arity, Some(-2));
     }
 
     #[test]

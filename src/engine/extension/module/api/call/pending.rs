@@ -8,6 +8,72 @@ use crate::engine::extension::module::{ValkeyModuleCtx, ValkeyModuleString};
 use crate::engine::extension::script::PropagationOp;
 use crate::foundation::io::protocol::Value;
 use bytes::Bytes;
+use std::cell::RefCell;
+use std::rc::Rc;
+
+#[derive(Debug)]
+pub struct EffectOverflow;
+
+type EffectCollector = Rc<RefCell<Vec<ModuleCallEffects>>>;
+
+thread_local! {
+    static CALL_EFFECT_SCOPES: RefCell<Vec<EffectCollector>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Main-thread owned effects, never a runtime or connection borrow.
+pub struct ModuleCallEffectScope {
+    effects: EffectCollector,
+}
+
+impl ModuleCallEffectScope {
+    pub(crate) fn is_active() -> bool {
+        CALL_EFFECT_SCOPES.with(|scopes| !scopes.borrow().is_empty())
+    }
+
+    pub fn enter() -> Self {
+        let effects = Rc::new(RefCell::new(Vec::new()));
+        CALL_EFFECT_SCOPES.with(|scopes| scopes.borrow_mut().push(effects.clone()));
+        Self { effects }
+    }
+
+    /// Returns effects when there is no active scope to collect them.
+    pub fn collect(effects: ModuleCallEffects) -> Option<ModuleCallEffects> {
+        CALL_EFFECT_SCOPES.with(|scopes| {
+            let collector = scopes.borrow().last().cloned();
+            match collector {
+                Some(collector) => {
+                    collector.borrow_mut().push(effects);
+                    None
+                }
+                None => Some(effects),
+            }
+        })
+    }
+
+    pub fn finish(self) -> Vec<ModuleCallEffects> {
+        let effects = std::mem::take(&mut *self.effects.borrow_mut());
+        effects
+    }
+}
+
+impl Drop for ModuleCallEffectScope {
+    fn drop(&mut self) {
+        CALL_EFFECT_SCOPES.with(|scopes| {
+            let mut scopes = scopes.borrow_mut();
+            if let Some(index) = scopes
+                .iter()
+                .position(|scope| Rc::ptr_eq(scope, &self.effects))
+            {
+                scopes.remove(index);
+            }
+            if let Some(parent) = scopes.last() {
+                parent
+                    .borrow_mut()
+                    .extend(self.effects.borrow_mut().drain(..));
+            }
+        });
+    }
+}
 
 #[derive(Default)]
 pub struct ModuleCallEffects {
@@ -21,6 +87,25 @@ pub struct ModuleCallEffects {
 }
 
 impl ModuleCallEffects {
+    pub(crate) fn append(&mut self, mut other: Self) -> Result<(), EffectOverflow> {
+        let mut result = Ok(());
+        if let Some(delta) = other.dirty_delta.take() {
+            match self.dirty_delta.unwrap_or(0).checked_add(delta) {
+                Some(delta) => self.dirty_delta = Some(delta),
+                None => result = Err(EffectOverflow),
+            }
+        }
+        self.dirty_keys.append(&mut other.dirty_keys);
+        self.propagation.append(&mut other.propagation);
+        self.notifications.append(&mut other.notifications);
+        self.shard_notifications
+            .append(&mut other.shard_notifications);
+        self.cluster_notifications
+            .append(&mut other.cluster_notifications);
+        self.cluster_shard_notifications
+            .append(&mut other.cluster_shard_notifications);
+        result
+    }
     pub(crate) fn is_empty(&self) -> bool {
         self.dirty_delta.is_none()
             && self.dirty_keys.is_empty()

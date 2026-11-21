@@ -25,6 +25,19 @@ pub(super) fn builtin_doc(name: &str) -> Value {
     if let Some(metadata) = metadata.filter(|metadata| !metadata.arguments.is_empty()) {
         fields.push((bulk("arguments"), argument_docs(metadata.arguments)));
     }
+    let subcommands = crate::framework::generated::commands::catalog::COMMAND_DOC_META
+        .iter()
+        .filter(|metadata| {
+            metadata
+                .name
+                .split_once('|')
+                .is_some_and(|(parent, _)| parent.eq_ignore_ascii_case(name))
+        })
+        .map(|metadata| (bulk(metadata.name), builtin_doc(metadata.name)))
+        .collect::<Vec<_>>();
+    if !subcommands.is_empty() {
+        fields.push((bulk("subcommands"), Value::Map(subcommands)));
+    }
     Value::Map(fields)
 }
 

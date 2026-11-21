@@ -26,9 +26,10 @@ impl SourceRoute {
         error: bool,
     ) -> EventDependencies {
         match self.owner {
-            SourceOwner::IoWorkerWake | SourceOwner::ControlWake | SourceOwner::ChildSignal(_) => {
-                EventDependencies::safe_producer()
-            }
+            SourceOwner::IoWorkerWake
+            | SourceOwner::ModuleThreadWake
+            | SourceOwner::ControlWake
+            | SourceOwner::ChildSignal(_) => EventDependencies::safe_producer(),
             SourceOwner::InternalPipe(
                 InternalPipeOwner::DisklessRdb { .. } | InternalPipeOwner::SlotSnapshot { .. },
             ) => EventDependencies::safe_producer(),
@@ -49,6 +50,7 @@ impl SourceRoute {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SourceOwner {
     IoWorkerWake,
+    ModuleThreadWake,
     // Task 6 installs the shared control wake source.
     // TODO(dead_code): remove after the control wake source is registered.
     #[allow(dead_code)]
@@ -70,9 +72,11 @@ pub(crate) enum SourceOwner {
 impl SourceOwner {
     fn blocked_policy(&self) -> BlockedPolicy {
         match self {
-            Self::IoWorkerWake | Self::ControlWake | Self::ChildSignal(_) | Self::Listener => {
-                BlockedPolicy::Always
-            }
+            Self::IoWorkerWake
+            | Self::ModuleThreadWake
+            | Self::ControlWake
+            | Self::ChildSignal(_)
+            | Self::Listener => BlockedPolicy::Always,
             Self::Connection | Self::ClusterBus | Self::Sentinel | Self::InternalPipe(_) => {
                 BlockedPolicy::DependencyChecked
             }
@@ -82,6 +86,7 @@ impl SourceOwner {
     pub(crate) fn label(&self) -> &'static str {
         match self {
             Self::IoWorkerWake => "IO worker wake",
+            Self::ModuleThreadWake => "module thread wake",
             Self::ControlWake => "control wake",
             Self::Listener => "listener",
             Self::Connection => "connection",

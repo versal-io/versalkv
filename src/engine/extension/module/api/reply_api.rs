@@ -7,20 +7,29 @@ use std::ffi::CStr;
 use super::super::{ValkeyModuleCtx, ValkeyModuleString, VALKEYMODULE_ERR, VALKEYMODULE_OK};
 use super::reply_builder::ReplyBuilder;
 
-// SAFETY: ctx must be a valid ValkeyModuleCtx pointer (or null, which is handled). The internal pointer
-// and reply_ptr are trusted to point to valid, aligned memory as set up by create_module_cmd_ctx.
-pub(crate) unsafe fn get_reply_builder(
+// SAFETY: ctx is NULL or live. The callback cannot retain the builder borrow
+// or enter C code; a bound thread context holds its reply mutex only here.
+pub(crate) unsafe fn with_reply_builder<R>(
     ctx: *mut ValkeyModuleCtx,
-) -> Option<&'static mut ReplyBuilder> {
+    callback: impl FnOnce(&mut ReplyBuilder) -> R,
+) -> Option<R> {
     unsafe {
         if ctx.is_null() {
             return None;
         }
         let internal = (*ctx).internal;
-        if internal.is_null() || (*internal).reply_ptr.is_null() {
+        if internal.is_null() {
             return None;
         }
-        Some(&mut *((*internal).reply_ptr as *mut ReplyBuilder))
+        if (*internal).kind == super::super::thread_bridge::ModuleContextKind::ThreadSafe {
+            return (*internal).blocked_client.as_ref()?.with_replies(callback);
+        }
+        if (*internal).kind == super::super::thread_bridge::ModuleContextKind::DisconnectedCleanup
+            || (*internal).reply_ptr.is_null()
+        {
+            return None;
+        }
+        Some(callback(&mut *((*internal).reply_ptr as *mut ReplyBuilder)))
     }
 }
 
@@ -30,13 +39,8 @@ pub unsafe extern "C" fn ValkeyModule_ReplyWithLongLong(
     ll: c_longlong,
 ) -> c_int {
     unsafe {
-        match get_reply_builder(ctx) {
-            Some(b) => {
-                b.add_integer(ll);
-                VALKEYMODULE_OK
-            }
-            None => VALKEYMODULE_ERR,
-        }
+        with_reply_builder(ctx, |builder| builder.add_integer(ll))
+            .map_or(VALKEYMODULE_ERR, |()| VALKEYMODULE_OK)
     }
 }
 
@@ -52,13 +56,8 @@ pub unsafe extern "C" fn ValkeyModule_ReplyWithError(
             let s = CStr::from_ptr(err).to_bytes();
             Bytes::copy_from_slice(s)
         };
-        match get_reply_builder(ctx) {
-            Some(b) => {
-                b.add_error(msg);
-                VALKEYMODULE_OK
-            }
-            None => VALKEYMODULE_ERR,
-        }
+        with_reply_builder(ctx, |builder| builder.add_error(msg))
+            .map_or(VALKEYMODULE_ERR, |()| VALKEYMODULE_OK)
     }
 }
 
@@ -76,13 +75,8 @@ pub unsafe extern "C" fn reply_with_error_buffer(
         } else {
             Bytes::copy_from_slice(std::slice::from_raw_parts(data.cast::<u8>(), len))
         };
-        match get_reply_builder(ctx) {
-            Some(builder) => {
-                builder.add_error(message);
-                VALKEYMODULE_OK
-            }
-            None => VALKEYMODULE_ERR,
-        }
+        with_reply_builder(ctx, |builder| builder.add_error(message))
+            .map_or(VALKEYMODULE_ERR, |()| VALKEYMODULE_OK)
     }
 }
 
@@ -97,13 +91,8 @@ pub unsafe extern "C" fn ValkeyModule_ReplyWithSimpleString(
         } else {
             Bytes::copy_from_slice(CStr::from_ptr(msg).to_bytes())
         };
-        match get_reply_builder(ctx) {
-            Some(b) => {
-                b.add_simple_string(s);
-                VALKEYMODULE_OK
-            }
-            None => VALKEYMODULE_ERR,
-        }
+        with_reply_builder(ctx, |builder| builder.add_simple_string(s))
+            .map_or(VALKEYMODULE_ERR, |()| VALKEYMODULE_OK)
     }
 }
 
@@ -113,13 +102,8 @@ pub unsafe extern "C" fn ValkeyModule_ReplyWithArray(
     len: c_long,
 ) -> c_int {
     unsafe {
-        match get_reply_builder(ctx) {
-            Some(b) => {
-                b.add_array(len as i32);
-                VALKEYMODULE_OK
-            }
-            None => VALKEYMODULE_ERR,
-        }
+        with_reply_builder(ctx, |builder| builder.add_array(len as i32))
+            .map_or(VALKEYMODULE_ERR, |()| VALKEYMODULE_OK)
     }
 }
 
@@ -129,13 +113,8 @@ pub unsafe extern "C" fn ValkeyModule_ReplyWithMap(
     len: c_long,
 ) -> c_int {
     unsafe {
-        match get_reply_builder(ctx) {
-            Some(builder) => {
-                builder.add_map(len as i32);
-                VALKEYMODULE_OK
-            }
-            None => VALKEYMODULE_ERR,
-        }
+        with_reply_builder(ctx, |builder| builder.add_map(len as i32))
+            .map_or(VALKEYMODULE_ERR, |()| VALKEYMODULE_OK)
     }
 }
 
@@ -145,13 +124,8 @@ pub unsafe extern "C" fn ValkeyModule_ReplyWithSet(
     len: c_long,
 ) -> c_int {
     unsafe {
-        match get_reply_builder(ctx) {
-            Some(builder) => {
-                builder.add_set(len as i32);
-                VALKEYMODULE_OK
-            }
-            None => VALKEYMODULE_ERR,
-        }
+        with_reply_builder(ctx, |builder| builder.add_set(len as i32))
+            .map_or(VALKEYMODULE_ERR, |()| VALKEYMODULE_OK)
     }
 }
 
@@ -164,39 +138,24 @@ pub unsafe extern "C" fn ValkeyModule_ReplyWithAttribute(
         if ctx.is_null() || (*ctx).internal.is_null() || (*(*ctx).internal).resp_version != 3 {
             return VALKEYMODULE_ERR;
         }
-        match get_reply_builder(ctx) {
-            Some(builder) => {
-                builder.add_attribute(len as i32);
-                VALKEYMODULE_OK
-            }
-            None => VALKEYMODULE_ERR,
-        }
+        with_reply_builder(ctx, |builder| builder.add_attribute(len as i32))
+            .map_or(VALKEYMODULE_ERR, |()| VALKEYMODULE_OK)
     }
 }
 
 // SAFETY: Called by C module code; ctx is a valid ValkeyModuleCtx pointer
 pub unsafe extern "C" fn ValkeyModule_ReplyWithNullArray(ctx: *mut ValkeyModuleCtx) -> c_int {
     unsafe {
-        match get_reply_builder(ctx) {
-            Some(b) => {
-                b.add_null_array();
-                VALKEYMODULE_OK
-            }
-            None => VALKEYMODULE_ERR,
-        }
+        with_reply_builder(ctx, ReplyBuilder::add_null_array)
+            .map_or(VALKEYMODULE_ERR, |()| VALKEYMODULE_OK)
     }
 }
 
 // SAFETY: Called by C module code; ctx is a valid ValkeyModuleCtx pointer
 pub unsafe extern "C" fn ValkeyModule_ReplyWithEmptyArray(ctx: *mut ValkeyModuleCtx) -> c_int {
     unsafe {
-        match get_reply_builder(ctx) {
-            Some(b) => {
-                b.add_array(0);
-                VALKEYMODULE_OK
-            }
-            None => VALKEYMODULE_ERR,
-        }
+        with_reply_builder(ctx, |builder| builder.add_array(0))
+            .map_or(VALKEYMODULE_ERR, |()| VALKEYMODULE_OK)
     }
 }
 
@@ -209,10 +168,7 @@ pub unsafe extern "C" fn ValkeyModule_ReplySetArrayLength(
         if len < 0 {
             return VALKEYMODULE_ERR;
         }
-        let Some(builder) = get_reply_builder(ctx) else {
-            return VALKEYMODULE_ERR;
-        };
-        if builder.set_array_length(len as usize) {
+        if with_reply_builder(ctx, |builder| builder.set_array_length(len as usize)) == Some(true) {
             VALKEYMODULE_OK
         } else {
             VALKEYMODULE_ERR
@@ -227,61 +183,38 @@ pub unsafe extern "C" fn ValkeyModule_ReplyWithString(
 ) -> c_int {
     unsafe {
         if s.is_null() {
-            return match get_reply_builder(ctx) {
-                Some(b) => {
-                    b.add_null();
-                    VALKEYMODULE_OK
-                }
-                None => VALKEYMODULE_ERR,
-            };
+            return with_reply_builder(ctx, ReplyBuilder::add_null)
+                .map_or(VALKEYMODULE_ERR, |()| VALKEYMODULE_OK);
         }
         let data = (*s).as_bytes();
-        match get_reply_builder(ctx) {
-            Some(b) => {
-                b.add_bulk_string(Bytes::copy_from_slice(data));
-                VALKEYMODULE_OK
-            }
-            None => VALKEYMODULE_ERR,
-        }
+        with_reply_builder(ctx, |builder| {
+            builder.add_bulk_string(Bytes::copy_from_slice(data))
+        })
+        .map_or(VALKEYMODULE_ERR, |()| VALKEYMODULE_OK)
     }
 }
 
 // SAFETY: Called by C module code; ctx is a valid ValkeyModuleCtx pointer
 pub unsafe extern "C" fn ValkeyModule_ReplyWithEmptyString(ctx: *mut ValkeyModuleCtx) -> c_int {
     unsafe {
-        match get_reply_builder(ctx) {
-            Some(b) => {
-                b.add_bulk_string(Bytes::new());
-                VALKEYMODULE_OK
-            }
-            None => VALKEYMODULE_ERR,
-        }
+        with_reply_builder(ctx, |builder| builder.add_bulk_string(Bytes::new()))
+            .map_or(VALKEYMODULE_ERR, |()| VALKEYMODULE_OK)
     }
 }
 
 // SAFETY: Called by C module code; ctx is a valid ValkeyModuleCtx pointer
 pub unsafe extern "C" fn ValkeyModule_ReplyWithNull(ctx: *mut ValkeyModuleCtx) -> c_int {
     unsafe {
-        match get_reply_builder(ctx) {
-            Some(b) => {
-                b.add_null();
-                VALKEYMODULE_OK
-            }
-            None => VALKEYMODULE_ERR,
-        }
+        with_reply_builder(ctx, ReplyBuilder::add_null)
+            .map_or(VALKEYMODULE_ERR, |()| VALKEYMODULE_OK)
     }
 }
 
 // SAFETY: Called by C module code; ctx is a valid ValkeyModuleCtx pointer
 pub unsafe extern "C" fn ValkeyModule_ReplyWithBool(ctx: *mut ValkeyModuleCtx, b: c_int) -> c_int {
     unsafe {
-        match get_reply_builder(ctx) {
-            Some(builder) => {
-                builder.add_bool(b != 0);
-                VALKEYMODULE_OK
-            }
-            None => VALKEYMODULE_ERR,
-        }
+        with_reply_builder(ctx, |builder| builder.add_bool(b != 0))
+            .map_or(VALKEYMODULE_ERR, |()| VALKEYMODULE_OK)
     }
 }
 
@@ -291,13 +224,8 @@ pub unsafe extern "C" fn ValkeyModule_ReplyWithDouble(
     d: c_double,
 ) -> c_int {
     unsafe {
-        match get_reply_builder(ctx) {
-            Some(b) => {
-                b.add_double(d);
-                VALKEYMODULE_OK
-            }
-            None => VALKEYMODULE_ERR,
-        }
+        with_reply_builder(ctx, |builder| builder.add_double(d))
+            .map_or(VALKEYMODULE_ERR, |()| VALKEYMODULE_OK)
     }
 }
 
@@ -323,13 +251,8 @@ pub unsafe extern "C" fn ValkeyModule_ReplyWithBigNumber(
         } else {
             Bytes::copy_from_slice(std::slice::from_raw_parts(bignum.cast::<u8>(), len))
         };
-        match get_reply_builder(ctx) {
-            Some(builder) => {
-                builder.add_big_number(value);
-                VALKEYMODULE_OK
-            }
-            None => VALKEYMODULE_ERR,
-        }
+        with_reply_builder(ctx, |builder| builder.add_big_number(value))
+            .map_or(VALKEYMODULE_ERR, |()| VALKEYMODULE_OK)
     }
 }
 
@@ -346,13 +269,8 @@ pub unsafe extern "C" fn ValkeyModule_ReplyWithStringBuffer(
             let slice = std::slice::from_raw_parts(buf.cast::<u8>(), len);
             Bytes::copy_from_slice(slice)
         };
-        match get_reply_builder(ctx) {
-            Some(b) => {
-                b.add_bulk_string(data);
-                VALKEYMODULE_OK
-            }
-            None => VALKEYMODULE_ERR,
-        }
+        with_reply_builder(ctx, |builder| builder.add_bulk_string(data))
+            .map_or(VALKEYMODULE_ERR, |()| VALKEYMODULE_OK)
     }
 }
 
@@ -367,13 +285,8 @@ pub unsafe extern "C" fn ValkeyModule_ReplyWithCString(
         } else {
             Bytes::copy_from_slice(CStr::from_ptr(buf).to_bytes())
         };
-        match get_reply_builder(ctx) {
-            Some(b) => {
-                b.add_bulk_string(data);
-                VALKEYMODULE_OK
-            }
-            None => VALKEYMODULE_ERR,
-        }
+        with_reply_builder(ctx, |builder| builder.add_bulk_string(data))
+            .map_or(VALKEYMODULE_ERR, |()| VALKEYMODULE_OK)
     }
 }
 
@@ -389,12 +302,7 @@ pub unsafe extern "C" fn ValkeyModule_ReplyWithVerbatimString(
         } else {
             Bytes::copy_from_slice(std::slice::from_raw_parts(buf.cast::<u8>(), len))
         };
-        match get_reply_builder(ctx) {
-            Some(builder) => {
-                builder.add_verbatim(*b"txt", data);
-                VALKEYMODULE_OK
-            }
-            None => VALKEYMODULE_ERR,
-        }
+        with_reply_builder(ctx, |builder| builder.add_verbatim(*b"txt", data))
+            .map_or(VALKEYMODULE_ERR, |()| VALKEYMODULE_OK)
     }
 }

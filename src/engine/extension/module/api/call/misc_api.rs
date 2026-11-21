@@ -8,7 +8,12 @@ use crate::engine::extension::module::capability::record_module_latency;
 
 // SAFETY: This ABI entrypoint takes no pointers and reads no external state.
 pub unsafe extern "C" fn ValkeyModule_GetServerVersion() -> c_int {
-    0x0008_0000
+    crate::foundation::memory::util_version::VALKEY_VERSION_NUM
+}
+
+// SAFETY: this ABI entrypoint takes no pointers and reads only fixed header flags.
+pub unsafe extern "C" fn ValkeyModule_GetContextFlagsAll() -> c_int {
+    (1 << 27) - 1
 }
 
 /// ValkeyModule_RegisterInfoFunc — register a module INFO callback.

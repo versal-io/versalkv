@@ -42,9 +42,41 @@ pub(crate) unsafe extern "C" fn module_get_api_impl(
             return VALKEYMODULE_ERR;
         };
 
+        record_native_thread_api_export(api_name);
         *ptr = func_ptr;
         VALKEYMODULE_OK
     }
+}
+
+fn record_native_thread_api_export(api_name: &str) {
+    if !matches!(
+        api_name,
+        "ValkeyModule_GetThreadSafeContext" | "ValkeyModule_GetDetachedThreadSafeContext"
+    ) {
+        return;
+    }
+    let Some(module_ctx) = super::active_registry::active_module_context() else {
+        return;
+    };
+    // SAFETY: the active scope owns this context through synchronous API resolution.
+    // Pending OnLoad carries the loader's still-live reference before registration.
+    let mut handle = unsafe {
+        let Some(internal) = (*module_ctx).internal.as_ref() else {
+            return;
+        };
+        internal.native_library_handle
+    };
+    if handle.is_null() {
+        // SAFETY: the active context owns its module-name CString during resolution.
+        let name = unsafe { super::ctx::get_module_name(module_ctx) };
+        handle = super::active_registry::with_active_registry(|registry| {
+            registry
+                .lookup(&name)
+                .map_or(std::ptr::null_mut(), |module| module.handle)
+        })
+        .unwrap_or(std::ptr::null_mut());
+    }
+    super::super::native_library::record_thread_api_export(handle);
 }
 
 struct ModuleApiEntry {
@@ -64,6 +96,19 @@ macro_rules! module_api_entries {
 }
 
 module_api_entries! {
+        "ValkeyModule_BlockClient" => super::block::ValkeyModule_BlockClient as *mut c_void,
+        "ValkeyModule_UnblockClient" => super::block::ValkeyModule_UnblockClient as *mut c_void,
+        "ValkeyModule_SetDisconnectCallback" => super::block::ValkeyModule_SetDisconnectCallback as *mut c_void,
+        "ValkeyModule_GetBlockedClientPrivateData" => super::block::ValkeyModule_GetBlockedClientPrivateData as *mut c_void,
+        "ValkeyModule_BlockClientGetPrivateData" => super::block::ValkeyModule_BlockClientGetPrivateData as *mut c_void,
+        "ValkeyModule_BlockClientSetPrivateData" => super::block::ValkeyModule_BlockClientSetPrivateData as *mut c_void,
+        "ValkeyModule_IsBlockedReplyRequest" => super::block::ValkeyModule_IsBlockedReplyRequest as *mut c_void,
+        "ValkeyModule_IsBlockedTimeoutRequest" => super::block::ValkeyModule_IsBlockedTimeoutRequest as *mut c_void,
+        "ValkeyModule_BlockedClientDisconnected" => super::block::ValkeyModule_BlockedClientDisconnected as *mut c_void,
+        "ValkeyModule_GetThreadSafeContext" => super::thread_safe_context_api::ValkeyModule_GetThreadSafeContext as *mut c_void,
+        "ValkeyModule_ThreadSafeContextLock" => super::thread_safe_context_api::ValkeyModule_ThreadSafeContextLock as *mut c_void,
+        "ValkeyModule_ThreadSafeContextUnlock" => super::thread_safe_context_api::ValkeyModule_ThreadSafeContextUnlock as *mut c_void,
+        "ValkeyModule_ThreadSafeContextTryLock" => super::thread_safe_context_api::ValkeyModule_ThreadSafeContextTryLock as *mut c_void,
         "ValkeyModule_Alloc" => memory_api::ValkeyModule_Alloc as *mut c_void,
         "ValkeyModule_Calloc" => memory_api::ValkeyModule_Calloc as *mut c_void,
         "ValkeyModule_Realloc" => memory_api::ValkeyModule_Realloc as *mut c_void,
@@ -72,7 +117,7 @@ module_api_entries! {
         "ValkeyModule_IncrExternalMemory" => memory_api::ValkeyModule_IncrExternalMemory as *mut c_void,
         "ValkeyModule_DecrExternalMemory" => memory_api::ValkeyModule_DecrExternalMemory as *mut c_void,
         "ValkeyModule_TryAlloc" => memory_api::ValkeyModule_Alloc as *mut c_void,
-        "ValkeyModule_TryCalloc" => memory_api::ValkeyModule_Calloc as *mut c_void,
+        "ValkeyModule_TryCalloc" => memory_api::ValkeyModule_TryCalloc as *mut c_void,
         "ValkeyModule_TryRealloc" => memory_api::ValkeyModule_Realloc as *mut c_void,
         "ValkeyModule_FreeMemoryIfNeeded" => {
             memory_api::ValkeyModule_FreeMemoryIfNeeded as *mut c_void
@@ -87,6 +132,9 @@ module_api_entries! {
             super::cluster_slot_api::ValkeyModule_ClusterCanonicalKeyNameInSlot as *mut c_void
         },
         "ValkeyModule_CreateCommand" => ctx::ValkeyModule_CreateCommand as *mut c_void,
+        "ValkeyModule_IsKeysPositionRequest" => super::key_position::ValkeyModule_IsKeysPositionRequest as *mut c_void,
+        "ValkeyModule_KeyAtPos" => super::key_position::ValkeyModule_KeyAtPos as *mut c_void,
+        "ValkeyModule_KeyAtPosWithFlags" => super::key_position::ValkeyModule_KeyAtPosWithFlags as *mut c_void,
         "ValkeyModule_SetModuleOptions" => ctx::ValkeyModule_SetModuleOptions as *mut c_void,
         "ValkeyModule_GetCommand" => ctx::ValkeyModule_GetCommand as *mut c_void,
         "ValkeyModule_CreateSubcommand" => ctx::ValkeyModule_CreateSubcommand as *mut c_void,
@@ -193,6 +241,7 @@ module_api_entries! {
         "ValkeyModule_StringToLongDouble" => VM_StringToLongDouble as *mut c_void,
         "ValkeyModule_StringAppendBuffer" => call::ValkeyModule_StringAppendBuffer as *mut c_void,
         "ValkeyModule_RetainString" => call::ValkeyModule_RetainString as *mut c_void,
+        "ValkeyModule_HoldString" => call::ValkeyModule_HoldString as *mut c_void,
         "ValkeyModule_StringSet" => call::ValkeyModule_StringSet as *mut c_void,
         "ValkeyModule_StringDMA" => call::ValkeyModule_StringDMA as *mut c_void,
         "ValkeyModule_StringTruncate" => call::ValkeyModule_StringTruncate as *mut c_void,
@@ -244,6 +293,9 @@ module_api_entries! {
             call::ValkeyModule_SetContextProtectedMode as *mut c_void
         },
         "ValkeyModule_NotifyKeyspaceEvent" => call::ValkeyModule_NotifyKeyspaceEvent as *mut c_void,
+        "ValkeyModule_AddPostNotificationJob" => {
+            super::notifications::ValkeyModule_AddPostNotificationJob as *mut c_void
+        },
         "ValkeyModule_Log" => VM_Log as *mut c_void,
         "ValkeyModule_WrongArity" => call::ValkeyModule_WrongArity as *mut c_void,
         "ValkeyModule_GetSelectedDb" => call::ValkeyModule_GetSelectedDb as *mut c_void,
@@ -350,6 +402,7 @@ module_api_entries! {
         "ValkeyModule_StreamTrimByLength" => stream::ValkeyModule_StreamTrimByLength as *mut c_void,
         "ValkeyModule_StreamTrimByID" => stream::ValkeyModule_StreamTrimByID as *mut c_void,
         "ValkeyModule_GetServerVersion" => call::ValkeyModule_GetServerVersion as *mut c_void,
+        "ValkeyModule_GetContextFlagsAll" => call::ValkeyModule_GetContextFlagsAll as *mut c_void,
         "ValkeyModule_RegisterInfoFunc" => call::ValkeyModule_RegisterInfoFunc as *mut c_void,
         "ValkeyModule_GetServerInfo" => call::ValkeyModule_GetServerInfo as *mut c_void,
         "ValkeyModule_FreeServerInfo" => call::ValkeyModule_FreeServerInfo as *mut c_void,
@@ -537,8 +590,12 @@ mod tests {
 
     #[test]
     fn detached_thread_safe_context_preserves_module_identity_and_frees_independently() {
+        use super::{module_get_api_impl, VALKEYMODULE_ERR, VALKEYMODULE_OK};
         use crate::engine::extension::module::api::ctx::ValkeyModule_SetModuleOptions;
+        use crate::engine::extension::module::api::thread_safe_context_api;
+        use crate::engine::extension::module::thread_bridge::ModuleThreadBridgeHandle;
         use crate::engine::extension::module::{ModuleRef, ModuleRegistry};
+        use libc::c_void;
 
         // SAFETY: These function types model module ABI entries that accept raw
         // contexts; callers must pass contexts allocated by this module runtime.
@@ -550,10 +607,14 @@ mod tests {
             .register(ModuleRef::new("misc", std::ptr::null_mut(), 1, true))
             .unwrap();
         let module = registry.lookup("misc").unwrap();
+        let identity = module.identity.clone().unwrap();
+        let bridge = ModuleThreadBridgeHandle::new().unwrap();
         let module_ref = (module as *const ModuleRef).cast_mut().cast();
         let mut internal =
             create_module_cmd_ctx("misc", "test.log_tsctx", module_ref, std::ptr::null_mut());
         internal.module_options = Some(module.options.clone());
+        internal.module_identity = Some(identity.clone());
+        internal.thread_bridge = Some(bridge.clone());
         let original = Box::into_raw(create_module_ctx(Box::into_raw(internal)));
         let get_detached = resolve_module_api("ValkeyModule_GetDetachedThreadSafeContext")
             .expect("detached context API must resolve");
@@ -570,12 +631,67 @@ mod tests {
         // SAFETY: detached and original are live contexts returned by the module API.
         unsafe {
             assert_ne!((*detached).internal, (*original).internal);
-            assert_eq!((*(*detached).internal).module_ref, module_ref);
+            assert!((*(*detached).internal).module_ref.is_null());
+            assert!(std::sync::Arc::ptr_eq(
+                (*(*detached).internal).module_identity.as_ref().unwrap(),
+                &identity
+            ));
             assert!((*(*detached).internal).runtime_handle.is_null());
             assert_eq!((*(*original).internal).module_ref, module_ref);
             assert_eq!(CStr::from_ptr(VM_ModuleName(detached)).to_bytes(), b"misc");
-            assert!(resolve_module_api("ValkeyModule_ThreadSafeContextLock").is_none());
-            assert!(resolve_module_api("ValkeyModule_ThreadSafeContextUnlock").is_none());
+            for (name, expected) in [
+                (
+                    "ValkeyModule_ThreadSafeContextLock",
+                    thread_safe_context_api::ValkeyModule_ThreadSafeContextLock as *mut c_void,
+                ),
+                (
+                    "ValkeyModule_ThreadSafeContextUnlock",
+                    thread_safe_context_api::ValkeyModule_ThreadSafeContextUnlock as *mut c_void,
+                ),
+                (
+                    "ValkeyModule_ThreadSafeContextTryLock",
+                    thread_safe_context_api::ValkeyModule_ThreadSafeContextTryLock as *mut c_void,
+                ),
+            ] {
+                let mut resolved = std::ptr::null_mut();
+                let name = std::ffi::CString::new(name).unwrap();
+                assert_eq!(
+                    module_get_api_impl(name.as_ptr(), &mut resolved),
+                    VALKEYMODULE_OK
+                );
+                assert_eq!(resolved, expected);
+            }
+            assert_eq!(
+                thread_safe_context_api::ValkeyModule_ThreadSafeContextTryLock(detached),
+                VALKEYMODULE_ERR
+            );
+            assert_eq!(crate::foundation::io::sys::os::errno(), libc::EBUSY);
+            assert!(bridge.prepare_sleep());
+            (*(*detached).internal)
+                .thread_context
+                .as_mut()
+                .unwrap()
+                .cancelled_errno = libc::EAGAIN;
+            assert_eq!(
+                thread_safe_context_api::ValkeyModule_ThreadSafeContextTryLock(detached),
+                VALKEYMODULE_OK
+            );
+            let lease = (*(*detached).internal)
+                .thread_context
+                .as_ref()
+                .unwrap()
+                .lease()
+                .unwrap();
+            assert_eq!(
+                (*(*detached).internal)
+                    .thread_context
+                    .as_ref()
+                    .unwrap()
+                    .cancelled_errno,
+                0
+            );
+            assert!(!bridge.resume_main());
+            assert_eq!(bridge.take_lease(), Some(lease));
             ValkeyModule_SetModuleOptions(detached, 3);
             assert_eq!(registry.lookup("misc").unwrap().options.get(), 3);
             ValkeyModule_SetModuleOptions(original, 4);
@@ -590,6 +706,13 @@ mod tests {
 
             let free_detached: FreeDetached = std::mem::transmute(free_detached);
             free_detached(detached);
+            assert_eq!(
+                identity.contexts.load(std::sync::atomic::Ordering::Acquire),
+                0
+            );
+            assert!(bridge.has_active_thread_work());
+            bridge.finish_lease(lease);
+            bridge.close();
             assert_eq!((*(*original).internal).module_ref, module_ref);
             free_module_ctx(original);
         }

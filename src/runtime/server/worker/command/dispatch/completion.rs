@@ -271,7 +271,26 @@ impl ServerWorkerState {
                 stat.usec = stat.usec.saturating_sub(duration_us);
             }
         }
+        self.commit_native_module_initial_effects(connection_token, Some(effects));
         self.commit_blocked_stream_read_effects(connection_token, None, None, Some(effects));
+        if !was_blocked_before {
+            if let Some(crate::engine::command::context::BlockedState {
+                cmd: BlockedCmd::Module { id },
+                ..
+            }) = self.connection_registry
+                [crate::framework::capabilities::io::Token(connection_token)]
+            .blocked
+            .as_ref()
+            {
+                if let Some(record) = self.ctx.module_registry_mut().native_blocks.get_mut(id) {
+                    record.active_time_usec = duration_us;
+                    crate::engine::extension::module::thread_bridge::lock(
+                        &record.shared.lifecycle,
+                    )
+                    .stage = crate::engine::extension::module::blocking::ModuleBlockStage::Armed;
+                }
+            }
+        }
         let request_wait_ack = self.register_blocked_command(connection_token);
         let monitor = (!was_blocked_before).then(|| {
             let connection = &self.connection_registry
@@ -322,6 +341,10 @@ impl ServerWorkerState {
                 self.ctx
                     .blocking_registry_mut()
                     .register_keyless_client(connection.session_id());
+                false
+            }
+            BlockedCmd::Module { .. } => {
+                self.ctx.blocking_registry_mut().register_keyless_client(connection.session_id());
                 false
             }
             BlockedCmd::Paused

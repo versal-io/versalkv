@@ -435,22 +435,12 @@ impl ServerWorkerState {
         args: &CommandArgs,
         key_targets: &[(u32, Vec<u8>)],
     ) -> bool {
-        key_targets.is_empty()
-            || (meta.flags & crate::engine::command::CMD_TOUCHES_ARBITRARY_KEYS) != 0
-            || [
-                b"eval".as_slice(),
-                b"evalsha".as_slice(),
-                b"fcall".as_slice(),
-            ]
-            .iter()
-            .any(|name| args.name.eq_ignore_ascii_case(name))
-            || key_targets.iter().any(|(db_id, key)| {
-                !self
-                    .ctx
-                    .blocking_registry()
-                    .waiters_for_key(*db_id, key)
-                    .is_empty()
-            })
+        crate::framework::capabilities::module_call_snapshot::forkless_command_needs_full_capture(
+            &self.ctx,
+            meta.flags,
+            args,
+            key_targets,
+        )
     }
 
     pub(crate) fn forkless_selected_db(&self, args: &CommandArgs, selected_db: u32) -> u32 {
@@ -570,11 +560,10 @@ impl ServerWorkerState {
         {
             return None;
         }
-        let is_capture_control = args.name.eq_ignore_ascii_case(b"bgsave")
-            || args.name.eq_ignore_ascii_case(b"save")
-            || args.name.eq_ignore_ascii_case(b"flushdb")
-            || args.name.eq_ignore_ascii_case(b"flushall")
-            || args.name.eq_ignore_ascii_case(b"shutdown");
+        let is_capture_control =
+            crate::framework::capabilities::module_call_snapshot::is_forkless_capture_control(
+                &args.name,
+            );
         if let Some(outcome) = self.evaluate_forkless_capture_barrier(
             meta,
             args,

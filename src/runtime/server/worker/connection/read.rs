@@ -485,6 +485,11 @@ impl ServerWorkerState {
             .saturating_add(prefetched_entries);
     }
 
+    #[cfg(test)]
+    pub(crate) fn take_prefetch_snapshot_copy_bytes_for_test() -> usize {
+        PREFETCH_SNAPSHOT_COPY_BYTES.with(|bytes| bytes.replace(0))
+    }
+
     fn preview_prefetch_commands(
         &self,
         connection_token: usize,
@@ -492,10 +497,22 @@ impl ServerWorkerState {
     ) -> Option<(u32, Vec<CommandArgs>)> {
         let conn =
             &self.connection_registry[crate::framework::capabilities::io::Token(connection_token)];
-        if !conn.authenticated || configured < 2 || !conn.parser.has_pending_data() {
+        if !conn.authenticated
+            || configured < 2
+            || !conn.parser.has_pending_data()
+            || conn.parser.has_incomplete_bulk_payload()
+        {
             return None;
         }
         let dbid = conn.selected_db;
+        #[cfg(test)]
+        PREFETCH_SNAPSHOT_COPY_BYTES.with(|bytes| {
+            bytes.set(
+                bytes
+                    .get()
+                    .saturating_add(conn.parser.snapshot_copy_bytes_for_test()),
+            );
+        });
         let mut preview = conn.parser.clone();
         let mut commands = Vec::with_capacity(configured);
         for _ in 0..configured {
@@ -834,6 +851,12 @@ impl ServerWorkerState {
 }
 
 #[cfg(test)]
+thread_local! {
+    static PREFETCH_SNAPSHOT_COPY_BYTES: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
 mod tests {
     use super::{read_stream_bounded, ClientReadMode, ServerWorkerState};
     use crate::foundation::io::transport::ReadOutcome;
@@ -858,6 +881,96 @@ mod tests {
         connection.set_token_for_test(Token(0));
         let connection_token = runtime.connection_registry.insert(connection);
         (runtime, Token(connection_token))
+    }
+
+    #[test]
+    fn large_frame_tcp_prefetch_preserves_parser_with_linear_snapshot_cost() {
+        use std::io::Write;
+        use std::net::TcpStream;
+        use std::time::Duration;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut writer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut reader, _) = listener.accept().unwrap();
+        writer.set_nodelay(true).unwrap();
+        writer
+            .set_write_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        reader
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let (mut runtime, token) = runtime_with_fake_client();
+        runtime.connection_registry[token].authenticated = true;
+        let payload: Vec<_> = (0..20 * 1024 * 1024)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        let mut frame = format!(
+            "*3\r\n$7\r\nPUBLISH\r\n$7\r\nchannel\r\n${}\r\n",
+            payload.len()
+        )
+        .into_bytes();
+        frame.extend_from_slice(&payload);
+        frame.extend_from_slice(b"\r\n");
+        ServerWorkerState::take_prefetch_snapshot_copy_bytes_for_test();
+        let mut copied_bytes = 0usize;
+        let mut received_bytes = 0usize;
+        let mut scratch = vec![0; 64 * 1024];
+        for chunk in frame.chunks(scratch.len()) {
+            writer.write_all(chunk).unwrap();
+            let (received, outcome) = read_stream_bounded(&mut reader, &mut scratch, chunk.len());
+            assert!(matches!(outcome, ReadOutcome::BudgetExhausted));
+            assert_eq!(received.as_slice(), chunk);
+            received_bytes += received.len();
+            runtime.connection_registry[token].parser.feed(&received);
+            let parser = &runtime.connection_registry[token].parser;
+            let pending_len = parser.pending_len();
+            let undecoded_len = parser.undecoded_len();
+            let last_cmd_len = parser.last_cmd_len();
+            let preview = runtime.preview_prefetch_commands(token.0, 2);
+            copied_bytes += ServerWorkerState::take_prefetch_snapshot_copy_bytes_for_test();
+            assert_eq!(
+                ServerWorkerState::take_prefetch_snapshot_copy_bytes_for_test(),
+                0
+            );
+            let parser = &mut runtime.connection_registry[token].parser;
+            assert_eq!(parser.pending_len(), pending_len);
+            assert_eq!(parser.undecoded_len(), undecoded_len);
+            assert_eq!(parser.last_cmd_len(), last_cmd_len);
+            if received_bytes < frame.len() {
+                assert!(preview.is_none());
+                assert_eq!(parser.try_parse_limited(0, 0).unwrap(), None);
+            } else {
+                let (dbid, commands) = preview.expect("preview the completed request");
+                assert_eq!(dbid, 0);
+                assert_eq!(commands.len(), 1);
+                assert_eq!(commands[0].name.as_ref(), b"PUBLISH");
+                assert_eq!(commands[0].args[0].as_ref(), b"channel");
+                assert!(
+                    commands[0].args[1].as_ref() == payload.as_slice(),
+                    "preview must retain the complete binary payload"
+                );
+                let parts = parser.try_parse_limited(0, 0).unwrap().unwrap();
+                assert_eq!(parts.len(), 3);
+                assert_eq!(parts[0].as_ref(), b"PUBLISH");
+                assert_eq!(parts[1].as_ref(), b"channel");
+                assert!(
+                    parts[2].as_ref() == payload.as_slice(),
+                    "the live parser must retain the complete binary payload"
+                );
+                assert_eq!(parser.last_cmd_len(), frame.len());
+                assert_eq!(parser.try_parse_limited(0, 0).unwrap(), None);
+            }
+        }
+        assert_eq!(received_bytes, frame.len());
+        eprintln!(
+            "client request_bytes={} snapshot_copy_bytes={copied_bytes}",
+            frame.len()
+        );
+        assert!(
+            copied_bytes <= 2 * frame.len(),
+            "prefetch snapshot copied {copied_bytes} bytes for a {}-byte request",
+            frame.len()
+        );
     }
 
     #[test]

@@ -262,6 +262,10 @@ impl ServerWorkerState {
             SourceOwner::IoWorkerWake => {
                 self.dispatch_control_now(super::ControlEvent::IoWorkerWake);
             }
+            SourceOwner::ModuleThreadWake => {
+                self.close_module_thread_bridge();
+                self.ctx.set_shutdown_requested(true);
+            }
             SourceOwner::InternalPipe(_) => self.retire_failed_internal_source(token, "readiness"),
             // Later tasks install these source classes together with their
             // concrete teardown state machines.
@@ -1004,6 +1008,7 @@ impl ServerWorkerState {
         {
             Some(
                 SourceOwner::IoWorkerWake
+                | SourceOwner::ModuleThreadWake
                 | SourceOwner::ControlWake
                 | SourceOwner::ChildSignal(_)
                 | SourceOwner::ClusterBus,
@@ -1036,6 +1041,9 @@ impl ServerWorkerState {
                 self.dispatch_control_now(super::ControlEvent::IoWorkerWake);
                 TransportEventDispatchOutcome::handled()
             }
+            // The transport drained this waker. Nested dispatch must never
+            // grant a lease while its outer synchronous invocation is live.
+            SourceOwner::ModuleThreadWake => TransportEventDispatchOutcome::handled(),
             SourceOwner::Listener => self.dispatch_listener_readiness(ready),
             SourceOwner::Connection => {
                 self.dispatch_connection_readiness(ready.token, ready, flush_after_readable)
@@ -1359,7 +1367,10 @@ impl ServerWorkerState {
         let owner_closed =
             self.is_pending_transport_removal(token) || !self.transport.is_registered(token);
         let outcome = match owner {
-            SourceOwner::IoWorkerWake | SourceOwner::ControlWake | SourceOwner::ChildSignal(_)
+            SourceOwner::IoWorkerWake
+            | SourceOwner::ModuleThreadWake
+            | SourceOwner::ControlWake
+            | SourceOwner::ChildSignal(_)
                 if owner_closed =>
             {
                 DispatchOutcome::Handled

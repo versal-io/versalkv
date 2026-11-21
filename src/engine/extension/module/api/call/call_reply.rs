@@ -349,6 +349,7 @@ impl ValkeyModuleCallReply {
         }
     }
 
+    #[cfg(test)]
     pub fn from_value(value: &Value, exact: bool) -> Box<Self> {
         Self::from_value_with_resp(value, exact, false)
     }

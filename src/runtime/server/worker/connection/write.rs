@@ -1141,6 +1141,14 @@ impl ServerWorkerState {
     }
 
     pub(crate) fn flush_aof_if_needed(&mut self) {
+        let _ = self.flush_aof(AofFlushMode::Ordinary);
+    }
+
+    pub(crate) fn flush_native_module_aof_barrier(&mut self) -> AofBarrierOutcome {
+        self.flush_aof(AofFlushMode::NativeModuleBarrier)
+    }
+
+    fn flush_aof(&mut self, mode: AofFlushMode) -> AofBarrierOutcome {
         #[cfg(test)]
         if self.ctx.config().persistence.aof_enabled {
             self.trace_turn_for_test(
@@ -1155,20 +1163,37 @@ impl ServerWorkerState {
                 crate::server_log!(notice, "AOF turned off");
             }
             self.ctx.persistence_mut().reset_aof_selected_db();
-            self.reject_blocked_waitaof_local_if_aof_disabled();
-            return;
+            if mode == AofFlushMode::Ordinary {
+                self.reject_blocked_waitaof_local_if_aof_disabled();
+            }
+            return AofBarrierOutcome::Ready;
         }
 
         if self.ctx.aof_mut().journal.is_none() {
+            if mode == AofFlushMode::NativeModuleBarrier {
+                // Initial rewrite completion owns journal creation. Release is
+                // not a durability acknowledgement and must not wait for reap.
+                return if !self.ctx.is_loading()
+                    && self.ctx.aof().aof_wait_rewrite
+                    && (self.ctx.persistence().aof_rewrite_child_pid().is_some()
+                        || self.ctx.persistence().aof_rewrite_scheduled())
+                {
+                    AofBarrierOutcome::PendingInitialRewrite
+                } else {
+                    // A new empty journal cannot recover effects already fed
+                    // without a known initial snapshot or incremental sink.
+                    AofBarrierOutcome::Failed
+                };
+            }
             if self.ctx.persistence().aof_rewrite_child_pid().is_some()
                 || self.ctx.persistence().aof_rewrite_scheduled()
                 || self.ctx.is_loading()
             {
-                return;
+                return AofBarrierOutcome::Ready;
             }
             let options =
                 crate::engine::persistence::AofOptions::from_config(&self.ctx.config().persistence);
-            let mode = if self.ctx.aof_mut().started_this_session {
+            let open_mode = if self.ctx.aof_mut().started_this_session {
                 crate::foundation::io::persistence::AofOpenMode::AppendExisting
             } else {
                 crate::foundation::io::persistence::AofOpenMode::CreateNew
@@ -1177,14 +1202,21 @@ impl ServerWorkerState {
                 options.dir.to_string_lossy().as_ref(),
                 &options.filename,
                 &options.appenddirname,
-                mode,
+                open_mode,
                 options.fsync,
             ) {
                 Ok(mut appender) => {
                     self.ctx
                         .persistence_mut()
                         .record_aof_size(appender.current_size());
-                    let _ = appender.force_fsync();
+                    if let Err(error) = appender.force_fsync() {
+                        if mode == AofFlushMode::NativeModuleBarrier {
+                            self.ctx.aof_mut().last_write_status =
+                                crate::engine::persistence::OperationStatus::Err;
+                            crate::server_log!(warning, "AOF initial fsync failed: {}", error);
+                            return AofBarrierOutcome::Failed;
+                        }
+                    }
                     self.ctx.aof_mut().last_fsync_sec =
                         (crate::foundation::io::store::kv_engine::now_ms() / 1000) as i64;
                     self.ctx.aof_mut().last_write_status =
@@ -1198,9 +1230,13 @@ impl ServerWorkerState {
                 }
                 Err(e) => {
                     crate::server_log!(warning, "Can't open AOF for append: {}", e);
-                    self.ctx.config_mut().persistence.aof_enabled = false;
+                    self.ctx.aof_mut().last_write_status =
+                        crate::engine::persistence::OperationStatus::Err;
+                    if mode == AofFlushMode::Ordinary {
+                        self.ctx.config_mut().persistence.aof_enabled = false;
+                    }
                     self.ctx.persistence_mut().reset_aof_selected_db();
-                    return;
+                    return AofBarrierOutcome::Failed;
                 }
             }
         }
@@ -1218,13 +1254,18 @@ impl ServerWorkerState {
         };
         let aof = match self.ctx.aof_mut().journal.as_mut() {
             Some(a) => a,
-            None => return,
+            None => return AofBarrierOutcome::Failed,
         };
         // Keep the appender on the live configured mode except while the C
         // no-appendfsync-on-rewrite gate is active.
         if aof.appender.fsync_mode() != effective_fsync {
             if let Err(e) = aof.appender.set_fsync_mode(effective_fsync) {
                 crate::server_log!(warning, "AOF fsync mode switch failed: {}", e);
+                if mode == AofFlushMode::NativeModuleBarrier {
+                    self.ctx.aof_mut().last_write_status =
+                        crate::engine::persistence::OperationStatus::Err;
+                    return AofBarrierOutcome::Failed;
+                }
             }
         }
         let fsync_mode = aof.appender.fsync_mode();
@@ -1275,7 +1316,10 @@ impl ServerWorkerState {
                     crate::foundation::io::persistence::AofFsync::No => {}
                 }
                 self.ctx.aof_mut().advance_fsynced_from_pending();
-                self.check_wait_replica_wakeups();
+                if mode == AofFlushMode::Ordinary {
+                    self.check_wait_replica_wakeups();
+                }
+                AofBarrierOutcome::Ready
             }
             Err(e) => {
                 self.ctx.aof_mut().last_write_status =
@@ -1288,6 +1332,20 @@ impl ServerWorkerState {
                         .replication
                         .replica_ignore_disk_write_errors,
                 );
+                if mode == AofFlushMode::NativeModuleBarrier {
+                    // Suppressing fsync during rewrite does not relax the
+                    // configured always policy for an actual write failure.
+                    return if configured_fsync
+                        == crate::foundation::io::persistence::AofFsync::Always
+                        || replica_action == ReplicaDiskWriteErrorAction::Fatal
+                    {
+                        AofBarrierOutcome::Failed
+                    } else {
+                        // The appender retains failed writes for a later flush;
+                        // ordinary completion does not acknowledge an fsync.
+                        AofBarrierOutcome::RetryPending
+                    };
+                }
                 if replica_action == ReplicaDiskWriteErrorAction::Fatal {
                     panic!("Replica was unable to write command to disk.");
                 }
@@ -1300,9 +1358,24 @@ impl ServerWorkerState {
                     );
                     std::process::exit(1);
                 }
+                AofBarrierOutcome::Failed
             }
         }
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AofFlushMode {
+    Ordinary,
+    NativeModuleBarrier,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AofBarrierOutcome {
+    Ready,
+    PendingInitialRewrite,
+    RetryPending,
+    Failed,
 }
 
 #[cfg(test)]

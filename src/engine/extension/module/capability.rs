@@ -7,6 +7,50 @@ use libc::c_void;
 use std::cell::Cell;
 use std::net::SocketAddr;
 
+#[derive(Clone, Copy)]
+pub(crate) struct ModuleCommandConnPtr(pub(crate) *mut dyn CommandConn);
+
+thread_local! {
+    pub(crate) static MODULE_COMMAND_CONN: Cell<Option<ModuleCommandConnPtr>> =
+        const { Cell::new(None) };
+}
+
+pub(crate) struct ModuleCommandConnScope {
+    previous: Option<ModuleCommandConnPtr>,
+}
+
+pub(crate) fn with_current_module_conn<R>(
+    callback: impl FnOnce(&mut dyn CommandConn) -> R,
+) -> Option<R> {
+    let conn = MODULE_COMMAND_CONN.with(Cell::get)?;
+    // SAFETY: the synchronous scope retains this connection until callback returns.
+    Some(unsafe { callback(&mut *conn.0) })
+}
+
+impl ModuleCommandConnScope {
+    pub(crate) fn suspend() -> Self {
+        Self {
+            previous: MODULE_COMMAND_CONN.with(|slot| slot.replace(None)),
+        }
+    }
+
+    pub(crate) fn enter(conn: &mut dyn CommandConn) -> Self {
+        // SAFETY: this scope restores the pointer before the borrowed connection is released.
+        let conn =
+            unsafe { std::mem::transmute::<&mut dyn CommandConn, *mut dyn CommandConn>(conn) };
+        Self {
+            previous: MODULE_COMMAND_CONN
+                .with(|slot| slot.replace(Some(ModuleCommandConnPtr(conn)))),
+        }
+    }
+}
+
+impl Drop for ModuleCommandConnScope {
+    fn drop(&mut self) {
+        MODULE_COMMAND_CONN.with(|slot| slot.set(self.previous));
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModuleClientInfo {
     pub id: u64,
@@ -39,10 +83,27 @@ pub struct ModuleKeyScan {
 }
 
 pub trait ModuleRuntime {
+    fn module_thread_bridge(&self) -> Option<super::thread_bridge::ModuleThreadBridgeHandle> {
+        None
+    }
+    fn block_module_client(
+        &mut self,
+        _module: std::sync::Arc<super::thread_bridge::ModuleIdentity>,
+        _origin: super::thread_bridge::ModuleBlockOrigin,
+        _callbacks: super::blocking::ModuleBlockCallbacks,
+        _timeout_ms: i64,
+    ) -> Result<std::sync::Arc<super::blocking::ModuleBlockedShared>, libc::c_int> {
+        Err(libc::ENOTSUP)
+    }
     fn apply_module_call_effects(
         &mut self,
         _effects: super::api::call::pending::ModuleCallEffects,
     ) {
+    }
+    fn take_module_call_expiration_effects(
+        &mut self,
+    ) -> super::api::call::pending::ModuleCallEffects {
+        Default::default()
     }
     fn module_server_info(&mut self, _section: Option<&str>) -> String {
         String::new()
@@ -74,6 +135,14 @@ pub trait ModuleRuntime {
     ) -> bool {
         false
     }
+    fn prepare_module_call_snapshot(
+        &mut self,
+        command: &CommandDescriptor,
+        args: &CommandArgs,
+        db_idx: u32,
+    ) -> bool {
+        !self.command_would_block(command, args, db_idx)
+    }
     fn effective_command_flags(
         &self,
         command: &CommandDescriptor,
@@ -85,6 +154,9 @@ pub trait ModuleRuntime {
         true
     }
     fn is_readonly_replica(&self) -> bool {
+        false
+    }
+    fn is_loading(&self) -> bool {
         false
     }
     fn is_stale_replica(&self) -> bool {
@@ -107,9 +179,6 @@ pub trait ModuleRuntime {
         None
     }
     fn remember_module_tracked_key(&mut self, _client_id: usize, _key: &[u8]) {}
-    fn reply_module_raw(&mut self, _reply: Vec<u8>) -> bool {
-        false
-    }
     fn list_max_listpack_size(&self) -> i64;
     fn lookup_command(&self, name: &[u8]) -> Option<CommandDescriptor>;
     fn command_acl_categories(
@@ -151,7 +220,16 @@ pub trait ModuleRuntime {
         message: bytes::Bytes,
         is_shard: bool,
     ) -> Option<usize>;
+    fn publish_module_keyspace_event(
+        &mut self,
+        _event: &super::notifications::ModuleKeyspaceEvent,
+    ) {
+    }
     fn propagate_module_command(&mut self, frame: Vec<u8>) -> bool;
+    /// Capture the context DB when explicit replication is requested.
+    fn propagate_module_command_in_db(&mut self, _db_idx: u32, frame: Vec<u8>) -> bool {
+        self.propagate_module_command(frame)
+    }
     fn authenticate_client(
         &mut self,
         _username: &str,
@@ -312,6 +390,12 @@ pub struct ActiveModuleRuntimeScope {
 }
 
 impl ActiveModuleRuntimeScope {
+    pub(crate) fn suspend() -> Self {
+        Self {
+            previous: ACTIVE_MODULE_RUNTIME.with(|active| active.replace(std::ptr::null_mut())),
+        }
+    }
+
     pub fn enter(handle: *mut ModuleRuntimeHandle) -> Option<Self> {
         if handle.is_null() {
             return None;

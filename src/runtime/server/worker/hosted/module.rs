@@ -7,6 +7,9 @@ use bytes::Bytes;
 
 impl ServerWorkerState {
     pub(crate) fn apply_pending_module_effects(&mut self) {
+        if self.command_execution_depth != 0 {
+            return;
+        }
         let pending = std::mem::take(&mut self.ctx.module_registry_mut().pending_effects);
         let monitor_events = std::mem::take(&mut self.ctx.script_mut().pending_internal_monitor);
         if pending.is_empty() {

@@ -1,3 +1,6 @@
+use std::io::Read;
+use std::time::Duration;
+
 use crate::engine::distributed::sentinel::failover::{
     advance_failover, find_misconfigured_replica, promotion_sent, start_failover, FailoverAction,
 };
@@ -8,6 +11,7 @@ use crate::engine::distributed::sentinel::{
 };
 use crate::framework::commands::sentinel::admin_cmds::flushconfig_internal;
 use crate::framework::context::ServerContext;
+use crate::framework::distributed::sentinel::link::RespFrame;
 
 use super::super::transport::{
     authenticate_stream, connect_command_stream, read_ok, sentinel_kill_clients, write_command,
@@ -379,6 +383,9 @@ fn send_failover_to(
         .ok_or_else(|| format!("Invalid target addr '{}'", target_addr))?;
     let target_port = target.port.to_string();
     let timeout = timeout_ms.to_string();
+    stream
+        .set_read_timeout(Some(Duration::from_millis(timeout_ms.max(1) as u64)))
+        .map_err(|error| format!("set transaction read timeout failed: {error}"))?;
     write_command(&mut stream, &["MULTI"])?;
     write_command(&mut stream, &["CLIENT", "PAUSE", timeout.as_str(), "WRITE"])?;
     write_command(
@@ -393,7 +400,44 @@ fn send_failover_to(
         ],
     )?;
     write_command(&mut stream, &["EXEC"])?;
-    read_ok(&mut stream)
+    std::thread::Builder::new()
+        .name("sentinel-failover-replies".to_string())
+        .spawn(move || {
+            let _ = drain_failover_transaction_replies(&mut stream);
+        })
+        .map_err(|error| format!("spawn transaction reply drain failed: {error}"))?;
+    Ok(())
+}
+
+fn drain_failover_transaction_replies(stream: &mut std::net::TcpStream) -> Result<(), String> {
+    let mut input = Vec::new();
+    for _ in 0..4 {
+        let _ = read_resp_frame(stream, &mut input)?;
+    }
+    Ok(())
+}
+
+fn read_resp_frame(
+    stream: &mut std::net::TcpStream,
+    input: &mut Vec<u8>,
+) -> Result<RespFrame, String> {
+    const MAX_TRANSACTION_REPLY_BYTES: usize = 64 * 1024;
+    loop {
+        if let Some(frame) = RespFrame::take(input) {
+            return Ok(frame);
+        }
+        if input.len() >= MAX_TRANSACTION_REPLY_BYTES {
+            return Err("transaction response exceeds maximum length".to_string());
+        }
+        let mut bytes = [0_u8; 1024];
+        let received = stream
+            .read(&mut bytes)
+            .map_err(|error| format!("transaction read failed: {error}"))?;
+        if received == 0 {
+            return Err("transaction response closed before completion".to_string());
+        }
+        input.extend_from_slice(&bytes[..received]);
+    }
 }
 
 #[cfg(test)]
@@ -427,7 +471,7 @@ mod tests {
                         .is_some_and(|name| name.eq_ignore_ascii_case(b"EXEC"))
                     {
                         stream
-                            .write_all(b"+OK\r\n")
+                            .write_all(b"+OK\r\n+QUEUED\r\n+QUEUED\r\n*2\r\n+OK\r\n+OK\r\n")
                             .expect("reply to complete pipeline");
                         return request;
                     }
@@ -478,8 +522,14 @@ mod tests {
                                     is_transaction = true;
                                 }
                                 if !is_transaction || name.eq_ignore_ascii_case(b"EXEC") {
+                                    let response = if is_transaction {
+                                        b"+OK\r\n+QUEUED\r\n+QUEUED\r\n*2\r\n+OK\r\n+OK\r\n"
+                                            .as_slice()
+                                    } else {
+                                        b"+OK\r\n".as_slice()
+                                    };
                                     stream
-                                        .write_all(b"+OK\r\n")
+                                        .write_all(response)
                                         .expect("reply to capture command");
                                     return request;
                                 }
@@ -527,6 +577,88 @@ mod tests {
 *6\r\n$8\r\nFAILOVER\r\n$2\r\nTO\r\n$9\r\n127.0.0.1\r\n$4\r\n6380\r\n$7\r\nTIMEOUT\r\n$6\r\n180000\r\n\
 *1\r\n$4\r\nEXEC\r\n"
         );
+    }
+
+    #[test]
+    fn coordinated_failover_keeps_connection_until_exec_reply() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind transaction listener");
+        let addr = listener.local_addr().expect("transaction listener address");
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let client = std::thread::spawn(move || {
+            result_tx
+                .send(send_failover_to(
+                    &addr.to_string(),
+                    "127.0.0.1:6380",
+                    180_000,
+                    None,
+                    None,
+                ))
+                .expect("send transaction result");
+        });
+
+        let (mut stream, _) = listener.accept().expect("accept transaction connection");
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .expect("bound transaction read");
+        let mut parser = crate::foundation::io::protocol::parser::Parser::new();
+        let mut bytes = [0_u8; 4096];
+        loop {
+            let read = stream.read(&mut bytes).expect("read transaction pipeline");
+            assert!(read > 0, "transaction pipeline closed before EXEC");
+            parser.feed(&bytes[..read]);
+            let mut saw_exec = false;
+            while let Some(command) = parser.try_parse().expect("parse transaction command") {
+                saw_exec = command
+                    .first()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(b"EXEC"));
+                if saw_exec {
+                    break;
+                }
+            }
+            if saw_exec {
+                break;
+            }
+        }
+
+        stream.write_all(b"+OK\r\n").expect("reply to MULTI");
+        assert!(result_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("coordinated failover returns after queueing the transaction")
+            .is_ok());
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .expect("bound connection lifetime probe");
+        let mut probe = [0_u8; 1];
+        assert_eq!(
+            stream
+                .read(&mut probe)
+                .expect_err("connection remains open before EXEC reply")
+                .kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        std::thread::sleep(std::time::Duration::from_millis(750));
+        stream
+            .write_all(b"-ERR CLIENT PAUSE rejected\r\n")
+            .expect("reply with queued command error");
+        assert_eq!(
+            stream
+                .read(&mut probe)
+                .expect_err("connection remains open after an intermediate error")
+                .kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        stream
+            .write_all(b"+QUEUED\r\n*1\r\n-ERR FAILOVER rejected\r\n")
+            .expect("reply to remaining queued command and EXEC");
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .expect("bound connection close probe");
+        assert_eq!(
+            stream.read(&mut probe).expect("read transaction EOF"),
+            0,
+            "connection closes after EXEC reply"
+        );
+        client.join().expect("join transaction client");
     }
 
     #[test]

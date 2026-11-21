@@ -142,6 +142,12 @@ impl Server {
         backend.ctx.set_startup_args(self.startup_args.clone());
         self.normalize_paths(&mut backend);
         self.apply_config(&mut backend);
+        if self.config.sentinel {
+            crate::foundation::io::sys::sentinel_config::probe_config_save(Path::new(
+                &self.config.config_file,
+            ))
+            .inspect_err(|error| crate::server_log!(warning, "{error}"))?;
+        }
         crate::foundation::io::sys::log::set_debug_context(
             backend.ctx.config().server.debug_context.clone(),
         );

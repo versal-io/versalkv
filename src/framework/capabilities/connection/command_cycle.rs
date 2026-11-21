@@ -125,6 +125,8 @@ impl CommandCycleState {
             || !self.custom_propagation.is_empty()
             || !self.script_propagation.is_empty()
             || !self.dirty_keys.is_empty()
+            || !self.notifications.module.is_empty()
+            || !self.notifications.callbacks.is_empty()
             || !self.notifications.local.is_empty()
             || !self.notifications.shard.is_empty()
             || !self.notifications.cluster.is_empty()
@@ -230,6 +232,11 @@ impl CommandCycleState {
 }
 
 impl ConnectionCommandEffects {
+    pub(crate) fn take_module_notification_effects(
+        &mut self,
+    ) -> Vec<crate::engine::extension::module::api::call::pending::ModuleCallEffects> {
+        std::mem::take(&mut self.notifications.callbacks)
+    }
     pub(crate) fn request_bytes(&self) -> usize {
         self.request_bytes
     }
@@ -524,6 +531,30 @@ impl Connection {
     pub(crate) fn record_notification(&mut self, notification: (Bytes, Bytes)) {
         self.command_cycle.effects_pending = true;
         self.command_cycle.notifications.local.push(notification);
+    }
+
+    pub(crate) fn record_module_keyspace_event(
+        &mut self,
+        event: crate::engine::extension::module::notifications::ModuleKeyspaceEvent,
+    ) {
+        self.command_cycle.effects_pending = true;
+        self.command_cycle.notifications.module.push(event);
+    }
+
+    pub(crate) fn record_module_notification_effects(
+        &mut self,
+        effects: crate::engine::extension::module::api::call::pending::ModuleCallEffects,
+    ) {
+        if !effects.is_empty() {
+            self.command_cycle.effects_pending = true;
+            self.command_cycle.notifications.callbacks.push(effects);
+        }
+    }
+
+    pub(crate) fn take_module_keyspace_events(
+        &mut self,
+    ) -> Vec<crate::engine::extension::module::notifications::ModuleKeyspaceEvent> {
+        std::mem::take(&mut self.command_cycle.notifications.module)
     }
 
     pub(crate) fn extend_notifications(&mut self, notifications: Vec<(Bytes, Bytes)>) {

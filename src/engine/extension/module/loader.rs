@@ -17,6 +17,7 @@ impl ModuleLoader {
         runtime_handle: *mut c_void,
     ) -> Result<String, super::registry::ModuleError> {
         use super::registry::ModuleError;
+        registry.ensure_thread_bridge()?;
 
         let cpath = CString::new(path).map_err(|_| ModuleError::InvalidPath(path.to_string()))?;
 
@@ -106,6 +107,8 @@ impl ModuleLoader {
         // references this memory yet.
         unsafe {
             (*internal_ptr).runtime_handle = runtime_handle;
+            (*internal_ptr).native_library_handle = handle;
+            (*internal_ptr).thread_bridge = registry.thread_bridge.clone();
         }
         let ctx = create_module_ctx(internal_ptr);
         let ctx_ptr = Box::into_raw(ctx);
@@ -138,6 +141,15 @@ impl ModuleLoader {
                 ValkeyModuleString::release(string);
             }
         }
+        // SAFETY: this OnLoad context remains owned here after all C callbacks
+        // and automatic resources have completed. Init registered this count.
+        unsafe {
+            if let Some(identity) = &(*internal_ptr).module_identity {
+                identity
+                    .invocations
+                    .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            }
+        }
 
         // SAFETY: internal_ptr is a valid non-null pointer obtained from
         // Box::into_raw. The module_name field is a CString that was set by
@@ -153,6 +165,7 @@ impl ModuleLoader {
         };
 
         if ret != VALKEYMODULE_OK {
+            let should_pin = registry.should_pin_native_library(module_name);
             // SAFETY: internal_ptr is a valid non-null pointer from Box::into_raw.
             // Reading module_ref is safe because the struct is still alive.
             let module_registered = unsafe { !(*internal_ptr).module_ref.is_null() };
@@ -186,7 +199,7 @@ impl ModuleLoader {
             // SAFETY: the handle is no longer needed after the failed
             // initialization has been rolled back.
             unsafe {
-                libc::dlclose(handle);
+                super::native_library::retire_native_library(handle, should_pin);
             }
             let error = if module_registered {
                 ModuleError::LoadFailed("module initialization failed".to_string())
@@ -204,12 +217,13 @@ impl ModuleLoader {
         }
 
         if module_name == "pending" {
+            let should_pin = registry.should_pin_native_library(module_name);
             // SAFETY: ctx_ptr is a valid Box allocation from Box::into_raw.
             // free_module_ctx takes ownership of both the ValkeyModuleCtx and its
             // internal ModuleInternalCtx, properly dropping them.
             unsafe {
                 free_module_ctx(ctx_ptr);
-                libc::dlclose(handle);
+                super::native_library::retire_native_library(handle, should_pin);
             }
             return Err(ModuleError::InitFailed(
                 "Module did not call ValkeyModule_Init during OnLoad".to_string(),

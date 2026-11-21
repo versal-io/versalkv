@@ -21,6 +21,8 @@ use crate::runtime::server::worker::ServerWorkerState;
 
 mod debugger;
 mod module;
+mod module_blocked;
+mod module_thread;
 mod rdb;
 
 #[derive(Clone, Copy, Default)]
@@ -78,6 +80,7 @@ impl ServerWorkerState {
                     result
                 } else {
                     let mut guest = task.finish_disconnected(&mut self.ctx);
+                    self.disconnect_native_module_client(token);
                     self.commit_disconnected_module_effects(&mut guest);
                     result
                 }
@@ -168,24 +171,37 @@ impl ServerWorkerState {
         }
         // These writes already happened. Losing the reply owner cannot discard
         // their ordered propagation or keyspace effects.
-        let committed_keys = self.commit_pending_module_effects(
-            vec![ModuleCallEffects {
-                dirty_delta: effects.take_dirty_delta(),
-                dirty_keys: if swapdb.is_none() {
-                    dirty_keys.clone()
-                } else {
-                    Vec::new()
-                },
-                propagation,
-                notifications: effects.take_notifications(),
-                shard_notifications: effects.take_shard_notifications(),
-                cluster_notifications: effects.take_cluster_notifications(),
-                cluster_shard_notifications: effects.take_cluster_shard_notifications(),
-            }],
-            None,
-            None,
-            None,
-        );
+        let mut source_effects = ModuleCallEffects {
+            dirty_delta: effects.take_dirty_delta(),
+            dirty_keys: if swapdb.is_none() {
+                dirty_keys.clone()
+            } else {
+                Vec::new()
+            },
+            propagation,
+            notifications: effects.take_notifications(),
+            shard_notifications: effects.take_shard_notifications(),
+            cluster_notifications: effects.take_cluster_notifications(),
+            cluster_shard_notifications: effects.take_cluster_shard_notifications(),
+        };
+        let mut trailing = effects.take_module_notification_effects();
+        if self.command_execution_depth <= 1 {
+            trailing.extend(
+                crate::framework::capabilities::module::finish_module_post_notification_jobs(
+                    &mut self.ctx,
+                ),
+            );
+        }
+        for effect in trailing {
+            if source_effects.append(effect).is_err() {
+                log::error!(
+                    "Disconnected module dirty effect overflow; requesting server shutdown"
+                );
+                self.ctx.set_shutdown_requested(true);
+            }
+        }
+        let committed_keys =
+            self.commit_pending_module_effects(vec![source_effects], None, None, None);
         if let Some((db1, db2)) = swapdb {
             self.apply_swapdb_watch_state(db1, db2);
             self.signal_keys_ready(&dirty_keys);
@@ -325,15 +341,22 @@ impl ServerWorkerState {
             HostRequest::ExecuteCommand {
                 args,
                 origin: HostCommandOrigin::Script { run, mode },
-            } => Ok(HostReply::Command(
-                crate::engine::extension::lua::redis_call::execute_script_command(
+            } => {
+                let value = crate::engine::extension::lua::redis_call::execute_script_command(
                     run,
                     mode,
                     args,
                     replay_conn,
                     &mut self.ctx,
-                ),
-            )),
+                );
+                let callbacks =
+                    crate::framework::capabilities::module::dispatch_module_keyspace_notifications(
+                        replay_conn,
+                        &mut self.ctx,
+                    );
+                replay_conn.record_module_notification_effects(callbacks);
+                Ok(HostReply::Command(value))
+            }
             HostRequest::CheckAcl { args } => {
                 crate::engine::extension::lua::redis_call::check_acl_command(
                     replay_conn,
@@ -549,6 +572,12 @@ impl ServerWorkerState {
                         connection,
                         &mut self.ctx,
                     );
+                    let callbacks =
+                        crate::framework::capabilities::module::dispatch_module_keyspace_notifications(
+                            connection,
+                            &mut self.ctx,
+                        );
+                    connection.record_module_notification_effects(callbacks);
                     Ok(HostReply::Command(value))
                 }
                 HostCommandOrigin::AofReplay => Err(HostError::Runtime(

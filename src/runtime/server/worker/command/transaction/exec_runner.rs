@@ -383,9 +383,17 @@ impl ServerWorkerState {
     ) -> ExecExecution {
         self.connection_registry[context.target.token()].discard_command_effects();
         let offset_before = self.ctx.replication().primary_repl_offset();
+        let mut output = {
+            let sinks = effects.exec_sinks();
+            self.exec_run_commands(context.target, sinks.wakeup_only)
+        };
+        if self.command_execution_depth == 1 {
+            output
+                .propagation_ops
+                .extend(self.collect_module_post_notification_effects(effects));
+        }
         let (replies, publish, publish_shard) = {
             let sinks = effects.exec_sinks();
-            let output = self.exec_run_commands(context.target, sinks.wakeup_only);
             self._append_exec_propagation(
                 &output.propagation_ops,
                 sinks.replication_only,

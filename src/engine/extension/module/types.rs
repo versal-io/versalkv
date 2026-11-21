@@ -50,6 +50,11 @@ pub struct ValkeyModuleCtx {
 }
 
 #[repr(C)]
+pub struct ValkeyModuleBlockedClient {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
 pub struct ModuleInternalCtx {
     pub module_name: *mut c_char,
     pub module_ref: *mut c_void,
@@ -57,12 +62,27 @@ pub struct ModuleInternalCtx {
     pub onload: c_int,
     pub reply_ptr: *mut c_void,
     pub runtime_handle: *mut c_void,
+    pub(crate) native_library_handle: *mut c_void,
     pub db_idx: c_int,
     pub resp_version: c_int,
     pub username: *mut c_char,
     pub module_auth_user: *mut c_char,
     pub current_command_name: *mut c_char,
+    pub(crate) key_position_request: Option<ModuleKeyPositionRequest>,
+    pub(crate) kind: super::thread_bridge::ModuleContextKind,
+    pub(crate) module_identity: Option<std::sync::Arc<super::thread_bridge::ModuleIdentity>>,
+    pub(crate) thread_bridge: Option<super::thread_bridge::ModuleThreadBridgeHandle>,
+    pub(crate) thread_context: Option<super::thread_bridge::ModuleThreadContext>,
+    pub(crate) block_origin: Option<super::thread_bridge::ModuleBlockOrigin>,
+    pub(crate) blocked_client: Option<std::sync::Arc<super::blocking::ModuleBlockedShared>>,
+    pub(crate) blocked_private_data: *mut c_void,
     pub(super) auto_memory: super::auto_memory::ModuleAutoMemoryScope,
+}
+
+pub(crate) struct ModuleKeyPositionRequest {
+    pub argc: usize,
+    pub positions: Vec<(usize, Vec<&'static str>)>,
+    pub is_valid: bool,
 }
 
 #[repr(C)]
@@ -74,7 +94,7 @@ struct ModuleStringData {
     bytes: Vec<u8>,
     len: usize,
     ref_count: usize,
-    auto_owner: Option<NonNull<ModuleInternalCtx>>,
+    auto_owners: Vec<(NonNull<ModuleInternalCtx>, usize)>,
 }
 
 #[cfg(test)]
@@ -93,7 +113,7 @@ impl ValkeyModuleString {
             bytes,
             len: data.len(),
             ref_count: 1,
-            auto_owner: None,
+            auto_owners: Vec::new(),
         });
         Box::new(ValkeyModuleString {
             _data: Box::into_raw(value).cast(),
@@ -137,20 +157,46 @@ impl ValkeyModuleString {
             if (*payload).ref_count != 0 {
                 return;
             }
-            let owner = (*payload).auto_owner;
-            super::auto_memory::remove_string(owner, string);
+            let owners = std::mem::take(&mut (*payload).auto_owners);
+            for (owner, count) in owners {
+                for _ in 0..count {
+                    super::auto_memory::remove_string(Some(owner), string);
+                }
+            }
             drop(Box::from_raw(payload));
             drop(Box::from_raw(string));
         }
     }
 
     // SAFETY: string points to a live shell and payload.
-    pub(super) unsafe fn set_auto_owner(
-        string: *mut Self,
-        owner: Option<NonNull<ModuleInternalCtx>>,
-    ) {
+    pub(super) unsafe fn add_auto_owner(string: *mut Self, owner: NonNull<ModuleInternalCtx>) {
         // SAFETY: the caller guarantees a live payload.
-        unsafe { (*(*string)._data.cast::<ModuleStringData>()).auto_owner = owner };
+        unsafe {
+            let owners = &mut (*(*string)._data.cast::<ModuleStringData>()).auto_owners;
+            if let Some((_, count)) = owners.iter_mut().find(|(candidate, _)| *candidate == owner) {
+                let Some(next) = count.checked_add(1) else {
+                    std::process::abort();
+                };
+                *count = next;
+            } else {
+                owners.push((owner, 1));
+            }
+        }
+    }
+
+    // SAFETY: string and owner are live; one automatic entry is being removed.
+    pub(super) unsafe fn remove_auto_owner(string: *mut Self, owner: NonNull<ModuleInternalCtx>) {
+        // SAFETY: the payload is live, and this short borrow does not release it.
+        unsafe {
+            let owners = &mut (*(*string)._data.cast::<ModuleStringData>()).auto_owners;
+            if let Some(index) = owners.iter().position(|(candidate, _)| *candidate == owner) {
+                if owners[index].1 == 1 {
+                    owners.swap_remove(index);
+                } else {
+                    owners[index].1 -= 1;
+                }
+            }
+        }
     }
 
     // SAFETY: string points to a live shell and payload.

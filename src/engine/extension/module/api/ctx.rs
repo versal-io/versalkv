@@ -90,7 +90,16 @@ unsafe fn init_module_attribs(
                             (*internal).module_ref =
                                 (module as *const ModuleRef).cast_mut().cast::<c_void>();
                             (*internal).module_options = Some(module.options.clone());
+                            (*internal).module_identity = module.identity.clone();
+                            if (*internal).onload != 0 {
+                                if let Some(identity) = &module.identity {
+                                    identity
+                                        .invocations
+                                        .store(1, std::sync::atomic::Ordering::Release);
+                                }
+                            }
                         }
+                        (*internal).thread_bridge = reg.thread_bridge.clone();
                     }
                 }
                 Err(e) => {

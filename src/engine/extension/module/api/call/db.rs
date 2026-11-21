@@ -31,6 +31,34 @@ pub unsafe extern "C" fn ValkeyModule_SelectDb(ctx: *mut ValkeyModuleCtx, dbid: 
         if internal.is_null() {
             return VALKEYMODULE_ERR;
         }
+        if let Some(context) = (*internal).thread_context.as_mut() {
+            let result = context.lease().and_then(|lease| {
+                let db_idx = u32::try_from(dbid).map_err(|_| libc::EINVAL)?;
+                let reply = super::super::super::thread_bridge::RpcReply::default();
+                context
+                    .bridge
+                    .submit(
+                        super::super::super::thread_bridge::ModuleThreadRequest::SelectDb {
+                            lease,
+                            db_idx,
+                            reply: reply.clone(),
+                        },
+                    )
+                    .and_then(|()| reply.wait())
+            });
+            return match result {
+                Ok(true) => {
+                    context.snapshot.db_idx = dbid as u32;
+                    (*internal).db_idx = dbid;
+                    VALKEYMODULE_OK
+                }
+                Ok(false) => VALKEYMODULE_ERR,
+                Err(errno) => {
+                    crate::foundation::io::sys::os::set_errno(errno);
+                    VALKEYMODULE_ERR
+                }
+            };
+        }
         let Some(runtime) = runtime_from_opaque((*internal).runtime_handle) else {
             return VALKEYMODULE_ERR;
         };
@@ -83,6 +111,10 @@ unsafe fn selected_db(
             return None;
         }
         let internal = (*ctx).internal;
+        if (*internal).thread_context.is_some() {
+            crate::foundation::io::sys::os::set_errno(libc::ENOTSUP);
+            return None;
+        }
         let db_idx = u32::try_from((*internal).db_idx).ok()?;
         runtime_from_opaque((*internal).runtime_handle)?.db_mut(db_idx)
     }

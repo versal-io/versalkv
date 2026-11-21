@@ -528,6 +528,7 @@ impl super::ServerWorkerState {
             // before cron resumes. Explicit shutdown requests are still
             // honored below.
             if self.ctx.is_shutdown_requested() {
+                self.close_module_thread_bridge();
                 self.perform_shutdown_handoff_if_needed();
                 self.save_cluster_config_before_exit();
                 crate::server_log!(notice, "Shutdown requested, exiting event loop");
@@ -547,6 +548,7 @@ impl super::ServerWorkerState {
         if !self.ctx.is_shutdown_requested() {
             return false;
         }
+        self.close_module_thread_bridge();
         self.perform_shutdown_handoff_if_needed();
         self.save_cluster_config_before_exit();
         crate::server_log!(notice, "Shutdown requested, exiting event loop");
