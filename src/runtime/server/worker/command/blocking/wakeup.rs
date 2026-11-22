@@ -861,9 +861,12 @@ impl ServerWorkerState {
             ) {
                 self.ctx.paused_clients_mut().insert(token);
             } else {
-                self.ctx
-                    .blocking_registry_mut()
-                    .register_client(db_id, &b.keys, session);
+                crate::runtime::server::worker::command::dispatch::register_key_blocked_command(
+                    self.ctx.blocking_registry_mut(),
+                    db_id,
+                    b,
+                    session,
+                );
             }
         }
         conn.discard_command_effects();

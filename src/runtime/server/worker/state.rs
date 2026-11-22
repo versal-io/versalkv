@@ -1,3 +1,4 @@
+use crate::engine::state::blocking_registry::ForklessReadySelection;
 use crate::foundation::io::sys::fd::{pipe, PipeFlags};
 use crate::foundation::io::sys::time::MonotonicInstant;
 use crate::foundation::io::transport::{
@@ -240,6 +241,27 @@ impl ServerWorkerState {
         if !keys.is_empty() {
             self.wakeup_blocked_on_keys(&keys, None, None);
         }
+    }
+
+    pub(crate) fn requeue_forkless_ready_keys(&mut self, selection: ForklessReadySelection) {
+        let mut keys = self
+            .ctx
+            .blocking_registry_mut()
+            .take_forkless_deferred_ready_keys(selection);
+        if keys.is_empty() {
+            return;
+        }
+        // Restored writers may have signaled selected keys already. Remove
+        // their old positions in one pass, preserving all other ready keys.
+        for key in &keys {
+            self.ready_keys_set.remove(key);
+        }
+        self.ready_keys
+            .retain(|key| self.ready_keys_set.contains(key));
+        // Retained keys are in encounter order; the existing ready stack pops
+        // from the end, so only this restoration boundary reverses the batch.
+        keys.reverse();
+        self.signal_keys_ready(&keys);
     }
 
     /// Acquire a reply buffer from the pool, reusing a previously-recycled

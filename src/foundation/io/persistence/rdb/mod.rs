@@ -1,6 +1,7 @@
 pub mod compression;
 mod encoder;
 pub mod frozen;
+mod record_scan;
 pub mod serialize;
 mod stream;
 #[cfg(test)]

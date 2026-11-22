@@ -1,4 +1,5 @@
 mod acl_stage;
+mod blocked_snapshot;
 mod command_exec;
 mod completion;
 mod dispatch_loop;
@@ -15,6 +16,7 @@ mod types;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use blocked_snapshot::{forkless_blocked_key_targets, register_key_blocked_command};
 pub(crate) use command_exec::TransactionPropagationInput;
 pub(crate) use completion::redacted_argv;
 pub(crate) use dispatch_loop::SpecialCommandCompletion;

@@ -27,6 +27,8 @@ use std::thread;
 
 type DispatchSideEffects = CommandEffects;
 
+mod forkless_blocking_tests;
+
 fn offset(value: i64) -> ReplicationOffset {
     ReplicationOffset::try_from(value).expect("valid test offset")
 }

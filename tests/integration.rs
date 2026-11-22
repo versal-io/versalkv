@@ -33,6 +33,9 @@ mod valkey_581;
 #[path = "integration/zset_encoding_581.rs"]
 mod zset_encoding_581;
 
+#[path = "integration/zintercard.rs"]
+mod zintercard;
+
 #[path = "integration/cluster_priority_581.rs"]
 mod cluster_priority_581;
 

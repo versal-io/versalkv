@@ -119,6 +119,8 @@ struct ControlState {
     queued: usize,
     enqueued: usize,
     item_started: Option<Instant>,
+    #[cfg(test)]
+    key_delay_wait_us: Option<i64>,
 }
 
 pub struct RdbSaveControl {
@@ -224,6 +226,8 @@ impl RdbSaveControl {
                 queued: 0,
                 enqueued: 0,
                 item_started: None,
+                #[cfg(test)]
+                key_delay_wait_us: None,
             }),
             changed: Condvar::new(),
         }
@@ -256,6 +260,13 @@ impl RdbSaveControl {
     #[cfg(test)]
     pub fn key_delay_us_for_test(&self) -> i64 {
         self.lock().key_delay_us
+    }
+
+    /// Delay used by the current finish_item Condvar wait, not its configuration.
+    /// The same state lock makes this observable only after the wait releases it.
+    #[cfg(test)]
+    pub fn key_delay_wait_us_for_test(&self) -> Option<i64> {
+        self.lock().key_delay_wait_us
     }
 
     pub fn progress(&self) -> RdbSaveProgress {
@@ -358,11 +369,19 @@ impl RdbSaveControl {
                 state.item_started = None;
                 return Ok(());
             }
+            #[cfg(test)]
+            {
+                state.key_delay_wait_us = Some(state.key_delay_us);
+            }
             state = self
                 .changed
                 .wait_timeout(state, delay - elapsed)
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .0;
+            #[cfg(test)]
+            {
+                state.key_delay_wait_us = None;
+            }
         }
         Err(io::Error::other(SaveCancelled))
     }

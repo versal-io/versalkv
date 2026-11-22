@@ -4,6 +4,7 @@
 //! prefix, so a paced load (`key-load-delay`) throttles how fast the caller
 //! reads the socket. See ADR 2026-08-19-replica-streaming-rdb-load.
 
+use super::record_scan::{RecordScan, ScanOutcome};
 use super::LoadError;
 use crate::foundation::io::persistence::codec::types::crc64;
 use crate::foundation::io::store::kv_engine::DbSet;
@@ -137,6 +138,9 @@ pub struct RdbDecoder {
     expiry_events: Vec<RdbExpiryEvent>,
     discarded_prefix: usize,
     finished: bool,
+    record_scan: Option<RecordScan>,
+    #[cfg(test)]
+    object_loader_invocations: usize,
 }
 
 impl RdbDecoder {
@@ -170,6 +174,9 @@ impl RdbDecoder {
             expiry_events: Vec::new(),
             discarded_prefix: 0,
             finished: false,
+            record_scan: None,
+            #[cfg(test)]
+            object_loader_invocations: 0,
         }
     }
 
@@ -347,10 +354,20 @@ impl RdbDecoder {
         use crate::foundation::io::persistence::codec::types::is_known_object_type;
 
         if !is_known_object_type(type_byte) {
+            self.record_scan = None;
             return Err(LoadError::UnknownType);
         }
 
         let input = &self.buf[self.cursor..];
+        if self.record_scan.is_none() {
+            self.record_scan = RecordScan::new(type_byte);
+        }
+        if let Some(scan) = &mut self.record_scan {
+            match scan.scan(input) {
+                ScanOutcome::NeedInput => return Ok(RdbStep::NeedInput),
+                ScanOutcome::Complete | ScanOutcome::Fallback => self.record_scan = None,
+            }
+        }
         let mut pos = 1usize;
         let Some(key) = load_string(input, &mut pos) else {
             return Ok(RdbStep::NeedInput);
@@ -359,6 +376,10 @@ impl RdbDecoder {
             ExpiredKeyPolicy::Retain => None,
             ExpiredKeyPolicy::Skip => Some(now),
         };
+        #[cfg(test)]
+        {
+            self.object_loader_invocations += 1;
+        }
         let Some(loaded) = codec::load_robj_with_hash_field_expires_and_limits(
             input,
             &mut pos,
@@ -465,6 +486,7 @@ impl RdbDecoder {
             };
             pos += 1;
             if self.is_redis_magic && (RDB_FOREIGN_TYPE_MIN..=RDB_FOREIGN_TYPE_MAX).contains(&op) {
+                self.record_scan = None;
                 return Err(LoadError::ForeignType {
                     type_byte: op,
                     version: self.rdbver,
@@ -496,6 +518,7 @@ impl RdbDecoder {
                     inline_args = Some(args);
                 }
                 RDB_OPCODE_EOF => {
+                    self.record_scan = None;
                     // Trailing CRC (rdbver >= 5): need 8 more bytes.
                     if self.rdbver >= 5 {
                         if input.len() < pos + 8 {
@@ -581,6 +604,7 @@ impl RdbDecoder {
 
             // Record fully consumed: advance CRC and cursor. `feed` compacts
             // this prefix once before appending more network bytes.
+            self.record_scan = None;
             self.crc = crc64(self.crc, &input[..pos]);
             self.cursor += pos;
             if let Some((key, value)) = pending_aux_field {
@@ -641,6 +665,10 @@ fn parse_inline_command(input: &[u8]) -> Result<Option<(Vec<Bytes>, usize)>, Loa
 }
 
 pub type RdbStreamDecoder = RdbDecoder;
+
+#[cfg(test)]
+#[path = "stream_record_scan_tests.rs"]
+mod record_scan_tests;
 
 #[cfg(test)]
 mod tests {

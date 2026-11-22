@@ -67,6 +67,9 @@ opt-level = 3
 [profile.dev.package.versal]
 opt-level = 2
 
+[profile.dev.package.sha1]
+opt-level = 3
+
 [lints.clippy]
 # --- Phase-out allow list ---
 too_many_arguments = "allow"

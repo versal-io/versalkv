@@ -21,6 +21,14 @@ pub enum ForklessSavePurpose {
     ReplicationSocket,
 }
 
+/// Coalesced snapshot progress awaiting the owner's maintenance boundary.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ForklessProgressNotification {
+    #[default]
+    Unchanged,
+    TargetsMayBeReady,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PersistenceChild {
     Rdb {
@@ -157,6 +165,7 @@ pub struct PersistenceState {
     forkless: Option<(BackgroundRdbSave, i64)>,
     forkless_purpose: ForklessSavePurpose,
     forkless_feed: Option<ForklessFeed>,
+    forkless_progress_notification: ForklessProgressNotification,
     forkless_keys: HashSet<ForklessItemId>,
     forkless_captured_keys: HashSet<ForklessItemId>,
     forkless_eviction_keys: HashMap<u32, CapturedEvictionKeys>,
@@ -226,6 +235,7 @@ impl PersistenceState {
             forkless: None,
             forkless_purpose: ForklessSavePurpose::Persistence,
             forkless_feed: None,
+            forkless_progress_notification: ForklessProgressNotification::Unchanged,
             forkless_keys: HashSet::new(),
             forkless_captured_keys: HashSet::new(),
             forkless_eviction_keys: HashMap::new(),
@@ -460,10 +470,20 @@ impl PersistenceState {
             released_any |= !feed.take_resolved_keys().is_empty();
             if feed.is_finished() {
                 self.forkless_feed = None;
+                self.forkless_progress_notification =
+                    ForklessProgressNotification::TargetsMayBeReady;
             }
             self.record_forkless_captured_keys(captured);
         }
+        if released_any {
+            self.forkless_progress_notification = ForklessProgressNotification::TargetsMayBeReady;
+        }
         released_any
+    }
+
+    /// Consume all progress once, after any module lease has been released.
+    pub(crate) fn take_forkless_progress_notification(&mut self) -> ForklessProgressNotification {
+        std::mem::take(&mut self.forkless_progress_notification)
     }
 
     pub fn forkless_key_blocked(&self, db_id: u32, key: &[u8]) -> bool {
@@ -629,6 +649,14 @@ impl PersistenceState {
             .map(|(task, _)| task.control().key_delay_us_for_test())
     }
 
+    /// Actual finish_item Condvar delay of the in-flight forkless save, if waiting.
+    #[cfg(test)]
+    pub fn forkless_key_delay_wait_for_test(&self) -> Option<i64> {
+        self.forkless
+            .as_ref()
+            .and_then(|(task, _)| task.control().key_delay_wait_us_for_test())
+    }
+
     pub fn cancel_forkless_save(&self) {
         if let Some((task, _)) = &self.forkless {
             task.control().cancel();
@@ -698,6 +726,8 @@ impl PersistenceState {
         }
         self.forkless_current_to_original_db.clear();
         self.forkless_original_to_current_db.clear();
+        // Completion, failure and cancellation all remove snapshot barriers.
+        self.forkless_progress_notification = ForklessProgressNotification::TargetsMayBeReady;
         if self.forkless_purpose != ForklessSavePurpose::Persistence {
             match &outcome {
                 RdbSaveOutcome::Saved => {

@@ -365,9 +365,10 @@ impl ServerWorkerState {
             // Script currently has no constructor; keep the historical
             // fall-through so behaviour is unchanged if it gets enabled.
             | BlockedCmd::Script => {
-                self.ctx.blocking_registry_mut().register_client(
+                super::register_key_blocked_command(
+                    self.ctx.blocking_registry_mut(),
                     connection.selected_db,
-                    &blocked.keys,
+                    blocked,
                     connection.session_id(),
                 );
                 false

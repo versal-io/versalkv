@@ -80,6 +80,13 @@ struct BlockedReplyOutput {
     has_custom_reply: bool,
 }
 
+enum ForklessWakeupDecision {
+    Ready,
+    Defer {
+        uncaptured_targets: Vec<(u32, Bytes)>,
+    },
+}
+
 impl ServerWorkerState {
     pub(crate) fn check_blocked_cluster_redirects(&mut self) {
         if !self.ctx.config().server.cluster_enabled {
@@ -476,12 +483,38 @@ impl ServerWorkerState {
         mut pending_aof: Option<&mut Vec<Vec<u8>>>,
         mut pending_effects: Option<&mut EffectQueue>,
     ) {
+        // A cascade or another writer in this turn must not retry a key whose
+        // head waiter is still deferred. Maintenance re-arms it after progress.
+        if self
+            .ctx
+            .blocking_registry()
+            .is_forkless_ready_key_deferred(db_id, key)
+        {
+            return;
+        }
         let waiters = self.ctx.blocking_registry().waiters_for_key(db_id, key);
         for session in waiters {
             let new_dirty = if let Some(token) = self.connection_registry.token_for_session(session)
             {
                 if !self.blocked_key_is_eligible_for_wake(token, db_id, key) {
                     continue;
+                }
+                match self.decide_forkless_wakeup(token) {
+                    ForklessWakeupDecision::Ready => {}
+                    ForklessWakeupDecision::Defer { uncaptured_targets } => {
+                        for (target_db, target_key) in uncaptured_targets {
+                            self.ctx.prioritize_forkless_keys(
+                                target_db,
+                                std::iter::once(target_key.to_vec()),
+                            );
+                        }
+                        self.ctx
+                            .blocking_registry_mut()
+                            .defer_forkless_ready_key(db_id, key);
+                        // Do not detach or move the head waiter behind its
+                        // followers, and do not restart its original deadline.
+                        break;
+                    }
                 }
                 self.wakeup_blocked_client_with_effect_queue(
                     token,
@@ -526,6 +559,48 @@ impl ServerWorkerState {
                     ready.push(dk);
                 }
             }
+        }
+    }
+
+    fn decide_forkless_wakeup(&self, token: Token) -> ForklessWakeupDecision {
+        let persistence = self.ctx.persistence();
+        if !persistence.forkless_save_in_progress() && !persistence.forkless_capture_in_progress() {
+            return ForklessWakeupDecision::Ready;
+        }
+        let Some(connection) = self.connection_registry.get(token) else {
+            return ForklessWakeupDecision::Ready;
+        };
+        if !self
+            .ctx
+            .blocking_registry()
+            .is_snapshot_guarded_client(&connection.session_id())
+        {
+            return ForklessWakeupDecision::Ready;
+        }
+        let Some(blocked) = connection.blocked.as_ref() else {
+            return ForklessWakeupDecision::Ready;
+        };
+        let targets =
+            crate::runtime::server::worker::command::dispatch::forkless_blocked_key_targets(
+                connection.selected_db,
+                blocked,
+            );
+        let uncaptured_targets: Vec<_> = targets
+            .iter()
+            .filter(|(db_id, key)| {
+                persistence.forkless_capture_in_progress()
+                    && !persistence.forkless_key_captured(*db_id, key)
+            })
+            .cloned()
+            .collect();
+        if !uncaptured_targets.is_empty()
+            || targets
+                .iter()
+                .any(|(db_id, key)| persistence.forkless_key_blocked(*db_id, key))
+        {
+            ForklessWakeupDecision::Defer { uncaptured_targets }
+        } else {
+            ForklessWakeupDecision::Ready
         }
     }
 

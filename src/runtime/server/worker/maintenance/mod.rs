@@ -1,6 +1,8 @@
 use super::ServerWorkerState;
 use crate::engine::distributed::replication::protocol as replication_svc;
 use crate::engine::extension::script::PropagationOp;
+use crate::engine::persistence::ForklessProgressNotification;
+use crate::engine::state::blocking_registry::ForklessReadySelection;
 use crate::foundation::io::sys::time::{mstime, MonotonicInstant};
 use crate::framework::capabilities::io::Token;
 use crate::framework::context::PauseAction;
@@ -134,7 +136,7 @@ impl ServerWorkerState {
     }
 
     /// Advance an in-flight forkless snapshot by one bounded feed step and
-    /// release any writers whose keys have just been captured.
+    /// release writers and re-arm ready keys after progress or head changes.
     ///
     /// Called both from the periodic cron task and from every before-poll
     /// phase. A feed with available capacity runs again immediately; a full
@@ -142,17 +144,29 @@ impl ServerWorkerState {
     /// This keeps capture independent of the slower cron tick while allowing
     /// socket events to wake the worker and writers to resume after capture.
     pub(crate) fn pump_forkless_capture(&mut self) {
-        if self.ctx.persistence().forkless_capture_in_progress() {
-            let released_forkless_key = self.ctx.drive_forkless_feed();
-            let capture_finished = !self.ctx.persistence().forkless_capture_in_progress();
-            if released_forkless_key || capture_finished {
-                self.release_forkless_clients();
-            }
+        if self.ctx.persistence().forkless_save_in_progress()
+            || self.ctx.persistence().forkless_capture_in_progress()
+        {
+            // Shared completions can arrive after the capture feed is gone.
+            // Drain them while serialization is still running as well.
+            self.ctx.drive_forkless_feed();
         }
-        if !self.ctx.persistence().forkless_save_in_progress() && self.ctx.has_forkless_waiters() {
-            // A replication producer can finish or be cancelled without a
-            // capture feed. Resume its barriers on the next maintenance turn.
-            self.release_forkless_clients();
+        // Progress may come from module preparation or save completion outside
+        // this pump. Consume it only here, after the module lease is released.
+        match self
+            .ctx
+            .persistence_mut()
+            .take_forkless_progress_notification()
+        {
+            ForklessProgressNotification::Unchanged => {
+                // Head exits retry even without snapshot progress. Select once
+                // per turn so simultaneous progress cannot regroup ready keys.
+                self.requeue_forkless_ready_keys(ForklessReadySelection::HeadRechecks);
+            }
+            ForklessProgressNotification::TargetsMayBeReady => {
+                self.release_forkless_clients();
+                self.requeue_forkless_ready_keys(ForklessReadySelection::All);
+            }
         }
         // Keep the serializer synchronized with the configured pace after
         // waiters resolve, including the final background serialization phase.

@@ -30,15 +30,20 @@ pub(crate) fn forkless_command_needs_full_capture(
     args: &CommandArgs,
     targets: &[(u32, Vec<u8>)],
 ) -> bool {
+    let has_loaded_modules = ctx.module_registry().list().next().is_some();
     targets.is_empty()
         || flags & crate::engine::command::CMD_TOUCHES_ARBITRARY_KEYS != 0
         || [b"eval".as_slice(), b"evalsha", b"fcall"]
             .iter()
             .any(|name| args.name.eq_ignore_ascii_case(name))
         || targets.iter().any(|(db_idx, key)| {
-            !ctx.blocking_registry()
-                .waiters_for_key(*db_idx, key)
-                .is_empty()
+            let registry = ctx.blocking_registry();
+            let waiters = registry.waiters_for_key(*db_idx, key);
+            // Only native ordinary waiters have a pre-wakeup target barrier.
+            // Modules may add callbacks outside that protected execution path.
+            waiters
+                .iter()
+                .any(|session| has_loaded_modules || !registry.is_snapshot_guarded_client(session))
         })
 }
 

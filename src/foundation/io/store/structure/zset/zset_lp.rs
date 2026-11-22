@@ -48,6 +48,11 @@ impl ZSetLp {
         &self.lp
     }
 
+    /// Checks member identity without interpreting its score.
+    pub fn contains_member(&self, member: &[u8]) -> bool {
+        lp_find_member(&self.lp, member).is_some()
+    }
+
     pub fn add_with_threshold(
         &mut self,
         member: &[u8],
@@ -472,6 +477,39 @@ fn format_score(score: f64) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contains_member_is_independent_of_score_parsing() {
+        use crate::foundation::io::persistence::codec::{decoder_compact, types};
+        use crate::foundation::io::persistence::load_robj;
+        use crate::foundation::io::store::Robj;
+
+        for member in [b"x".as_slice(), b"", b"\0\xff", b"1"] {
+            let raw = decoder_compact::listpack_encode(&[
+                member.to_vec(),
+                b" 1".to_vec(),
+                b"y".to_vec(),
+                b"2".to_vec(),
+            ]);
+            let mut encoded = Vec::new();
+            types::save_len(&mut encoded, raw.len() as u64);
+            encoded.extend_from_slice(&raw);
+            let mut pos = 0;
+            let Robj::ZSetListpack(zset) =
+                load_robj(&encoded, &mut pos, types::RDB_TYPE_ZSET_LISTPACK).unwrap()
+            else {
+                panic!("Expected a physically compact sorted set");
+            };
+            assert_eq!(pos, encoded.len());
+            assert_eq!(zset.score(member), None);
+            assert!(zset.contains_member(member));
+            assert!(zset.contains_member(b"y"));
+            for absent in [b"missing".as_slice(), b"01", b"+1", b"-0", b"\0\xfe"] {
+                assert!(!zset.contains_member(absent));
+            }
+            assert_eq!(zset.raw_bytes(), raw);
+        }
+    }
 
     #[test]
     fn new_is_empty() {
