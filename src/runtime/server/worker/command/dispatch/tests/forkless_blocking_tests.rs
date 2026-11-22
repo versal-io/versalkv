@@ -1648,6 +1648,76 @@ fn shared_tail_completion_requeues_waiter_after_capture_feed_finishes() {
 }
 
 #[test]
+fn save_only_maintenance_keeps_shared_barriers_without_native_demand() {
+    let mut fixture = CaptureFixture::new("forkless-save-only-shared-barrier");
+    fixture.start();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while fixture
+        .backend
+        .ctx
+        .persistence()
+        .forkless_capture_in_progress()
+    {
+        assert!(Instant::now() < deadline, "capture feed must reach EOF");
+        fixture.backend.pump_forkless_capture();
+        thread::yield_now();
+    }
+    fixture
+        .backend
+        .ctx
+        .config_mut()
+        .persistence
+        .rdb_key_save_delay = 10_000_000;
+    fixture
+        .backend
+        .ctx
+        .persistence()
+        .set_forkless_key_delay(10_000_000);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while fixture
+        .backend
+        .ctx
+        .persistence()
+        .forkless_key_delay_wait_for_test()
+        != Some(10_000_000)
+    {
+        assert!(
+            Instant::now() < deadline,
+            "serializer must publish a completion before entering key delay"
+        );
+        thread::yield_now();
+    }
+    let blocked_before = (0..SNAPSHOT_LISTS)
+        .filter(|index| {
+            fixture
+                .backend
+                .ctx
+                .persistence()
+                .forkless_key_blocked(0, format!("snapshot-list-{index}").as_bytes())
+        })
+        .count();
+    assert!(blocked_before > 0);
+    assert!(!fixture.backend.ctx.has_forkless_waiters());
+    assert_eq!(fixture.backend.ctx.blocking_registry().count(), 0);
+
+    fixture.backend.pump_forkless_capture();
+
+    let blocked_after = (0..SNAPSHOT_LISTS)
+        .filter(|index| {
+            fixture
+                .backend
+                .ctx
+                .persistence()
+                .forkless_key_blocked(0, format!("snapshot-list-{index}").as_bytes())
+        })
+        .count();
+    assert_eq!(
+        blocked_after, blocked_before,
+        "save-only maintenance must retain module-visible shared barriers without native demand"
+    );
+}
+
+#[test]
 fn ordinary_list_zset_and_stream_waiters_share_target_scoped_classification() {
     for (blocked, writer) in [
         (

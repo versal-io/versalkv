@@ -144,11 +144,17 @@ impl ServerWorkerState {
     /// This keeps capture independent of the slower cron tick while allowing
     /// socket events to wake the worker and writers to resume after capture.
     pub(crate) fn pump_forkless_capture(&mut self) {
-        if self.ctx.persistence().forkless_save_in_progress()
-            || self.ctx.persistence().forkless_capture_in_progress()
+        if self.ctx.persistence().forkless_capture_in_progress()
+            || (self.ctx.persistence().forkless_save_in_progress()
+                && (self.ctx.has_forkless_waiters()
+                    || self
+                        .ctx
+                        .blocking_registry()
+                        .has_forkless_progress_ready_keys()))
         {
             // Shared completions can arrive after the capture feed is gone.
-            // Drain them while serialization is still running as well.
+            // Drain them only when native admission is waiting on progress;
+            // otherwise module calls retain their conservative barrier.
             self.ctx.drive_forkless_feed();
         }
         // Progress may come from module preparation or save completion outside

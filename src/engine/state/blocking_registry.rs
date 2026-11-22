@@ -140,6 +140,13 @@ impl BlockingClientRegistry {
                 .contains_key(&(db_id, Bytes::copy_from_slice(key)))
     }
 
+    pub(crate) fn has_forkless_progress_ready_keys(&self) -> bool {
+        self.forkless_deferred_ready_keys
+            .iter()
+            .flatten()
+            .any(|deferred| matches!(deferred.route, ForklessReadyRoute::SnapshotProgress))
+    }
+
     /// Select a single batch in first-encounter order, without grouping routes.
     pub(crate) fn take_forkless_deferred_ready_keys(
         &mut self,
