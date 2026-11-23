@@ -4,6 +4,10 @@ const MAX_LIT: usize = 1 << 5;
 const MAX_OFF: usize = 1 << 13;
 const MAX_REF: usize = (1 << 8) + (1 << 3);
 
+// The touched-slot table stores each hash slot in u16, so the table must
+// never exceed the u16 index range.
+const _: () = assert!(HSIZE <= u16::MAX as usize + 1);
+
 #[inline]
 fn frst(input: &[u8], p: usize) -> u32 {
     ((input[p] as u32) << 8) | input[p + 1] as u32
@@ -19,13 +23,100 @@ fn idx(h: u32) -> usize {
     ((h >> 8).wrapping_sub(h.wrapping_mul(5)) & (HSIZE as u32 - 1)) as usize
 }
 
-pub(crate) fn lzf_compress(input: &[u8], out_capacity: usize) -> Option<Vec<u8>> {
+/// Sole write entry for the LZF hash table. A slot transitioning from the
+/// zero sentinel to a real position is recorded for exact reset.
+#[inline]
+fn set_htab_slot(htab: &mut [usize], touched: &mut Vec<u16>, slot: usize, position: usize) {
+    if position != 0 && htab[slot] == 0 {
+        touched.push(slot as u16);
+    }
+    htab[slot] = position;
+}
+
+/// Reusable per-serialization-session LZF compression state. The hash table is
+/// allocated once and reset through touched slots between independent strings.
+pub(crate) struct LzfWorkspace {
+    compression_enabled: bool,
+    htab: Vec<usize>,
+    touched: Vec<u16>,
+    scratch: Vec<u8>,
+}
+
+impl LzfWorkspace {
+    pub(crate) fn new(compression_enabled: bool) -> Self {
+        Self {
+            compression_enabled,
+            htab: if compression_enabled {
+                vec![0; HSIZE]
+            } else {
+                Vec::new()
+            },
+            touched: Vec::new(),
+            scratch: Vec::new(),
+        }
+    }
+
+    /// Restore all-zero table semantics while keeping every allocation.
+    fn reset(&mut self) {
+        for &slot in &self.touched {
+            self.htab[slot as usize] = 0;
+        }
+        self.touched.clear();
+        self.scratch.clear();
+    }
+
+    /// Compress one string. The returned slice borrows the scratch buffer and
+    /// stays valid until the next call on this workspace.
+    pub(crate) fn compress(&mut self, input: &[u8], out_capacity: usize) -> Option<&[u8]> {
+        if !self.compression_enabled {
+            return None;
+        }
+        self.reset();
+        let len = compress_into(
+            input,
+            out_capacity,
+            &mut self.scratch,
+            &mut self.htab,
+            &mut self.touched,
+        )?;
+        Some(&self.scratch[..len])
+    }
+
+    #[cfg(test)]
+    fn htab_capacity_for_test(&self) -> usize {
+        self.htab.capacity()
+    }
+
+    #[cfg(test)]
+    fn scratch_capacity_for_test(&self) -> usize {
+        self.scratch.capacity()
+    }
+
+    #[cfg(test)]
+    fn touched_len_for_test(&self) -> usize {
+        self.touched.len()
+    }
+
+    #[cfg(test)]
+    fn htab_is_zero_for_test(&self) -> bool {
+        self.htab.iter().all(|&value| value == 0)
+    }
+}
+
+/// Stateless LZF core operating on caller-owned buffers so the workspace can
+/// hold the table and output without overlapping mutable self borrows.
+fn compress_into(
+    input: &[u8],
+    out_capacity: usize,
+    out: &mut Vec<u8>,
+    htab: &mut [usize],
+    touched: &mut Vec<u16>,
+) -> Option<usize> {
     let in_len = input.len();
     if in_len == 0 || out_capacity == 0 {
         return None;
     }
-    let mut out = vec![0u8; out_capacity];
-    let mut htab = vec![0usize; HSIZE];
+    out.resize(out_capacity, 0);
 
     let mut ip = 0usize;
     let mut op = 0usize;
@@ -39,8 +130,8 @@ pub(crate) fn lzf_compress(input: &[u8], out_capacity: usize) -> Option<Vec<u8>>
     while ip < in_len - 2 {
         hval = next(hval, input, ip);
         let slot = idx(hval);
-        let refp = htab[slot]; // BIAS=0
-        htab[slot] = ip;
+        let refp = htab[slot];
+        set_htab_slot(htab, touched, slot, ip);
 
         let off = ip.wrapping_sub(refp).wrapping_sub(1);
         if refp != 0
@@ -63,7 +154,7 @@ pub(crate) fn lzf_compress(input: &[u8], out_capacity: usize) -> Option<Vec<u8>>
             }
 
             if lit == 0 {
-                op -= 1; //  run
+                op -= 1; // run
             } else {
                 out[op - lit - 1] = (lit - 1) as u8; // stop run
             }
@@ -87,7 +178,7 @@ pub(crate) fn lzf_compress(input: &[u8], out_capacity: usize) -> Option<Vec<u8>>
                 }
             }
 
-            len -= 2; // len  #octets - 1
+            len -= 2; // len #octets - 1
             ip += 1;
 
             if len < 7 {
@@ -115,11 +206,11 @@ pub(crate) fn lzf_compress(input: &[u8], out_capacity: usize) -> Option<Vec<u8>>
             ip -= 1;
             hval = frst(input, ip);
             hval = next(hval, input, ip);
-            htab[idx(hval)] = ip;
+            set_htab_slot(htab, touched, idx(hval), ip);
             ip += 1;
 
             hval = next(hval, input, ip);
-            htab[idx(hval)] = ip;
+            set_htab_slot(htab, touched, idx(hval), ip);
             ip += 1;
         } else {
             if op >= out_capacity {
@@ -155,13 +246,13 @@ pub(crate) fn lzf_compress(input: &[u8], out_capacity: usize) -> Option<Vec<u8>>
     }
 
     if lit == 0 {
-        op -= 1; //  run
+        op -= 1; // run
     } else {
         out[op - lit - 1] = (lit - 1) as u8; // end run
     }
 
     out.truncate(op);
-    Some(out)
+    Some(op)
 }
 
 #[cfg(test)]
@@ -172,15 +263,17 @@ mod tests {
     #[test]
     fn repeated_bytes_compress_and_roundtrip() {
         let input = vec![b'x'; 60];
-        let compressed = lzf_compress(&input, input.len() - 4).expect("compresses");
+        let mut ws = LzfWorkspace::new(true);
+        let compressed = ws.compress(&input, input.len() - 4).expect("compresses");
         assert_eq!(compressed.len(), 9);
-        assert_eq!(lzf_decompress(&compressed, input.len()).unwrap(), input);
+        assert_eq!(lzf_decompress(compressed, input.len()).unwrap(), input);
     }
 
     #[test]
     fn incompressible_short_input_returns_none() {
         let input: Vec<u8> = (0..24).map(|i| (i * 37) as u8).collect();
-        assert!(lzf_compress(&input, input.len() - 4).is_none());
+        let mut ws = LzfWorkspace::new(true);
+        assert!(ws.compress(&input, input.len() - 4).is_none());
     }
 
     #[test]
@@ -189,8 +282,82 @@ mod tests {
         for i in 0..1000u32 {
             input.extend_from_slice(format!("item{:04}-", i).as_bytes());
         }
-        let compressed = lzf_compress(&input, input.len() - 4).expect("compresses");
+        let mut ws = LzfWorkspace::new(true);
+        let compressed = ws.compress(&input, input.len() - 4).expect("compresses");
         assert!(compressed.len() < input.len());
-        assert_eq!(lzf_decompress(&compressed, input.len()).unwrap(), input);
+        assert_eq!(lzf_decompress(compressed, input.len()).unwrap(), input);
+    }
+
+    fn compress_once(input: &[u8]) -> Vec<u8> {
+        // Reference semantics: a brand-new workspace starts from an all-zero table.
+        let mut ws = LzfWorkspace::new(true);
+        ws.compress(input, input.len() - 4)
+            .expect("reference compresses")
+            .to_vec()
+    }
+
+    #[test]
+    fn workspace_reuse_matches_fresh_workspace_for_every_string() {
+        let inputs: Vec<Vec<u8>> = (0..64)
+            .map(|i| {
+                // Adjacent strings share three-byte prefixes to exercise table residue.
+                format!("shared-prefix-{i:04}-item-tail-{i:04}")
+                    .repeat(8)
+                    .into_bytes()
+            })
+            .collect();
+        let mut session = LzfWorkspace::new(true);
+        let htab_capacity_before = session.htab_capacity_for_test();
+        let scratch_capacity_before = session.scratch_capacity_for_test();
+        // The scratch buffer starts empty and is sized lazily by the first string.
+        assert_eq!(scratch_capacity_before, 0);
+        for input in &inputs {
+            let reused = session
+                .compress(input, input.len() - 4)
+                .expect("compresses");
+            assert_eq!(reused, compress_once(input).as_slice());
+        }
+        // The table is allocated once at construction and reused by every
+        // string, so its capacity must stay constant across the session.
+        assert_eq!(session.htab_capacity_for_test(), htab_capacity_before);
+    }
+
+    #[test]
+    fn disabled_workspace_allocates_no_table_and_never_compresses() {
+        let mut ws = LzfWorkspace::new(false);
+        assert_eq!(ws.htab_capacity_for_test(), 0);
+        assert!(ws.compress(b"repeated-bytes-repeated-bytes", 20).is_none());
+    }
+
+    #[test]
+    fn new_table_starts_zero_and_touched_is_stable_across_repeats() {
+        let mut ws = LzfWorkspace::new(true);
+        // A freshly allocated table is all zero before any compression.
+        assert!(ws.htab_is_zero_for_test());
+        let input = b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let _ = ws.compress(input, input.len() - 4).expect("compresses");
+        let first_touched = ws.touched_len_for_test();
+        assert!(first_touched > 0 && first_touched <= HSIZE);
+        // The same input touches the same slot set; reset must restore an
+        // equivalent table so the second pass records an identical slot count.
+        let _ = ws.compress(input, input.len() - 4).expect("compresses");
+        assert_eq!(ws.touched_len_for_test(), first_touched);
+    }
+
+    #[test]
+    fn capacity_failure_leaves_a_clean_table_for_the_next_string() {
+        let mut ws = LzfWorkspace::new(true);
+        // An out_capacity of zero always rejects compression without poisoning state.
+        assert!(ws.compress(b"xxxxxxxxxxxxxxxxxxxxxxxx", 0).is_none());
+        // A tiny non-zero capacity passes the entry guard, records touched
+        // slots, and only then rejects from the mid-stream capacity guard.
+        let crowded = b"x".repeat(64);
+        assert!(ws.compress(&crowded, 4).is_none());
+        assert!(ws.touched_len_for_test() > 0);
+        // reset() must clear the partial failure state so the next string is
+        // compressed exactly as it would be on a brand-new workspace.
+        let normal = b"repeated-pattern-repeated-pattern";
+        let reused = ws.compress(normal, normal.len() - 4).expect("compresses");
+        assert_eq!(reused, compress_once(normal).as_slice());
     }
 }

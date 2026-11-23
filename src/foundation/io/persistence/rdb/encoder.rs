@@ -1,7 +1,9 @@
-use crate::foundation::io::persistence::codec::lzf::lzf_compress;
 use crate::foundation::io::persistence::codec::types::{
     save_len, RDB_ENCVAL, RDB_ENC_INT16, RDB_ENC_INT32, RDB_ENC_INT8, RDB_ENC_LZF,
 };
+// Re-exported through `rdb` below, so the import itself must be crate-visible.
+// It goes through the codec re-export so every LzfWorkspace path shares one entry.
+pub(crate) use crate::foundation::io::persistence::codec::LzfWorkspace;
 use crate::foundation::io::persistence::codec::RdbWriter;
 
 fn try_save_integer(out: &mut Vec<u8>, s: &[u8]) -> bool {
@@ -42,36 +44,40 @@ fn try_save_integer(out: &mut Vec<u8>, s: &[u8]) -> bool {
     true
 }
 
-pub(crate) fn save_raw_string(out: &mut Vec<u8>, s: &[u8], compress: bool) {
+fn write_raw_string(out: &mut Vec<u8>, s: &[u8]) {
+    save_len(out, s.len() as u64);
+    out.extend_from_slice(s);
+}
+
+pub(crate) fn save_raw_string(out: &mut Vec<u8>, s: &[u8], ws: &mut LzfWorkspace) {
     let len = s.len();
     if len <= 11 && try_save_integer(out, s) {
         return;
     }
 
-    if compress && len > 20 {
-        if let Some(compressed) = lzf_compress(s, len - 4) {
+    if len > 20 {
+        if let Some(compressed) = ws.compress(s, len - 4) {
             if !compressed.is_empty() {
                 out.push((RDB_ENCVAL << 6) | RDB_ENC_LZF);
                 save_len(out, compressed.len() as u64);
                 save_len(out, len as u64);
-                out.extend_from_slice(&compressed);
+                out.extend_from_slice(compressed);
                 return;
             }
         }
     }
 
-    save_len(out, len as u64);
-    out.extend_from_slice(s);
+    write_raw_string(out, s);
 }
 
 pub(crate) struct RdbVecWriter<'a> {
     out: &'a mut Vec<u8>,
-    compression: bool,
+    ws: &'a mut LzfWorkspace,
 }
 
 impl<'a> RdbVecWriter<'a> {
-    pub(crate) fn new(out: &'a mut Vec<u8>, compression: bool) -> Self {
-        Self { out, compression }
+    pub(crate) fn new(out: &'a mut Vec<u8>, ws: &'a mut LzfWorkspace) -> Self {
+        Self { out, ws }
     }
 }
 
@@ -81,7 +87,7 @@ impl RdbWriter for RdbVecWriter<'_> {
     }
 
     fn write_string(&mut self, s: &[u8]) {
-        save_raw_string(self.out, s, self.compression);
+        save_raw_string(self.out, s, self.ws);
     }
 
     fn write_binary_double(&mut self, val: f64) {
@@ -98,9 +104,13 @@ impl RdbWriter for RdbVecWriter<'_> {
 }
 
 /// Unconfigured RDB string writes retain the historical uncompressed path.
-/// Production snapshot owners use `RdbVecWriter` with an explicit policy.
+/// Production snapshot owners use `RdbVecWriter` with an explicit workspace.
 pub fn save_string(out: &mut Vec<u8>, s: &[u8]) {
-    save_raw_string(out, s, false);
+    let len = s.len();
+    if len <= 11 && try_save_integer(out, s) {
+        return;
+    }
+    write_raw_string(out, s);
 }
 
 pub fn save_millisecond_time(out: &mut Vec<u8>, t: i64) {

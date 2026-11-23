@@ -1,12 +1,12 @@
 //! Cancellable background file saving with owned frozen input.
 
 use super::rdb::RDB_AUTOSYNC_BYTES;
-use crate::foundation::io::persistence::rdb::save_key_value;
 use crate::foundation::io::persistence::rdb::{
     compression::{new_rdb_frame_encoder, RdbCompression, RdbSnapshotOptions, VCS_RDB_HEADER},
     frozen::{ForklessItemId, FrozenRdb, FrozenWorkItem},
     RdbSerializeOptions,
 };
+use crate::foundation::io::persistence::rdb::{save_key_value, LzfWorkspace};
 use crate::foundation::io::persistence::{
     crc64, save_len, RDB_OPCODE_EOF, RDB_OPCODE_RESIZEDB, RDB_OPCODE_SELECTDB,
 };
@@ -431,6 +431,7 @@ where
     F: FnMut(&[u8]) -> io::Result<()>,
 {
     let mut crc = 0;
+    let mut ws = LzfWorkspace::new(options.compression);
     let mut write = |bytes: &[u8]| {
         control.check_cancelled()?;
         crc = crc64(crc, bytes);
@@ -461,7 +462,7 @@ where
                     entry.value.as_ref(),
                     entry.expire_ms,
                     entry.hash_field_expires.as_ref(),
-                    options.compression,
+                    &mut ws,
                 );
                 write(&chunk)?;
                 let completion = entry.completion.clone();

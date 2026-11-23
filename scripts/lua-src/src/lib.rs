@@ -48,7 +48,11 @@ impl Build {
             panic!("Unsupported native Lua target: {target}");
         }
         if cfg!(debug_assertions) {
-            compiler.define("LUA_USE_APICHECK", None).debug(true);
+            // Optimize the Lua VM without disabling development API checks.
+            compiler
+                .opt_level(2)
+                .define("LUA_USE_APICHECK", None)
+                .debug(true);
         }
         // Match the library objects in the pinned Lua Makefile; exclude tools.
         for name in [

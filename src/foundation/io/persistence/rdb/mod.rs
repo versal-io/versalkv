@@ -8,7 +8,7 @@ mod stream;
 mod tests;
 
 pub use encoder::{save_millisecond_time, save_string};
-pub(crate) use encoder::{save_raw_string, RdbVecWriter};
+pub(crate) use encoder::{save_raw_string, LzfWorkspace, RdbVecWriter};
 pub(crate) use serialize::save_key_value;
 pub use serialize::{
     serialize_all, serialize_all_with_functions, serialize_all_with_functions_and_replication,

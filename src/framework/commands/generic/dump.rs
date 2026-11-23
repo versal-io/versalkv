@@ -38,14 +38,13 @@ pub(crate) fn serialize_object_with_hash_field_expires_with_compression(
     compression: bool,
 ) -> Option<Vec<u8>> {
     let mut buf = Vec::new();
+    let mut ws = crate::foundation::io::persistence::rdb::LzfWorkspace::new(compression);
     buf.push(persistence::type_byte_with_hash_field_expires(
         obj,
         hash_field_expires,
     ));
-    let mut writer = crate::foundation::io::persistence::rdb::RdbVecWriter::new(
-        &mut buf,
-        compression,
-    );
+    let mut writer =
+        crate::foundation::io::persistence::rdb::RdbVecWriter::new(&mut buf, &mut ws);
     persistence::save_robj_with_hash_field_expires(obj, hash_field_expires, &mut writer);
     buf.extend_from_slice(&persistence::RDB_VERSION.to_le_bytes());
     let crc = persistence::crc64(0, &buf);

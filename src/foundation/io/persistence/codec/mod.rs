@@ -4,6 +4,7 @@ mod dispatch;
 mod hash;
 mod list;
 pub(crate) mod lzf;
+pub(crate) use lzf::LzfWorkspace;
 mod path_hash;
 mod registry;
 mod set;

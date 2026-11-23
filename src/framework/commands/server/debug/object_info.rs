@@ -2,7 +2,7 @@ use crate::engine::command::context::CommandConn;
 use crate::foundation::io::persistence::codec::decoder_compact;
 use crate::foundation::io::persistence::codec::types::QUICKLIST_NODE_CONTAINER_PACKED;
 use crate::foundation::io::persistence::codec::RdbWriter;
-use crate::foundation::io::persistence::rdb::save_raw_string;
+use crate::foundation::io::persistence::rdb::{save_raw_string, LzfWorkspace};
 use crate::foundation::io::persistence::save_robj;
 use crate::foundation::io::protocol::Value;
 use crate::foundation::io::store::structure::list::ListValue;
@@ -117,26 +117,26 @@ fn is_lfu_policy(ctx: &ServerContext) -> bool {
     .is_some_and(|policy| policy.uses_lfu())
 }
 
-struct DebugRdbWriter {
+struct DebugRdbWriter<'a> {
     buf: Vec<u8>,
-    compress: bool,
+    ws: &'a mut LzfWorkspace,
 }
 
-impl DebugRdbWriter {
-    fn new(compress: bool) -> Self {
+impl<'a> DebugRdbWriter<'a> {
+    fn new(ws: &'a mut LzfWorkspace) -> Self {
         Self {
             buf: Vec::new(),
-            compress,
+            ws,
         }
     }
 }
 
-impl RdbWriter for DebugRdbWriter {
+impl RdbWriter for DebugRdbWriter<'_> {
     fn write_len(&mut self, len: u64) {
         self.buf.write_len(len);
     }
     fn write_string(&mut self, s: &[u8]) {
-        save_raw_string(&mut self.buf, s, self.compress);
+        save_raw_string(&mut self.buf, s, self.ws);
     }
     fn write_binary_double(&mut self, val: f64) {
         self.buf.write_binary_double(val);
@@ -157,7 +157,8 @@ fn serialized_length(
     compress: bool,
     stream_max_entries: i64,
 ) -> usize {
-    let mut w = DebugRdbWriter::new(compress);
+    let mut ws = LzfWorkspace::new(compress);
+    let mut w = DebugRdbWriter::new(&mut ws);
     match obj {
         Robj::ListQuicklist(list) if enc == "listpack" => save_listpack_string(list, &mut w),
         Robj::ListQuicklist(list) if enc == "quicklist" => save_quicklist2_body(list, fill, &mut w),

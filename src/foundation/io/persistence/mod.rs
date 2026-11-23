@@ -18,8 +18,8 @@ mod rdb_encoder;
 
 #[cfg(feature = "wasm")]
 pub mod rdb {
-    pub(crate) use super::rdb_encoder::RdbVecWriter;
     pub use super::rdb_encoder::{save_millisecond_time, save_string};
+    pub(crate) use super::rdb_encoder::{LzfWorkspace, RdbVecWriter};
 }
 
 #[cfg(not(feature = "wasm"))]

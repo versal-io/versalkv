@@ -1,7 +1,7 @@
 use super::compression::{
     new_rdb_frame_encoder, RdbCompression, RdbSnapshotOptions, VCS_RDB_HEADER,
 };
-use super::{save_raw_string, RdbVecWriter};
+use super::{save_raw_string, LzfWorkspace, RdbVecWriter};
 use crate::foundation::io::persistence::{
     crc64, save_len, save_millisecond_time, type_byte_with_hash_field_expires, RDB_OPCODE_AUX,
     RDB_OPCODE_EOF, RDB_OPCODE_EXPIRETIME_MS, RDB_OPCODE_RESIZEDB, RDB_OPCODE_SELECTDB,
@@ -233,6 +233,7 @@ pub fn serialize_all_with_functions_and_replication_with_options(
     };
     let estimate = 9 + 256 + total_keys.saturating_mul(64);
     let mut out = Vec::with_capacity(estimate as usize);
+    let mut ws = LzfWorkspace::new(options.compression);
 
     out.extend_from_slice(format!("VALKEY{:03}", RDB_VERSION).as_bytes());
 
@@ -240,14 +241,14 @@ pub fn serialize_all_with_functions_and_replication_with_options(
         &mut out,
         b"valkey-ver",
         version::REDIS_VERSION.as_bytes(),
-        options.compression,
+        &mut ws,
     );
-    save_aux_str(&mut out, b"redis-bits", b"64", options.compression);
+    save_aux_str(&mut out, b"redis-bits", b"64", &mut ws);
     save_aux_str(
         &mut out,
         b"ctime",
         (now_ms() / 1000).to_string().as_bytes(),
-        options.compression,
+        &mut ws,
     );
     save_aux_str(
         &mut out,
@@ -255,41 +256,41 @@ pub fn serialize_all_with_functions_and_replication_with_options(
         crate::foundation::memory::util_alloc::total_allocated()
             .to_string()
             .as_bytes(),
-        options.compression,
+        &mut ws,
     );
     if let Some(replication) = replication {
         save_aux_str(
             &mut out,
             b"repl-stream-db",
             replication.repl_stream_db.to_string().as_bytes(),
-            options.compression,
+            &mut ws,
         );
         save_aux_str(
             &mut out,
             b"repl-id",
             replication.repl_id.as_bytes(),
-            options.compression,
+            &mut ws,
         );
         save_aux_str(
             &mut out,
             b"repl-offset",
             replication.repl_offset.to_string().as_bytes(),
-            options.compression,
+            &mut ws,
         );
         for (key, value) in &replication.aux_fields {
-            save_aux_str(&mut out, key, value, options.compression);
+            save_aux_str(&mut out, key, value, &mut ws);
         }
     }
-    save_aux_str(&mut out, b"aof-base", b"0", options.compression);
+    save_aux_str(&mut out, b"aof-base", b"0", &mut ws);
 
     for code in function_codes {
         out.push(crate::foundation::io::persistence::codec::types::RDB_OPCODE_FUNCTION2);
-        save_raw_string(&mut out, code, options.compression);
+        save_raw_string(&mut out, code, &mut ws);
     }
 
     if include_keys {
         for dataset in std::iter::once(dbs).chain(additional_datasets.iter().copied()) {
-            append_dataset(&mut out, dataset, key_delay_us, options.compression);
+            append_dataset(&mut out, dataset, key_delay_us, &mut ws);
         }
     }
 
@@ -404,6 +405,7 @@ where
     F: FnMut(&[u8]) -> bool,
 {
     let mut chunk = Vec::with_capacity(RDB_STREAM_BATCH_BYTES);
+    let mut ws = LzfWorkspace::new(options.compression);
     let mut crc = 0u64;
     chunk.extend_from_slice(format!("VALKEY{:03}", RDB_VERSION).as_bytes());
     let ctime = (now_ms() / 1000).to_string();
@@ -414,7 +416,7 @@ where
         (b"ctime".as_slice(), ctime.as_bytes()),
         (b"used-mem".as_slice(), used_mem.as_bytes()),
     ] {
-        save_aux_str(&mut chunk, key, value, options.compression);
+        save_aux_str(&mut chunk, key, value, &mut ws);
         if chunk.len() >= RDB_STREAM_BATCH_BYTES
             && !flush_stream_chunk(&mut chunk, &mut crc, &mut emit)
         {
@@ -429,7 +431,7 @@ where
             (b"repl-id".as_slice(), replication.repl_id.as_bytes()),
             (b"repl-offset".as_slice(), repl_offset.as_bytes()),
         ] {
-            save_aux_str(&mut chunk, key, value, options.compression);
+            save_aux_str(&mut chunk, key, value, &mut ws);
             if chunk.len() >= RDB_STREAM_BATCH_BYTES
                 && !flush_stream_chunk(&mut chunk, &mut crc, &mut emit)
             {
@@ -437,7 +439,7 @@ where
             }
         }
         for (key, value) in &replication.aux_fields {
-            save_aux_str(&mut chunk, key, value, options.compression);
+            save_aux_str(&mut chunk, key, value, &mut ws);
             if chunk.len() >= RDB_STREAM_BATCH_BYTES
                 && !flush_stream_chunk(&mut chunk, &mut crc, &mut emit)
             {
@@ -445,14 +447,14 @@ where
             }
         }
     }
-    save_aux_str(&mut chunk, b"aof-base", b"0", options.compression);
+    save_aux_str(&mut chunk, b"aof-base", b"0", &mut ws);
     if chunk.len() >= RDB_STREAM_BATCH_BYTES && !flush_stream_chunk(&mut chunk, &mut crc, &mut emit)
     {
         return false;
     }
     for code in function_codes {
         chunk.push(crate::foundation::io::persistence::codec::types::RDB_OPCODE_FUNCTION2);
-        save_raw_string(&mut chunk, code, options.compression);
+        save_raw_string(&mut chunk, code, &mut ws);
         if chunk.len() >= RDB_STREAM_BATCH_BYTES
             && !flush_stream_chunk(&mut chunk, &mut crc, &mut emit)
         {
@@ -476,7 +478,7 @@ where
                     if !ok {
                         return;
                     }
-                    save_key_value(&mut chunk, key, val, expire, hfe, options.compression);
+                    save_key_value(&mut chunk, key, val, expire, hfe, &mut ws);
                     if chunk.len() >= RDB_STREAM_BATCH_BYTES {
                         ok = flush_stream_chunk(&mut chunk, &mut crc, &mut emit);
                     }
@@ -498,7 +500,7 @@ where
     emit(&checksum.to_le_bytes())
 }
 
-fn append_dataset(out: &mut Vec<u8>, dbs: &DbSet, key_delay_us: i64, compression: bool) {
+fn append_dataset(out: &mut Vec<u8>, dbs: &DbSet, key_delay_us: i64, ws: &mut LzfWorkspace) {
     for i in 0..dbs.num_dbs() as u32 {
         let Some(db) = dbs.get(i) else { continue };
         if db.dbsize() == 0 {
@@ -510,7 +512,7 @@ fn append_dataset(out: &mut Vec<u8>, dbs: &DbSet, key_delay_us: i64, compression
         save_len(out, db.dbsize() as u64);
         save_len(out, db.expires_count() as u64);
         db.for_each_entry_with_hash_field_expires(|key, val, expire, hfe| {
-            save_key_value(out, key, val, expire, hfe, compression);
+            save_key_value(out, key, val, expire, hfe, ws);
             delay_after_key_save(key_delay_us);
         });
     }
@@ -527,10 +529,10 @@ pub(crate) fn delay_after_key_save(key_delay_us: i64) {
     });
 }
 
-fn save_aux_str(out: &mut Vec<u8>, key: &[u8], val: &[u8], compression: bool) {
+fn save_aux_str(out: &mut Vec<u8>, key: &[u8], val: &[u8], ws: &mut LzfWorkspace) {
     out.push(RDB_OPCODE_AUX);
-    save_raw_string(out, key, compression);
-    save_raw_string(out, val, compression);
+    save_raw_string(out, key, ws);
+    save_raw_string(out, val, ws);
 }
 
 pub(crate) fn save_key_value(
@@ -539,15 +541,15 @@ pub(crate) fn save_key_value(
     val: &Robj,
     expire: Option<u64>,
     hash_field_expires: Option<&HashMap<Vec<u8>, u64>>,
-    compression: bool,
+    ws: &mut LzfWorkspace,
 ) {
     if let Some(exp) = expire {
         out.push(RDB_OPCODE_EXPIRETIME_MS);
         save_millisecond_time(out, exp as i64);
     }
     out.push(type_byte_with_hash_field_expires(val, hash_field_expires));
-    save_raw_string(out, key, compression);
-    let mut writer = RdbVecWriter::new(out, compression);
+    save_raw_string(out, key, ws);
+    let mut writer = RdbVecWriter::new(out, ws);
     crate::foundation::io::persistence::codec::save_robj_with_hash_field_expires(
         val,
         hash_field_expires,
