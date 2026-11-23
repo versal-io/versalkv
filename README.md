@@ -1,6 +1,14 @@
 # VersalKV
 
+[![CI](https://github.com/versal-io/versalkv/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/versal-io/versalkv/actions/workflows/ci.yml)
+[![Daily Tcl Regression](https://github.com/versal-io/versalkv/actions/workflows/daily-runtest.yml/badge.svg?branch=main)](https://github.com/versal-io/versalkv/actions/workflows/daily-runtest.yml)
 [![CodSpeed](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json)](https://app.codspeed.io/versal-io/versalkv?utm_source=badge)
+
+[![Rust](https://img.shields.io/badge/Rust-1.99.1-orange?logo=rust)](rust-toolchain.toml)
+[![License: BSD 3-Clause](https://img.shields.io/badge/License-BSD--3--Clause-blue.svg)](LICENSE)
+
+[![GitHub stars](https://img.shields.io/github/stars/versal-io/versalkv)](https://github.com/versal-io/versalkv/stargazers)
+[![GitHub issues](https://img.shields.io/github/issues/versal-io/versalkv)](https://github.com/versal-io/versalkv/issues)
 
 A pure-Rust reimplementation of the [Valkey](https://valkey.io) server, wire
 compatible with the RESP protocol. VersalKV targets the same on-disk formats
