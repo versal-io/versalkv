@@ -205,6 +205,7 @@ impl ClusterBusManager {
                     for fm in &fail_msgs {
                         if !fm.is_empty() {
                             conn.write_buf.extend_from_slice(fm);
+                            self.pending_link_view_updates.insert(conn.token.0);
                         }
                     }
                 }

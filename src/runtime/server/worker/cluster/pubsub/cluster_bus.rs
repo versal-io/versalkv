@@ -254,26 +254,18 @@ impl ServerWorkerState {
                 connection.write_buf.extend_from_slice(&frame);
                 sent += 1;
             }
+            self.cluster_bus.mark_link_view_dirty(token);
         }
         if sent > 0 {
-            let cluster_link_memory = self
-                .cluster_bus
-                .connections
-                .values()
-                .map(|connection| {
-                    connection
-                        .read_buf
-                        .capacity()
-                        .saturating_add(connection.write_buf.capacity())
-                })
-                .sum();
-            if let Some(state) = self.ctx.cluster_state_mut().as_deref_mut() {
+            let mut state = self.ctx.cluster_state_mut().take();
+            if let Some(state) = state.as_deref_mut() {
                 for _ in 0..sent {
                     state.record_bus_message_sent(message_type);
                     state.record_bus_frame_sent(message_type, frame.len());
                 }
-                state.set_cluster_link_memory(cluster_link_memory);
+                self.refresh_pending_cluster_link_views_for_state(state);
             }
+            *self.ctx.cluster_state_mut() = state;
         }
     }
 

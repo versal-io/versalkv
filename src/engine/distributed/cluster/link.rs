@@ -66,6 +66,23 @@ pub struct LinkBufferEvent {
 }
 
 impl ClusterLinkView {
+    pub(crate) fn observe_io(&mut self, event: LinkIoEvent) {
+        if let Some(last_read_ms) = event.read_at_ms {
+            self.last_read_ms = self.last_read_ms.max(last_read_ms);
+        }
+        if let Some(last_write_ms) = event.wrote_at_ms {
+            self.last_write_ms = self.last_write_ms.max(last_write_ms);
+        }
+        self.bytes_received = self.bytes_received.max(event.total_bytes_received);
+        self.bytes_sent = self.bytes_sent.max(event.total_bytes_sent);
+    }
+
+    pub(crate) fn observe_buffer(&mut self, event: LinkBufferEvent) {
+        self.send_buffer_allocated = event.allocated;
+        self.send_buffer_used = event.used;
+        self.events = event.events;
+    }
+
     pub fn new(
         node_id: NodeId,
         direction: ClusterLinkDirection,
@@ -101,30 +118,67 @@ impl ClusterLinkView {
 }
 
 impl ClusterState {
+    /// Retain stable metadata and return the view for an incremental I/O update.
+    pub(crate) fn observe_link_metadata(
+        &mut self,
+        previous_node_id: Option<&str>,
+        node_name: &str,
+        direction: ClusterLinkDirection,
+        created_at_ms: i64,
+        endpoint: std::net::SocketAddr,
+        temporary_handshake: bool,
+    ) -> Option<&mut ClusterLinkView> {
+        let node_id = if previous_node_id != Some(node_name) {
+            Some(NodeId::parse(node_name.as_bytes()).ok()?)
+        } else {
+            None
+        };
+        if let Some(previous) = previous_node_id.filter(|previous| *previous != node_name) {
+            self.link_views.remove(&(previous.to_string(), direction));
+        }
+        let view = match self.link_views.entry((node_name.to_string(), direction)) {
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                let view = entry.into_mut();
+                if let Some(node_id) = node_id {
+                    *view = ClusterLinkView::new(
+                        node_id,
+                        direction,
+                        created_at_ms,
+                        super::LinkEvents::default(),
+                    );
+                }
+                view
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let node_id = match node_id {
+                    Some(node_id) => node_id,
+                    None => NodeId::parse(node_name.as_bytes()).ok()?,
+                };
+                entry.insert(ClusterLinkView::new(
+                    node_id,
+                    direction,
+                    created_at_ms,
+                    super::LinkEvents::default(),
+                ))
+            }
+        };
+        let endpoint_matches = view.endpoint.as_ref().is_some_and(|(host, port)| {
+            *port == endpoint.port() && host.parse::<std::net::IpAddr>().ok() == Some(endpoint.ip())
+        });
+        if !endpoint_matches {
+            view.endpoint = Some((endpoint.ip().to_string(), endpoint.port()));
+        }
+        view.temporary_handshake = temporary_handshake;
+        Some(view)
+    }
+
     pub fn observe_link_open(&mut self, view: ClusterLinkView) {
         let key = (view.node_id.to_string(), view.direction);
         self.link_views.insert(key, view);
         self.debug_assert_link_invariants();
     }
 
-    pub fn observe_link_identity(&mut self, previous_node_id: Option<&str>, view: ClusterLinkView) {
-        if previous_node_id == Some(view.node_id.as_str()) {
-            let key = (view.node_id.to_string(), view.direction);
-            if let Some(existing) = self.link_views.get_mut(&key) {
-                existing.endpoint = view.endpoint;
-                existing.temporary_handshake = view.temporary_handshake;
-            } else {
-                self.link_views.insert(key, view);
-            }
-            return;
-        }
-        if let Some(previous_node_id) = previous_node_id {
-            self.link_views
-                .remove(&(previous_node_id.to_string(), view.direction));
-        }
-        self.observe_link_open(view);
-    }
-
+    #[cfg(test)]
     pub fn observe_link_io(
         &mut self,
         node_id: &str,
@@ -134,16 +188,10 @@ impl ClusterState {
         let Some(view) = self.link_views.get_mut(&(node_id.to_string(), direction)) else {
             return;
         };
-        if let Some(last_read_ms) = event.read_at_ms {
-            view.last_read_ms = view.last_read_ms.max(last_read_ms);
-        }
-        if let Some(last_write_ms) = event.wrote_at_ms {
-            view.last_write_ms = view.last_write_ms.max(last_write_ms);
-        }
-        view.bytes_received = view.bytes_received.max(event.total_bytes_received);
-        view.bytes_sent = view.bytes_sent.max(event.total_bytes_sent);
+        view.observe_io(event);
     }
 
+    #[cfg(test)]
     pub fn observe_link_buffer(
         &mut self,
         node_id: &str,
@@ -153,9 +201,7 @@ impl ClusterState {
         let Some(view) = self.link_views.get_mut(&(node_id.to_string(), direction)) else {
             return;
         };
-        view.send_buffer_allocated = event.allocated;
-        view.send_buffer_used = event.used;
-        view.events = event.events;
+        view.observe_buffer(event);
     }
 
     pub fn observe_link_close(&mut self, node_id: &str, direction: ClusterLinkDirection) {

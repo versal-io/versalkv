@@ -93,6 +93,9 @@ impl ClusterBusManager {
         bytes: &[u8],
         now: i64,
     ) -> bool {
+        if !bytes.is_empty() {
+            self.mark_link_view_dirty(token_value);
+        }
         if let Some(connection) = self.connections.get_mut(&token_value) {
             if !bytes.is_empty() {
                 connection.read_buf.extend_from_slice(bytes);
@@ -342,9 +345,11 @@ impl ClusterBusManager {
             if connection.handshake_node_name == handshake_id {
                 connection.node_name = message.sender_id.clone();
                 connection.handshake_node_name.clear();
+                self.pending_link_view_updates.insert(connection.token.0);
             }
             if connection.projected_node_name == handshake_id {
                 connection.projected_node_name = message.sender_id.clone();
+                self.pending_link_view_updates.insert(connection.token.0);
             }
         }
         if let Some(connection) = self.connections.get_mut(&token_value) {
@@ -398,6 +403,7 @@ impl ClusterBusManager {
                     && !connection.node_name.is_empty()
                 {
                     connection.write_buf.extend_from_slice(&fail);
+                    self.pending_link_view_updates.insert(connection.token.0);
                     state.record_bus_message_sent(ClusterMsgType::Fail);
                 }
             }
@@ -481,6 +487,7 @@ impl ClusterBusManager {
                     && connection.node_name != expected_id
                 {
                     connection.write_buf.extend_from_slice(&fail);
+                    self.pending_link_view_updates.insert(connection.token.0);
                     state.record_bus_message_sent(ClusterMsgType::Fail);
                 }
             }
@@ -548,6 +555,7 @@ impl ClusterBusManager {
                     let pong = self.build_pong(state);
                     if let Some(connection) = self.connections.get_mut(&token_value) {
                         connection.write_buf.extend_from_slice(&pong);
+                        self.pending_link_view_updates.insert(connection.token.0);
                     }
                 }
             }
@@ -716,6 +724,7 @@ impl ClusterBusManager {
                             .get_mut(&reply_token.unwrap_or(token_value))
                         {
                             connection.write_buf.extend_from_slice(&update);
+                            self.pending_link_view_updates.insert(connection.token.0);
                             state.record_bus_message_sent(ClusterMsgType::Update);
                         }
                     }
@@ -732,6 +741,7 @@ impl ClusterBusManager {
                         ).encode().expect("local cluster wire metadata must be valid");
                         if let Some(connection) = self.connections.get_mut(&reply_token) {
                             connection.write_buf.extend_from_slice(&nack);
+                            self.pending_link_view_updates.insert(connection.token.0);
                             state.record_bus_message_sent(ClusterMsgType::FailoverAuthNack);
                         }
                     }
@@ -1012,6 +1022,7 @@ impl ClusterBusManager {
                 let pong = self.build_pong(state);
                 if let Some(conn) = self.connections.get_mut(&token_value) {
                     conn.write_buf.extend_from_slice(&pong);
+                    self.pending_link_view_updates.insert(conn.token.0);
                 }
                 return;
             }
@@ -1046,6 +1057,7 @@ impl ClusterBusManager {
                 let pong = self.build_pong(state);
                 if let Some(conn) = self.connections.get_mut(&token_value) {
                     conn.write_buf.extend_from_slice(&pong);
+                    self.pending_link_view_updates.insert(conn.token.0);
                 }
                 return;
             }
@@ -1066,6 +1078,7 @@ impl ClusterBusManager {
             let pong = self.build_pong(state);
             if let Some(conn) = self.connections.get_mut(&token_value) {
                 conn.write_buf.extend_from_slice(&pong);
+                self.pending_link_view_updates.insert(conn.token.0);
             }
             return;
         }
@@ -1148,6 +1161,7 @@ impl ClusterBusManager {
         let pong = self.build_pong(state);
         if let Some(conn) = self.connections.get_mut(&token_value) {
             conn.write_buf.extend_from_slice(&pong);
+            self.pending_link_view_updates.insert(conn.token.0);
         }
 
         crate::server_log!(
@@ -1237,6 +1251,7 @@ impl ClusterBusManager {
         let pong = self.build_pong(state);
         if let Some(conn) = self.connections.get_mut(&token_value) {
             conn.write_buf.extend_from_slice(&pong);
+            self.pending_link_view_updates.insert(conn.token.0);
         }
     }
 
@@ -1258,6 +1273,7 @@ impl ClusterBusManager {
             let pong = self.build_pong(state);
             if let Some(connection) = self.connections.get_mut(&token_value) {
                 connection.write_buf.extend_from_slice(&pong);
+                self.pending_link_view_updates.insert(connection.token.0);
             }
             return;
         }

@@ -205,7 +205,7 @@ impl ServerWorkerState {
             self.execute_cluster_actions(state, failover_actions.actions, now);
             let actions = reduce(state, ClusterEvent::BroadcastTopology);
             self.execute_cluster_bus_actions(state, actions);
-            self.refresh_cluster_link_views_for_state(state);
+            self.refresh_pending_cluster_link_views_for_state(state);
         }
         *self.ctx.cluster_state_mut() = state_opt;
         self.drain_cluster_bus_publishes();
@@ -236,7 +236,11 @@ impl ServerWorkerState {
             .is_ok()
         {
             if let Some(connection) = self.cluster_bus.connections.get_mut(&token.0) {
-                connection.events = crate::engine::distributed::cluster::LinkEvents::READ_WRITE;
+                if connection.events != crate::engine::distributed::cluster::LinkEvents::READ_WRITE
+                {
+                    connection.events = crate::engine::distributed::cluster::LinkEvents::READ_WRITE;
+                    self.cluster_bus.mark_link_view_dirty(token.0);
+                }
             }
         }
     }
@@ -246,6 +250,7 @@ impl ServerWorkerState {
         if let Some(cluster_state) = state.as_deref_mut() {
             let actions = reduce(cluster_state, ClusterEvent::BroadcastTopology);
             self.execute_cluster_bus_actions(cluster_state, actions);
+            self.refresh_pending_cluster_link_views_for_state(cluster_state);
         }
         *self.ctx.cluster_state_mut() = state;
     }
@@ -365,23 +370,50 @@ impl ServerWorkerState {
                     .ok()
                     .map(|node_id| (node_id, connection.direction()))
             });
-        match (schedule_reconnect, state) {
-            (true, Some(cluster_state)) => {
-                self.cluster_bus
-                    .remove_and_schedule_retry(cluster_state, token.0);
+        match state {
+            Some(cluster_state) => {
+                if schedule_reconnect {
+                    self.cluster_bus
+                        .remove_and_schedule_retry(cluster_state, token.0);
+                } else {
+                    self.cluster_bus.remove(token.0);
+                }
                 if let Some((node_id, direction)) = removed_link {
-                    cluster_state.observe_link_close(node_id.as_str(), direction);
+                    self.refresh_cluster_link_after_removal(cluster_state, node_id, direction);
                 }
                 Self::update_cluster_link_memory(&self.cluster_bus, cluster_state);
             }
-            (_, Some(cluster_state)) => {
-                self.cluster_bus.remove(token.0);
-                if let Some((node_id, direction)) = removed_link {
-                    cluster_state.observe_link_close(node_id.as_str(), direction);
-                }
-                Self::update_cluster_link_memory(&self.cluster_bus, cluster_state);
-            }
-            (_, None) => self.cluster_bus.remove(token.0),
+            None => self.cluster_bus.remove(token.0),
+        }
+    }
+
+    fn refresh_cluster_link_after_removal(
+        &mut self,
+        state: &mut crate::engine::distributed::cluster::ClusterState,
+        node_id: NodeId,
+        direction: crate::engine::distributed::cluster::ClusterLinkDirection,
+    ) {
+        // Several inbound sockets can briefly share a directional identity.
+        // Keep a surviving socket visible without emitting a peer disconnect.
+        let survivor = self
+            .cluster_bus
+            .connections
+            .iter()
+            .filter(|(_, connection)| {
+                let identity = if connection.node_name.is_empty() {
+                    &connection.handshake_node_name
+                } else {
+                    &connection.node_name
+                };
+                identity == node_id.as_str() && connection.direction() == direction
+            })
+            .max_by_key(|(token, connection)| (connection.created_at, **token))
+            .map(|(token, connection)| (*token, connection.created_at, connection.events));
+        if let Some((token, created_at, events)) = survivor {
+            state.observe_link_open(ClusterLinkView::new(node_id, direction, created_at, events));
+            self.refresh_cluster_link_view_for_state(state, Token(token));
+        } else {
+            state.observe_link_close(node_id.as_str(), direction);
         }
     }
 
@@ -401,6 +433,7 @@ impl ServerWorkerState {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn refresh_cluster_link_views(&mut self) {
         let mut state = self.ctx.cluster_state_mut().take();
         if let Some(state) = state.as_deref_mut() {
@@ -420,11 +453,31 @@ impl ServerWorkerState {
         Self::update_cluster_link_memory(&self.cluster_bus, state);
     }
 
+    pub(crate) fn refresh_pending_cluster_link_views(&mut self) {
+        let mut state = self.ctx.cluster_state_mut().take();
+        if let Some(state) = state.as_deref_mut() {
+            self.refresh_pending_cluster_link_views_for_state(state);
+        }
+        *self.ctx.cluster_state_mut() = state;
+    }
+
+    pub(in crate::runtime) fn refresh_pending_cluster_link_views_for_state(
+        &mut self,
+        state: &mut crate::engine::distributed::cluster::ClusterState,
+    ) {
+        for token in self.cluster_bus.take_link_view_updates() {
+            self.refresh_cluster_link_view_for_state(state, Token(token));
+        }
+        Self::update_cluster_link_memory(&self.cluster_bus, state);
+    }
+
     pub(in crate::runtime) fn refresh_cluster_link_view_for_state(
         &mut self,
         state: &mut crate::engine::distributed::cluster::ClusterState,
         token: Token,
     ) {
+        self.cluster_bus.refresh_link_memory(token.0);
+        Self::update_cluster_link_memory(&self.cluster_bus, state);
         let kernel_pending = self
             .transport
             .raw_fd(token)
@@ -438,57 +491,40 @@ impl ServerWorkerState {
         } else {
             &connection.node_name
         };
-        let Ok(node_id) = NodeId::parse(identity.as_bytes()) else {
-            return;
-        };
         let direction = connection.direction();
         let previous_node_id = (!connection.projected_node_name.is_empty())
-            .then(|| std::mem::replace(&mut connection.projected_node_name, node_id.to_string()));
-        if previous_node_id.is_none() {
-            connection.projected_node_name = node_id.to_string();
+            .then_some(connection.projected_node_name.as_str());
+        let Some(view) = state.observe_link_metadata(
+            previous_node_id,
+            identity,
+            direction,
+            connection.created_at,
+            connection.addr,
+            !connection.handshake_node_name.is_empty(),
+        ) else {
+            return;
+        };
+        if connection.projected_node_name != *identity {
+            connection.projected_node_name.clone_from(identity);
         }
-        let node_name = node_id.to_string();
-        let view =
-            ClusterLinkView::new(node_id, direction, connection.created_at, connection.events)
-                .with_endpoint(connection.addr.ip().to_string(), connection.addr.port())
-                .with_temporary_handshake(!connection.handshake_node_name.is_empty());
-        state.observe_link_identity(previous_node_id.as_deref(), view);
-        state.observe_link_io(
-            &node_name,
-            direction,
-            LinkIoEvent {
-                read_at_ms: (connection.last_recv > 0).then_some(connection.last_recv),
-                wrote_at_ms: (connection.last_send > 0).then_some(connection.last_send),
-                total_bytes_received: connection.bytes_received,
-                total_bytes_sent: connection.bytes_sent,
-            },
-        );
-        state.observe_link_buffer(
-            &node_name,
-            direction,
-            LinkBufferEvent {
-                allocated: connection.write_buf.capacity(),
-                used: connection.write_buf.len().saturating_add(kernel_pending),
-                events: connection.events,
-            },
-        );
+        view.observe_io(LinkIoEvent {
+            read_at_ms: (connection.last_recv > 0).then_some(connection.last_recv),
+            wrote_at_ms: (connection.last_send > 0).then_some(connection.last_send),
+            total_bytes_received: connection.bytes_received,
+            total_bytes_sent: connection.bytes_sent,
+        });
+        view.observe_buffer(LinkBufferEvent {
+            allocated: connection.write_buf.capacity(),
+            used: connection.write_buf.len().saturating_add(kernel_pending),
+            events: connection.events,
+        });
     }
 
     fn update_cluster_link_memory(
         bus: &crate::engine::distributed::cluster::bus::ClusterBusManager,
         state: &mut crate::engine::distributed::cluster::ClusterState,
     ) {
-        let memory = bus
-            .connections
-            .values()
-            .map(|connection| {
-                connection
-                    .read_buf
-                    .capacity()
-                    .saturating_add(connection.write_buf.capacity())
-            })
-            .sum();
-        state.set_cluster_link_memory(memory);
+        state.set_cluster_link_memory(bus.link_buffer_memory());
     }
 
     #[cfg(test)]
@@ -748,12 +784,17 @@ impl ServerWorkerState {
                     .set_interest(Token(writable), Interest::ReadWritable)
                 {
                     if let Some(connection) = self.cluster_bus.connections.get_mut(&writable) {
-                        connection.events =
-                            crate::engine::distributed::cluster::LinkEvents::READ_WRITE;
+                        if connection.events
+                            != crate::engine::distributed::cluster::LinkEvents::READ_WRITE
+                        {
+                            connection.events =
+                                crate::engine::distributed::cluster::LinkEvents::READ_WRITE;
+                            self.cluster_bus.mark_link_view_dirty(writable);
+                        }
                     }
                 }
             }
-            self.refresh_cluster_link_views_for_state(state);
+            self.refresh_pending_cluster_link_views_for_state(state);
         }
         self.drain_cluster_bus_publishes();
         if should_close {
@@ -867,8 +908,8 @@ impl ServerWorkerState {
         }
         let sendbuf_limit = self.ctx.config().server.cluster_link_sendbuf_limit;
         if let Some(state) = state_opt.as_deref_mut() {
-            // A write changes only this link. Keep full projection at receive
-            // and maintenance boundaries, where actions can affect other links.
+            // Project this write immediately; receive-generated updates are
+            // tracked independently and maintenance samples idle kernel queues.
             self.refresh_cluster_link_view_for_state(state, token);
             Self::update_cluster_link_memory(&self.cluster_bus, state);
             self.enforce_cluster_bus_sendbuf_limit_for_state(state, sendbuf_limit);
@@ -1326,6 +1367,221 @@ mod tests {
         assert!(!backend.cluster_bus.connections.contains_key(&token.0));
         assert!(!backend.is_pending_transport_removal(token));
         assert!(!backend.transport.is_registered(token));
+    }
+
+    #[test]
+    fn cluster_bus_receive_refreshes_only_changed_links() {
+        use crate::foundation::io::transport::ReadOutcome;
+
+        let mut backend = ServerWorkerState::new(1).unwrap();
+        *backend.ctx.cluster_state_mut() =
+            Some(Box::new(ClusterState::new("127.0.0.1", 6379, 16379)));
+        for (token, node_id) in [
+            (Token(41), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            (Token(42), "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+        ] {
+            backend.cluster_bus.register_outgoing_for_node(
+                token,
+                "127.0.0.1:16380".parse().unwrap(),
+                false,
+                node_id.to_string(),
+            );
+            let connection = backend.cluster_bus.connections.get_mut(&token.0).unwrap();
+            connection.bytes_sent = 17;
+            connection.handshake_sent = true;
+        }
+        backend.refresh_cluster_link_views();
+        backend
+            .cluster_bus
+            .connections
+            .get_mut(&42)
+            .unwrap()
+            .bytes_sent = 99;
+
+        backend.begin_cluster_bus_receive_batch();
+        backend.process_cluster_bus_read_result(Token(41), b"RCm".to_vec(), ReadOutcome::Quiescent);
+        backend.finish_cluster_bus_receive_batch();
+
+        let state = backend.ctx.cluster_state().as_deref().unwrap();
+        let untouched = state
+            .link_views()
+            .find(|view| view.node_id.as_str() == "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+            .unwrap();
+        assert_eq!(untouched.bytes_sent, 17);
+        let changed = state
+            .link_views()
+            .find(|view| view.node_id.as_str() == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            .unwrap();
+        assert_eq!(changed.bytes_received, 3);
+        assert_eq!(
+            state.cluster_link_memory(),
+            backend
+                .cluster_bus
+                .connections
+                .values()
+                .map(|connection| {
+                    connection.read_buf.capacity() + connection.write_buf.capacity()
+                })
+                .sum::<usize>()
+        );
+
+        backend.refresh_cluster_link_views();
+        let state = backend.ctx.cluster_state().as_deref().unwrap();
+        assert_eq!(
+            state
+                .link_views()
+                .find(|view| view.node_id.as_str() == "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+                .unwrap()
+                .bytes_sent,
+            99
+        );
+    }
+
+    #[test]
+    fn stable_cluster_link_identity_retains_its_allocation() {
+        let mut backend = ServerWorkerState::new(1).unwrap();
+        *backend.ctx.cluster_state_mut() =
+            Some(Box::new(ClusterState::new("127.0.0.1", 6379, 16379)));
+        backend.cluster_bus.register_outgoing_for_node(
+            Token(41),
+            "127.0.0.1:16380".parse().unwrap(),
+            false,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        );
+        backend.refresh_cluster_link_views();
+        let connection = backend.cluster_bus.connections.get_mut(&41).unwrap();
+        connection.projected_node_name.reserve(128);
+        let capacity = connection.projected_node_name.capacity();
+        let state = backend.ctx.cluster_state_mut().as_deref_mut().unwrap();
+        let endpoint = &mut state.link_views.values_mut().next().unwrap().endpoint;
+        endpoint.as_mut().unwrap().0.reserve(128);
+        let endpoint_capacity = endpoint.as_ref().unwrap().0.capacity();
+
+        backend.refresh_cluster_link_views();
+
+        assert_eq!(
+            backend.cluster_bus.connections[&41]
+                .projected_node_name
+                .capacity(),
+            capacity
+        );
+        let state = backend.ctx.cluster_state().as_deref().unwrap();
+        assert_eq!(
+            state
+                .link_views()
+                .next()
+                .unwrap()
+                .endpoint
+                .as_ref()
+                .unwrap()
+                .0
+                .capacity(),
+            endpoint_capacity
+        );
+    }
+
+    #[test]
+    fn cluster_bus_broadcast_refreshes_all_recipients_and_accounts_link_reuse() {
+        let mut backend = ServerWorkerState::new(1).unwrap();
+        *backend.ctx.cluster_state_mut() =
+            Some(Box::new(ClusterState::new("127.0.0.1", 6379, 16379)));
+        for (token, node_id) in [
+            (Token(41), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            (Token(42), "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+        ] {
+            backend.cluster_bus.register_outgoing_for_node(
+                token,
+                "127.0.0.1:16380".parse().unwrap(),
+                false,
+                node_id.to_string(),
+            );
+            backend
+                .cluster_bus
+                .connections
+                .get_mut(&token.0)
+                .unwrap()
+                .handshake_sent = true;
+        }
+        backend.refresh_cluster_link_views();
+        backend
+            .ctx
+            .cluster_state_mut()
+            .as_deref_mut()
+            .unwrap()
+            .request_topology_broadcast();
+
+        backend.flush_pending_topology_broadcast();
+
+        let state = backend.ctx.cluster_state().as_deref().unwrap();
+        assert_eq!(state.link_views().count(), 2);
+        assert!(state.link_views().all(|view| view.send_buffer_used > 0));
+        assert!(backend.cluster_bus.take_link_view_updates().is_empty());
+        backend.remove_cluster_bus_connection_without_retry(Token(41));
+        assert_eq!(
+            backend
+                .ctx
+                .cluster_state()
+                .as_deref()
+                .unwrap()
+                .link_views()
+                .count(),
+            1
+        );
+        assert!(backend.cluster_bus.take_link_view_updates().is_empty());
+        backend.cluster_bus.register_outgoing_for_node(
+            Token(41),
+            "127.0.0.1:16380".parse().unwrap(),
+            false,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        );
+        backend.refresh_pending_cluster_link_views();
+        let state = backend.ctx.cluster_state().as_deref().unwrap();
+        assert_eq!(state.link_views().count(), 2);
+        assert_eq!(
+            state.cluster_link_memory(),
+            backend
+                .cluster_bus
+                .connections
+                .values()
+                .map(|connection| connection.read_buf.capacity() + connection.write_buf.capacity())
+                .sum::<usize>()
+        );
+    }
+
+    #[test]
+    fn closing_obsolete_cluster_link_preserves_the_live_peer_projection() {
+        use crate::engine::distributed::cluster::NodeId;
+
+        let mut backend = ServerWorkerState::new(1).unwrap();
+        let node_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let mut state = ClusterState::new("127.0.0.1", 6379, 16379);
+        state.manual_failover.accept_on_primary(
+            NodeId::parse(node_id.as_bytes()).unwrap(),
+            1_000,
+            5_000,
+        );
+        *backend.ctx.cluster_state_mut() = Some(Box::new(state));
+        for (token, port, created_at) in [(Token(41), 16380, 100), (Token(42), 26380, 200)] {
+            backend
+                .cluster_bus
+                .register_incoming(token, format!("127.0.0.1:{port}").parse().unwrap());
+            let connection = backend.cluster_bus.connections.get_mut(&token.0).unwrap();
+            connection.node_name = node_id.to_string();
+            connection.created_at = created_at;
+        }
+        backend.refresh_cluster_link_views();
+
+        backend.remove_cluster_bus_connection_without_retry(Token(41));
+
+        let state = backend.ctx.cluster_state_mut().as_deref_mut().unwrap();
+        let view = state
+            .link_views()
+            .next()
+            .expect("live peer link must remain visible");
+        assert_eq!(view.created_at_ms, 200);
+        assert_eq!(view.endpoint, Some(("127.0.0.1".to_string(), 26380)));
+        assert!(state.take_manual_failover_actions().is_empty());
+        assert!(backend.cluster_bus.take_link_view_updates().is_empty());
     }
 
     #[test]

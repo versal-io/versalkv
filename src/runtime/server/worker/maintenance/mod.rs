@@ -648,7 +648,7 @@ impl ServerWorkerState {
         self.flush_cluster_bus_writes();
         self.pump_cluster_bus_reads();
         self.flush_cluster_bus_writes();
-        self.refresh_cluster_link_views();
+        self.refresh_pending_cluster_link_views();
     }
 
     fn run_expire_cycle(&mut self) {

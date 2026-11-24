@@ -329,7 +329,7 @@ impl ServerWorkerState {
     }
 
     pub(crate) fn cluster_process_pending_connects(&mut self, state: &mut ClusterState) {
-        self.refresh_cluster_link_views_for_state(state);
+        self.refresh_pending_cluster_link_views_for_state(state);
         let resolved_endpoints = state
             .pending_connects()
             .iter()

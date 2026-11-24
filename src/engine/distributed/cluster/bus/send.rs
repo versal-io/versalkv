@@ -111,6 +111,7 @@ impl ClusterBusManager {
         };
         if let Some(connection) = self.connections.get_mut(&token_value) {
             connection.write_buf.extend_from_slice(&message);
+            self.pending_link_view_updates.insert(connection.token.0);
             connection.handshake_sent = true;
             if message_type == ClusterMsgType::Meet {
                 connection.meet_sent_at = crate::foundation::io::sys::time::mstime();
@@ -151,6 +152,7 @@ impl ClusterBusManager {
             return false;
         };
         connection.write_buf.extend_from_slice(&ping);
+        self.pending_link_view_updates.insert(connection.token.0);
         state
             .nodes
             .get_mut(&node_name)
@@ -241,6 +243,7 @@ impl ClusterBusManager {
             .find(|connection| connection.connected && connection.node_name == recipient.as_str())
         {
             connection.write_buf.extend_from_slice(&pong);
+            self.pending_link_view_updates.insert(connection.token.0);
             state.record_bus_message_sent(ClusterMsgType::Pong);
         }
     }
@@ -251,6 +254,7 @@ impl ClusterBusManager {
             if connection.connected && !connection.node_name.is_empty() && connection.handshake_sent
             {
                 connection.write_buf.extend_from_slice(&pong);
+                self.pending_link_view_updates.insert(connection.token.0);
                 state.record_bus_message_sent(ClusterMsgType::Pong);
             }
         }
@@ -271,6 +275,7 @@ impl ClusterBusManager {
                 && is_local_replica
             {
                 connection.write_buf.extend_from_slice(&pong);
+                self.pending_link_view_updates.insert(connection.token.0);
                 state.record_bus_message_sent(ClusterMsgType::Pong);
             }
         }
@@ -311,6 +316,7 @@ impl ClusterBusManager {
             .find(|connection| connection.connected && connection.node_name == primary.as_str())
         {
             connection.write_buf.extend_from_slice(&packet);
+            self.pending_link_view_updates.insert(connection.token.0);
             state.record_bus_message_sent(ClusterMsgType::MfStart);
         }
     }

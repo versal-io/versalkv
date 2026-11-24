@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 
 use crate::engine::distributed::cluster::action::{ClusterAction, ClusterActionBatch};
@@ -38,6 +38,8 @@ pub struct BusConnection {
     pub handshake_node_name: String,
     /// Last node identity projected into ClusterState.
     pub projected_node_name: String,
+    /// Buffer capacity already included in the manager's memory total.
+    accounted_buffer_memory: usize,
     /// Last time we received data (ms).
     pub last_recv: i64,
     /// Connection creation time (ms).
@@ -80,6 +82,7 @@ impl BusConnection {
             node_name: String::new(),
             handshake_node_name: String::new(),
             projected_node_name: String::new(),
+            accounted_buffer_memory: 0,
             last_recv: 0,
             created_at: mstime(),
             meet_sent_at: 0,
@@ -107,6 +110,10 @@ impl BusConnection {
 pub struct ClusterBusManager {
     /// Bus connections (token_value -> connection).
     pub connections: HashMap<usize, BusConnection>,
+    /// Connections whose runtime projections must be refreshed.
+    pub(super) pending_link_view_updates: HashSet<usize>,
+    /// Sum of the last observed read and write buffer capacities.
+    link_buffer_memory: usize,
     /// Tokens of the Cluster Bus listeners, one per successfully bound address family.
     pub listener_tokens: Vec<crate::engine::command::context::Token>,
     /// Last time the once-per-second random probe was considered (ms).
@@ -137,6 +144,8 @@ impl ClusterBusManager {
     pub fn new() -> Self {
         Self {
             connections: HashMap::new(),
+            pending_link_view_updates: HashSet::new(),
+            link_buffer_memory: 0,
             listener_tokens: Vec::new(),
             last_random_ping_time: 0,
             ping_trace_displays: HashMap::new(),
@@ -176,7 +185,10 @@ impl ClusterBusManager {
     ) {
         let mut conn = BusConnection::new(token, addr, false);
         conn.connected = true;
+        self.remove(token.0);
         self.connections.insert(token.0, conn);
+        self.refresh_link_memory(token.0);
+        self.mark_link_view_dirty(token.0);
     }
 
     pub fn register_outgoing_for_node(
@@ -191,7 +203,10 @@ impl ClusterBusManager {
         conn.events = LinkEvents::READ_WRITE;
         conn.send_meet = send_meet;
         conn.node_name = node_name;
+        self.remove(token.0);
         self.connections.insert(token.0, conn);
+        self.refresh_link_memory(token.0);
+        self.mark_link_view_dirty(token.0);
     }
 
     pub fn register_outgoing_for_handshake(
@@ -205,7 +220,10 @@ impl ClusterBusManager {
         conn.events = LinkEvents::READ_WRITE;
         conn.send_meet = true;
         conn.handshake_node_name = handshake_id;
+        self.remove(token.0);
         self.connections.insert(token.0, conn);
+        self.refresh_link_memory(token.0);
+        self.mark_link_view_dirty(token.0);
     }
 
     pub fn arm_meet_for_addr(&mut self, addr: SocketAddr) -> Option<usize> {
@@ -216,6 +234,7 @@ impl ClusterBusManager {
         connection.send_meet = true;
         connection.handshake_sent = false;
         connection.events = LinkEvents::READ_WRITE;
+        self.pending_link_view_updates.insert(*token);
         Some(*token)
     }
 
@@ -228,12 +247,50 @@ impl ClusterBusManager {
         })?;
         connection.handshake_sent = false;
         connection.events = LinkEvents::READ_WRITE;
+        self.pending_link_view_updates.insert(*token);
         Some(*token)
     }
 
     /// Remove a bus connection.
     pub fn remove(&mut self, token_value: usize) {
-        self.connections.remove(&token_value);
+        self.take_connection(token_value);
+    }
+
+    pub(crate) fn mark_link_view_dirty(&mut self, token_value: usize) {
+        self.pending_link_view_updates.insert(token_value);
+    }
+
+    pub(crate) fn take_link_view_updates(&mut self) -> Vec<usize> {
+        self.pending_link_view_updates.drain().collect()
+    }
+
+    pub(crate) fn refresh_link_memory(&mut self, token_value: usize) {
+        self.pending_link_view_updates.remove(&token_value);
+        let Some(connection) = self.connections.get_mut(&token_value) else {
+            return;
+        };
+        let memory = connection
+            .read_buf
+            .capacity()
+            .saturating_add(connection.write_buf.capacity());
+        self.link_buffer_memory = self
+            .link_buffer_memory
+            .saturating_sub(connection.accounted_buffer_memory)
+            .saturating_add(memory);
+        connection.accounted_buffer_memory = memory;
+    }
+
+    pub(crate) fn link_buffer_memory(&self) -> usize {
+        self.link_buffer_memory
+    }
+
+    fn take_connection(&mut self, token_value: usize) -> Option<BusConnection> {
+        self.pending_link_view_updates.remove(&token_value);
+        let connection = self.connections.remove(&token_value)?;
+        self.link_buffer_memory = self
+            .link_buffer_memory
+            .saturating_sub(connection.accounted_buffer_memory);
+        Some(connection)
     }
 
     pub fn remove_and_schedule_retry(
@@ -241,7 +298,7 @@ impl ClusterBusManager {
         state: &mut crate::engine::distributed::cluster::state::ClusterState,
         token_value: usize,
     ) {
-        let Some(connection) = self.connections.remove(&token_value) else {
+        let Some(connection) = self.take_connection(token_value) else {
             return;
         };
         if !connection.is_outgoing || !connection.send_meet {
