@@ -79,6 +79,15 @@ impl Write for IncrementalSyncWriter {
 struct CancellablePipeWriter {
     file: std::fs::File,
     control: Arc<RdbSaveControl>,
+    #[cfg(test)]
+    test_wait: Option<PipeWriteTestWait>,
+}
+
+#[cfg(test)]
+struct PipeWriteTestWait {
+    entered: Sender<()>,
+    resume: Receiver<()>,
+    timeout: Duration,
 }
 
 impl Write for CancellablePipeWriter {
@@ -88,18 +97,44 @@ impl Write for CancellablePipeWriter {
             match self.file.write(bytes) {
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    // Never join a serializer blocked in write(2). A bounded
-                    // wait also observes cancellation while the reader is idle.
-                    let state = self.control.lock();
-                    if state.is_cancelled {
-                        return Err(io::Error::other(SaveCancelled));
+                    let timeout = Duration::from_millis(1);
+                    #[cfg(test)]
+                    let timeout = if let Some(wait) = self.test_wait.take() {
+                        wait.entered.send(()).map_err(io::Error::other)?;
+                        wait.resume.recv().map_err(io::Error::other)?;
+                        wait.timeout
+                    } else {
+                        timeout
+                    };
+                    // Wait for pipe space rather than an unrelated feed notification.
+                    // Bound the wait so cancellation also works with an idle reader.
+                    #[cfg(unix)]
+                    {
+                        use crate::foundation::io::sys::os::{poll_descriptors, PollDescriptor};
+                        use std::os::fd::AsRawFd;
+
+                        self.control.check_cancelled()?;
+                        let mut descriptors =
+                            [PollDescriptor::new(self.file.as_raw_fd(), libc::POLLOUT)];
+                        match poll_descriptors(&mut descriptors, timeout) {
+                            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                            Err(error) => return Err(error),
+                            Ok(_) => {}
+                        }
                     }
-                    drop(
-                        self.control
-                            .changed
-                            .wait_timeout(state, Duration::from_millis(1))
-                            .unwrap_or_else(std::sync::PoisonError::into_inner),
-                    );
+                    #[cfg(not(unix))]
+                    {
+                        let state = self.control.lock();
+                        if state.is_cancelled {
+                            return Err(io::Error::other(SaveCancelled));
+                        }
+                        drop(
+                            self.control
+                                .changed
+                                .wait_timeout(state, timeout)
+                                .unwrap_or_else(std::sync::PoisonError::into_inner),
+                        );
+                    }
                 }
                 result => return result,
             }
@@ -532,6 +567,8 @@ impl BackgroundRdbSave {
                 let mut writer = CancellablePipeWriter {
                     file: write,
                     control: Arc::clone(&worker_control),
+                    #[cfg(test)]
+                    test_wait: None,
                 };
                 let result = if serialization.compression == RdbCompression::Lz4 {
                     (|| -> io::Result<()> {

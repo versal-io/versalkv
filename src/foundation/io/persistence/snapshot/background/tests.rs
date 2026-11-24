@@ -104,6 +104,101 @@ fn pipe_serializer_cancels_with_a_live_reader_and_a_full_pipe() {
     drop(read);
 }
 
+#[cfg(unix)]
+#[test]
+fn pipe_writer_resumes_when_reader_drains_before_waiting() {
+    use crate::foundation::io::sys::fd::{pipe, PipeFlags};
+    use std::io::Read;
+
+    let (mut read, mut write) = pipe(PipeFlags::CLOEXEC_NONBLOCK).unwrap().into_parts();
+    let chunk = [0_u8; 4096];
+    loop {
+        match write.write(&chunk) {
+            Ok(written) => assert!(written > 0),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+            Err(error) => panic!("failed to fill the pipe: {error}"),
+        }
+    }
+    let control = Arc::new(RdbSaveControl::new(0, 0));
+    let (entered, waiting) = channel();
+    let (resume, resumed) = channel();
+    let (completed, completion) = channel();
+    let mut writer = CancellablePipeWriter {
+        file: write,
+        control: Arc::clone(&control),
+        test_wait: Some(PipeWriteTestWait {
+            entered,
+            resume: resumed,
+            timeout: Duration::from_secs(10),
+        }),
+    };
+    let writing = std::thread::spawn(move || {
+        let result = writer.write_all(b"x");
+        let _ = completed.send(result);
+    });
+
+    let has_entered_wait = waiting.recv_timeout(Duration::from_secs(2)).is_ok();
+    if has_entered_wait {
+        let mut buffer = [0_u8; 4096];
+        loop {
+            match read.read(&mut buffer) {
+                Ok(count) => assert!(count > 0),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("failed to drain the pipe: {error}"),
+            }
+        }
+    }
+    let _ = resume.send(());
+    let result = completion.recv_timeout(Duration::from_secs(1));
+    // Wake and join the writer even when the old timed wait loses readiness.
+    control.cancel();
+    writing.join().unwrap();
+    assert!(
+        has_entered_wait,
+        "the full pipe must backpressure the writer"
+    );
+    assert!(
+        matches!(result, Ok(Ok(()))),
+        "draining the pipe must resume writing without waiting for a timeout: {result:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn pipe_writer_reports_a_disconnected_reader() {
+    use crate::foundation::io::sys::fd::{pipe, PipeFlags};
+
+    const CHILD_MARKER: &str = "VERSAL_RDB_PIPE_DISCONNECT_TEST_CHILD";
+    if std::env::var_os(CHILD_MARKER).is_none() {
+        // Other parallel tests fork and may inherit a live pipe reader.
+        // Create this pipe only after exec in an isolated test process.
+        let module = module_path!().split_once("::").unwrap().1;
+        let test = format!("{module}::pipe_writer_reports_a_disconnected_reader");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &test])
+            .env(CHILD_MARKER, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed;"),
+            "the isolated disconnect test must run and pass: {output:?}"
+        );
+        return;
+    }
+    let (read, write) = pipe(PipeFlags::CLOEXEC_NONBLOCK).unwrap().into_parts();
+    drop(read);
+    let mut writer = CancellablePipeWriter {
+        file: write,
+        control: Arc::new(RdbSaveControl::new(0, 0)),
+        test_wait: None,
+    };
+    assert_eq!(
+        writer.write_all(b"x").unwrap_err().kind(),
+        io::ErrorKind::BrokenPipe
+    );
+}
+
 #[test]
 fn incremental_save_drop_cancels_an_idle_receiver_with_a_live_feeder() {
     let dir = std::env::temp_dir().join(format!(
