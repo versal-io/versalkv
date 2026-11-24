@@ -261,6 +261,83 @@ mod tests {
     use crate::foundation::io::persistence::codec::decoder_compact::lzf_decompress;
 
     #[test]
+    fn workspace_reuse_preserves_encoded_bytes_after_failed_attempts() {
+        let mut workspace = LzfWorkspace::new(true);
+        for _ in 0..100 {
+            let input = vec![b'x'; 60];
+            assert_eq!(
+                workspace.compress(&input, input.len() - 4),
+                Some(&[1, 120, 120, 224, 47, 0, 1, 120, 120][..])
+            );
+            let input: Vec<u8> = (0..20_000).map(|value| (value * 37) as u8).collect();
+            assert!(workspace.compress(&input, 12).is_none());
+            assert!(workspace
+                .compress(b"member-padding-0000000001", 21)
+                .is_none());
+            let input = b"abcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabc";
+            assert_eq!(
+                workspace.compress(input, input.len() - 4),
+                Some(&[3, 97, 98, 99, 97, 224, 39, 2, 1, 98, 99][..])
+            );
+        }
+    }
+
+    #[test]
+    fn touched_slots_are_unique_and_clear_to_empty() {
+        let mut workspace = LzfWorkspace::new(true);
+        for slot in 0..HSIZE {
+            assert_eq!(workspace.htab[slot], 0);
+            set_htab_slot(&mut workspace.htab, &mut workspace.touched, slot, 0);
+            assert_eq!(workspace.htab[slot], 0);
+            set_htab_slot(&mut workspace.htab, &mut workspace.touched, slot, slot + 1);
+            assert_eq!(workspace.htab[slot], slot + 1);
+            set_htab_slot(&mut workspace.htab, &mut workspace.touched, slot, slot + 2);
+            assert_eq!(workspace.htab[slot], slot + 2);
+        }
+        assert_eq!(workspace.touched.len(), HSIZE);
+        workspace.reset();
+        assert!(workspace.touched.is_empty());
+        assert!(workspace.htab.iter().all(|position| *position == 0));
+    }
+
+    #[test]
+    fn concurrent_compressors_have_independent_workspaces() {
+        let threads: Vec<_> = (0..4)
+            .map(|index| {
+                std::thread::spawn(move || {
+                    let mut workspace = LzfWorkspace::new(true);
+                    for length in [25, 60, 128, 1024, 20_000] {
+                        let input = vec![b'a' + index; length];
+                        let compressed = workspace.compress(&input, length + 32).unwrap();
+                        assert_eq!(lzf_decompress(compressed, length).unwrap(), input);
+                        assert!(workspace.compress(&input, 1).is_none());
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+    }
+
+    #[cfg(all(not(feature = "wasm"), not(target_family = "wasm"), not(miri)))]
+    #[test]
+    fn warmed_short_compression_has_bounded_allocation_cost() {
+        let input = b"member-padding-0000000001";
+        let mut workspace = LzfWorkspace::new(true);
+        let _ = workspace.compress(input, input.len() - 4);
+        let (_, cost) = crate::foundation::memory::util_alloc::measure_allocations(|| {
+            for _ in 0..100 {
+                let _ = workspace.compress(input, input.len() - 4);
+            }
+        });
+        assert!(
+            cost.allocated_bytes <= 100 * 128,
+            "short compression allocated too much: {cost:?}"
+        );
+    }
+
+    #[test]
     fn repeated_bytes_compress_and_roundtrip() {
         let input = vec![b'x'; 60];
         let mut ws = LzfWorkspace::new(true);

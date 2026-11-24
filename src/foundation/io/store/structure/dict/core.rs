@@ -130,6 +130,15 @@ impl<K: Eq + Hash, V> Dict<K, V> {
         Self::with_resize_budget(ResizeBudget::new(None))
     }
 
+    /// Create an empty dictionary sized for a known number of entries.
+    pub fn with_capacity(capacity: usize) -> Self {
+        let mut dict = Self::new();
+        if capacity > 0 {
+            dict.expand(capacity);
+        }
+        dict
+    }
+
     pub(crate) fn with_resize_budget(resize_budget: ResizeBudget) -> Self {
         Self {
             tables: [Table::new(), Table::new()],

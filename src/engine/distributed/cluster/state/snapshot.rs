@@ -258,7 +258,7 @@ pub(super) fn node_view(
                 crate::engine::distributed::cluster::ClusterLinkDirection::To,
             ),
         slots: if include_slots {
-            node.slots.clone()
+            node.slots.to_vec()
         } else {
             Vec::new()
         },

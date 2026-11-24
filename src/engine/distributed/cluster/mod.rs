@@ -24,6 +24,7 @@ pub mod msg;
 pub mod node;
 pub mod projection;
 pub mod reducer;
+mod slot_storage;
 pub mod state;
 
 pub use endpoint::{

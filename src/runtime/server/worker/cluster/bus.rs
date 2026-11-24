@@ -1038,7 +1038,7 @@ mod tests {
             Promotion {
                 old_primary: primary_node_id,
                 shard_id: NodeId::parse(primary.shard_id.as_bytes()).unwrap(),
-                slots: primary.slots.clone(),
+                slots: primary.slots.to_vec(),
                 config_epoch: 1,
             },
             4000,
@@ -1138,7 +1138,7 @@ mod tests {
                     Promotion {
                         old_primary: primary_node_id.clone(),
                         shard_id: shard_id.clone(),
-                        slots: slots.clone(),
+                        slots: slots.to_vec(),
                         config_epoch: 10,
                     },
                     1000,
@@ -1172,7 +1172,7 @@ mod tests {
                 primary: Some(FailedPrimaryFacts {
                     node_id: primary_node_id,
                     shard_id,
-                    slots,
+                    slots: slots.to_vec(),
                     is_failed: true,
                 }),
             };
@@ -2180,7 +2180,7 @@ mod tests {
             primary: Some(FailedPrimaryFacts {
                 node_id: NodeId::parse(failed_primary_id.as_bytes()).unwrap(),
                 shard_id: NodeId::parse(failed_primary_id.as_bytes()).unwrap(),
-                slots: inherited_slots,
+                slots: inherited_slots.to_vec(),
                 is_failed: true,
             }),
             siblings: vec![local],
@@ -2336,7 +2336,7 @@ mod tests {
             primary: Some(FailedPrimaryFacts {
                 node_id: NodeId::parse(failed_primary_id.as_bytes()).unwrap(),
                 shard_id: NodeId::parse(failed_primary_id.as_bytes()).unwrap(),
-                slots: inherited_slots,
+                slots: inherited_slots.to_vec(),
                 is_failed: true,
             }),
             siblings: vec![
@@ -2516,7 +2516,7 @@ mod tests {
             primary: Some(FailedPrimaryFacts {
                 node_id: NodeId::parse(old_primary_id.as_bytes()).unwrap(),
                 shard_id: NodeId::parse(shard_id.as_bytes()).unwrap(),
-                slots: inherited_slots,
+                slots: inherited_slots.to_vec(),
                 is_failed: true,
             }),
             siblings: vec![local],
@@ -2673,7 +2673,7 @@ mod tests {
             primary: Some(FailedPrimaryFacts {
                 node_id: NodeId::parse(old_primary_id.as_bytes()).unwrap(),
                 shard_id: NodeId::parse(old_shard_id.as_bytes()).unwrap(),
-                slots: inherited_slots,
+                slots: inherited_slots.to_vec(),
                 is_failed: true,
             }),
             siblings: vec![local],

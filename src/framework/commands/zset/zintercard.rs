@@ -165,7 +165,7 @@ impl<'a> MembershipSource<'a> {
     fn contains(&mut self, member: &[u8]) -> bool {
         match self {
             Self::Borrowed(source) => match source {
-                Robj::ZSetSkiplist(_) => source.zset_score(member).is_some(),
+                Robj::ZSetSkiplist(zset) => zset.dict().contains_key(member),
                 Robj::SetHashtable(_) => source.set_contains(member),
                 Robj::SetIntset(set) => {
                     int_encodable(member).is_some_and(|value| set.contains(value))

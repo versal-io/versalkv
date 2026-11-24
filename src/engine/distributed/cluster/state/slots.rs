@@ -2,10 +2,31 @@
 use super::types::CLUSTER_FAIL;
 use super::types::{ClusterState, SlotOwner, CLUSTER_SLOTS};
 use crate::engine::distributed::cluster::node::{ClusterNode, CLUSTER_NODE_MIGRATE_TO};
+use crate::engine::distributed::cluster::slot_storage::{SharedSlots, SlotBitmap};
 use crate::engine::distributed::cluster::NodeId;
 use std::collections::HashMap;
 
 const OPEN_SLOTS_AUX_NODE_ID_LEN: usize = 40;
+
+pub(super) struct WithdrawalIndex {
+    snapshot: SharedSlots<Option<String>>,
+    slots_by_node: HashMap<String, Vec<usize>>,
+}
+
+impl WithdrawalIndex {
+    fn build(snapshot: &SharedSlots<Option<String>>) -> Self {
+        let mut slots_by_node: HashMap<String, Vec<usize>> = HashMap::new();
+        for (slot, node_id) in snapshot.iter().enumerate() {
+            if let Some(node_id) = node_id {
+                slots_by_node.entry(node_id.clone()).or_default().push(slot);
+            }
+        }
+        Self {
+            snapshot: snapshot.clone(),
+            slots_by_node,
+        }
+    }
+}
 
 #[derive(Debug)]
 struct OpenSlotState {
@@ -58,6 +79,21 @@ fn apply_open_slot_update(slots: &mut HashMap<usize, String>, slot: usize, updat
 }
 
 impl ClusterState {
+    pub(crate) fn has_reasserted_withdrawal(&self, node_id: &str, slots: &SlotBitmap) -> bool {
+        let table = &self.slot_ownership;
+        let mut index = table.withdrawal_index.borrow_mut();
+        if index
+            .as_ref()
+            .is_none_or(|index| !index.snapshot.shares_storage(&table.withdrawn_by))
+        {
+            *index = Some(WithdrawalIndex::build(&table.withdrawn_by));
+        }
+        index
+            .as_ref()
+            .and_then(|index| index.slots_by_node.get(node_id))
+            .is_some_and(|withdrawn| withdrawn.iter().any(|&slot| slots[slot]))
+    }
+
     pub(crate) fn apply_slot_claim_decision(
         &mut self,
         decision: SlotClaimDecision,
@@ -505,7 +541,7 @@ impl ClusterState {
                 ),
             };
         }
-        self.slot_ownership.owners = owners;
+        self.slot_ownership.owners = owners.into();
         Ok(())
     }
 
@@ -523,7 +559,7 @@ impl ClusterState {
                 | crate::engine::distributed::cluster::node::CLUSTER_NODE_NOADDR,
         );
         let mut changed = false;
-        for (slot, claimed) in claimed.into_iter().enumerate() {
+        for (slot, &claimed) in claimed.iter().enumerate() {
             if claimed && self.slot_ownership.owners[slot] == SlotOwner::Unassigned {
                 self.slot_ownership.owners[slot] = SlotOwner::Remote(owner_id.clone());
                 self.slots[slot] = is_available;
@@ -1063,11 +1099,46 @@ mod tests {
         ClusterNode, CLUSTER_NODE_HANDSHAKE, CLUSTER_NODE_MIGRATE_TO, CLUSTER_NODE_MYSELF,
         CLUSTER_NODE_PRIMARY, CLUSTER_NODE_REPLICA,
     };
+    use crate::engine::distributed::cluster::slot_storage::SlotBitmap;
     use crate::engine::distributed::cluster::state::{CLUSTER_OK, CLUSTER_SLOTS};
     use crate::engine::distributed::cluster::{NodeId, SlotRange};
 
     const SOURCE: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const TARGET: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    #[test]
+    fn withdrawal_index_tracks_direct_writes_and_identity_changes() {
+        let mut state = ClusterState::new("127.0.0.1", 6379, 16379);
+        let mut slots = SlotBitmap::from(vec![false; CLUSTER_SLOTS]);
+        slots[8] = true;
+        assert!(!state.has_reasserted_withdrawal(SOURCE, &slots));
+        state.slot_ownership.withdrawn_by[8] = Some(SOURCE.to_string());
+        assert!(state.has_reasserted_withdrawal(SOURCE, &slots));
+        assert!(state
+            .slot_ownership
+            .withdrawal_index
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .snapshot
+            .shares_storage(&state.slot_ownership.withdrawn_by));
+        state.slot_ownership.withdrawn_by[8] = Some(SOURCE.to_string());
+        assert!(state.has_reasserted_withdrawal(SOURCE, &slots));
+        state.slot_ownership.withdrawn_by[8] = Some(TARGET.to_string());
+        assert!(!state.has_reasserted_withdrawal(SOURCE, &slots));
+        assert!(state.has_reasserted_withdrawal(TARGET, &slots));
+        state.slot_ownership.withdrawn_by.fill(None);
+        assert!(!state.has_reasserted_withdrawal(TARGET, &slots));
+
+        let handshake = state.ensure_handshake_node("127.0.0.1", 6380, 16380, 0);
+        state.set_slot_claim_withdrawn(8, Some(handshake.clone()));
+        assert!(state.has_reasserted_withdrawal(&handshake, &slots));
+        assert!(state.rename_handshake_node(&handshake, SOURCE));
+        assert!(!state.has_reasserted_withdrawal(&handshake, &slots));
+        assert!(state.has_reasserted_withdrawal(SOURCE, &slots));
+        state.reset_soft();
+        assert!(!state.has_reasserted_withdrawal(SOURCE, &slots));
+    }
 
     #[test]
     fn failover_slot_claim_batch_replaces_previous_owner() {

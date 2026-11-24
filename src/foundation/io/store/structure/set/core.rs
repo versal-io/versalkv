@@ -45,7 +45,7 @@ impl ValkeySet {
     }
 
     pub fn from_hashset(data: HashSet<Bytes>) -> Self {
-        let mut dict = Dict::new();
+        let mut dict = Dict::with_capacity(data.len());
         for v in data {
             dict.insert(v, ());
         }
@@ -61,23 +61,39 @@ impl ValkeySet {
         max_listpack_entries: usize,
         max_listpack_value: usize,
     ) -> Self {
-        let encoding =
-            if max_intset_entries > 0 && data.len() <= max_intset_entries && all_integers(&data) {
-                SetEncoding::Intset
-            } else if max_listpack_entries > 0
-                && data.len() <= max_listpack_entries
-                && data.iter().all(|v| v.len() <= max_listpack_value)
-            {
-                SetEncoding::Listpack
-            } else {
-                SetEncoding::Hashtable
-            };
-        let mut dict = Dict::new();
-        for v in data {
-            dict.insert(v, ());
+        let mut dict = Dict::with_capacity(data.len());
+        for value in data {
+            dict.insert(value, ());
         }
+        Self::from_dict_with_thresholds(
+            dict,
+            max_intset_entries,
+            max_listpack_entries,
+            max_listpack_value,
+        )
+    }
+
+    pub fn from_dict_with_thresholds(
+        data: Dict<Bytes, ()>,
+        max_intset_entries: usize,
+        max_listpack_entries: usize,
+        max_listpack_value: usize,
+    ) -> Self {
+        let encoding = if max_intset_entries > 0
+            && data.len() <= max_intset_entries
+            && data.keys().all(|value| int_encodable(value).is_some())
+        {
+            SetEncoding::Intset
+        } else if max_listpack_entries > 0
+            && data.len() <= max_listpack_entries
+            && data.keys().all(|v| v.len() <= max_listpack_value)
+        {
+            SetEncoding::Listpack
+        } else {
+            SetEncoding::Hashtable
+        };
         ValkeySet {
-            data: Box::new(dict),
+            data: Box::new(data),
             encoding,
         }
     }
@@ -211,6 +227,16 @@ pub fn infer_set_encoding(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn known_cardinality_constructor_finishes_without_rehashing() {
+        let values = (0..3585)
+            .map(|value| Bytes::from(value.to_string()))
+            .collect();
+        let result = ValkeySet::from_hashset_with_thresholds(values, 0, 0, 0);
+        assert_eq!(result.data.len(), 3585);
+        assert!(!result.data.is_rehashing());
+    }
 
     fn set(values: &[&[u8]]) -> HashSet<Bytes> {
         values

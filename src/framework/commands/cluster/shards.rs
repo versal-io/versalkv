@@ -136,7 +136,7 @@ mod tests {
             ping_sent: node.ping_sent,
             pong_received: node.pong_received,
             outbound_connected: false,
-            slots: node.slots,
+            slots: node.slots.to_vec(),
         };
         let snapshot = ClusterTopologySnapshot {
             generation: state.topology_generation(),

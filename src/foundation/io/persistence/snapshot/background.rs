@@ -388,9 +388,19 @@ impl RdbSaveControl {
         state.enqueued = state.enqueued.saturating_sub(1);
     }
 
-    pub(crate) fn finish_item(&self) -> io::Result<()> {
-        let delay_started = Instant::now();
+    pub(crate) fn finish_item<F>(&self, flush: F) -> io::Result<()>
+    where
+        F: FnOnce() -> io::Result<()>,
+    {
         let mut state = self.lock();
+        if !state.is_cancelled && state.key_delay_us != 0 {
+            // Select the wait while holding the configuration lock, but never
+            // hold that lock during a potentially backpressured output flush.
+            drop(state);
+            flush()?;
+            state = self.lock();
+        }
+        let delay_started = Instant::now();
         if state.key_delay_us < 0 {
             let delay_us = state.key_delay_us;
             drop(state);
@@ -459,6 +469,11 @@ fn feed_work_items(
     control.notify_feed_changed();
 }
 
+enum RdbOutput<'a> {
+    Bytes(&'a [u8]),
+    Flush,
+}
+
 fn serialize_work_items<F>(
     receiver: Receiver<FrozenWorkItem>,
     options: RdbSerializeOptions,
@@ -467,18 +482,20 @@ fn serialize_work_items<F>(
     mut emit: F,
 ) -> io::Result<()>
 where
-    F: FnMut(&[u8]) -> io::Result<()>,
+    F: FnMut(RdbOutput<'_>) -> io::Result<()>,
 {
     let mut crc = 0;
     let mut ws = LzfWorkspace::new(options.compression);
-    let mut write = |bytes: &[u8]| {
+    let mut write = |output: RdbOutput<'_>| {
         control.check_cancelled()?;
-        crc = crc64(crc, bytes);
-        emit(bytes)
+        if let RdbOutput::Bytes(bytes) = output {
+            crc = crc64(crc, bytes);
+        }
+        emit(output)
     };
     while let Some(item) = control.receive_work_item(&receiver)? {
         match item {
-            FrozenWorkItem::Header(header) => write(&header)?,
+            FrozenWorkItem::Header(header) => write(RdbOutput::Bytes(&header))?,
             FrozenWorkItem::Database {
                 id,
                 entries,
@@ -490,7 +507,7 @@ where
                 chunk.push(RDB_OPCODE_RESIZEDB);
                 save_len(&mut chunk, entries as u64);
                 save_len(&mut chunk, expires as u64);
-                write(&chunk)?;
+                write(RdbOutput::Bytes(&chunk))?;
             }
             FrozenWorkItem::Entry(entry) => {
                 control.begin_item()?;
@@ -503,20 +520,38 @@ where
                     entry.hash_field_expires.as_ref(),
                     &mut ws,
                 );
-                write(&chunk)?;
+                write(RdbOutput::Bytes(&chunk))?;
                 let completion = entry.completion.clone();
                 drop(entry);
                 if let (Some(completion), Some(sender)) = (completion, completed_items) {
                     let _ = sender.send(completion);
                 }
                 // Publish progress only after the release notification is visible.
-                control.finish_item()?;
+                control.finish_item(|| write(RdbOutput::Flush))?;
             }
         }
     }
-    write(&[RDB_OPCODE_EOF])?;
+    write(RdbOutput::Bytes(&[RDB_OPCODE_EOF]))?;
     let checksum: u64 = if options.checksum { crc } else { 0 };
-    emit(&checksum.to_le_bytes())
+    emit(RdbOutput::Bytes(&checksum.to_le_bytes()))
+}
+
+fn serialize_pipe_work_items<W: Write>(
+    receiver: Receiver<FrozenWorkItem>,
+    options: RdbSerializeOptions,
+    control: &RdbSaveControl,
+    writer: W,
+) -> io::Result<()> {
+    let mut writer = io::BufWriter::with_capacity(16 * 1024, writer);
+    let result = serialize_work_items(receiver, options, control, None, |output| match output {
+        RdbOutput::Bytes(chunk) => writer.write_all(chunk),
+        RdbOutput::Flush => writer.flush(),
+    })
+    .and_then(|()| writer.flush());
+    // Never let BufWriter's destructor retry after a write error or cancel.
+    // A successful finish already flushed the RDB checksum.
+    let (_writer, _pending) = writer.into_parts();
+    result
 }
 
 fn commit_temporary_snapshot<F>(
@@ -574,16 +609,17 @@ impl BackgroundRdbSave {
                     (|| -> io::Result<()> {
                         writer.write_all(VCS_RDB_HEADER)?;
                         let mut encoder = new_rdb_frame_encoder(writer, serialization.checksum);
-                        serialize_work_items(receiver, options, &worker_control, None, |chunk| {
-                            encoder.write_all(chunk)
+                        serialize_work_items(receiver, options, &worker_control, None, |output| {
+                            match output {
+                                RdbOutput::Bytes(chunk) => encoder.write_all(chunk),
+                                RdbOutput::Flush => Ok(()),
+                            }
                         })?;
                         encoder.finish().map_err(io::Error::other)?;
                         Ok(())
                     })()
                 } else {
-                    serialize_work_items(receiver, options, &worker_control, None, |chunk| {
-                        writer.write_all(chunk)
-                    })
+                    serialize_pipe_work_items(receiver, options, &worker_control, writer)
                 };
                 // Dropping the receiver unblocks the feeder on every error.
                 // The pipe writer closes before a successful result is joined.
@@ -646,7 +682,10 @@ impl BackgroundRdbSave {
                             options,
                             &worker_control,
                             Some(&completed_sender),
-                            |chunk| emit(chunk),
+                            |output| match output {
+                                RdbOutput::Bytes(chunk) => emit(chunk),
+                                RdbOutput::Flush => Ok(()),
+                            },
                         )
                     };
                     if serialization.compression == RdbCompression::Lz4 {
@@ -743,8 +782,11 @@ impl BackgroundRdbSave {
                 };
                 let result: io::Result<()> = (|| {
                     let serialize = |emit: &mut dyn FnMut(&[u8]) -> io::Result<()>| {
-                        serialize_work_items(receiver, options, &worker_control, None, |chunk| {
-                            emit(chunk)
+                        serialize_work_items(receiver, options, &worker_control, None, |output| {
+                            match output {
+                                RdbOutput::Bytes(chunk) => emit(chunk),
+                                RdbOutput::Flush => Ok(()),
+                            }
                         })
                     };
                     if serialization.compression == RdbCompression::Lz4 {

@@ -3,6 +3,7 @@
 //! flags, config epoch, IP/port, and slot assignment.
 
 use super::endpoint::{ClusterAddress, ClusterEndpoints};
+use super::slot_storage::{SharedSlots, SlotBitmap};
 use crate::engine::distributed::cluster::msg::SLOT_BYTES;
 use std::ops::Deref;
 
@@ -45,12 +46,11 @@ pub struct ClusterNode {
     pub replica_priority: i64,
     /// Cluster election tie-breaker. Lower values rank first, including zero.
     pub cluster_replica_priority: u32,
-    /// Slot bitmap: 16384 bits (2048 bytes).
-    pub slots: Vec<bool>,
-    /// Last compact bitmap received directly from this node. Stable cluster
-    /// heartbeats compare this C-compatible representation before expanding
-    /// individual slots.
-    pub advertised_slots: Vec<u8>,
+    /// Dense slot assignment with a cached 2048-byte wire bitmap.
+    pub slots: SlotBitmap,
+    /// Last compact bitmap received directly from this node, shared across
+    /// metadata observations and retained independently of accepted ownership.
+    pub advertised_slots: SharedSlots<u8>,
     pub has_advertised_slots: bool,
     /// Number of slots handled.
     pub numslots: usize,
@@ -117,8 +117,8 @@ impl ClusterNode {
             repl_offset: 0,
             replica_priority: 100,
             cluster_replica_priority: 0,
-            slots: vec![false; 16384],
-            advertised_slots: vec![0; SLOT_BYTES],
+            slots: vec![false; 16384].into(),
+            advertised_slots: vec![0; SLOT_BYTES].into(),
             has_advertised_slots: false,
             numslots: 0,
             endpoints: ClusterEndpoints::new(ip, port, cport),
@@ -257,6 +257,24 @@ fn crc16(data: &[u8]) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::ClusterNode;
+
+    #[test]
+    fn metadata_clone_shares_slot_storage() {
+        let mut node = ClusterNode::new(
+            "primary-node".to_string(),
+            "127.0.0.1".to_string(),
+            6379,
+            16379,
+            true,
+        );
+        node.slots[8] = true;
+        let cloned = node.clone();
+        assert_eq!(node.slots.as_ptr(), cloned.slots.as_ptr());
+        assert_eq!(
+            node.advertised_slots.as_ptr(),
+            cloned.advertised_slots.as_ptr()
+        );
+    }
 
     #[test]
     fn primary_node_defaults_shard_id_to_node_id() {

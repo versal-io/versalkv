@@ -12,6 +12,52 @@ thread_local! {
     static THREAD_ALLOCATED: Cell<usize> = const { Cell::new(0) };
 }
 
+#[cfg(all(test, not(target_family = "wasm"), not(miri)))]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub(crate) struct AllocationEvents {
+    pub allocations: usize,
+    pub reallocations: usize,
+    pub deallocations: usize,
+    pub allocated_bytes: usize,
+}
+
+#[cfg(all(test, not(target_family = "wasm"), not(miri)))]
+thread_local! {
+    static ALLOCATION_EVENTS: Cell<AllocationEvents> = const {
+        Cell::new(AllocationEvents {
+            allocations: 0,
+            reallocations: 0,
+            deallocations: 0,
+            allocated_bytes: 0,
+        })
+    };
+}
+
+#[cfg(all(test, not(target_family = "wasm"), not(miri)))]
+fn record_allocation_event(update: impl FnOnce(&mut AllocationEvents)) {
+    let _ = ALLOCATION_EVENTS.try_with(|events| {
+        let mut current = events.get();
+        update(&mut current);
+        events.set(current);
+    });
+}
+
+#[cfg(all(test, not(target_family = "wasm"), not(miri)))]
+pub(crate) fn measure_allocations<T>(run: impl FnOnce() -> T) -> (T, AllocationEvents) {
+    let before = ALLOCATION_EVENTS.with(Cell::get);
+    let result = run();
+    let after = ALLOCATION_EVENTS.with(Cell::get);
+    (
+        result,
+        AllocationEvents {
+            allocations: after.allocations - before.allocations,
+            reallocations: after.reallocations - before.reallocations,
+            deallocations: after.deallocations - before.deallocations,
+            allocated_bytes: after.allocated_bytes - before.allocated_bytes,
+        },
+    )
+}
+
 /// Return the accounted size for an allocation.
 ///
 /// Uses `Layout::size()` rather than querying the allocator for the real
@@ -37,6 +83,11 @@ unsafe impl GlobalAlloc for LibcAllocator {
         // SAFETY: The backend accepts this non-zero valid Layout and returns a block
         // satisfying its size and alignment requirements.
         let ptr = unsafe { AllocatorBackend.alloc(layout) };
+        #[cfg(all(test, not(target_family = "wasm"), not(miri)))]
+        record_allocation_event(|events| {
+            events.allocations += 1;
+            events.allocated_bytes += layout.size();
+        });
         if ptr.is_null() {
             std::alloc::handle_alloc_error(layout);
         }
@@ -58,6 +109,11 @@ unsafe impl GlobalAlloc for LibcAllocator {
         // SAFETY: The backend accepts this non-zero valid Layout and returns a
         // zero-initialized block satisfying its size and alignment requirements.
         let ptr = unsafe { AllocatorBackend.alloc_zeroed(layout) };
+        #[cfg(all(test, not(target_family = "wasm"), not(miri)))]
+        record_allocation_event(|events| {
+            events.allocations += 1;
+            events.allocated_bytes += layout.size();
+        });
         if ptr.is_null() {
             std::alloc::handle_alloc_error(layout);
         }
@@ -75,6 +131,8 @@ unsafe impl GlobalAlloc for LibcAllocator {
         if layout.size() == 0 {
             return;
         }
+        #[cfg(all(test, not(target_family = "wasm"), not(miri)))]
+        record_allocation_event(|events| events.deallocations += 1);
         let real = malloc_real_size(ptr, layout);
         if real > 0 {
             ALLOCATED.fetch_sub(real, Ordering::Relaxed);
@@ -88,6 +146,11 @@ unsafe impl GlobalAlloc for LibcAllocator {
     // SAFETY: ptr and layout came from a previous allocation by this allocator;
     // The backend preserves layout alignment while growing or shrinking the block.
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        #[cfg(all(test, not(target_family = "wasm"), not(miri)))]
+        record_allocation_event(|events| {
+            events.reallocations += 1;
+            events.allocated_bytes += new_size;
+        });
         if new_size == 0 {
             let old_real = malloc_real_size(ptr, layout);
             if old_real > 0 {

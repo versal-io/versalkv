@@ -11,6 +11,28 @@ use std::io::{Error, ErrorKind, Read};
 use super::gossip::{ObservedRole, SenderObservation};
 
 #[test]
+fn stable_replica_heartbeat_preserves_empty_slot_storage() {
+    let mut state = ClusterState::new("127.0.0.1", 6379, 16379);
+    let mut manager = ClusterBusManager::new();
+    let mut sender = ClusterNode::new(
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        "127.0.0.1".to_string(),
+        6380,
+        16380,
+        false,
+    );
+    sender.flags &= !CLUSTER_NODE_MYSELF;
+    sender.replicaof = state.myself.name.clone();
+    state.insert_node(sender.clone());
+    manager.register_incoming(Token(29), "127.0.0.1:16380".parse().unwrap());
+    let packet = msg::encode_msg(ClusterMsgType::Pong, &sender, 0, &[]);
+    assert!(!manager.process_read_bytes(&mut state, 29, &packet, 200));
+    let previous = state.nodes[&sender.name].slots.clone();
+    assert!(!manager.process_read_bytes(&mut state, 29, &packet, 300));
+    assert_eq!(previous.as_ptr(), state.nodes[&sender.name].slots.as_ptr());
+}
+
+#[test]
 fn outbound_handshake_confirmation_preserves_replication_identity() {
     use crate::engine::distributed::cluster::action::ReplicationSwitchMode;
     use crate::engine::distributed::cluster::state::PendingReplicationSwitch;

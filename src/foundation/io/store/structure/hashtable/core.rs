@@ -262,7 +262,7 @@ impl<V: Clone> HashTable<V> {
     }
 
     pub fn contains_key(&self, key: &[u8]) -> bool {
-        self.get(key).is_some()
+        !self.is_empty() && self.find(hash_key(key), key).is_some()
     }
 
     pub fn get_mut(&mut self, key: &[u8]) -> Option<&mut V> {
@@ -542,6 +542,8 @@ impl<V: Clone> HashTable<V> {
     }
 
     fn bucket_at(buckets: &[Bucket<V>], top: usize, depth: usize) -> &Bucket<V> {
+        #[cfg(test)]
+        membership_tests::record_revisited_depth(depth);
         let mut b = &buckets[top];
         for _ in 0..depth {
             b = b.child.as_ref().unwrap();
@@ -827,5 +829,64 @@ impl<V: Clone + PartialEq> PartialEq for HashTable<V> {
         other
             .iter()
             .all(|(k, v)| lhs.get(k.as_ref()).is_some_and(|lv| *lv == v))
+    }
+}
+
+#[cfg(test)]
+mod membership_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    thread_local! {
+        static REVISITED_DEPTH: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn record_revisited_depth(depth: usize) {
+        REVISITED_DEPTH.with(|total| total.set(total.get() + depth));
+    }
+
+    fn colliding_table() -> HashTable<usize> {
+        let mut table = HashTable::new();
+        table.tables[0] = Table::allocate(0);
+        for value in 0..21 {
+            let key = Bytes::from(value.to_string());
+            let hash = hash_key(&key);
+            table.insert_new(hash, (key, value), high_bits(hash));
+        }
+        table
+    }
+
+    #[test]
+    fn existence_query_does_not_revisit_overflow_chain() {
+        let table = colliding_table();
+        let (_, _, depth, _) = table.find(hash_key(b"20"), b"20").unwrap();
+        assert!(depth >= 2);
+        REVISITED_DEPTH.with(|total| total.set(0));
+        assert!(table.contains_key(b"20"));
+        assert!(!table.contains_key(b"missing"));
+        assert_eq!(REVISITED_DEPTH.with(Cell::get), 0);
+    }
+
+    #[test]
+    fn existence_queries_preserve_membership_during_grow_and_shrink() {
+        let mut table = colliding_table();
+        table.pause_auto_shrink();
+        for capacity in [300, 1] {
+            assert!(table.resize(capacity));
+            let extra = Bytes::from_static(b"extra");
+            let hash = hash_key(&extra);
+            table.insert_new(hash, (extra, 42), high_bits(hash));
+            while table.is_rehashing() {
+                for value in 0..21 {
+                    let key = value.to_string();
+                    assert!(table.contains_key(key.as_bytes()));
+                    assert_eq!(table.get(key.as_bytes()), Some(&value));
+                }
+                assert!(table.contains_key(b"extra"));
+                assert!(!table.contains_key(b"missing"));
+                table.rehash_step();
+            }
+            assert_eq!(table.remove(b"extra"), Some(42));
+        }
     }
 }

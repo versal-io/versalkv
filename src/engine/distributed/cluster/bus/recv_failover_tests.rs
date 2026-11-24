@@ -98,7 +98,7 @@ fn nack_candidate() -> (ClusterBusManager, ClusterState, AutomaticFailoverFacts)
         primary: Some(FailedPrimaryFacts {
             node_id: NodeId::parse(primary_id.as_bytes()).unwrap(),
             shard_id: NodeId::parse(primary_id.as_bytes()).unwrap(),
-            slots: state.nodes[primary_id].slots.clone(),
+            slots: state.nodes[primary_id].slots.to_vec(),
             is_failed: true,
         }),
         siblings: vec![local],
@@ -664,7 +664,7 @@ fn assert_sibling_auth_request_deferral(
         primary: Some(FailedPrimaryFacts {
             node_id: NodeId::parse(primary_id.as_bytes()).unwrap(),
             shard_id: NodeId::parse(primary_id.as_bytes()).unwrap(),
-            slots: primary_slots.clone(),
+            slots: primary_slots.to_vec(),
             is_failed: true,
         }),
         siblings: vec![
@@ -757,7 +757,7 @@ fn paused_ping_from_primary_advances_manual_failover_to_catchup() {
     let promotion = Promotion {
         old_primary: NodeId::parse(primary_id.as_bytes()).unwrap(),
         shard_id: NodeId::parse(primary_id.as_bytes()).unwrap(),
-        slots: primary.slots.clone(),
+        slots: primary.slots.to_vec(),
         config_epoch: 2,
     };
     state.manual_failover.start_replica(
@@ -1092,7 +1092,7 @@ fn failover_auth_acks_are_deduplicated_by_voting_primary_identity() {
         primary: Some(FailedPrimaryFacts {
             node_id: NodeId::parse(primary_id.as_bytes()).unwrap(),
             shard_id: NodeId::parse(primary_id.as_bytes()).unwrap(),
-            slots: state.nodes[primary_id].slots.clone(),
+            slots: state.nodes[primary_id].slots.to_vec(),
             is_failed: true,
         }),
         siblings: vec![local],

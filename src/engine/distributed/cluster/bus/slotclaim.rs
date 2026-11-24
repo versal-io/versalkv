@@ -75,12 +75,8 @@ impl ClusterBusManager {
         if sender.is_replica() || !sender.replicaof.is_empty() || !sender.has_advertised_slots {
             return false;
         }
-        sender.slots.iter().enumerate().all(|(slot, &claimed)| {
-            let advertised = slots[slot / 8] & (1 << (7 - slot % 8)) != 0;
-            claimed == advertised
-                && (!advertised
-                    || state.slot_claim_withdrawn_by(slot) != Some(sender.name.as_str()))
-        })
+        sender.slots.wire_bitmap() == slots
+            && !state.has_reasserted_withdrawal(&sender.name, &sender.slots)
     }
 
     /// Apply sender's claimed slots from an UPDATE message against every

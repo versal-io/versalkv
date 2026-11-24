@@ -10,6 +10,7 @@ use crate::engine::distributed::cluster::node::{
     ClusterNode, CLUSTER_NODE_FAIL, CLUSTER_NODE_HANDSHAKE, CLUSTER_NODE_MYSELF,
     CLUSTER_NODE_NOADDR, CLUSTER_NODE_PRIMARY, CLUSTER_NODE_REPLICA,
 };
+use crate::engine::distributed::cluster::slot_storage::{SharedSlots, SlotBitmap};
 use crate::engine::distributed::cluster::NodeId;
 
 const STRUCTURAL_FLAGS: u16 = CLUSTER_NODE_FAIL
@@ -25,7 +26,7 @@ struct StructuralNode {
     replica_of: String,
     flags: u16,
     config_epoch: u64,
-    slots: Vec<bool>,
+    slots: SlotBitmap,
 }
 
 impl StructuralNode {
@@ -41,9 +42,9 @@ impl StructuralNode {
 
 pub(super) struct ManagementCache {
     nodes: Vec<StructuralNode>,
-    owners: Vec<SlotOwner>,
-    delete_epochs: Vec<u64>,
-    withdrawn_by: Vec<Option<String>>,
+    owners: SharedSlots<SlotOwner>,
+    delete_epochs: SharedSlots<u64>,
+    withdrawn_by: SharedSlots<Option<String>>,
     require_full_coverage: bool,
     structure: Arc<ManagementStructure>,
 }
@@ -66,6 +67,15 @@ pub struct ManagementTopology {
 }
 
 impl ManagementCache {
+    fn refresh_slot_inputs(&mut self, state: &ClusterState, nodes: &[&ClusterNode]) {
+        for (cached, node) in self.nodes.iter_mut().zip(nodes) {
+            cached.slots = node.slots.clone();
+        }
+        self.owners = state.slot_ownership.owners.clone();
+        self.delete_epochs = state.slot_ownership.delete_epochs.clone();
+        self.withdrawn_by = state.slot_ownership.withdrawn_by.clone();
+    }
+
     fn matches(&self, state: &ClusterState, nodes: &[&ClusterNode]) -> bool {
         // Exact input comparisons also cover bottom-level mutations that do
         // not bump the topology generation. Live fields never enter this key.
@@ -184,6 +194,10 @@ impl ClusterState {
                 .is_none_or(|cache| !cache.matches(self, &nodes))
             {
                 *cache = Some(ManagementCache::build(self, &nodes));
+            } else if let Some(cache) = cache.as_mut() {
+                // A no-op write may detach storage without changing topology.
+                // Keep the shared snapshots current after exact comparison.
+                cache.refresh_slot_inputs(self, &nodes);
             }
             Arc::clone(
                 &cache
@@ -207,5 +221,41 @@ impl ClusterState {
             })
             .collect();
         ManagementTopology { nodes, structure }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn management_cache_shares_slot_inputs() {
+        let state = ClusterState::new("127.0.0.1", 6379, 16379);
+        let nodes = vec![&state.myself];
+        let cache = ManagementCache::build(&state, &nodes);
+        assert_eq!(cache.nodes[0].slots.as_ptr(), state.myself.slots.as_ptr());
+        assert_eq!(cache.owners.as_ptr(), state.slot_ownership.owners.as_ptr());
+        assert_eq!(
+            cache.delete_epochs.as_ptr(),
+            state.slot_ownership.delete_epochs.as_ptr()
+        );
+        assert_eq!(
+            cache.withdrawn_by.as_ptr(),
+            state.slot_ownership.withdrawn_by.as_ptr()
+        );
+    }
+
+    #[test]
+    fn no_op_writes_refresh_snapshots_without_rebuilding_structure() {
+        let mut state = ClusterState::new("127.0.0.1", 6379, 16379);
+        let original = state.management_topology(&BTreeMap::new(), 0);
+        state.myself.slots[8] = false;
+        state.slot_ownership.owners[8] = SlotOwner::Unassigned;
+        let refreshed = state.management_topology(&BTreeMap::new(), 0);
+        assert!(Arc::ptr_eq(&original.structure, &refreshed.structure));
+        let cache = state.management_cache.borrow();
+        let cache = cache.as_ref().unwrap();
+        assert_eq!(cache.nodes[0].slots.as_ptr(), state.myself.slots.as_ptr());
+        assert!(cache.owners.shares_storage(&state.slot_ownership.owners));
     }
 }

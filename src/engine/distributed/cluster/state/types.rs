@@ -13,6 +13,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use super::debug::{ClusterActiveOperations, ClusterDebugSnapshot, ClusterPendingWork};
 use super::snapshot::ClusterHealth;
+use crate::engine::distributed::cluster::slot_storage::SharedSlots;
 
 /// Cluster state constants.
 pub const CLUSTER_SLOTS: usize = 16384;
@@ -28,9 +29,10 @@ pub(crate) enum SlotOwner {
 }
 
 pub(super) struct SlotOwnershipTable {
-    pub(super) owners: Vec<SlotOwner>,
-    pub(super) delete_epochs: Vec<u64>,
-    pub(super) withdrawn_by: Vec<Option<String>>,
+    pub(super) owners: SharedSlots<SlotOwner>,
+    pub(super) delete_epochs: SharedSlots<u64>,
+    pub(super) withdrawn_by: SharedSlots<Option<String>>,
+    pub(super) withdrawal_index: std::cell::RefCell<Option<super::slots::WithdrawalIndex>>,
     pub(super) migrating_to: HashMap<usize, String>,
     pub(super) importing_from: HashMap<usize, String>,
 }
@@ -38,9 +40,10 @@ pub(super) struct SlotOwnershipTable {
 impl SlotOwnershipTable {
     fn new() -> Self {
         Self {
-            owners: vec![SlotOwner::Unassigned; CLUSTER_SLOTS],
-            delete_epochs: vec![0; CLUSTER_SLOTS],
-            withdrawn_by: vec![None; CLUSTER_SLOTS],
+            owners: vec![SlotOwner::Unassigned; CLUSTER_SLOTS].into(),
+            delete_epochs: vec![0; CLUSTER_SLOTS].into(),
+            withdrawn_by: vec![None; CLUSTER_SLOTS].into(),
+            withdrawal_index: std::cell::RefCell::new(None),
             migrating_to: HashMap::new(),
             importing_from: HashMap::new(),
         }
@@ -904,7 +907,7 @@ impl ClusterState {
         // identity may belong to the primary it replicated, so it must move to
         // a fresh shard even though its node identity remains unchanged.
         self.myself.shard_id = generate_node_id();
-        self.myself.slots = vec![false; CLUSTER_SLOTS];
+        self.myself.slots = vec![false; CLUSTER_SLOTS].into();
         self.myself.numslots = 0;
         self.myself.replicaof.clear();
         self.myself.flags = crate::engine::distributed::cluster::node::CLUSTER_NODE_MYSELF
@@ -1237,7 +1240,7 @@ impl ClusterState {
                 primary.shard_id.as_bytes(),
             )
             .map_err(|_| "primary shard ID is invalid".to_string())?,
-            slots: primary.slots.clone(),
+            slots: primary.slots.to_vec(),
             config_epoch: epoch,
         };
         if self.automatic_failover.phase()

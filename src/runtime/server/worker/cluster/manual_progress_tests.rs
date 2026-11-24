@@ -35,7 +35,7 @@ fn awaiting_catchup() -> ServerWorkerState {
     let promotion = Promotion {
         old_primary: primary_id.clone(),
         shard_id: NodeId::parse(primary.shard_id.as_bytes()).unwrap(),
-        slots: primary.slots.clone(),
+        slots: primary.slots.to_vec(),
         config_epoch: 1,
     };
     state.nodes.insert(primary.name.clone(), primary);

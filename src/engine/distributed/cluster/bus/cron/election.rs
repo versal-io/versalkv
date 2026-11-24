@@ -29,7 +29,7 @@ impl ClusterBusManager {
                 Some(FailedPrimaryFacts {
                     node_id: NodeId::parse(primary.name.as_bytes()).ok()?,
                     shard_id: NodeId::parse(primary.shard_id.as_bytes()).ok()?,
-                    slots: primary.slots.clone(),
+                    slots: primary.slots.to_vec(),
                     is_failed: primary.has_flag(CLUSTER_NODE_FAIL),
                 })
             });

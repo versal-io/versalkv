@@ -83,15 +83,16 @@ impl<K, V> Table<K, V> {
     }
 
     pub(super) fn insert_entry(&mut self, idx: usize, entry: Entry<K, V>) {
-        let bucket = self.table[idx].take();
-        self.table[idx] = Some(Box::new(match bucket.map(|bucket| *bucket) {
-            None => BucketEntries::Single(entry),
-            Some(BucketEntries::Single(old)) => BucketEntries::Many(vec![old, entry]),
-            Some(BucketEntries::Many(mut entries)) => {
-                entries.push(entry);
-                BucketEntries::Many(entries)
+        match self.table[idx].as_deref_mut() {
+            None => self.table[idx] = Some(Box::new(BucketEntries::Single(entry))),
+            Some(BucketEntries::Many(entries)) => entries.push(entry),
+            Some(bucket @ BucketEntries::Single(_)) => {
+                let previous = std::mem::replace(bucket, BucketEntries::Many(Vec::new()));
+                if let BucketEntries::Single(old) = previous {
+                    *bucket = BucketEntries::Many(vec![old, entry]);
+                }
             }
-        }));
+        }
     }
 
     pub(super) fn remove_entry(&mut self, idx: usize, pos: usize) -> Option<Entry<K, V>> {
@@ -141,6 +142,53 @@ pub(super) fn rev(mut v: u64) -> u64 {
     v = ((v >> 2) & 0x3333333333333333) | ((v & 0x3333333333333333) << 2);
     v = ((v >> 4) & 0x0F0F0F0F0F0F0F0F) | ((v & 0x0F0F0F0F0F0F0F0F) << 4);
     v.swap_bytes()
+}
+
+#[cfg(all(test, not(feature = "wasm"), not(target_family = "wasm"), not(miri)))]
+mod tests {
+    use super::*;
+    use crate::foundation::memory::util_alloc::measure_allocations;
+
+    #[test]
+    fn spare_capacity_bucket_insertion_does_not_allocate() {
+        let mut table = Table::allocate(0);
+        let mut entries = Vec::with_capacity(8);
+        entries.push(Entry {
+            key: 1usize,
+            value: (),
+        });
+        entries.push(Entry {
+            key: 2usize,
+            value: (),
+        });
+        table.table[0] = Some(Box::new(BucketEntries::Many(entries)));
+        let (_, cost) = measure_allocations(|| {
+            table.insert_entry(0, Entry { key: 3, value: () });
+        });
+        assert_eq!(cost.allocations, 0, "{cost:?}");
+        assert_eq!(cost.reallocations, 0, "{cost:?}");
+        assert_eq!(cost.deallocations, 0, "{cost:?}");
+        assert_eq!(table.bucket_entry_count(0), 3);
+    }
+
+    #[test]
+    fn singleton_promotion_preserves_bucket_allocation() {
+        let mut table = Table::allocate(0);
+        table.insert_entry(
+            0,
+            Entry {
+                key: 1usize,
+                value: (),
+            },
+        );
+        let (_, cost) = measure_allocations(|| {
+            table.insert_entry(0, Entry { key: 2, value: () });
+        });
+        assert_eq!(cost.allocations, 1, "{cost:?}");
+        assert_eq!(cost.reallocations, 0, "{cost:?}");
+        assert_eq!(cost.deallocations, 0, "{cost:?}");
+        assert_eq!(table.bucket_entry_count(0), 2);
+    }
 }
 
 pub fn next_cursor(v: u64, mask: u64) -> u64 {

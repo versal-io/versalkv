@@ -628,7 +628,9 @@ impl ClusterBusManager {
         if !apply_slot_bitmap || msg.myslots.len() != msg::SLOT_BYTES {
             return (false, Vec::new());
         }
-        node.advertised_slots.clone_from(&msg.myslots);
+        if *node.advertised_slots != msg.myslots {
+            node.advertised_slots.copy_from_slice(&msg.myslots);
+        }
         node.has_advertised_slots = true;
         let old_flags = node.flags;
         let old_numslots = node.numslots;
@@ -769,9 +771,9 @@ impl ClusterBusManager {
             node.shard_id = shard;
         }
         if msg.myslots.len() == msg::SLOT_BYTES && plan.observation.role == ObservedRole::Primary {
-            node.slots = bytes_to_slots(&msg.myslots);
+            node.slots = bytes_to_slots(&msg.myslots).into();
             node.numslots = node.count_slots();
-            node.advertised_slots.clone_from(&msg.myslots);
+            node.advertised_slots.copy_from_slice(&msg.myslots);
             node.has_advertised_slots = true;
         }
         if plan.observation.role == ObservedRole::Replica {
@@ -856,7 +858,7 @@ impl ClusterBusManager {
             shard_id: sender.shard_id.clone(),
             old_primary_name: sender.display_name(),
             new_primary_name: new_primary.display_name(),
-            slots: sender.slots.clone(),
+            slots: sender.slots.to_vec(),
         })
     }
 

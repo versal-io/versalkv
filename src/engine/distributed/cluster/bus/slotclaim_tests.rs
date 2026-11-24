@@ -538,7 +538,7 @@ fn unchanged_primary_ping_skips_slot_reconciliation() {
     sender.config_epoch = 7;
     sender.slots[42] = true;
     sender.numslots = 1;
-    sender.advertised_slots = slots_to_bytes(&sender.slots);
+    sender.advertised_slots = slots_to_bytes(&sender.slots).into();
     sender.has_advertised_slots = true;
     state.nodes.insert(sender.name.clone(), sender.clone());
 
@@ -549,6 +549,26 @@ fn unchanged_primary_ping_skips_slot_reconciliation() {
     sender.numslots = 2;
     let changed = topology_message(ClusterMsgType::Pong, &sender, 7, 7);
     assert!(!ClusterBusManager::sender_slot_claim_deltas(&state, &changed).is_empty());
+}
+
+#[test]
+fn withdrawn_zero_slot_does_not_prevent_a_stable_heartbeat() {
+    let mut state = ClusterState::new("127.0.0.1", 6379, 16379);
+    let mut sender = remote_primary(TARGET_ID, "target-shard", 7);
+    sender.slots[42] = true;
+    sender.numslots = 1;
+    sender.has_advertised_slots = true;
+    state.nodes.insert(sender.name.clone(), sender.clone());
+    state.set_slot_claim_withdrawn(43, Some(TARGET_ID.to_string()));
+    let message = topology_message(ClusterMsgType::Pong, &sender, 7, 7);
+    assert!(ClusterBusManager::sender_slot_claim_deltas(&state, &message).is_empty());
+
+    state.set_slot_claim_withdrawn(42, Some(OLD_PRIMARY_ID.to_string()));
+    assert!(ClusterBusManager::sender_slot_claim_deltas(&state, &message).is_empty());
+    state.set_slot_claim_withdrawn(42, Some(TARGET_ID.to_string()));
+    assert!(!ClusterBusManager::sender_slot_claim_deltas(&state, &message).is_empty());
+    state.set_slot_claim_withdrawn(42, None);
+    assert!(ClusterBusManager::sender_slot_claim_deltas(&state, &message).is_empty());
 }
 
 #[test]
@@ -578,7 +598,7 @@ fn unchanged_advertisement_reconciles_slots_removed_by_a_third_party_claim() {
     let mut observed_sender = advertised_sender.clone();
     observed_sender.slots[43] = false;
     observed_sender.numslots = 1;
-    observed_sender.advertised_slots = slots_to_bytes(&advertised_sender.slots);
+    observed_sender.advertised_slots = slots_to_bytes(&advertised_sender.slots).into();
     observed_sender.has_advertised_slots = true;
     state
         .nodes
@@ -602,7 +622,7 @@ fn unchanged_bitmap_reassertion_clears_withdrawn_sender_claim() {
     let mut sender = remote_primary(TARGET_ID, "target-shard", 6);
     sender.slots[0] = true;
     sender.numslots = 1;
-    sender.advertised_slots = slots_to_bytes(&sender.slots);
+    sender.advertised_slots = slots_to_bytes(&sender.slots).into();
     sender.has_advertised_slots = true;
     state.nodes.insert(sender.name.clone(), sender.clone());
     state.set_slot_claim_withdrawn(0, Some(TARGET_ID.to_string()));
@@ -641,7 +661,7 @@ fn promoted_replica_reconciles_an_unchanged_primary_bitmap() {
     promoted.replicaof = OLD_PRIMARY_ID.to_string();
     promoted.slots[42] = true;
     promoted.numslots = 1;
-    promoted.advertised_slots = slots_to_bytes(&promoted.slots);
+    promoted.advertised_slots = slots_to_bytes(&promoted.slots).into();
     promoted.has_advertised_slots = true;
     state.nodes.insert(promoted.name.clone(), promoted.clone());
 
@@ -766,7 +786,7 @@ fn withdrawn_sender_keeps_live_slot_binding_until_successor_claims() {
     let mut sender = remote_primary(TARGET_ID, "target-shard", 6);
     sender.slots[0] = true;
     sender.numslots = 1;
-    sender.advertised_slots = slots_to_bytes(&sender.slots);
+    sender.advertised_slots = slots_to_bytes(&sender.slots).into();
     sender.has_advertised_slots = true;
     state.nodes.insert(sender.name.clone(), sender.clone());
 
@@ -800,7 +820,7 @@ fn withdrawn_owner_slot_accepts_a_lower_epoch_successor_claim() {
     let mut withdrawn_owner = remote_primary(OLD_PRIMARY_ID, "source-shard", 10);
     withdrawn_owner.slots[0] = true;
     withdrawn_owner.numslots = 1;
-    withdrawn_owner.advertised_slots = slots_to_bytes(&withdrawn_owner.slots);
+    withdrawn_owner.advertised_slots = slots_to_bytes(&withdrawn_owner.slots).into();
     withdrawn_owner.has_advertised_slots = true;
     state.insert_node(withdrawn_owner.clone());
 
