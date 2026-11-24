@@ -413,75 +413,65 @@ impl ServerWorkerState {
         &mut self,
         state: &mut crate::engine::distributed::cluster::ClusterState,
     ) {
-        let kernel_pending: std::collections::HashMap<usize, usize> = self
-            .cluster_bus
-            .connections
-            .keys()
-            .copied()
-            .map(|token| {
-                let pending = self
-                    .transport
-                    .raw_fd(Token(token))
-                    .and_then(crate::foundation::io::sys::os::socket_pending_write_bytes_fd)
-                    .unwrap_or(0);
-                (token, pending)
-            })
-            .collect();
-        let observations: Vec<_> = self
-            .cluster_bus
-            .connections
-            .iter_mut()
-            .filter_map(|(token, connection)| {
-                let identity = if connection.node_name.is_empty() {
-                    &connection.handshake_node_name
-                } else {
-                    &connection.node_name
-                };
-                let Ok(node_id) = NodeId::parse(identity.as_bytes()) else {
-                    return None;
-                };
-                let direction = connection.direction();
-                let previous_node_id = (!connection.projected_node_name.is_empty()).then(|| {
-                    std::mem::replace(&mut connection.projected_node_name, node_id.to_string())
-                });
-                if previous_node_id.is_none() {
-                    connection.projected_node_name = node_id.to_string();
-                }
-                Some((
-                    previous_node_id,
-                    ClusterLinkView::new(
-                        node_id,
-                        direction,
-                        connection.created_at,
-                        connection.events,
-                    )
-                    .with_endpoint(connection.addr.ip().to_string(), connection.addr.port())
-                    .with_temporary_handshake(!connection.handshake_node_name.is_empty()),
-                    LinkIoEvent {
-                        read_at_ms: (connection.last_recv > 0).then_some(connection.last_recv),
-                        wrote_at_ms: (connection.last_send > 0).then_some(connection.last_send),
-                        total_bytes_received: connection.bytes_received,
-                        total_bytes_sent: connection.bytes_sent,
-                    },
-                    LinkBufferEvent {
-                        allocated: connection.write_buf.capacity(),
-                        used: connection
-                            .write_buf
-                            .len()
-                            .saturating_add(kernel_pending.get(token).copied().unwrap_or(0)),
-                        events: connection.events,
-                    },
-                ))
-            })
-            .collect();
-        for (previous_node_id, view, io, buffer) in observations {
-            let node_id = view.node_id.to_string();
-            let direction = view.direction;
-            state.observe_link_identity(previous_node_id.as_deref(), view);
-            state.observe_link_io(&node_id, direction, io);
-            state.observe_link_buffer(&node_id, direction, buffer);
+        let tokens: Vec<_> = self.cluster_bus.connections.keys().copied().collect();
+        for token in tokens {
+            self.refresh_cluster_link_view_for_state(state, Token(token));
         }
         Self::update_cluster_link_memory(&self.cluster_bus, state);
+    }
+
+    pub(in crate::runtime) fn refresh_cluster_link_view_for_state(
+        &mut self,
+        state: &mut crate::engine::distributed::cluster::ClusterState,
+        token: Token,
+    ) {
+        let kernel_pending = self
+            .transport
+            .raw_fd(token)
+            .and_then(crate::foundation::io::sys::os::socket_pending_write_bytes_fd)
+            .unwrap_or(0);
+        let Some(connection) = self.cluster_bus.connections.get_mut(&token.0) else {
+            return;
+        };
+        let identity = if connection.node_name.is_empty() {
+            &connection.handshake_node_name
+        } else {
+            &connection.node_name
+        };
+        let Ok(node_id) = NodeId::parse(identity.as_bytes()) else {
+            return;
+        };
+        let direction = connection.direction();
+        let previous_node_id = (!connection.projected_node_name.is_empty())
+            .then(|| std::mem::replace(&mut connection.projected_node_name, node_id.to_string()));
+        if previous_node_id.is_none() {
+            connection.projected_node_name = node_id.to_string();
+        }
+        let node_name = node_id.to_string();
+        let view =
+            ClusterLinkView::new(node_id, direction, connection.created_at, connection.events)
+                .with_endpoint(connection.addr.ip().to_string(), connection.addr.port())
+                .with_temporary_handshake(!connection.handshake_node_name.is_empty());
+        state.observe_link_identity(previous_node_id.as_deref(), view);
+        state.observe_link_io(
+            &node_name,
+            direction,
+            LinkIoEvent {
+                read_at_ms: (connection.last_recv > 0).then_some(connection.last_recv),
+                wrote_at_ms: (connection.last_send > 0).then_some(connection.last_send),
+                total_bytes_received: connection.bytes_received,
+                total_bytes_sent: connection.bytes_sent,
+            },
+        );
+        state.observe_link_buffer(
+            &node_name,
+            direction,
+            LinkBufferEvent {
+                allocated: connection.write_buf.capacity(),
+                used: connection.write_buf.len().saturating_add(kernel_pending),
+                events: connection.events,
+            },
+        );
     }
 
     fn update_cluster_link_memory(
@@ -815,9 +805,7 @@ impl ServerWorkerState {
             return;
         };
         let result = if let Some(ref mut state) = state_opt {
-            let res = self.cluster_bus.writable(&mut stream, tv, state);
-            self.refresh_cluster_link_views_for_state(state);
-            res
+            self.cluster_bus.writable(&mut stream, tv, state)
         } else {
             let buf = self
                 .cluster_bus
@@ -879,7 +867,10 @@ impl ServerWorkerState {
         }
         let sendbuf_limit = self.ctx.config().server.cluster_link_sendbuf_limit;
         if let Some(state) = state_opt.as_deref_mut() {
-            self.refresh_cluster_link_views_for_state(state);
+            // A write changes only this link. Keep full projection at receive
+            // and maintenance boundaries, where actions can affect other links.
+            self.refresh_cluster_link_view_for_state(state, token);
+            Self::update_cluster_link_memory(&self.cluster_bus, state);
             self.enforce_cluster_bus_sendbuf_limit_for_state(state, sendbuf_limit);
         }
         *self.ctx.cluster_state_mut() = state_opt;

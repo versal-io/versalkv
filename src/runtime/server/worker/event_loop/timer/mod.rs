@@ -209,6 +209,9 @@ impl ServerWorkerState {
         let has_immediate_work = self.transport.has_pending_data()
             || self.event_batch.has_pending_transport_data()
             || self.event_batch.has_due_time_events()
+            // Replay owns buffered commands while main-channel reads are paused.
+            // Its next batch needs a new logical turn, not a new socket event.
+            || self.pending_replication_replay.is_some()
             || capture_deadline.is_some_and(|delay| delay.is_zero());
         let blocked_deadline = (self.ctx.blocking_registry().count() > 0)
             .then(|| self.next_blocked_timeout(now_ms))
@@ -595,6 +598,37 @@ mod poll_deadline_tests {
             runtime.next_poll_timeout(1_000),
             Some(Duration::from_millis(100)),
             "next-turn slot-export work must not affect the current poll deadline"
+        );
+    }
+
+    #[test]
+    fn pending_replication_replay_does_not_sleep_between_batches() {
+        use crate::framework::distributed::replication::ConnectionId;
+        use crate::runtime::server::worker::event_loop::blocked_events::PendingReplayContinuation;
+
+        let mut runtime = ServerWorkerState::new(1).expect("create event loop runtime");
+        runtime.time_events.create_time_event(
+            1_000,
+            Duration::from_millis(100),
+            None,
+            RuntimeTimeEvent::Test(0),
+        );
+        runtime.set_pending_replication_replay(PendingReplayContinuation::new(
+            ConnectionId(7),
+            42,
+            1_000,
+        ));
+
+        assert_eq!(
+            runtime.next_poll_timeout(1_000),
+            Some(Duration::ZERO),
+            "buffered commands can progress without another socket readiness event"
+        );
+        runtime.clear_pending_replication_replay();
+        assert_eq!(
+            runtime.next_poll_timeout(1_000),
+            Some(Duration::from_millis(100)),
+            "completed or aborted replay must restore the idle poll deadline"
         );
     }
 

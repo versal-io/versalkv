@@ -184,9 +184,9 @@ impl ServerWorkerState {
                 }
                 if let Some(state) = state.as_deref_mut() {
                     self.record_inbound_cluster_link_if_ready(state, token);
-                    self.refresh_cluster_link_views_for_state(state);
                     let limit = self.ctx.config().server.cluster_link_sendbuf_limit;
                     self.enforce_cluster_bus_sendbuf_limit_for_state(state, limit);
+                    Self::update_cluster_link_memory(&self.cluster_bus, state);
                 }
                 *self.ctx.cluster_state_mut() = state;
                 if let WriteOutcome::Failed(error) = outcome {
@@ -195,6 +195,11 @@ impl ServerWorkerState {
                     return;
                 }
                 self.update_cluster_bus_interest(token);
+                let mut state = self.ctx.cluster_state_mut().take();
+                if let Some(state) = state.as_deref_mut() {
+                    self.refresh_cluster_link_view_for_state(state, token);
+                }
+                *self.ctx.cluster_state_mut() = state;
                 if self.io_threads.cluster_read_deferred(token) {
                     self.handle_cluster_bus_readable(token);
                 }
@@ -364,6 +369,35 @@ mod tests {
         );
         assert_eq!(backend.ctx.stats().cluster_io_threaded_writes_processed, 2);
         assert_eq!(backend.ctx.stats().cluster_io_main_thread_fallbacks, 0);
+    }
+
+    #[test]
+    fn threaded_write_projects_the_final_link_interest() {
+        let (mut backend, token, mut socket) = bus_connection(2);
+        let node_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let connection = backend.cluster_bus.connections.get_mut(&token.0).unwrap();
+        connection.node_name = node_id.to_string();
+        connection.write_buf.extend_from_slice(b"payload");
+        connection.events = crate::engine::distributed::cluster::LinkEvents::READ_WRITE;
+        backend.refresh_cluster_link_views();
+
+        backend.handle_cluster_bus_writable(token);
+        let completion = write_completion(&mut backend);
+        backend.complete_io_write(completion);
+        let mut received = [0; 7];
+        socket.read_exact(&mut received).unwrap();
+        assert_eq!(&received, b"payload");
+
+        let state = backend.ctx.cluster_state().as_ref().unwrap();
+        let view = state
+            .link_views()
+            .find(|view| view.node_id.as_str() == node_id)
+            .unwrap();
+        assert_eq!(
+            view.events,
+            crate::engine::distributed::cluster::LinkEvents::READABLE
+        );
+        assert_eq!(view.bytes_sent, 7);
     }
 
     #[test]
