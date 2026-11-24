@@ -108,7 +108,7 @@ fn pending_output_memory_counts_frame_capacity_and_not_empty_queue_reserve() {
     assert_eq!(
         conn.pending_output_memory_usage(),
         frame_allocation
-            + std::mem::size_of::<Vec<u8>>()
+            + std::mem::size_of::<OutputFrame>()
             + std::mem::size_of::<OutputFrameAccounting>()
     );
     conn.clear_output_queue();
@@ -153,7 +153,7 @@ fn pending_dispatch_replies_follow_inline_and_list_memory_projection() {
     let frame_allocation = crate::foundation::memory::util_alloc::vec_allocation_bytes(&large);
     let listed = conn.client_memory_usage_with_pending_replies(&[small, large]);
     let expected_extra = frame_allocation
-        + std::mem::size_of::<Vec<u8>>()
+        + std::mem::size_of::<OutputFrame>()
         + std::mem::size_of::<OutputFrameAccounting>();
 
     assert_eq!(listed.output, baseline.output + expected_extra);
@@ -181,7 +181,7 @@ fn partial_consumption_retains_the_complete_frame_allocation() {
     conn.queue_replication_reply(frame);
     let before = conn.pending_output_memory_usage();
 
-    conn.output.queue.front_mut().unwrap().drain(..3);
+    conn.output.queue.front_mut().unwrap().advance(3);
     assert_eq!(conn.consume_written_bytes(3, 8), Ok(3));
     assert_eq!(conn.pending_output_memory_usage(), before);
     assert_eq!(conn.replication_output_bytes(), 5);

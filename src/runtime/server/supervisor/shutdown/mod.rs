@@ -623,8 +623,12 @@ mod tests {
         assert_eq!(runtime.connection_registry[token].cmd_count, 1);
         queue_next_ping(&mut runtime, token);
         assert_eq!(
-            runtime.connection_registry[token].output.queue.back(),
-            Some(&b"+PONG\r\n".to_vec())
+            runtime.connection_registry[token]
+                .output
+                .queue
+                .back()
+                .map(|frame| frame.as_slice()),
+            Some(b"+PONG\r\n".as_slice())
         );
     }
 

@@ -8,6 +8,7 @@ pub mod external;
 pub mod key_access;
 pub mod metrics;
 pub mod numeric;
+pub(crate) mod shared_output;
 pub mod tls;
 #[cfg_attr(feature = "wasm", path = "util_alloc_wasm.rs")]
 pub mod util_alloc;

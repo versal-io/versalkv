@@ -1083,7 +1083,7 @@ mod tests {
             .take_threaded_write_snapshot()
             .into_frames()
             .into_iter()
-            .flatten()
+            .flat_map(|frame| frame.into_vec())
             .collect::<Vec<_>>();
         assert!(!runtime.ctx.script().debug_modes.contains_key(&session));
         assert!(

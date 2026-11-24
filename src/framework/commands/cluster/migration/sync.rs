@@ -503,7 +503,7 @@ mod tests {
 
         assert_eq!(reply, Value::Null);
         assert_eq!(
-            conn.output.queue.front().map(Vec::as_slice),
+            conn.output.queue.front().map(|frame| frame.as_slice()),
             Some(b"+OK\r\n".as_slice())
         );
         assert_eq!(
@@ -556,7 +556,7 @@ mod tests {
         );
 
         assert_eq!(
-            conn.output.queue.front().map(Vec::as_slice),
+            conn.output.queue.front().map(|frame| frame.as_slice()),
             Some(
                 crate::engine::distributed::replication::protocol::encode_command(&[
                     b"CLUSTER",

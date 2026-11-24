@@ -6,6 +6,9 @@ use super::*;
 use crate::framework::capabilities::io::Token;
 use std::collections::{hash_map::Entry, HashMap};
 
+#[cfg(test)]
+mod shared_output_tests;
+
 #[derive(Clone, Copy)]
 struct ReplicaOutputBufferLimits {
     hard: Option<usize>,
@@ -218,6 +221,10 @@ impl ServerWorkerState {
                 .unwrap_or(0);
             backlog_bytes.max(queued)
         };
+        // Keep the existing max projection for connection-owned payloads
+        // and queue containers. Shared backing stores have no per-connection
+        // ownership; maxmemory reads their separate live foundation counter
+        // directly instead of caching it here or subtracting it per replica.
         let allocation = if self.ctx.replication().is_replica() {
             self.replication_runtime
                 .replica_pending_buffer()

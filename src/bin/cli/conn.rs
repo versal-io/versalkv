@@ -46,6 +46,14 @@ impl Write for StreamType {
 }
 
 impl StreamType {
+    pub fn try_clone(&self) -> io::Result<Self> {
+        match self {
+            StreamType::Tcp(stream) => stream.try_clone().map(Self::Tcp),
+            #[cfg(unix)]
+            StreamType::Unix(stream) => stream.try_clone().map(Self::Unix),
+        }
+    }
+
     pub fn set_read_timeout(&self, dur: Option<Duration>) -> io::Result<()> {
         match self {
             StreamType::Tcp(s) => s.set_read_timeout(dur),
@@ -76,6 +84,12 @@ pub struct Connection {
     parser: RespParser,
     buf: [u8; 8192],
     username: Option<Vec<u8>>,
+}
+
+pub enum ReplyRead {
+    Reply(RespValue),
+    Progress,
+    Pending,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -378,6 +392,33 @@ impl Connection {
                 return Err("Connection closed by server".to_string());
             }
             self.parser.feed(&self.buf[..n]);
+        }
+    }
+
+    pub fn read_reply_chunk(&mut self) -> io::Result<ReplyRead> {
+        if let Some(reply) = self.parser.try_parse().map_err(io::Error::other)? {
+            return Ok(ReplyRead::Reply(reply));
+        }
+        match self.stream.read(&mut self.buf) {
+            Ok(0) => Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "Connection closed before the last pipe reply",
+            )),
+            Ok(count) => {
+                self.parser.feed(&self.buf[..count]);
+                Ok(ReplyRead::Progress)
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock
+                        | io::ErrorKind::TimedOut
+                        | io::ErrorKind::Interrupted
+                ) =>
+            {
+                Ok(ReplyRead::Pending)
+            }
+            Err(error) => Err(error),
         }
     }
 

@@ -1,5 +1,6 @@
 use super::super::super::ServerWorkerState;
 use crate::foundation::io::transport::{Interest, OwnedPollSource, WriteOutcome};
+use crate::framework::capabilities::connection::SharedOutputBlock;
 use crate::framework::capabilities::io::Token;
 use crate::framework::distributed::replication::{ConnectionId, PrimaryLinkState, ReplicaId};
 use crate::runtime::server::worker::event_loop::sources::{RuntimeSourceHandle, TransferId};
@@ -1405,7 +1406,7 @@ impl ServerWorkerState {
                 self.finish_diskless_relay_if_ready();
             }
             Ok(n) => {
-                let chunk = buf[..n].to_vec();
+                let chunk = SharedOutputBlock::from(buf[..n].to_vec());
                 if let Some(relay) = self.full_sync.diskless_relay.as_ref() {
                     let ids = relay.targets.clone();
                     for id in ids {
@@ -1420,7 +1421,7 @@ impl ServerWorkerState {
                             else {
                                 continue;
                             };
-                            conn.queue_reply(chunk.clone());
+                            conn.queue_shared_reply(chunk.clone());
                         }
                         // Push the chunk to this replica's socket immediately,
                         // mirroring C's synchronous connWrite in rdbPipeReadHandler

@@ -12,6 +12,7 @@ mod debug;
 pub mod failover;
 mod handshake;
 pub mod invariants;
+mod management;
 mod replica;
 mod replica_migration;
 mod routing;
@@ -29,6 +30,7 @@ mod types;
 
 pub use crate::engine::distributed::cluster::action::ReplicationSwitchMode;
 pub use debug::ClusterDebugSnapshot;
+pub use management::ManagementTopology;
 pub use replica::{ClusterReplicaHealth, ClusterReplicationView};
 pub use replica_migration::{
     select_replica_migration, MigrationFacts, MigrationPrimaryFacts, MigrationReplicaFacts,

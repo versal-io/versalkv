@@ -99,8 +99,7 @@ impl ClusterState {
         &self,
         replication: &BTreeMap<String, ClusterReplicationView>,
     ) -> ClusterTopologySnapshot {
-        self.projection()
-            .management_topology_with_replication(replication)
+        self.topology_snapshot_with_local_replication_offset(replication, self.myself.repl_offset)
     }
 
     pub fn topology_snapshot_with_local_replication_offset(
@@ -149,6 +148,7 @@ impl ClusterState {
                     self,
                     local_replication,
                     node.is_myself().then_some(local_replication_offset),
+                    true,
                 )
             })
             .collect::<Vec<_>>();
@@ -212,11 +212,12 @@ impl ClusterState {
     }
 }
 
-fn node_view(
+pub(super) fn node_view(
     node: &ClusterNode,
     state: &ClusterState,
     replication: Option<&ClusterReplicationView>,
     local_replication_offset: Option<i64>,
+    include_slots: bool,
 ) -> NodeView {
     let shard_id = if !node.shard_id.is_empty() {
         node.shard_id.as_str()
@@ -256,7 +257,11 @@ fn node_view(
                 &node.name,
                 crate::engine::distributed::cluster::ClusterLinkDirection::To,
             ),
-        slots: node.slots.clone(),
+        slots: if include_slots {
+            node.slots.clone()
+        } else {
+            Vec::new()
+        },
     }
 }
 

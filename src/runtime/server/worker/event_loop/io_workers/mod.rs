@@ -6,6 +6,7 @@ use crate::foundation::io::transport::{
     ReadOutcome, ThreadIoHandle, TransportWakeHandle, WriteOutcome,
 };
 use crate::foundation::memory::util_hash::FxHashMap;
+use crate::framework::capabilities::connection::OutputFrame;
 use crate::framework::capabilities::io::mt_driver::IoDriverMtConfig;
 use crate::framework::capabilities::io::Token;
 use crate::framework::context::IoThreadInfo;
@@ -46,14 +47,14 @@ pub(crate) struct ReadCompletion {
 pub(crate) struct WriteJob {
     pub(crate) id: IoOperationId,
     pub(crate) handle: ThreadIoHandle,
-    pub(crate) frames: VecDeque<Vec<u8>>,
+    pub(crate) frames: VecDeque<OutputFrame>,
     pub(crate) byte_budget: usize,
 }
 
 pub(crate) struct WriteCompletion {
     pub(crate) id: IoOperationId,
     pub(crate) handle: ThreadIoHandle,
-    pub(crate) frames: VecDeque<Vec<u8>>,
+    pub(crate) frames: VecDeque<OutputFrame>,
     pub(crate) written: usize,
     pub(crate) released_allocation_bytes: usize,
     pub(crate) outcome: WriteOutcome,
@@ -322,14 +323,14 @@ pub(crate) enum ReadCompletionAction {
 
 pub(crate) enum WriteSubmission {
     Submitted,
-    AlreadyPending(std::collections::VecDeque<Vec<u8>>),
-    Unavailable(std::collections::VecDeque<Vec<u8>>),
+    AlreadyPending(std::collections::VecDeque<OutputFrame>),
+    Unavailable(std::collections::VecDeque<OutputFrame>),
 }
 
 pub(crate) enum WriteCompletionAction {
     Apply {
         token: Token,
-        frames: std::collections::VecDeque<Vec<u8>>,
+        frames: std::collections::VecDeque<OutputFrame>,
         written: usize,
         released_allocation_bytes: usize,
         outcome: WriteOutcome,
@@ -544,7 +545,7 @@ impl IoThreadRuntime {
     pub(crate) fn submit_write(
         &mut self,
         token: Token,
-        frames: std::collections::VecDeque<Vec<u8>>,
+        frames: std::collections::VecDeque<OutputFrame>,
         byte_budget: usize,
     ) -> WriteSubmission {
         if self.connections.get(&token).is_some_and(|state| {

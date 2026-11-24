@@ -12,6 +12,7 @@ use command_macros::command;
 #[path = "links.rs"]
 mod links;
 #[path = "shards.rs"]
+#[cfg(test)]
 mod shards;
 #[path = "topology_reply.rs"]
 mod topology_reply;
@@ -186,18 +187,14 @@ fn cluster_slots(args: &[Bytes], conn: &mut dyn CommandConn, ctx: &mut ServerCon
         Some(state) => state,
         None => return Value::error("ERR This instance has cluster support disabled"),
     };
-    let topology = state.topology_snapshot_with_replication(replication_views);
-    let ranges = topology_reply::render_slots(
+    let topology = state.management_topology(replication_views, state.myself.repl_offset);
+    let ranges = topology_reply::render_management_slots(
         &topology,
         preference,
         crate::engine::distributed::cluster::ClientTransport::Tcp,
         prefer_ipv6,
     );
-    if ranges.is_empty() {
-        Value::Array(vec![])
-    } else {
-        Value::Array(ranges.into_iter().map(Value::Array).collect())
-    }
+    Value::Array(ranges)
 }
 
 fn cluster_shards(conn: &mut dyn CommandConn, ctx: &mut ServerContext) -> Value {
@@ -214,11 +211,11 @@ fn cluster_shards(conn: &mut dyn CommandConn, ctx: &mut ServerContext) -> Value 
         .as_deref()
         .ok_or_else(|| Value::error("ERR This instance has cluster support disabled"))
         .map(|state| {
-            let topology = state.topology_snapshot_with_local_replication_offset(
+            let topology = state.management_topology(
                 replication_views,
                 local_replication_offset,
             );
-            Value::Array(shards::cluster_shards(
+            Value::Array(topology_reply::render_management_shards(
                 &topology,
                 preference,
                 crate::engine::distributed::cluster::ClientTransport::Tcp,

@@ -6,7 +6,12 @@ use crate::engine::distributed::cluster::{
     ClientTransport, ClusterNodeHealth, ClusterNodeRole, ClusterTopologySnapshot, NodeId, NodeView,
     PreferredEndpoint,
 };
+use crate::engine::distributed::cluster::state::ManagementTopology;
 use crate::foundation::io::protocol::Value;
+
+#[cfg(test)]
+#[path = "management_reply_tests.rs"]
+mod management_reply_tests;
 
 pub(super) fn render_nodes(
     snapshot: &ClusterTopologySnapshot,
@@ -89,6 +94,7 @@ pub(super) fn render_nodes(
     lines.join("\n") + "\n"
 }
 
+#[cfg(test)]
 pub(super) fn render_slots(
     snapshot: &ClusterTopologySnapshot,
     preference: PreferredEndpoint,
@@ -143,6 +149,87 @@ fn is_node_available_for_slots(node: &NodeView) -> bool {
     node.health != ClusterNodeHealth::Fail && node.replication_offset != 0
 }
 
+pub(super) fn render_management_slots(
+    topology: &ManagementTopology,
+    preference: PreferredEndpoint,
+    transport: ClientTransport,
+    prefer_ipv6: bool,
+) -> Vec<Value> {
+    let render = |start: u16, end: u16, index: usize| {
+        let mut range = vec![
+            Value::integer(start as i64),
+            Value::integer(end as i64),
+            Value::Array(slot_node_entry(
+                &topology.nodes[index],
+                preference,
+                transport,
+                prefer_ipv6,
+            )),
+        ];
+        range.extend(
+            topology.structure.replica_indices[index]
+                .iter()
+                .map(|&replica| &topology.nodes[replica])
+                .filter(|replica| is_node_available_for_slots(replica))
+                .map(|replica| {
+                    Value::Array(slot_node_entry(replica, preference, transport, prefer_ipv6))
+                }),
+        );
+        Value::Array(range)
+    };
+    if topology.structure.slot_ranges.is_empty() {
+        return fallback_node(&topology.nodes)
+            .and_then(|owner| topology.nodes.iter().position(|node| node.id == owner.id))
+            .map(|index| {
+                vec![render(
+                    0,
+                    (crate::engine::distributed::cluster::state::CLUSTER_SLOTS - 1) as u16,
+                    index,
+                )]
+            })
+            .unwrap_or_default();
+    }
+    topology
+        .structure
+        .slot_ranges
+        .iter()
+        .map(|(range, index)| render(range.start, range.end, *index))
+        .collect()
+}
+
+pub(super) fn render_management_shards(
+    topology: &ManagementTopology,
+    preference: PreferredEndpoint,
+    transport: ClientTransport,
+    prefer_ipv6: bool,
+) -> Vec<Value> {
+    topology
+        .structure
+        .shards
+        .iter()
+        .map(|shard| {
+            let slots = shard
+                .slot_ranges
+                .iter()
+                .flat_map(|range| {
+                    [Value::integer(range.start as i64), Value::integer(range.end as i64)]
+                })
+                .collect();
+            let nodes = shard
+                .node_indices
+                .iter()
+                .map(|&index| node_map(&topology.nodes[index], preference, transport, prefer_ipv6))
+                .collect();
+            Value::Map(vec![
+                (Value::bulk("slots"), Value::Array(slots)),
+                (Value::bulk("nodes"), Value::Array(nodes)),
+                (Value::bulk("id"), Value::bulk(shard.id.to_string())),
+            ])
+        })
+        .collect()
+}
+
+#[cfg(test)]
 pub(super) fn render_shards(
     snapshot: &ClusterTopologySnapshot,
     preference: PreferredEndpoint,
@@ -273,6 +360,7 @@ fn slot_node_entry(
     ]
 }
 
+#[cfg(test)]
 fn find_node<'a>(snapshot: &'a ClusterTopologySnapshot, id: &NodeId) -> Option<&'a NodeView> {
     snapshot.nodes.iter().find(|node| node.id == *id)
 }
@@ -308,8 +396,11 @@ fn fallback_owner(snapshot: &ClusterTopologySnapshot) -> Option<NodeId> {
     if snapshot.slot_owners.iter().any(Option::is_some) {
         return None;
     }
-    snapshot
-        .nodes
+    fallback_node(&snapshot.nodes).map(|node| node.id.clone())
+}
+
+fn fallback_node(nodes: &[NodeView]) -> Option<&NodeView> {
+    nodes
         .iter()
         .filter(|node| {
             node.role == ClusterNodeRole::Primary
@@ -325,7 +416,6 @@ fn fallback_owner(snapshot: &ClusterTopologySnapshot) -> Option<NodeId> {
                 .cmp(&right.config_epoch)
                 .then_with(|| right.id.as_str().cmp(left.id.as_str()))
         })
-        .map(|node| node.id.clone())
 }
 
 fn append_slot_transition(lines: &mut [String], node_id: &str, transition: &str) {

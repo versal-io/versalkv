@@ -4,6 +4,7 @@
 
 use super::super::ServerWorkerState;
 use crate::foundation::io::transport::{Interest, WriteOutcome};
+use crate::framework::capabilities::connection::OutputFrame;
 use crate::framework::capabilities::io::Token;
 
 impl ServerWorkerState {
@@ -103,7 +104,7 @@ impl ServerWorkerState {
                     debug,
                     "dual-rdb primary set-rdb-client-id response writer: phase=queued token={} pending_bytes={}",
                     token_value,
-                    connection.output.queue.iter().map(Vec::len).sum::<usize>()
+                    connection.output.queue.iter().map(OutputFrame::len).sum::<usize>()
                 );
             }
         }
@@ -238,7 +239,7 @@ impl ServerWorkerState {
             self.connection_registry[crate::framework::capabilities::io::Token(connection_token)]
                 .output.queue
                 .iter()
-                .map(Vec::len)
+                .map(OutputFrame::len)
                 .sum::<usize>(),
             socket
         );

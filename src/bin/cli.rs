@@ -20,6 +20,8 @@ mod conn;
 mod hints;
 #[path = "cli/json.rs"]
 mod json;
+#[path = "cli/pipe.rs"]
+mod pipe;
 #[path = "cli/repl.rs"]
 mod repl;
 #[path = "cli/resp.rs"]
@@ -902,41 +904,14 @@ fn run_pipe_mode(opts: &CliOptions) {
         }
     };
 
-    let mut stdin = io::stdin();
-    let mut buf = [0u8; 65536];
-    let mut replies: usize = 0;
-    let mut errors: usize = 0;
-    let mut data = Vec::new();
-
-    loop {
-        match stdin.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                data.extend_from_slice(&buf[..n]);
-            }
-            Err(e) => {
-                eprintln!("Error reading stdin: {}", e);
-                std::process::exit(1);
-            }
-        }
-    }
-
-    if !data.is_empty() {
-        if let Err(e) = conn.stream.write_all(&data) {
-            eprintln!("Error writing to server: {}", e);
+    let stats = match pipe::transfer(&mut conn, io::stdin()) {
+        Ok(stats) => stats,
+        Err(error) => {
+            eprintln!("Error transferring pipe input: {}", error);
             std::process::exit(1);
         }
-    }
-
-    conn.stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .ok();
-    while let Ok(resp) = conn.read_response() {
-        replies += 1;
-        if let RespValue::Error(_) = resp {
-            errors += 1;
-        }
-    }
+    };
+    let pipe::PipeStats { replies, errors } = stats;
 
     eprintln!("All data transferred. Waiting for the last reply...");
     eprintln!("Last reply received from server.");

@@ -70,6 +70,151 @@ fn command(parts: &[&[u8]]) -> CommandArgs {
 }
 
 #[test]
+fn exec_with_select_resumes_from_later_database_targets_while_first_database_is_delayed() {
+    let mut fixture = CaptureFixture::new("forkless-exec-future-databases", Vec::new());
+    let backend = &mut fixture.backend;
+    backend.ctx.abort_forkless_save(0);
+    backend.connection_registry[Token(7)].selected_db = 1;
+    for (db_id, key) in [(1, b"one".as_slice()), (2, b"two".as_slice())] {
+        backend.ctx.db_mut(db_id).unwrap().set(
+            key.to_vec(),
+            Robj::string_raw(Bytes::from_static(b"before")),
+        );
+    }
+    backend.ctx.config_mut().persistence.rdb_key_save_delay = i64::MAX;
+    crate::framework::commands::server::save::start_bgsave(&mut backend.ctx).unwrap();
+    for args in [
+        command(&[b"SET", b"one", b"after-one"]),
+        command(&[b"SELECT", b"2"]),
+        command(&[b"SET", b"two", b"after-two"]),
+        command(&[b"SET", b"missing", b"created"]),
+    ] {
+        assert!(backend.connection_registry[Token(7)]
+            .transaction
+            .queue(1, args));
+    }
+    let target = CommandTarget::new(Token(7));
+    let mut effects = CommandEffects::default();
+    assert_eq!(
+        backend.handle_exec(target, "exec", false, &mut effects),
+        CommandDisposition::Blocked
+    );
+    backend.ctx.drive_forkless_feed();
+    assert!(backend.ctx.persistence().forkless_capture_in_progress());
+    assert_eq!(
+        backend.ctx.persistence().forkless_key_delay_for_test(),
+        Some(i64::MAX)
+    );
+    assert_eq!(
+        backend.handle_exec(target, "exec", false, &mut effects),
+        CommandDisposition::Completed,
+        "later database targets must not wait for the delayed first database"
+    );
+    assert_eq!(
+        backend
+            .ctx
+            .db(1)
+            .unwrap()
+            .get_no_expire(b"one")
+            .unwrap()
+            .as_bytes(),
+        b"after-one"
+    );
+    assert_eq!(
+        backend
+            .ctx
+            .db(2)
+            .unwrap()
+            .get_no_expire(b"two")
+            .unwrap()
+            .as_bytes(),
+        b"after-two"
+    );
+    backend.ctx.persistence().set_forkless_key_delay(0);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while backend.ctx.persistence().forkless_capture_in_progress() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "snapshot feed did not finish"
+        );
+        backend.ctx.drive_forkless_feed();
+        std::thread::yield_now();
+    }
+    assert!(matches!(
+        backend.ctx.finish_primary_forkless_save_for_test(),
+        Some(RdbSaveOutcome::Saved)
+    ));
+    let bytes = std::fs::read(fixture.dir.join("dump.rdb")).unwrap();
+    let mut restored = DbSet::new(3);
+    let mut decoder = RdbDecoder::new(true);
+    decoder.feed(&bytes);
+    loop {
+        match decoder.step(&mut restored).unwrap() {
+            RdbStep::RecordApplied => {}
+            RdbStep::Finished(_) => break,
+            RdbStep::NeedInput => panic!("complete snapshot requested more input"),
+            RdbStep::InlineCommand { .. } => panic!("snapshot has no inline commands"),
+        }
+    }
+    for (db_id, key) in [(1, b"one".as_slice()), (2, b"two".as_slice())] {
+        let db = restored.get(db_id).unwrap();
+        assert_eq!(db.get_no_expire(key).unwrap().as_bytes(), b"before");
+        assert!(db.get_no_expire(b"missing").is_none());
+    }
+    assert!(restored.get(1).unwrap().get_no_expire(b"two").is_none());
+}
+
+#[test]
+fn cancelling_future_capture_clears_targets_after_database_swap() {
+    let mut fixture = CaptureFixture::new("forkless-cancel-future-capture", Vec::new());
+    let backend = &mut fixture.backend;
+    backend.ctx.abort_forkless_save(0);
+    backend.ctx.db_mut(1).unwrap().set(
+        b"target".to_vec(),
+        Robj::string_raw(Bytes::from_static(b"before")),
+    );
+    backend.ctx.config_mut().persistence.rdb_key_save_delay = i64::MAX;
+    crate::framework::commands::server::save::start_bgsave(&mut backend.ctx).unwrap();
+    assert!(backend
+        .ctx
+        .prioritize_forkless_keys(1, [b"target".to_vec()]));
+    backend.ctx.drive_forkless_feed();
+    assert!(backend.ctx.persistence().forkless_capture_in_progress());
+    assert!(backend
+        .ctx
+        .persistence()
+        .forkless_key_captured(1, b"target"));
+    assert!(!backend.ctx.persistence().forkless_key_blocked(1, b"target"));
+    backend.ctx.swap_dbs(1, 2);
+    assert!(backend
+        .ctx
+        .persistence()
+        .forkless_key_captured(2, b"target"));
+    backend.ctx.db_mut(2).unwrap().set(
+        b"target".to_vec(),
+        Robj::string_raw(Bytes::from_static(b"after")),
+    );
+    backend.ctx.abort_forkless_save(0);
+    assert!(!backend.ctx.persistence().forkless_save_in_progress());
+    assert!(!backend.ctx.persistence().forkless_capture_in_progress());
+    assert!(!backend
+        .ctx
+        .persistence()
+        .forkless_key_captured(2, b"target"));
+    assert!(!backend.ctx.persistence().forkless_key_blocked(2, b"target"));
+    assert_eq!(
+        backend
+            .ctx
+            .db(2)
+            .unwrap()
+            .get_no_expire(b"target")
+            .unwrap()
+            .as_bytes(),
+        b"after"
+    );
+}
+
+#[test]
 fn exec_resumes_after_target_capture_and_preserves_snapshot_values() {
     let mut fixture = CaptureFixture::new("forkless-exec-targets", Vec::new());
     let backend = &mut fixture.backend;

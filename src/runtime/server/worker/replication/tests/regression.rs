@@ -3855,7 +3855,7 @@ fn offset_domain_restored_dual_partial_write_ack_trim_and_drain_stays_ordered() 
         .queue
         .front_mut()
         .unwrap()
-        .drain(..1);
+        .advance(1);
     let replication_written = backend.connection_registry[Token(connection_token)]
         .consume_written_bytes(1, queued_before)
         .unwrap();

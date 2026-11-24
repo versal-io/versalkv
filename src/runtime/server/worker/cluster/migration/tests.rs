@@ -147,7 +147,7 @@ fn queue_owned_export_output(
     runtime.connection_registry[crate::framework::capabilities::io::Token(connection_token)]
         .output
         .queue[0]
-        .drain(..17);
+        .advance(17);
     assert_eq!(
         runtime.connection_registry[crate::framework::capabilities::io::Token(connection_token)]
             .consume_written_bytes(17, queued_before),

@@ -62,6 +62,7 @@ impl ServerWorkerState {
         // ready and time phases. Settle them at the same beforeSleep boundary
         // C uses for CLUSTER_TODO_HANDLE_FAILOVER.
         self.finish_cluster_bus_receive_batch();
+        self.advance_manual_failover_before_sleep();
         self.poll_cluster_config_saves();
         if let Some(state) = self.ctx.cluster_state_mut().as_deref_mut() {
             state.recompute_state_if_dirty();

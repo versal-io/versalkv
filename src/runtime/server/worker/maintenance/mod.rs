@@ -2827,7 +2827,7 @@ mod tests {
             .queue
             .front_mut()
             .unwrap()
-            .drain(..64 * 1024);
+            .advance(64 * 1024);
         backend.connection_registry[crate::framework::capabilities::io::Token(connection_token)]
             .consume_written_bytes(64 * 1024, queued_before)
             .unwrap();

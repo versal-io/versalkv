@@ -16,6 +16,8 @@ pub use eligibility::{
     evaluate_failure, failover_election_delay_ms, rank_replicas, FailureDecision, FailureFacts,
     FailureReport, ReplicaEligibility,
 };
+#[cfg(test)]
+pub use manual::ManualFailoverPhase;
 pub use manual::{ManualFailover, ManualFailoverMode};
 
 #[cfg(test)]

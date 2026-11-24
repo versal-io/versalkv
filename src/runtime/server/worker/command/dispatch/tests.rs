@@ -3075,8 +3075,12 @@ fn setslot_timeout_replies_noreplicas_without_rerunning_body() {
         "the SETSLOT body must not run on timeout"
     );
     assert_eq!(
-        backend.connection_registry[token].output.queue.front(),
-        Some(&b"-NOREPLICAS Not enough good replicas to write.\r\n".to_vec())
+        backend.connection_registry[token]
+            .output
+            .queue
+            .front()
+            .map(|frame| frame.as_slice()),
+        Some(b"-NOREPLICAS Not enough good replicas to write.\r\n".as_slice())
     );
     assert!(!backend.event_batch.contains_runnable(
         crate::runtime::server::worker::event_loop::RunnableKey::ClientRead(token)

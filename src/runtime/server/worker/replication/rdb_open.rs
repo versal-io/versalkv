@@ -152,7 +152,7 @@ impl ServerWorkerState {
             .output
             .queue
             .iter()
-            .map(Vec::len)
+            .map(|frame| frame.len())
             .sum();
             self.replication_runtime
                 .replica_link_mut()

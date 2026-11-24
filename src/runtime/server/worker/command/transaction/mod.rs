@@ -1670,8 +1670,9 @@ mod standalone_redirect_tests {
                 [crate::framework::capabilities::io::Token(connection_token)]
             .output
             .queue
-            .back(),
-            Some(&b"-REDIRECT 192.0.2.1:6380\r\n".to_vec())
+            .back()
+            .map(|frame| frame.as_slice()),
+            Some(b"-REDIRECT 192.0.2.1:6380\r\n".as_slice())
         );
     }
 }

@@ -992,7 +992,14 @@ fn full_resync_rdb_output_does_not_advance_replication_cursor() {
     backend.pump_full_resync_transfers();
 
     let connection = &mut backend.connection_registry[Token(connection_token)];
-    assert_eq!(connection.output.queue.pop_front(), Some(rdb.clone()));
+    assert_eq!(
+        connection
+            .output
+            .queue
+            .pop_front()
+            .map(|frame| frame.into_vec()),
+        Some(rdb.clone())
+    );
     let rdb_written = connection
         .consume_written_bytes(rdb.len(), rdb.len() + tail.len())
         .unwrap();
@@ -1011,7 +1018,14 @@ fn full_resync_rdb_output_does_not_advance_replication_cursor() {
     assert_eq!(link.sent_cursor().get(), boundary.stream_cursor().get());
 
     let connection = &mut backend.connection_registry[Token(connection_token)];
-    assert_eq!(connection.output.queue.pop_front(), Some(tail.clone()));
+    assert_eq!(
+        connection
+            .output
+            .queue
+            .pop_front()
+            .map(|frame| frame.into_vec()),
+        Some(tail.clone())
+    );
     let tail_written = connection
         .consume_written_bytes(tail.len(), tail.len())
         .unwrap();
@@ -2390,7 +2404,9 @@ fn dual_happy_path_rdb_over_rdb_channel() {
         main_slab
     };
     if let Some(conn) = backend.connection_registry.get_mut(Token(target_slab)) {
-        conn.output.queue.push_back(RDB_BYTES.to_vec());
+        conn.queue_shared_reply(
+            crate::framework::capabilities::connection::SharedOutputBlock::from(RDB_BYTES.to_vec()),
+        );
     }
 
     let queued_rdb: Vec<u8> = backend.connection_registry[Token(rdb_slab)]
@@ -2441,7 +2457,9 @@ fn classic_fallback_still_to_main() {
         main_slab
     };
     if let Some(conn) = backend.connection_registry.get_mut(Token(target_slab)) {
-        conn.output.queue.push_back(RDB_BYTES.to_vec());
+        conn.queue_shared_reply(
+            crate::framework::capabilities::connection::SharedOutputBlock::from(RDB_BYTES.to_vec()),
+        );
     }
 
     let queued_main: Vec<u8> = backend.connection_registry[Token(main_slab)]
@@ -2529,7 +2547,11 @@ fn stale_rdb_token_fallback_to_main_no_panic() {
             .or(main_slab_fallback);
         if let Some(slab) = target_slab {
             if let Some(conn) = backend.connection_registry.get_mut(Token(slab)) {
-                conn.output.queue.push_back(RDB_BYTES.to_vec());
+                conn.queue_shared_reply(
+                    crate::framework::capabilities::connection::SharedOutputBlock::from(
+                        RDB_BYTES.to_vec(),
+                    ),
+                );
             }
         }
     }));
@@ -2608,7 +2630,7 @@ fn eof_marker_only_on_rdb_channel_in_dual_mode() {
         main_slab
     };
     if let Some(conn) = backend.connection_registry.get_mut(Token(target_slab)) {
-        conn.output.queue.push_back(marker.clone());
+        conn.queue_reply(marker.clone());
     }
 
     let queued_rdb: Vec<u8> = backend.connection_registry[Token(rdb_slab)]

@@ -15,6 +15,10 @@ use std::io::{IoSlice, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
+fn output_frames(data: impl IntoIterator<Item = Vec<u8>>) -> VecDeque<OutputFrame> {
+    data.into_iter().map(OutputFrame::from).collect()
+}
+
 fn offset(value: i64) -> ReplicationOffset {
     ReplicationOffset::try_from(value).expect("valid test offset")
 }
@@ -203,7 +207,12 @@ fn fill_transport_send_buffer(backend: &mut ServerWorkerState, token: Token) {
 fn partial_slot_export_write_retains_unaccepted_replication_bytes() {
     let mut connection = Connection::new_fake();
     connection.queue_replication_reply(b"mutation-frame".to_vec());
-    let queued_before = connection.output.queue.iter().map(Vec::len).sum::<usize>();
+    let queued_before = connection
+        .output
+        .queue
+        .iter()
+        .map(OutputFrame::len)
+        .sum::<usize>();
     let mut queue = std::mem::take(&mut connection.output.queue);
     let mut writer = OneWriteThenBlock {
         accepted: 5,
@@ -213,7 +222,7 @@ fn partial_slot_export_write_retains_unaccepted_replication_bytes() {
     let allocation_before = connection.output_buffer_allocation_bytes();
     let (result, released_allocation_bytes) =
         flush_queue_vectored(&mut writer, &mut queue, None, None);
-    let queued_after = queue.iter().map(Vec::len).sum::<usize>();
+    let queued_after = queue.iter().map(OutputFrame::len).sum::<usize>();
     connection
         .consume_written_bytes(queued_before - queued_after, queued_before)
         .unwrap();
@@ -490,9 +499,9 @@ fn c_shaped_export_partial_then_eagain_closes_on_second_limit_check() {
             .output
             .queue,
     );
-    let queued_before = queue.iter().map(Vec::len).sum::<usize>();
+    let queued_before = queue.iter().map(OutputFrame::len).sum::<usize>();
     let (partial, released_on_partial) = flush_queue_vectored(&mut writer, &mut queue, None, None);
-    let queued_after = queue.iter().map(Vec::len).sum::<usize>();
+    let queued_after = queue.iter().map(OutputFrame::len).sum::<usize>();
     let written = queued_before - queued_after;
     backend.connection_registry[Token(connection_token)]
         .consume_written_bytes(written, queued_before)
@@ -535,9 +544,9 @@ fn c_shaped_export_partial_then_eagain_closes_on_second_limit_check() {
             .output
             .queue,
     );
-    let queued_before_eagain = queue.iter().map(Vec::len).sum::<usize>();
+    let queued_before_eagain = queue.iter().map(OutputFrame::len).sum::<usize>();
     let (blocked, released_on_eagain) = flush_queue_vectored(&mut writer, &mut queue, None, None);
-    let queued_after_eagain = queue.iter().map(Vec::len).sum::<usize>();
+    let queued_after_eagain = queue.iter().map(OutputFrame::len).sum::<usize>();
     backend.connection_registry[Token(connection_token)]
         .consume_written_bytes(
             queued_before_eagain - queued_after_eagain,
@@ -768,7 +777,7 @@ fn later_enqueue_does_not_duplicate_a_serviced_export_into_current() {
 
 #[test]
 fn zero_budget_queue_flush_is_budget_exhausted_without_writing() {
-    let mut queue = std::collections::VecDeque::from([b"pending".to_vec()]);
+    let mut queue = output_frames([b"pending".to_vec()]);
     let mut writer = Vec::new();
 
     let (result, released_allocation_bytes) =
@@ -777,15 +786,12 @@ fn zero_budget_queue_flush_is_budget_exhausted_without_writing() {
     assert!(matches!(result, WriteOutcome::BudgetExhausted));
     assert_eq!(released_allocation_bytes, 0);
     assert!(writer.is_empty());
-    assert_eq!(
-        queue,
-        std::collections::VecDeque::from([b"pending".to_vec()])
-    );
+    assert_eq!(queue, output_frames([b"pending".to_vec()]));
 }
 
 #[test]
 fn short_write_before_configured_budget_is_backpressured() {
-    let mut queue = std::collections::VecDeque::from([b"long-frame".to_vec()]);
+    let mut queue = output_frames([b"long-frame".to_vec()]);
     let mut writer = OneWriteThenBlock {
         accepted: 4,
         calls: 0,
@@ -795,12 +801,15 @@ fn short_write_before_configured_budget_is_backpressured() {
 
     assert!(matches!(result, WriteOutcome::Backpressured));
     assert_eq!(writer.calls, 1);
-    assert_eq!(queue.front().map(Vec::as_slice), Some(b"-frame".as_slice()));
+    assert_eq!(
+        queue.front().map(OutputFrame::as_slice),
+        Some(b"-frame".as_slice())
+    );
 }
 
 #[test]
 fn progress_then_would_block_is_backpressured_before_budget() {
-    let mut queue = std::collections::VecDeque::from(vec![vec![b'x']; MAX_IOV_PER_WRITE + 1]);
+    let mut queue = output_frames(vec![vec![b'x']; MAX_IOV_PER_WRITE + 1]);
     let mut writer = ProgressThenBlock { calls: 0 };
 
     let (result, _) =
@@ -808,12 +817,12 @@ fn progress_then_would_block_is_backpressured_before_budget() {
 
     assert!(matches!(result, WriteOutcome::Backpressured));
     assert_eq!(writer.calls, 2);
-    assert_eq!(queue, std::collections::VecDeque::from([vec![b'x']]));
+    assert_eq!(queue, output_frames([vec![b'x']]));
 }
 
 #[test]
 fn interrupted_vectored_write_retries_and_completes() {
-    let mut queue = std::collections::VecDeque::from([b"retry".to_vec()]);
+    let mut queue = output_frames([b"retry".to_vec()]);
     let mut writer = InterruptedThenWriter {
         calls: 0,
         followup: InterruptedFollowup::Success,
@@ -832,7 +841,7 @@ fn interrupted_vectored_write_retries_and_completes() {
 
 #[test]
 fn interrupted_vectored_write_retries_then_reports_backpressure() {
-    let mut queue = std::collections::VecDeque::from([b"pending".to_vec()]);
+    let mut queue = output_frames([b"pending".to_vec()]);
     let mut writer = InterruptedThenWriter {
         calls: 0,
         followup: InterruptedFollowup::WouldBlock,
@@ -846,14 +855,14 @@ fn interrupted_vectored_write_retries_then_reports_backpressure() {
     assert_eq!(writer.calls, 2);
     assert_eq!(released_allocation_bytes, 0);
     assert_eq!(
-        queue.front().map(Vec::as_slice),
+        queue.front().map(OutputFrame::as_slice),
         Some(b"pending".as_slice())
     );
 }
 
 #[test]
 fn drained_queue_flush_reports_complete_exactly() {
-    let mut queue = std::collections::VecDeque::from([b"complete".to_vec()]);
+    let mut queue = output_frames([b"complete".to_vec()]);
     let mut writer = Vec::new();
 
     let (result, released_allocation_bytes) =
@@ -867,7 +876,7 @@ fn drained_queue_flush_reports_complete_exactly() {
 
 #[test]
 fn write_zero_is_preserved_as_failed_outcome() {
-    let mut queue = std::collections::VecDeque::from([b"pending".to_vec()]);
+    let mut queue = output_frames([b"pending".to_vec()]);
 
     let (result, released_allocation_bytes) =
         flush_queue_vectored(&mut WriteZero, &mut queue, None, None);
@@ -878,14 +887,14 @@ fn write_zero_is_preserved_as_failed_outcome() {
     ));
     assert_eq!(released_allocation_bytes, 0);
     assert_eq!(
-        queue.front().map(Vec::as_slice),
+        queue.front().map(OutputFrame::as_slice),
         Some(b"pending".as_slice())
     );
 }
 
 #[test]
 fn hard_write_error_is_preserved_as_failed_outcome() {
-    let mut queue = std::collections::VecDeque::from([b"pending".to_vec()]);
+    let mut queue = output_frames([b"pending".to_vec()]);
     let mut writer = FailingWriter(std::io::ErrorKind::BrokenPipe);
 
     let (result, released_allocation_bytes) =
@@ -897,7 +906,7 @@ fn hard_write_error_is_preserved_as_failed_outcome() {
     ));
     assert_eq!(released_allocation_bytes, 0);
     assert_eq!(
-        queue.front().map(Vec::as_slice),
+        queue.front().map(OutputFrame::as_slice),
         Some(b"pending".as_slice())
     );
 }
@@ -1123,15 +1132,14 @@ fn slot_export_write_immediately_refreshes_remaining_repl_size() {
 
 #[test]
 fn bounded_queue_flush_stops_after_budget_on_always_writable_stream() {
-    let mut queue =
-        std::collections::VecDeque::from([vec![b'a'; 48 * 1024], vec![b'b'; 48 * 1024]]);
+    let mut queue = output_frames([vec![b'a'; 48 * 1024], vec![b'b'; 48 * 1024]]);
     let mut writer = Vec::new();
 
     let (result, _) = flush_queue_vectored(&mut writer, &mut queue, Some(64 * 1024), None);
 
     assert!(matches!(result, WriteOutcome::BudgetExhausted));
     assert_eq!(writer.len(), 64 * 1024);
-    assert_eq!(queue.iter().map(Vec::len).sum::<usize>(), 32 * 1024);
+    assert_eq!(queue.iter().map(OutputFrame::len).sum::<usize>(), 32 * 1024);
 }
 
 #[test]
@@ -1171,7 +1179,7 @@ fn bounded_slot_export_write_turn_leaves_followup_bytes_queued() {
             .output
             .queue
             .iter()
-            .map(Vec::len)
+            .map(OutputFrame::len)
             .sum::<usize>(),
         64 * 1024
     );
@@ -1251,8 +1259,7 @@ fn ordinary_write_updates_incremental_client_memory_at_lifecycle_boundaries() {
 #[test]
 fn ordinary_large_write_turn_stops_after_first_frame_crossing_c_budget() {
     let frame_len = 512 * 1024;
-    let mut queue =
-        std::collections::VecDeque::from([vec![b'a'; frame_len], vec![b'b'; frame_len]]);
+    let mut queue = output_frames([vec![b'a'; frame_len], vec![b'b'; frame_len]]);
     let budget = c_client_write_budget(&queue);
     let mut writer = Vec::new();
 
@@ -1260,10 +1267,7 @@ fn ordinary_large_write_turn_stops_after_first_frame_crossing_c_budget() {
 
     assert!(matches!(result, WriteOutcome::BudgetExhausted));
     assert_eq!(writer.len(), frame_len);
-    assert_eq!(
-        queue,
-        std::collections::VecDeque::from([vec![b'b'; frame_len]])
-    );
+    assert_eq!(queue, output_frames([vec![b'b'; frame_len]]));
 }
 
 fn _temp_dir(name: &str) -> std::path::PathBuf {

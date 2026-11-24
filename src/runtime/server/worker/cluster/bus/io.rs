@@ -105,7 +105,7 @@ impl ServerWorkerState {
         if self.ensure_cluster_bus_io_handles(token) {
             match self.io_threads.submit_write(
                 token,
-                VecDeque::from([snapshot]),
+                VecDeque::from([snapshot.into()]),
                 CLUSTER_IO_BYTE_BUDGET,
             ) {
                 WriteSubmission::Submitted => {

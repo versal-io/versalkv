@@ -2,6 +2,12 @@
 
 use std::collections::VecDeque;
 
+mod frame;
+pub(crate) use frame::{OutputFrame, SharedOutputBlock};
+
+#[cfg(test)]
+mod shared_tests;
+
 pub(super) const CLIENT_INLINE_OUTPUT_CAPACITY: usize = 16 * 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -15,12 +21,13 @@ pub(super) enum OutputFrameKind {
 pub(super) struct OutputFrameAccounting {
     pub(super) remaining_bytes: usize,
     pub(super) kind: OutputFrameKind,
+    // Logical capacity for client limits, not physical shared ownership.
     pub(super) allocation_bytes: usize,
     pub(super) counts_toward_client_output: bool,
 }
 
 pub(crate) struct OutputState {
-    pub(crate) queue: VecDeque<Vec<u8>>,
+    pub(crate) queue: VecDeque<OutputFrame>,
     pub(super) frame_accounting: VecDeque<OutputFrameAccounting>,
     pub(super) pending_frame_allocation_bytes: usize,
     pub(super) pending_frame_count: usize,
@@ -39,7 +46,7 @@ impl OutputState {
         let frame_accounting = VecDeque::with_capacity(capacity);
         let allocation_bytes = queue
             .capacity()
-            .saturating_mul(std::mem::size_of::<Vec<u8>>())
+            .saturating_mul(std::mem::size_of::<OutputFrame>())
             .saturating_add(
                 frame_accounting
                     .capacity()
@@ -62,7 +69,7 @@ impl OutputState {
 }
 
 pub(crate) struct ThreadedWriteSnapshot {
-    pub(super) frames: VecDeque<Vec<u8>>,
+    pub(super) frames: VecDeque<OutputFrame>,
     pub(super) logical_len: usize,
 }
 
@@ -72,11 +79,20 @@ impl ThreadedWriteSnapshot {
     }
 
     #[cfg(test)]
-    pub(crate) fn frames(&self) -> &VecDeque<Vec<u8>> {
+    pub(crate) fn frames(&self) -> &VecDeque<OutputFrame> {
         &self.frames
     }
 
-    pub(crate) fn into_frames(self) -> VecDeque<Vec<u8>> {
+    pub(crate) fn into_frames(self) -> VecDeque<OutputFrame> {
         self.frames
+    }
+}
+
+impl super::Connection {
+    /// RDB relay data is ordinary output, never command-stream replication.
+    pub(crate) fn queue_shared_reply(&mut self, block: SharedOutputBlock) {
+        self.output.ordinary_bytes = self.output.ordinary_bytes.saturating_add(block.bytes.len());
+        self.tot_net_out += block.bytes.len() as u64;
+        self.queue_output_frame(OutputFrame::Shared(block), OutputFrameKind::Ordinary);
     }
 }

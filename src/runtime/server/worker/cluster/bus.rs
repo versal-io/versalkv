@@ -218,16 +218,26 @@ impl ServerWorkerState {
         let tokens = self.cluster_bus.writable_tokens();
         for token_value in tokens {
             let token = Token(token_value);
-            if self
-                .transport
-                .set_interest(token, Interest::ReadWritable)
-                .is_ok()
-            {
-                if let Some(connection) = self.cluster_bus.connections.get_mut(&token_value) {
-                    connection.events = crate::engine::distributed::cluster::LinkEvents::READ_WRITE;
-                }
-            }
+            self.install_cluster_bus_write_interest(token);
             self.handle_cluster_bus_writable(token);
+        }
+    }
+
+    pub(super) fn schedule_cluster_bus_writes(&mut self) {
+        for token_value in self.cluster_bus.writable_tokens() {
+            self.install_cluster_bus_write_interest(Token(token_value));
+        }
+    }
+
+    fn install_cluster_bus_write_interest(&mut self, token: Token) {
+        if self
+            .transport
+            .set_interest(token, Interest::ReadWritable)
+            .is_ok()
+        {
+            if let Some(connection) = self.cluster_bus.connections.get_mut(&token.0) {
+                connection.events = crate::engine::distributed::cluster::LinkEvents::READ_WRITE;
+            }
         }
     }
 

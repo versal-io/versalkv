@@ -66,7 +66,7 @@ fn run_confirmation_sequence(
         .output
         .queue
         .back()
-        .map(Vec::len)
+        .map(|frame| frame.len())
         .expect("unsubscribe confirmation");
     (backend, token, output, last_bytes)
 }

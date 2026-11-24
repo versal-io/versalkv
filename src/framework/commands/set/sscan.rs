@@ -58,11 +58,11 @@ fn sscan_reply(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> Value {
         return CommandError::db_index_out_of_range();
     };
         db.set_no_lazy_expire(true);
-        let enc_len_members = db
+        let encoding_and_len = db
             .get_set(key)
-            .map(|s| s.map(|s| (s.encoding(), s.len(), s.members())))
+            .map(|s| s.map(|s| (s.encoding(), s.len())))
             .map_err(|_| ());
-        let (encoding, set_len, members) = match enc_len_members {
+        let (encoding, set_len) = match encoding_and_len {
             Err(_) => {
                 db.set_no_lazy_expire(false);
                 return CommandError::wrong_type();
@@ -74,7 +74,7 @@ fn sscan_reply(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> Value {
                     Value::Array(Vec::new()),
                 ]);
             }
-            Ok(Some(triple)) => triple,
+            Ok(Some(pair)) => pair,
         };
 
         let match_all = match pattern {
@@ -84,7 +84,7 @@ fn sscan_reply(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> Value {
 
         use crate::foundation::memory::value::Encoding;
 
-        let budget_threshold = count * 10;
+        let budget_threshold = count.saturating_mul(10);
 
         // Hashtable encoding + larger than budget threshold: call .scan()
         // directly on the underlying Dict (via ValkeySet.scan) to avoid O(N)
@@ -135,6 +135,10 @@ fn sscan_reply(runtime: &mut dyn CommandRuntime, args: &CommandArgs) -> Value {
         // Small encodings (intset / listpack) OR small hashtables that fit
         // inside the scan budget: return every matching element in one shot
         // with cursor=0, matching C's iterator path for compact encodings.
+        let members = match db.get_set(key) {
+            Ok(Some(set)) => set.members(),
+            _ => Vec::new(),
+        };
         let mut out: Vec<Value> = Vec::with_capacity(members.len());
         for elem in members {
             if pattern

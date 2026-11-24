@@ -452,7 +452,7 @@ pub(super) fn execute_write(mut job: WriteJob) -> WriteCompletion {
 
 pub(super) fn write_with_budget(
     writer: &mut impl Write,
-    frames: &mut VecDeque<Vec<u8>>,
+    frames: &mut VecDeque<super::OutputFrame>,
     byte_budget: usize,
 ) -> (usize, usize, WriteOutcome) {
     const MAX_IOV: usize = 128;
@@ -499,12 +499,11 @@ pub(super) fn write_with_budget(
             };
             if remaining >= front.len() {
                 let frame = frames.pop_front().expect("front exists");
-                released_allocation_bytes = released_allocation_bytes.saturating_add(
-                    crate::foundation::memory::util_alloc::vec_allocation_bytes(&frame),
-                );
+                released_allocation_bytes =
+                    released_allocation_bytes.saturating_add(frame.owned_allocation_bytes());
                 remaining -= frame.len();
             } else {
-                frames.front_mut().expect("front exists").drain(..remaining);
+                frames.front_mut().expect("front exists").advance(remaining);
                 break;
             }
         }

@@ -206,7 +206,7 @@ impl ModuleTask {
             }
         }
         for reply in std::mem::take(&mut self.conn.output.queue) {
-            conn.queue_reply(reply);
+            conn.queue_reply(reply.into_vec());
         }
         result
     }

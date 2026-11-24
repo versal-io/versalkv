@@ -92,6 +92,7 @@ impl ServerWorkerState {
         if config.server.maxmemory == 0
             || (meta.flags & CMD_DENYOOM) == 0
             || !(policy.starts_with("volatile-") || policy.starts_with("allkeys-"))
+            || !self.ctx.maxmemory_state().is_over_limit()
         {
             return None;
         }
@@ -104,7 +105,7 @@ impl ServerWorkerState {
                 }
             })
         });
-        if self.ctx.maxmemory_state().is_over_limit() && !has_candidate {
+        if !has_candidate {
             return Some(DispatchOutcome {
                 action: DispatchAction::Rejected,
                 call_flags,
@@ -629,8 +630,8 @@ impl ServerWorkerState {
             return None;
         }
         // Register every uncaptured key with the feed priority queues. Keys in
-        // the database currently being scanned are captured on the next pump,
-        // while keys in later databases wait for the scan to reach them. The
+        // the database currently being scanned are captured on the next pump;
+        // later databases use a bounded independent capture buffer. The
         // configured save delay stays authoritative: expediting one writer's
         // keys must not accelerate the whole save, so the command is postponed
         // until its snapshot state is resolved.

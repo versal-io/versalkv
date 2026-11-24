@@ -51,10 +51,10 @@ impl MaxmemoryState {
 impl super::ServerContext {
     pub fn maxmemory_state(&self) -> MaxmemoryState {
         let reported = crate::foundation::memory::util_alloc::total_allocated();
-        // C shares backlog blocks with replica clients. Rust currently owns
-        // the retained backlog and each queued replica frame separately, so
-        // maxmemory must exclude both physical allocations while INFO keeps
-        // its C-facing shared-buffer projection.
+        // C shares backlog blocks with replica clients. Rust also retains
+        // connection-owned output and queue containers, so maxmemory excludes
+        // their existing physical projection while INFO keeps its C-facing
+        // shared-buffer projection. Shared output owners are accounted below.
         let repl_buffer = self
             .replication()
             .backlog
@@ -67,7 +67,14 @@ impl super::ServerContext {
         } else {
             0
         };
+        // Shared output owners already contribute to reported allocator
+        // memory. Exclude their backing stores once, outside the backlog
+        // allowance, and read live accounting so I/O-thread final drops do
+        // not leave a stale replica-output allocation snapshot.
+        let shared_output_not_counted =
+            crate::foundation::memory::shared_output::allocation_bytes();
         let not_counted = replication_not_counted
+            .saturating_add(shared_output_not_counted)
             .saturating_add(aof_not_counted)
             .saturating_add(self.slot_export_output_memory)
             .saturating_add(self.slot_import_infrastructure_memory);

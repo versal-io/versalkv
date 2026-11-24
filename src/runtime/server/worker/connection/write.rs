@@ -2,20 +2,24 @@ use super::super::ServerWorkerState;
 use crate::engine::distributed::replication::BacklogCursor;
 use crate::foundation::io::transport::{Interest, WriteOutcome};
 use crate::foundation::memory::util_hash::FxHashSet;
-use crate::framework::capabilities::connection::{Connection, ConnectionState};
+use crate::framework::capabilities::connection::{Connection, ConnectionState, OutputFrame};
 use crate::framework::capabilities::io::Token;
 use crate::runtime::server::worker::event_loop::io_workers::{
     WriteCompletion, WriteCompletionAction, WriteSubmission,
 };
 use crate::runtime::server::worker::state::{REPLY_BUFFER_POOL_MAX_CAP, REPLY_BUFFER_POOL_MAX_LEN};
+#[cfg(test)]
 use std::collections::VecDeque;
-use std::io::{IoSlice, Write};
 
+mod queue;
 #[cfg(test)]
 mod regression_tests;
 mod replica_disk_error;
+#[cfg(test)]
+mod shared_tests;
 mod state;
 
+use queue::{c_client_write_budget, flush_queue_vectored};
 use replica_disk_error::{replica_disk_write_error_action, ReplicaDiskWriteErrorAction};
 use state::{WritableContext, WritableFlush, WritableTarget};
 
@@ -47,121 +51,6 @@ pub(super) fn is_slot_export_connection(connection: &Connection) -> bool {
             crate::engine::distributed::cluster::migration::SlotMigrationConnectionRole::Export(_)
         )
     )
-}
-
-/// Match C `writevToClient`: include complete reply frames until the first
-/// frame crosses the per-event write threshold. A single large bulk reply may
-/// exceed the threshold, but later replies wait for another writable turn.
-fn c_client_write_budget(queue: &VecDeque<Vec<u8>>) -> usize {
-    let mut total = 0usize;
-    for frame in queue.iter().take(MAX_IOV_PER_WRITE) {
-        total = total.saturating_add(frame.len());
-        if total > NET_MAX_WRITES_PER_EVENT {
-            break;
-        }
-    }
-    total
-}
-
-fn flush_queue_vectored(
-    stream: &mut impl Write,
-    queue: &mut VecDeque<Vec<u8>>,
-    byte_budget: Option<usize>,
-    mut reply_buffer_pool: Option<&mut Vec<Vec<u8>>>,
-) -> (WriteOutcome, usize) {
-    let mut total_written = 0usize;
-    let mut released_allocation_bytes = 0usize;
-    loop {
-        if queue.is_empty() {
-            return (WriteOutcome::Complete, released_allocation_bytes);
-        }
-        let remaining_budget = byte_budget
-            .map(|budget| budget.saturating_sub(total_written))
-            .unwrap_or(usize::MAX);
-        if remaining_budget == 0 {
-            return (WriteOutcome::BudgetExhausted, released_allocation_bytes);
-        }
-        // Compute total and call write_vectored; iov_buf must be dropped before mutating queue
-        let (total, nwritten) = {
-            let mut iov_buf = [IoSlice::new(&[]); MAX_IOV_PER_WRITE];
-            let mut total = 0usize;
-            let mut nslices = 0usize;
-            for chunk in queue.iter().take(MAX_IOV_PER_WRITE) {
-                let available = remaining_budget.saturating_sub(total);
-                if available == 0 {
-                    break;
-                }
-                let included = chunk.len().min(available);
-                iov_buf[nslices] = IoSlice::new(&chunk[..included]);
-                total += included;
-                nslices += 1;
-            }
-            match stream.write_vectored(&iov_buf[..nslices]) {
-                Ok(0) => {
-                    // Peer closed/EOF: leave the unsent data in the queue so
-                    // backpressure gates stay closed (e.g. diskless relay does
-                    // not keep draining the pipe into a dead socket). The
-                    // owner observes Failed and performs role-aware teardown.
-                    // Clearing the queue here would falsely signal "drained"
-                    // and let in-flight relays finish before the connection
-                    // death is observed (GH issue: slow-replica-drop count
-                    // reported 2 replicas still up after one died).
-                    return (
-                        WriteOutcome::Failed(std::io::ErrorKind::WriteZero.into()),
-                        released_allocation_bytes,
-                    );
-                }
-                Ok(n) => (total, n),
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    return (WriteOutcome::Backpressured, released_allocation_bytes);
-                }
-                Err(error) => {
-                    // Hard write error (EPIPE/ECONNRESET/etc.). Same reasoning
-                    // as Ok(0): do not drop unsent bytes before owner teardown.
-                    return (WriteOutcome::Failed(error), released_allocation_bytes);
-                }
-            }
-        };
-        total_written = total_written.saturating_add(nwritten);
-        let mut n = nwritten;
-        while n > 0 {
-            let Some(front) = queue.front() else {
-                break;
-            };
-            let flen = front.len();
-            if n >= flen {
-                let frame = queue.pop_front().expect("front exists");
-                released_allocation_bytes = released_allocation_bytes.saturating_add(
-                    crate::foundation::memory::util_alloc::vec_allocation_bytes(&frame),
-                );
-                // Recycle fully-consumed reply frames back into the pool so
-                // the next command reply can reuse the heap allocation
-                // instead of paying for a fresh `malloc`. Large frames
-                // (bulk strings, replication payloads) are dropped to keep
-                // the pool bounded.
-                if let Some(pool) = reply_buffer_pool.as_deref_mut() {
-                    if frame.capacity() <= REPLY_BUFFER_POOL_MAX_CAP
-                        && pool.len() < REPLY_BUFFER_POOL_MAX_LEN
-                    {
-                        let mut frame = frame;
-                        frame.clear();
-                        pool.push(frame);
-                    }
-                }
-                n -= flen;
-            } else {
-                queue.front_mut().unwrap().drain(..n);
-                break;
-            }
-        }
-        if nwritten < total {
-            return (WriteOutcome::Backpressured, released_allocation_bytes);
-        }
-        if byte_budget.is_some_and(|budget| total_written >= budget) && !queue.is_empty() {
-            return (WriteOutcome::BudgetExhausted, released_allocation_bytes);
-        }
-    }
 }
 
 impl ServerWorkerState {
@@ -454,14 +343,15 @@ impl ServerWorkerState {
                 }
             };
             let mut queue = std::mem::take(&mut conn.output.queue);
-            let queued_before: usize = queue.iter().map(Vec::len).sum();
+            let queued_before: usize = queue.iter().map(OutputFrame::len).sum();
             let (result, released_allocation_bytes) = flush_queue_vectored(
                 &mut stream,
                 &mut queue,
                 write_budget,
                 Some(&mut self.reply_buffer_pool),
             );
-            let written = queued_before.saturating_sub(queue.iter().map(Vec::len).sum::<usize>());
+            let written =
+                queued_before.saturating_sub(queue.iter().map(OutputFrame::len).sum::<usize>());
             let replication_written = conn.consume_written_bytes(written, queued_before);
             conn.release_output_frame_allocations(released_allocation_bytes);
             conn.output.queue = queue;
@@ -684,7 +574,7 @@ impl ServerWorkerState {
             };
         };
         let mut queue = std::mem::take(&mut conn.output.queue);
-        let queued_before: usize = queue.iter().map(Vec::len).sum();
+        let queued_before: usize = queue.iter().map(OutputFrame::len).sum();
         let flushing_dual_rdb_client_id = context.is_master_link()
             && queue.iter().any(|frame| {
                 frame
@@ -701,7 +591,8 @@ impl ServerWorkerState {
             write_budget,
             Some(&mut self.reply_buffer_pool),
         );
-        let written = queued_before.saturating_sub(queue.iter().map(Vec::len).sum::<usize>());
+        let written =
+            queued_before.saturating_sub(queue.iter().map(OutputFrame::len).sum::<usize>());
         let replication_written = conn.consume_written_bytes(written, queued_before);
         conn.release_output_frame_allocations(released);
         conn.output.queue = queue;
@@ -821,7 +712,7 @@ impl ServerWorkerState {
                     .output
                     .queue
                     .iter()
-                    .map(Vec::len)
+                    .map(OutputFrame::len)
                     .sum::<usize>()
             );
         }

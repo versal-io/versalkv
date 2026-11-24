@@ -7,6 +7,7 @@ use crate::foundation::io::sys::time::MonotonicInstant;
 use crate::foundation::io::transport::{
     PollingTransportRuntime, ReadOutcome, ThreadIoHandle, TransportWorkerBackend, WriteOutcome,
 };
+use crate::framework::capabilities::connection::OutputFrame;
 use crate::framework::capabilities::io::mt_driver::IoDriverMtConfig;
 use crate::framework::capabilities::io::Token;
 use crate::runtime::server::worker::event_loop::transport::{
@@ -18,6 +19,12 @@ use std::io::{Cursor, Read, Write};
 use std::net::Shutdown;
 use std::os::fd::AsRawFd;
 use std::time::Duration;
+
+mod shared_output;
+
+fn output_frames(data: impl IntoIterator<Item = Vec<u8>>) -> VecDeque<OutputFrame> {
+    data.into_iter().map(OutputFrame::from).collect()
+}
 
 fn recv_runtime_read_completion(
     runtime: &mut crate::runtime::server::worker::ServerWorkerState,
@@ -136,7 +143,7 @@ fn write_job(token: usize, payload: &[u8]) -> (WriteJob, std::os::unix::net::Uni
                 sequence: 1,
             },
             handle: ThreadIoHandle::Unix(worker),
-            frames: VecDeque::from([payload.to_vec()]),
+            frames: output_frames([payload.to_vec()]),
             byte_budget: usize::MAX,
         },
         peer,
@@ -645,7 +652,7 @@ fn saturated_shutdown_cancels_queued_io_and_returns_all_ownership() {
                 assert_eq!(completion.written, 0);
                 assert_eq!(
                     completion.frames,
-                    VecDeque::from([b"must-not-write".to_vec()])
+                    output_frames([b"must-not-write".to_vec()])
                 );
                 pool.stats().cancel_write_submission();
             }
@@ -700,11 +707,7 @@ fn saturated_resize_cancels_queue_and_restores_connection_sidecars() {
     write_peer.set_nonblocking(true).unwrap();
     io.register_connection(token, read_handle, write_handle);
     assert!(matches!(
-        io.submit_write(
-            token,
-            VecDeque::from([b"queued-write".to_vec()]),
-            usize::MAX
-        ),
+        io.submit_write(token, output_frames([b"queued-write".to_vec()]), usize::MAX),
         super::WriteSubmission::Submitted
     ));
     assert!(io.submit_read(token, 64, false));
@@ -748,7 +751,7 @@ fn saturated_resize_cancels_queue_and_restores_connection_sidecars() {
                 };
                 assert_eq!(written, 0);
                 assert!(matches!(outcome, WriteOutcome::Backpressured));
-                assert_eq!(frames, VecDeque::from([b"queued-write".to_vec()]));
+                assert_eq!(frames, output_frames([b"queued-write".to_vec()]));
             }
             IoCompletion::Poll(completion) => polls.push(completion),
             IoCompletion::WorkerStopped => {}
@@ -964,11 +967,11 @@ fn cluster_bus_full_queue_rolls_back_both_io_handles() {
     let (write, _write_peer) = thread_handle_pair();
     io.register_cluster_bus(token, read, write);
     let super::WriteSubmission::Unavailable(frames) =
-        io.submit_write(token, VecDeque::from([b"queued".to_vec()]), 64)
+        io.submit_write(token, output_frames([b"queued".to_vec()]), 64)
     else {
         panic!("full worker queue must return the write snapshot");
     };
-    assert_eq!(frames, VecDeque::from([b"queued".to_vec()]));
+    assert_eq!(frames, output_frames([b"queued".to_vec()]));
     assert!(!io.is_write_inflight(token));
     assert!(io.connections[&token].write_handle.is_some());
     assert!(!io.submit_read(token, 64, false));
@@ -1333,7 +1336,7 @@ fn sync_admission_waits_for_threaded_output_settlement() {
                     runtime.connection_registry[peer.token].take_threaded_write_snapshot();
                 assert_eq!(
                     snapshot.frames(),
-                    &VecDeque::from([pending_output_error.to_vec()]),
+                    &output_frames([pending_output_error.to_vec()]),
                     "unsettled write must reject {request:?}"
                 );
                 assert_eq!(runtime.ctx.stats().sync_full, 0);
@@ -1422,7 +1425,7 @@ fn closing_inline_error_waits_for_threaded_output_settlement() {
         let snapshot = runtime.connection_registry[peer.token].take_threaded_write_snapshot();
         assert_eq!(
             snapshot.frames(),
-            &VecDeque::from([b"+PONG\r\n".to_vec(), error.to_vec()])
+            &output_frames([b"+PONG\r\n".to_vec(), error.to_vec()])
         );
         assert!(matches!(
             runtime
@@ -1942,7 +1945,7 @@ fn worker_write_preserves_unwritten_frames_and_reports_progress() {
     let second = b"second".to_vec();
     let expected_released = crate::foundation::memory::util_alloc::vec_allocation_bytes(&first)
         + crate::foundation::memory::util_alloc::vec_allocation_bytes(&second);
-    let frames = std::collections::VecDeque::from([first, second]);
+    let frames = output_frames([first, second]);
     let job = WriteJob {
         id: IoOperationId {
             token: Token(10),
@@ -2012,28 +2015,28 @@ fn worker_read_maps_typed_stop_reasons_exactly() {
 
 #[test]
 fn worker_write_maps_typed_stop_reasons_exactly() {
-    let mut complete_frames = VecDeque::from([b"done".to_vec()]);
+    let mut complete_frames = output_frames([b"done".to_vec()]);
     let (_, _, complete) = write_with_budget(&mut Vec::new(), &mut complete_frames, 4);
     assert!(matches!(complete, WriteOutcome::Complete));
     assert!(complete_frames.is_empty());
 
-    let mut budget_frames = VecDeque::from([b"first".to_vec(), b"second".to_vec()]);
+    let mut budget_frames = output_frames([b"first".to_vec(), b"second".to_vec()]);
     let (written, _, budget) = write_with_budget(&mut Vec::new(), &mut budget_frames, 5);
     assert_eq!(written, 5);
     assert!(matches!(budget, WriteOutcome::BudgetExhausted));
-    assert_eq!(budget_frames, VecDeque::from([b"second".to_vec()]));
+    assert_eq!(budget_frames, output_frames([b"second".to_vec()]));
 
-    let mut blocked_frames = VecDeque::from([b"blocked".to_vec()]);
+    let mut blocked_frames = output_frames([b"blocked".to_vec()]);
     let (written, _, blocked) =
         write_with_budget(&mut ShortWriter, &mut blocked_frames, usize::MAX);
     assert_eq!(written, 1);
     assert!(matches!(blocked, WriteOutcome::Backpressured));
     assert_eq!(
-        blocked_frames.front().map(Vec::as_slice),
+        blocked_frames.front().map(OutputFrame::as_slice),
         Some(b"locked".as_slice())
     );
 
-    let mut failed_frames = VecDeque::from([b"failed".to_vec()]);
+    let mut failed_frames = output_frames([b"failed".to_vec()]);
     let (written, _, failed) = write_with_budget(
         &mut ErrorWriter(std::io::ErrorKind::BrokenPipe),
         &mut failed_frames,
@@ -2046,7 +2049,7 @@ fn worker_write_maps_typed_stop_reasons_exactly() {
             if error.kind() == std::io::ErrorKind::BrokenPipe
                 && error.to_string() == "scripted write failure"
     ));
-    assert_eq!(failed_frames, VecDeque::from([b"failed".to_vec()]));
+    assert_eq!(failed_frames, output_frames([b"failed".to_vec()]));
 }
 
 #[test]

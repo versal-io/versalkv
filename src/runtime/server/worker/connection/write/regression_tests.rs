@@ -10,11 +10,11 @@ fn reply_buffer_pool_stays_bounded_when_replication_frames_are_drained() {
         let mut reply = pool.pop().unwrap_or_else(Vec::new);
         reply.clear();
         reply.extend_from_slice(b"+OK\r\n");
-        let mut queue = VecDeque::from([reply]);
-        queue.extend((0..32).map(|_| vec![b'x'; 1024]));
+        let mut queue = VecDeque::from([OutputFrame::from(reply)]);
+        queue.extend((0..32).map(|_| OutputFrame::from(vec![b'x'; 1024])));
         let expected_released = queue
             .iter()
-            .map(crate::foundation::memory::util_alloc::vec_allocation_bytes)
+            .map(OutputFrame::owned_allocation_bytes)
             .sum::<usize>();
 
         let (outcome, released) =
@@ -101,7 +101,7 @@ fn partial_dual_channel_sync_flush_does_not_start_rdb_wait_deadline() {
             .output
             .queue
             .back()
-            .map(Vec::as_slice),
+            .map(OutputFrame::as_slice),
         Some(reply),
         "the terminal dual-channel reply must remain intact behind pending padding"
     );

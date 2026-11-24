@@ -19,6 +19,7 @@ mod tracking;
 mod transaction;
 
 pub(crate) use command_cycle::{CommandCycleState, CommandEffectDrain, ConnectionCommandEffects};
+pub(crate) use output::{OutputFrame, SharedOutputBlock};
 use output::{
     OutputFrameAccounting, OutputFrameKind, OutputState, ThreadedWriteSnapshot,
     CLIENT_INLINE_OUTPUT_CAPACITY,
@@ -300,7 +301,7 @@ impl Connection {
         let n = data.len();
         self.output.ordinary_bytes = self.output.ordinary_bytes.saturating_add(n);
         self.tot_net_out += n as u64;
-        self.queue_output_frame(data, OutputFrameKind::Ordinary);
+        self.queue_output_frame(data.into(), OutputFrameKind::Ordinary);
     }
 
     pub(crate) fn queue_command_reply(&mut self, data: Vec<u8>) {
@@ -320,14 +321,14 @@ impl Connection {
         let n = data.len();
         self.output.replication_bytes = self.output.replication_bytes.saturating_add(n);
         self.tot_net_out += n as u64;
-        self.queue_output_frame(data, OutputFrameKind::Replication);
+        self.queue_output_frame(data.into(), OutputFrameKind::Replication);
     }
 
     pub(crate) fn queue_slot_snapshot_reply(&mut self, data: Vec<u8>) {
         let n = data.len();
         self.output.slot_snapshot_bytes = self.output.slot_snapshot_bytes.saturating_add(n);
         self.tot_net_out += n as u64;
-        self.queue_output_frame(data, OutputFrameKind::SlotSnapshot);
+        self.queue_output_frame(data.into(), OutputFrameKind::SlotSnapshot);
     }
 
     pub(crate) fn queue_pre_client_handshake_reply(&mut self, data: Vec<u8>) {
@@ -335,10 +336,10 @@ impl Connection {
         self.output.pre_client_handshake_bytes =
             self.output.pre_client_handshake_bytes.saturating_add(n);
         self.tot_net_out += n as u64;
-        self.queue_output_frame(data, OutputFrameKind::PreClientHandshake);
+        self.queue_output_frame(data.into(), OutputFrameKind::PreClientHandshake);
     }
 
-    fn queue_output_frame(&mut self, data: Vec<u8>, kind: OutputFrameKind) {
+    fn queue_output_frame(&mut self, data: OutputFrame, kind: OutputFrameKind) {
         if data.is_empty() {
             return;
         }
@@ -361,12 +362,13 @@ impl Connection {
         ) && !is_inline_reply;
         let output_capacity = self.output.queue.capacity();
         let accounting_capacity = self.output.frame_accounting.capacity();
-        let frame_allocation = crate::foundation::memory::util_alloc::vec_allocation_bytes(&data);
+        let frame_allocation = data.logical_allocation_bytes();
+        let owned_allocation = data.owned_allocation_bytes();
         self.output.queue.push_back(data);
         self.output
             .frame_accounting
             .push_back(OutputFrameAccounting {
-                remaining_bytes: self.output.queue.back().map_or(0, Vec::len),
+                remaining_bytes: frame_len,
                 kind,
                 allocation_bytes: frame_allocation,
                 counts_toward_client_output,
@@ -376,7 +378,7 @@ impl Connection {
             .queue
             .capacity()
             .saturating_sub(output_capacity)
-            .saturating_mul(std::mem::size_of::<Vec<u8>>());
+            .saturating_mul(std::mem::size_of::<OutputFrame>());
         let accounting_growth = self
             .output
             .frame_accounting
@@ -396,7 +398,7 @@ impl Connection {
         self.output.allocation_bytes = self
             .output
             .allocation_bytes
-            .saturating_add(frame_allocation)
+            .saturating_add(owned_allocation)
             .saturating_add(output_growth)
             .saturating_add(accounting_growth);
     }
@@ -527,7 +529,7 @@ impl Connection {
             .output
             .queue
             .capacity()
-            .saturating_mul(std::mem::size_of::<Vec<u8>>())
+            .saturating_mul(std::mem::size_of::<OutputFrame>())
             .saturating_add(
                 self.output
                     .frame_accounting
@@ -543,15 +545,27 @@ impl Connection {
 
     pub(crate) fn take_threaded_write_snapshot(&mut self) -> ThreadedWriteSnapshot {
         let frames = std::mem::take(&mut self.output.queue);
-        let logical_len = frames.iter().map(Vec::len).sum();
+        let logical_len = frames.iter().map(OutputFrame::len).sum();
         ThreadedWriteSnapshot {
             frames,
             logical_len,
         }
     }
 
-    pub(crate) fn restore_threaded_write_snapshot(&mut self, mut frames: VecDeque<Vec<u8>>) {
+    pub(crate) fn restore_threaded_write_snapshot(&mut self, mut frames: VecDeque<OutputFrame>) {
+        let old_capacity = frames
+            .capacity()
+            .saturating_add(self.output.queue.capacity());
         frames.append(&mut self.output.queue);
+        self.output.allocation_bytes = self
+            .output
+            .allocation_bytes
+            .saturating_sub(old_capacity.saturating_mul(std::mem::size_of::<OutputFrame>()))
+            .saturating_add(
+                frames
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<OutputFrame>()),
+            );
         self.output.queue = frames;
     }
 
@@ -592,7 +606,7 @@ impl Connection {
             .saturating_add(
                 self.output
                     .pending_frame_count
-                    .saturating_mul(std::mem::size_of::<Vec<u8>>()),
+                    .saturating_mul(std::mem::size_of::<OutputFrame>()),
             )
             .saturating_add(
                 self.output
@@ -696,7 +710,7 @@ impl Connection {
                 .saturating_add(crate::foundation::memory::util_alloc::vec_allocation_bytes(
                     reply,
                 ))
-                .saturating_add(std::mem::size_of::<Vec<u8>>())
+                .saturating_add(std::mem::size_of::<OutputFrame>())
                 .saturating_add(std::mem::size_of::<OutputFrameAccounting>());
         }
         usage.output = usage.output.saturating_add(additional_output);
@@ -974,6 +988,8 @@ impl Connection {
     }
 }
 
+#[cfg(test)]
+mod shared_output_tests;
 #[cfg(test)]
 mod tests;
 

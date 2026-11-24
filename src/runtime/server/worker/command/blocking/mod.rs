@@ -1282,8 +1282,9 @@ mod role_rejection_tests {
                 [crate::framework::capabilities::io::Token(connection_token)]
             .output
             .queue
-            .front(),
-            Some(&b"-REDIRECT 192.0.2.1:6380\r\n".to_vec())
+            .front()
+            .map(|frame| frame.as_slice()),
+            Some(b"-REDIRECT 192.0.2.1:6380\r\n".as_slice())
         );
         assert_eq!(
             backend.connection_registry

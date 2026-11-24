@@ -130,8 +130,11 @@ impl ServerWorkerState {
         let timer = Instant::now();
         let mut freed = 0usize;
         let mut evicted = Vec::new();
+        let mut retained_result_bytes = 0usize;
 
-        while freed < target {
+        // Results retain copied keys until propagation. Discount that
+        // temporary storage when checking the memory left after this cycle.
+        while freed < target || self.ctx.maxmemory_state().to_free > retained_result_bytes {
             let mut candidate: Option<(u32, Vec<u8>, u64)> = None;
             let mut has_uncaptured_candidate = false;
             for db_idx in 0..self.ctx.num_dbs() {
@@ -178,6 +181,8 @@ impl ServerWorkerState {
             };
 
             // Shared values retained by snapshots are not released by deletion.
+            let retained_key_bytes =
+                crate::foundation::memory::util_alloc::vec_allocation_bytes(&key);
             let before = crate::foundation::memory::util_alloc::total_allocated();
             let deleted = self.ctx.db_mut(db_idx).is_some_and(|db| db.del(&key));
             let after = crate::foundation::memory::util_alloc::total_allocated();
@@ -188,9 +193,16 @@ impl ServerWorkerState {
             }
             freed = freed.saturating_add(before.saturating_sub(after));
             self.ctx.incr_evicted_keys(1);
+            let before_result = crate::foundation::memory::util_alloc::current_thread_allocated();
             evicted.push((db_idx, Bytes::from(key)));
+            retained_result_bytes = retained_result_bytes
+                .saturating_add(retained_key_bytes)
+                .saturating_add(
+                    crate::foundation::memory::util_alloc::current_thread_allocated()
+                        .saturating_sub(before_result),
+                );
 
-            if freed < target
+            if (freed < target || self.ctx.maxmemory_state().to_free > retained_result_bytes)
                 && evicted.len() % 16 == 0
                 && timer.elapsed().as_micros() > time_limit_us
             {
