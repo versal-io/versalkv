@@ -5,4 +5,4 @@ mod state;
 
 pub use aof::AofRewritePolicy;
 pub use options::{AofOptions, RdbSaveOptions};
-pub use state::{AofState, OperationStatus, PersistenceChild, PersistenceState};
+pub use state::{AofBaseline, AofState, OperationStatus, PersistenceChild, PersistenceState};

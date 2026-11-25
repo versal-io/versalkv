@@ -82,6 +82,10 @@ pub fn config_rewrite(ctx: &mut ServerContext) -> Value {
         bool_to_yesno(r.persistence.aof_enabled)
     ));
     lines.push(format!("appendfilename {}", r.persistence.aof_filename));
+    lines.push(format!(
+        "repl-after-aof-fsync {}",
+        bool_to_yesno(r.replication.repl_after_aof_fsync)
+    ));
     lines.push(format!("appenddirname {}", r.persistence.aof_appenddirname));
     lines.push(format!(
         "appendfsync {}",

@@ -23,6 +23,17 @@ pub struct RuntimeConfig {
 }
 
 impl RuntimeConfig {
+    pub fn validate_replication_durability(&self) -> Result<(), String> {
+        if self.replication.repl_after_aof_fsync
+            && (!self.persistence.aof_enabled
+                || self.persistence.aof_fsync == crate::foundation::io::persistence::AofFsync::No
+                || self.persistence.aof_no_fsync_on_rewrite)
+        {
+            return Err("ERR repl-after-aof-fsync requires appendonly yes, appendfsync always or everysec, and no-appendfsync-on-rewrite no".to_string());
+        }
+        Ok(())
+    }
+
     pub fn new() -> Self {
         Self {
             replication: ReplicationConfig::new(),
@@ -48,5 +59,29 @@ impl RuntimeConfig {
 
     pub fn rdb_version_check_relaxed(&self) -> bool {
         self.persistence.rdb_version_check_relaxed
+    }
+}
+
+#[cfg(test)]
+mod durability_tests {
+    use super::*;
+
+    #[test]
+    fn durable_replication_requires_compatible_aof_configuration() {
+        let registry = spec_registry::ConfigRegistry::new();
+        let mut config = RuntimeConfig::new();
+        assert!(config.validate_replication_durability().is_ok());
+        registry
+            .try_set(&mut config, "repl-after-aof-fsync", "yes")
+            .expect("durability configuration is registered")
+            .unwrap();
+        assert!(config.validate_replication_durability().is_err());
+        config.persistence.aof_enabled = true;
+        assert!(config.validate_replication_durability().is_ok());
+        config.persistence.aof_fsync = crate::foundation::io::persistence::AofFsync::No;
+        assert!(config.validate_replication_durability().is_err());
+        config.persistence.aof_fsync = crate::foundation::io::persistence::AofFsync::Always;
+        config.persistence.aof_no_fsync_on_rewrite = true;
+        assert!(config.validate_replication_durability().is_err());
     }
 }

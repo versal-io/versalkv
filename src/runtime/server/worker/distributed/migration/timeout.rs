@@ -5,6 +5,59 @@ use crate::engine::distributed::cluster::migration::{
 use std::time::{Duration, Instant};
 
 impl ServerWorkerState {
+    pub(super) fn refresh_slot_migration_durability_waits(&mut self) {
+        if !self.ctx.config().replication.repl_after_aof_fsync {
+            self.slot_migration_durability_waits.clear();
+            return;
+        }
+        let state = self.ctx.cluster_state().as_deref();
+        self.slot_migration_durability_waits.retain(|id| {
+            state
+                .and_then(|state| state.migrations.get(id))
+                .is_some_and(|job| {
+                    matches!(
+                        job.phase,
+                        MigrationPhase::Import(ImportPhase::FailoverGranted)
+                            | MigrationPhase::Export(ExportPhase::FailoverGranted)
+                    )
+                })
+        });
+        if self.ctx.replication_aof_write_error().is_none() {
+            return;
+        }
+        let Some(state) = state else { return };
+        // Admit each ready terminal job to the local wait before scanning peer
+        // deadlines. A fault must not suspend expiration of unrelated jobs.
+        self.slot_migration_durability_waits.extend(
+            state.migrations.views().into_iter().filter_map(|job| {
+                let is_ready = match job.phase {
+                    MigrationPhase::Import(ImportPhase::FailoverGranted) => {
+                        !state.debug_prevent_slot_migration_failover()
+                    }
+                    MigrationPhase::Export(ExportPhase::FailoverGranted) => {
+                        job.ranges.iter().all(|range| {
+                            (range.start..=range.end).all(|slot| {
+                                state
+                                    .declared_node_by_slot(slot as usize)
+                                    .is_some_and(|owner| owner.name == job.target.as_str())
+                            })
+                        })
+                    }
+                    _ => false,
+                };
+                is_ready.then_some(job.id)
+            }),
+        );
+    }
+
+    pub(super) fn wait_for_slot_migration_durability(&mut self, id: &MigrationJobId) -> bool {
+        if self.ctx.replication_aof_write_error().is_none() {
+            return false;
+        }
+        self.slot_migration_durability_waits.insert(id.clone());
+        true
+    }
+
     pub(super) fn expire_stalled_slot_migrations(&mut self) {
         let timeout_sec = self.ctx.config().replication.repl_timeout;
         if timeout_sec == 0 {
@@ -24,6 +77,11 @@ impl ServerWorkerState {
                     .into_iter()
                     .filter(|job| {
                         if !job.is_active_for_connection_timeout() {
+                            return false;
+                        }
+                        if self.ctx.config().replication.repl_after_aof_fsync
+                            && self.slot_migration_durability_waits.contains(&job.id)
+                        {
                             return false;
                         }
                         match job.operation {

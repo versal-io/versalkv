@@ -182,6 +182,7 @@ pub(super) struct ScriptCommandRestrictions {
 }
 
 pub(super) struct CompletedCommandEffect<'a> {
+    pub(super) persistence: crate::engine::extension::script::PropagationPersistence,
     pub(super) db_id: u32,
     pub(super) args: &'a CommandArgs,
     pub(super) result: &'a Value,
@@ -210,6 +211,7 @@ pub(super) fn _capture_propagation_effect(
             script_ctx.append_propagation_frame(
                 effect.db_id,
                 script_ctx.propagation_targets,
+                effect.persistence,
                 frame,
             );
         }
@@ -219,6 +221,7 @@ pub(super) fn _capture_propagation_effect(
     script_ctx.append_propagation_command(
         effect.db_id,
         script_ctx.propagation_targets,
+        effect.persistence,
         effect.args,
     );
 }
@@ -930,6 +933,11 @@ fn capture_nested_effect(
     _capture_propagation_effect(
         script_ctx,
         CompletedCommandEffect {
+            persistence: if invocation.spec.flags & CMD_WRITE != 0 {
+                crate::engine::extension::script::PropagationPersistence::Data
+            } else {
+                crate::engine::extension::script::PropagationPersistence::Transient
+            },
             db_id: outcome.db_id,
             args: invocation.args,
             result: &outcome.result,

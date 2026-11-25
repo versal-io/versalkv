@@ -7,11 +7,11 @@
 //! rewriteListObject/rewriteSetObject/rewriteHashObject/rewriteSortedSetObject
 
 use crate::engine::command::context::CommandConn;
+use crate::foundation::io::persistence::aof_rewrite::AofRewriteFileOptions;
+use crate::foundation::io::protocol::Value;
+use crate::foundation::io::store::kv_engine::now_ms;
 use crate::framework::context::ServerContext;
 use crate::framework::CommandArgs;
-use crate::foundation::io::store::kv_engine::now_ms;
-use crate::foundation::io::protocol::Value;
-use crate::foundation::io::persistence::aof_rewrite::AofRewriteFileOptions;
 use command_macros::command;
 use std::path::Path;
 
@@ -87,6 +87,7 @@ pub(crate) fn start_aof_rewrite(ctx: &mut ServerContext) -> Result<(), String> {
     )
     .map_err(|error| format!("invalid aof-rewrite-cpulist: {error}"))?;
     rotate_increment_for_rewrite(ctx, &options)?;
+    let baseline_epoch = ctx.aof().baseline_epoch;
     let fork_started = std::time::Instant::now();
     let pid = match crate::framework::capabilities::process::fork_process()
         .map_err(|error| format!("fork failed: {error}"))?
@@ -126,6 +127,7 @@ pub(crate) fn start_aof_rewrite(ctx: &mut ServerContext) -> Result<(), String> {
     ctx.persistence_mut()
         .begin_aof_rewrite_child(pid, now_ms() as i64)
         .map_err(|_| "background persistence operation already in progress".to_string())?;
+    ctx.aof_mut().rewrite.baseline_epoch = baseline_epoch;
     Ok(())
 }
 
@@ -149,7 +151,7 @@ fn rotate_increment_for_rewrite(
     if let Some(journal) = ctx.aof_mut().journal.as_mut() {
         journal
             .appender
-            .flush(true)
+            .shutdown()
             .map_err(|error| error.to_string())?;
     }
     let incr_path = crate::foundation::io::persistence::rotate_aof_increment(
@@ -158,12 +160,8 @@ fn rotate_increment_for_rewrite(
         &options.appenddirname,
     )
     .map_err(|error| error.to_string())?;
-    crate::server_log!(
-        notice,
-        "Creating AOF increment {}",
-        incr_path.display()
-    );
-    let appender = crate::foundation::io::persistence::AofAppender::open(
+    crate::server_log!(notice, "Creating AOF increment {}", incr_path.display());
+    let mut appender = crate::foundation::io::persistence::AofAppender::open(
         options.dir.to_string_lossy().as_ref(),
         &options.filename,
         &options.appenddirname,
@@ -171,21 +169,13 @@ fn rotate_increment_for_rewrite(
         ctx.config().persistence.aof_fsync,
     )
     .map_err(|error| error.to_string())?;
-    let shutdown_result = ctx
-        .aof_mut()
-        .journal
-        .take()
-        .map(|mut old_journal| old_journal.appender.shutdown());
-    ctx.aof_mut().journal = Some(
-        crate::foundation::io::persistence::journal::AofJournal::new(appender),
-    );
-    shutdown_result
-        .transpose()
-        .map(|_| ())
-        .map_err(|error| error.to_string())
+    appender.flush(true).map_err(|error| error.to_string())?;
+    ctx.aof_mut().journal =
+        Some(crate::foundation::io::persistence::journal::AofJournal::new(appender));
+    Ok(())
 }
 
-///   4. aof_current_size > aof_rewrite_min_size；
+/// Start an automatic rewrite when the configured size and growth thresholds are met.
 pub fn check_auto_aof_rewrite(ctx: &mut ServerContext) {
     let policy =
         crate::engine::persistence::AofRewritePolicy::from_config(&ctx.config().persistence);
@@ -193,10 +183,7 @@ pub fn check_auto_aof_rewrite(ctx: &mut ServerContext) {
         return;
     }
     if ctx.persistence().auto_aof_rewrite_limited() {
-        if ctx
-            .persistence_mut()
-            .mark_auto_aof_rewrite_limit_logged()
-        {
+        if ctx.persistence_mut().mark_auto_aof_rewrite_limit_logged() {
             crate::server_log!(
                 warning,
                 "Automatic AOF rewrite triggered the limit after repeated failures"
@@ -244,8 +231,7 @@ pub fn reap_aof_child_if_any(ctx: &mut ServerContext) -> Option<ReapResult> {
             let options = rewrite_file_options(ctx);
             let _ = std::fs::remove_file(options.temp_path(pid));
             ctx.persistence_mut().abort_child();
-            ctx.persistence_mut()
-                .record_aof_rewrite_commit_failure();
+            ctx.persistence_mut().record_aof_rewrite_commit_failure();
             return Some(ReapResult::Error);
         }
     };
@@ -278,36 +264,75 @@ pub(crate) fn apply_aof_rewrite_child_completion(
         return Some(ReapResult::Error);
     }
 
-    let increment_rotated = ctx.aof().journal.is_some();
-    if let Some(mut aof) = ctx.aof_mut().journal.take() {
-        aof.appender.shutdown().ok();
+    if ctx.aof().rewrite.baseline_epoch != ctx.aof().baseline_epoch {
+        let _ = std::fs::remove_file(options.temp_path(pid));
+        ctx.persistence_mut().record_aof_rewrite_commit_failure();
+        ctx.aof_mut().replication_baseline = crate::engine::persistence::AofBaseline::Unavailable;
+        if ctx.config().persistence.aof_enabled {
+            ctx.persistence_mut().set_aof_rewrite_scheduled(true);
+        }
+        crate::server_log!(warning, "AOF rewrite snapshot was invalidated by unrecorded writes");
+        return Some(ReapResult::Error);
     }
+
+    let increment_rotated = ctx.aof().journal.is_some();
+    if let Some(aof) = ctx.aof_mut().journal.as_mut() {
+        if let Err(error) = aof.appender.shutdown() {
+            ctx.persistence_mut().record_aof_rewrite_commit_failure();
+            ctx.aof_mut().last_write_status = crate::engine::persistence::OperationStatus::Err;
+            let _ = std::fs::remove_file(options.temp_path(pid));
+            crate::server_log!(
+                warning,
+                "AOF rewrite old journal synchronization failed: {error}"
+            );
+            return Some(ReapResult::Error);
+        }
+    }
+    ctx.aof_mut().journal.take();
 
     let append_enabled = ctx.config().persistence.aof_enabled;
     let disable_auto_gc = ctx.config().persistence.aof_disable_auto_gc;
-    let finalize_result =
-        crate::foundation::io::persistence::aof_rewrite::finalize_rewrite(
-            &options,
-            pid,
-            &buf,
-            append_enabled,
-            disable_auto_gc,
-            increment_rotated,
-        );
+    let finalize_result = crate::foundation::io::persistence::aof_rewrite::finalize_rewrite(
+        &options,
+        pid,
+        &buf,
+        append_enabled,
+        disable_auto_gc,
+        increment_rotated,
+    );
 
     if let Err(e) = finalize_result {
-        ctx.persistence_mut()
-            .record_aof_rewrite_commit_failure();
+        ctx.persistence_mut().record_aof_rewrite_commit_failure();
+        ctx.aof_mut().invalidate_replication_baseline();
         crate::server_log!(warning, "AOF rewrite finalize failed: {}", e);
         let new_aof = _open_rewrite_aof(&options, ctx.config_mut().persistence.aof_fsync);
         match new_aof {
-            Ok(app) => {
+            Ok(mut app) => {
+                if let Err(error) = app.flush(true) {
+                    ctx.aof_mut().last_write_status =
+                        crate::engine::persistence::OperationStatus::Err;
+                    record_rewrite_journal_failure(ctx);
+                    crate::server_log!(
+                        warning,
+                        "AOF rewrite: can't sync reopened old AOF: {error}"
+                    );
+                    return Some(ReapResult::Error);
+                }
                 ctx.persistence_mut().record_aof_size(app.current_size());
                 ctx.aof_mut().last_write_status = crate::engine::persistence::OperationStatus::Ok;
-                ctx.aof_mut().journal = Some(crate::foundation::io::persistence::journal::AofJournal::new(app));
+                ctx.aof_mut().journal =
+                    Some(crate::foundation::io::persistence::journal::AofJournal::new(app));
+                if ctx.config().replication.repl_after_aof_fsync
+                    && ctx.aof().replication_baseline
+                        == crate::engine::persistence::AofBaseline::Unavailable
+                {
+                    ctx.aof_mut().last_write_status =
+                        crate::engine::persistence::OperationStatus::Err;
+                    ctx.persistence_mut().set_aof_rewrite_scheduled(true);
+                }
             }
             Err(e2) => {
-                ctx.config_mut().persistence.aof_enabled = false;
+                record_rewrite_journal_failure(ctx);
                 ctx.persistence_mut().reset_aof_selected_db();
                 crate::server_log!(warning, "AOF rewrite: can't reopen old AOF: {}", e2);
             }
@@ -316,24 +341,35 @@ pub(crate) fn apply_aof_rewrite_child_completion(
     }
 
     if !append_enabled {
-        ctx.persistence_mut()
-            .record_aof_rewrite_commit_success();
+        ctx.persistence_mut().record_aof_rewrite_commit_success();
         crate::server_log!(notice, "AOF rewrite complete ({}s)", elapsed);
         return Some(ReapResult::Success);
     }
 
+    // Finalization has installed and synced the complete baseline. A failed journal
+    // reopen must block writes, but does not invalidate those installed files.
+    ctx.aof_mut().replication_baseline = crate::engine::persistence::AofBaseline::Ready;
     let new_aof = _open_rewrite_aof(&options, ctx.config_mut().persistence.aof_fsync);
     match new_aof {
-        Ok(app) => {
+        Ok(mut app) => {
+            if let Err(error) = app.flush(true) {
+                ctx.persistence_mut().record_aof_rewrite_commit_failure();
+                ctx.aof_mut().last_write_status = crate::engine::persistence::OperationStatus::Err;
+                record_rewrite_journal_failure(ctx);
+                ctx.persistence_mut().reset_aof_selected_db();
+                crate::server_log!(warning, "AOF rewrite: can't sync new AOF: {error}");
+                return Some(ReapResult::Error);
+            }
             let current_size = app.current_size();
             ctx.persistence_mut().record_aof_size(current_size);
             ctx.persistence_mut()
                 .record_aof_rewrite_base_size(current_size);
             ctx.aof_mut().last_write_status = crate::engine::persistence::OperationStatus::Ok;
-            ctx.persistence_mut()
-                .record_aof_rewrite_commit_success();
+            ctx.persistence_mut().record_aof_rewrite_commit_success();
             ctx.aof_mut().started_this_session = true;
-            ctx.aof_mut().journal = Some(crate::foundation::io::persistence::journal::AofJournal::new(app));
+            ctx.aof_mut().journal =
+                Some(crate::foundation::io::persistence::journal::AofJournal::new(app));
+            ctx.aof_mut().replication_baseline = crate::engine::persistence::AofBaseline::Ready;
             crate::server_log!(
                 notice,
                 "AOF rewrite complete ({}s, {} bytes final)",
@@ -343,13 +379,23 @@ pub(crate) fn apply_aof_rewrite_child_completion(
             Some(ReapResult::Success)
         }
         Err(e) => {
-            ctx.persistence_mut()
-                .record_aof_rewrite_commit_failure();
-            ctx.config_mut().persistence.aof_enabled = false;
+            ctx.persistence_mut().record_aof_rewrite_commit_failure();
+            record_rewrite_journal_failure(ctx);
             ctx.persistence_mut().reset_aof_selected_db();
             crate::server_log!(warning, "AOF rewrite: can't reopen new AOF: {}", e);
             Some(ReapResult::Error)
         }
+    }
+}
+
+fn record_rewrite_journal_failure(ctx: &mut ServerContext) {
+    ctx.aof_mut().last_write_status = crate::engine::persistence::OperationStatus::Err;
+    if !ctx.config().replication.repl_after_aof_fsync {
+        ctx.config_mut().persistence.aof_enabled = false;
+        ctx.aof_mut().replication_baseline = crate::engine::persistence::AofBaseline::Unavailable;
+    } else if ctx.aof().replication_baseline == crate::engine::persistence::AofBaseline::Unavailable
+    {
+        ctx.persistence_mut().set_aof_rewrite_scheduled(true);
     }
 }
 

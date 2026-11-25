@@ -2,6 +2,8 @@ mod encode;
 mod file;
 mod slot;
 
+#[cfg(test)]
+pub(crate) use file::FAIL_NEXT_INSTALL_DIRECTORY_SYNC;
 pub use file::{finalize_rewrite, write_rewrite_temp};
 pub use slot::write_filtered_command_snapshot;
 use std::path::PathBuf;

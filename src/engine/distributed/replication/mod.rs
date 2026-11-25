@@ -52,6 +52,19 @@ pub enum ReplicationRole {
     Replica,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum UpstreamTransactionPhase {
+    Buffered,
+    AofPrefixWritten,
+    Executing,
+}
+
+impl UpstreamTransactionPhase {
+    pub(crate) fn invalidates_baseline_on_abort(self) -> bool {
+        self != Self::Buffered
+    }
+}
+
 pub struct ReplicationState {
     pub role: ReplicationRole,
     pub repl_seldb: i64,
@@ -80,6 +93,8 @@ pub struct ReplicationState {
     pub backlog_idle_deadline_ms: i64,
     primary_down_since_ms: i64,
     primary_link_was_observed: bool,
+    /// Owners of upstream transactions, including EXEC side-effect publication.
+    upstream_transactions: HashMap<usize, UpstreamTransactionPhase>,
 }
 
 impl ReplicationState {
@@ -109,7 +124,36 @@ impl ReplicationState {
             backlog_idle_deadline_ms: 0,
             primary_down_since_ms: 0,
             primary_link_was_observed: false,
+            upstream_transactions: HashMap::new(),
         }
+    }
+
+    pub fn has_active_upstream_transaction(&self) -> bool {
+        !self.upstream_transactions.is_empty()
+    }
+
+    pub(crate) fn record_upstream_transaction(
+        &mut self,
+        connection: usize,
+        phase: UpstreamTransactionPhase,
+    ) {
+        self.upstream_transactions
+            .entry(connection)
+            .and_modify(|current| *current = (*current).max(phase))
+            .or_insert(phase);
+    }
+
+    pub(crate) fn end_upstream_transaction(
+        &mut self,
+        connection: usize,
+    ) -> Option<UpstreamTransactionPhase> {
+        self.upstream_transactions.remove(&connection)
+    }
+
+    pub(crate) fn take_upstream_transactions(
+        &mut self,
+    ) -> HashMap<usize, UpstreamTransactionPhase> {
+        std::mem::take(&mut self.upstream_transactions)
     }
 
     pub fn repl_buffer_mem(&self) -> usize {
@@ -237,6 +281,7 @@ impl ReplicationState {
     /// Commit a replica-to-primary transition once. The boolean result lets
     /// coordinators keep replication-ID rotation idempotent.
     pub fn switch_to_primary(&mut self) -> bool {
+        self.upstream_transactions.clear();
         if self.role == ReplicationRole::Primary {
             return false;
         }

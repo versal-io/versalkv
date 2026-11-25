@@ -307,7 +307,12 @@ impl PrimaryLink {
         let read_cursor = self
             .dual_main_resume_read_cursor
             .unwrap_or(self.next_send_cursor);
-        let bytes = match backlog.read_from(read_cursor) {
+        if read_cursor > backlog.replication_release_cursor()
+            || (read_cursor == backlog.replication_release_cursor() && read_cursor < backlog_end)
+        {
+            return Ok(Vec::new());
+        }
+        let bytes = match backlog.read_released_from(read_cursor) {
             Some(bytes) => bytes,
             None => {
                 self.state = PrimaryLinkState::Closing;
@@ -315,7 +320,7 @@ impl PrimaryLink {
             }
         };
         Self::enforce_cursor_invariant(self.sent_cursor, backlog_end, backlog_end)?;
-        self.next_send_cursor = backlog_end;
+        self.next_send_cursor = backlog.replication_release_cursor();
         self.dual_main_resume_read_cursor = None;
         self.dual_main_backlog_pin_cursor = None;
         Self::enforce_cursor_invariant(self.sent_cursor, self.next_send_cursor, backlog_end)?;

@@ -400,6 +400,7 @@ fn nested_effects_capture_selected_db_at_command_completion() {
     redis_call::_capture_propagation_effect(
         &mut ctx,
         redis_call::CompletedCommandEffect {
+            persistence: crate::engine::extension::script::PropagationPersistence::Data,
             db_id: 0,
             args: &first_args,
             result: &Value::SimpleString(Bytes::from_static(b"OK")),
@@ -411,6 +412,7 @@ fn nested_effects_capture_selected_db_at_command_completion() {
     redis_call::_capture_propagation_effect(
         &mut ctx,
         redis_call::CompletedCommandEffect {
+            persistence: crate::engine::extension::script::PropagationPersistence::Data,
             db_id: 10,
             args: &select_args,
             result: &Value::SimpleString(Bytes::from_static(b"OK")),
@@ -422,6 +424,7 @@ fn nested_effects_capture_selected_db_at_command_completion() {
     redis_call::_capture_propagation_effect(
         &mut ctx,
         redis_call::CompletedCommandEffect {
+            persistence: crate::engine::extension::script::PropagationPersistence::Data,
             db_id: 10,
             args: &second_args,
             result: &Value::SimpleString(Bytes::from_static(b"OK")),
@@ -454,6 +457,7 @@ fn consecutive_nested_effects_share_one_propagation_batch() {
         redis_call::_capture_propagation_effect(
             &mut ctx,
             redis_call::CompletedCommandEffect {
+                persistence: crate::engine::extension::script::PropagationPersistence::Data,
                 db_id: 0,
                 args,
                 result: &Value::SimpleString(Bytes::from_static(b"OK")),
@@ -484,6 +488,7 @@ fn failed_nested_effect_does_not_discard_prior_operations() {
     redis_call::_capture_propagation_effect(
         &mut ctx,
         redis_call::CompletedCommandEffect {
+            persistence: crate::engine::extension::script::PropagationPersistence::Data,
             db_id: 10,
             args: &args,
             result: &Value::error("ERR failed"),

@@ -142,6 +142,11 @@ impl Server {
         backend.ctx.set_startup_args(self.startup_args.clone());
         self.normalize_paths(&mut backend);
         self.apply_config(&mut backend);
+        backend
+            .ctx
+            .config()
+            .validate_replication_durability()
+            .map_err(std::io::Error::other)?;
         crate::foundation::io::sys::log::set_debug_context(
             backend.ctx.config().server.debug_context.clone(),
         );
@@ -768,7 +773,6 @@ impl Server {
             .persistence
             .aof_appenddirname
             .clone();
-        let fsync_mode = backend.ctx.config_mut().persistence.aof_fsync;
         if !appenddirname.is_empty() {
             let manifest_path = Path::new(&dir)
                 .join(&appenddirname)
@@ -888,13 +892,19 @@ impl Server {
         } else {
             AofOpenMode::CreateNew
         };
+        let fsync_mode = backend.ctx.config().persistence.aof_fsync;
         match AofAppender::open(&dir, &filename, &appenddirname, mode, fsync_mode) {
             Ok(mut appender) => {
                 backend
                     .ctx
                     .persistence_mut()
                     .record_aof_size(appender.current_size());
-                let _ = appender.force_fsync();
+                if let Err(error) = appender.force_fsync() {
+                    crate::server_log!(warning, "Can't synchronize initial AOF: {}", error);
+                    process::exit(1);
+                }
+                backend.ctx.aof_mut().replication_baseline =
+                    crate::engine::persistence::AofBaseline::Ready;
                 backend.ctx.aof_mut().last_fsync_sec =
                     (crate::foundation::io::store::kv_engine::now_ms() / 1000) as i64;
                 backend.ctx.aof_mut().last_write_status =

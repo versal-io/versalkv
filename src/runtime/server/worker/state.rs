@@ -116,6 +116,10 @@ pub(crate) struct ServerWorkerState {
         crate::framework::distributed::replication::ReplicationRuntime,
     pub(in crate::runtime::server) slot_migration_runtime:
         crate::framework::distributed::migration::SlotMigrationRuntime,
+    /// Finalizing jobs that encountered local durability backpressure. Retain
+    /// their identity through recovery until terminal cleanup releases it.
+    pub(in crate::runtime::server) slot_migration_durability_waits:
+        HashSet<crate::engine::distributed::cluster::migration::MigrationJobId>,
     pub(in crate::runtime::server) slot_migration_snapshot:
         Option<crate::runtime::server::worker::distributed::migration::SlotSnapshotRelay>,
     pub(in crate::runtime::server) processing_blocked_clients: bool,
@@ -123,6 +127,8 @@ pub(crate) struct ServerWorkerState {
     pub(in crate::runtime::server) cluster_config:
         crate::runtime::server::worker::distributed::cluster::ClusterConfigFile,
     pub(in crate::runtime::server) io_threads: IoThreadRuntime,
+    pub(in crate::runtime::server) aof_sync_wake:
+        crate::foundation::io::transport::TransportWakeHandle,
     pub(in crate::runtime::server) worker_completions: WorkerCompletionQueue,
     pub(in crate::runtime::server) time_events: TimeEventRegistry,
     pub(in crate::runtime::server) pending_due_time_events: HashMap<TimeEventId, DueTimeEvent>,
@@ -184,6 +190,7 @@ impl ServerWorkerState {
             return Err(source_install_error(error, cleanup.err()));
         }
         let worker_completions = WorkerCompletionQueue::new(io_wake.clone());
+        let aof_sync_wake = io_wake.clone();
         let worker_completion_sender = worker_completions.sender();
         let io_threads = IoThreadRuntime::new_with_completion_sender(
             IoDriverMtConfig::new(1),
@@ -206,6 +213,7 @@ impl ServerWorkerState {
             child_signal_write.as_raw_fd(),
         );
         Ok(Self {
+            aof_sync_wake,
             transport,
             runtime_sources,
             child_registry: ChildRegistry::default(),
@@ -239,6 +247,7 @@ impl ServerWorkerState {
                 crate::framework::distributed::replication::ReplicationRuntime::new(),
             slot_migration_runtime:
                 crate::framework::distributed::migration::SlotMigrationRuntime::default(),
+            slot_migration_durability_waits: HashSet::new(),
             slot_migration_snapshot: None,
             processing_blocked_clients: false,
             initial_rdb_replication_info_installed: false,

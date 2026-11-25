@@ -20,6 +20,22 @@ struct ParsedCommandInput {
     resp3: bool,
 }
 
+fn requires_propagation_boundary(name: &str, args: &CommandArgs) -> bool {
+    match name {
+        "psync" | "sync" => true,
+        "config" => args
+            .args
+            .first()
+            .is_some_and(|subcommand| subcommand.eq_ignore_ascii_case(b"SET")),
+        "replconf" => args.args.iter().any(|argument| {
+            argument.eq_ignore_ascii_case(b"rdb-channel")
+                || argument.eq_ignore_ascii_case(b"main-channel")
+                || argument.eq_ignore_ascii_case(b"set-rdb-client-id")
+        }),
+        _ => false,
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct SpecialCommandCompletion {
     pub(crate) disposition: CommandDisposition,
@@ -54,6 +70,16 @@ impl ServerWorkerState {
         resp3: bool,
         batch: &mut ReadBatchEffects,
     ) -> LoopAction {
+        if self.ctx.config().replication.repl_after_aof_fsync
+            || requires_propagation_boundary(&name_lower, &args)
+        {
+            self.queue_command_propagation(batch);
+            batch.aof_only.clear();
+            batch.replication_only.clear();
+        }
+        if self.ctx.config().replication.repl_after_aof_fsync {
+            self.update_pause_skip_expire();
+        }
         let input = ParsedCommandInput {
             token,
             args,

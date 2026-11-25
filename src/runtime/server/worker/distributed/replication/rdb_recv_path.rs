@@ -564,6 +564,8 @@ impl ServerWorkerState {
         let disk_backed =
             load_mode == crate::framework::distributed::replication::RdbLoadMode::DiskBacked;
         if !swapdb && !disk_backed {
+            self.discard_upstream_transactions();
+            self.ctx.aof_mut().invalidate_replication_baseline();
             // C attaches a replica to the new primary before loading a
             // non-SWAPDB RDB: downstream replicas are disconnected and the
             // old replication backlog is discarded before the new dataset is
@@ -1223,6 +1225,48 @@ mod tests {
         assert!(link.master_replid().is_none());
         assert!(!link.is_receiving_rdb());
         assert!(!runtime.ctx.replication().backlog.is_active());
+    }
+
+    #[test]
+    fn failed_direct_decode_invalidates_aof_before_the_first_dataset_mutation() {
+        for is_lazy in [false, true] {
+            let mut runtime = ServerWorkerState::new(1).unwrap();
+            runtime.ctx.replication_mut().switch_to_replica();
+            runtime.ctx.config_mut().replication.replica_lazy_flush = is_lazy;
+            runtime.ctx.aof_mut().replication_baseline =
+                crate::engine::persistence::AofBaseline::Ready;
+            runtime
+                .ctx
+                .db_mut(0)
+                .unwrap()
+                .set(b"old".to_vec(), Robj::string("value"));
+            let mut link = ReplicaLink::new(
+                ConnectionId(41),
+                MasterInfo {
+                    host: "127.0.0.1".to_string(),
+                    port: 6379,
+                },
+            );
+            link.connected(None, None);
+            link.on_bytes(
+                b"+PONG\r\n+OK\r\n+OK\r\n+FULLRESYNC 0123456789abcdef0123456789abcdef01234567 0\r\n$100\r\nab",
+                6380,
+            ).unwrap();
+            runtime.init_streaming_target(&mut link).unwrap();
+            assert_eq!(runtime.ctx.db_size(0), 0);
+            assert_eq!(
+                runtime.ctx.aof().replication_baseline,
+                crate::engine::persistence::AofBaseline::Unavailable
+            );
+            link.on_bytes(b"cdefghij", 6380).unwrap();
+            assert!(runtime.drive_streaming_decode(41, 41, &mut link).is_err());
+            assert_eq!(
+                runtime.ctx.aof().replication_baseline,
+                crate::engine::persistence::AofBaseline::Unavailable
+            );
+            runtime.ctx.replication_mut().switch_to_primary();
+            assert!(runtime.ctx.sync_replication_aof().is_err());
+        }
     }
 
     #[test]

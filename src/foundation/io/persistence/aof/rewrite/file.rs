@@ -1,11 +1,29 @@
 use super::encode::{write_command_snapshot, write_function_snapshot};
 use super::AofRewriteFileOptions;
+use crate::foundation::io::persistence::aof::manifest::{
+    create_aof_directory, sync_directory, sync_parent, write_manifest_atomically,
+};
 use crate::foundation::io::store::kv_engine::DbSet;
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::Path;
 
 pub(super) const AOF_REWRITE_AUTOSYNC_BYTES: usize = 32 * 1024 * 1024;
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FAIL_NEXT_INSTALL_DIRECTORY_SYNC: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+}
+
+#[cfg(test)]
+fn inject_install_directory_sync_failure() {
+    if FAIL_NEXT_INSTALL_DIRECTORY_SYNC.with(|fail| fail.replace(false)) {
+        crate::foundation::io::persistence::aof::manifest::FAIL_NEXT_DIRECTORY_SYNC
+            .with(|fail| fail.set(true));
+    }
+}
 
 struct IncrementalSyncWriter<W, F>
 where
@@ -71,7 +89,7 @@ pub fn write_rewrite_temp(
     pid: i32,
 ) -> std::io::Result<()> {
     let aof_dir = options.aof_dir();
-    std::fs::create_dir_all(&aof_dir)?;
+    create_aof_directory(&aof_dir)?;
     let tmp_path = options.temp_path(pid);
     let result = write_temp_contents(dbs, function_codes, migration_snapshot, options, &tmp_path);
     if result.is_err() {
@@ -164,7 +182,10 @@ fn finalize_single_file(
     file.write_all(rewrite_buffer)?;
     file.sync_all()?;
     drop(file);
-    std::fs::rename(tmp_path, options.dir.join(&options.filename))
+    std::fs::rename(tmp_path, options.dir.join(&options.filename))?;
+    #[cfg(test)]
+    inject_install_directory_sync_failure();
+    sync_directory(&options.dir)
 }
 
 fn finalize_multi_part(
@@ -176,15 +197,20 @@ fn finalize_multi_part(
     increment_rotated: bool,
 ) -> std::io::Result<()> {
     let app_dir = options.aof_dir();
-    std::fs::create_dir_all(&app_dir)?;
+    create_aof_directory(&app_dir)?;
     let base_ext = if temp_uses_rdb_preamble(tmp_path)? {
         "rdb"
     } else {
         "aof"
     };
     let manifest_path = app_dir.join(format!("{}.manifest", options.filename));
-    let old_entries = crate::foundation::io::persistence::read_manifest_entries(&manifest_path)
-        .unwrap_or_default();
+    let old_entries = match std::fs::read(&manifest_path) {
+        Ok(bytes) => {
+            crate::foundation::io::persistence::aof::manifest::parse_manifest_bytes(&bytes)?
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(error),
+    };
     let (base_sequence, incr_sequence) =
         crate::foundation::io::persistence::next_rewrite_sequences(
             &manifest_path,
@@ -193,10 +219,13 @@ fn finalize_multi_part(
     let base_name = format!("{}.{}.base.{}", options.filename, base_sequence, base_ext);
     let incr_name = format!("{}.{}.incr.aof", options.filename, incr_sequence);
 
+    std::fs::File::open(tmp_path)?.sync_all()?;
     std::fs::rename(tmp_path, app_dir.join(&base_name))?;
     let mut manifest = if append_enabled {
         if !increment_rotated {
             write_increment(&app_dir.join(&incr_name), rewrite_buffer)?;
+        } else {
+            std::fs::File::open(app_dir.join(&incr_name))?.sync_all()?;
         }
         format!(
             "file {} seq {} type b\nfile {} seq {} type i\n",
@@ -238,6 +267,9 @@ fn finalize_multi_part(
             ));
         }
     }
+    sync_directory(&app_dir)?;
+    #[cfg(test)]
+    inject_install_directory_sync_failure();
     write_manifest_atomically(&manifest_path, manifest.as_bytes())?;
     if !disable_auto_gc {
         for entry in old_entries {
@@ -278,17 +310,8 @@ fn write_increment(path: &Path, rewrite_buffer: &[u8]) -> std::io::Result<()> {
     file.write_all(rewrite_buffer)?;
     file.sync_all()?;
     drop(file);
-    std::fs::rename(temp_path, path)
-}
-
-fn write_manifest_atomically(path: &Path, manifest: &[u8]) -> std::io::Result<()> {
-    let temp_path = path.with_extension("manifest.tmp");
-    let mut file = std::fs::File::create(&temp_path)?;
-    file.write_all(manifest)?;
-    file.sync_all()?;
-    drop(file);
     std::fs::rename(temp_path, path)?;
-    std::fs::File::open(path.parent().unwrap_or(Path::new(".")))?.sync_all()
+    sync_parent(path)
 }
 
 #[cfg(test)]

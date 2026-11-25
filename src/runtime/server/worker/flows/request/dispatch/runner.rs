@@ -62,6 +62,17 @@ impl ServerWorkerState {
         }
         let eviction = self.perform_evictions();
         self.apply_command_evictions(invocation.target.token_value(), eviction.evicted, effects);
+        if invocation.args.name.eq_ignore_ascii_case(b"CONFIG")
+            && invocation
+                .args
+                .args
+                .first()
+                .is_some_and(|subcommand| subcommand.eq_ignore_ascii_case(b"SET"))
+        {
+            self.queue_propagation_frames(&effects.replication_only, &effects.aof_only);
+            effects.replication_only.clear();
+            effects.aof_only.clear();
+        }
         self.ctx.refresh_dict_resize_budget();
         Ok((connection_token, client_eviction_was_enabled))
     }

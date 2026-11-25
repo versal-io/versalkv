@@ -53,6 +53,7 @@ impl ServerWorkerState {
                 }
                 Err(error) => {
                     *self.ctx.config_mut() = request.previous_config;
+                    self.ctx.sync_eviction_policy();
                     if let Some(previous) = request.previous_oom_score_adj {
                         let _ = crate::framework::commands::server::config::write_oom_score_adj(
                             previous,
@@ -104,6 +105,7 @@ impl ServerWorkerState {
             }
             Err(error) => {
                 *self.ctx.config_mut() = previous_config;
+                self.ctx.sync_eviction_policy();
                 let _ = self.configure_tls_server_from_config();
                 if request.rebind_cluster_bus {
                     let _ = self.rebind_cluster_bus_transport();

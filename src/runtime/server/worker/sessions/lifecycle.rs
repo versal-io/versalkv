@@ -163,6 +163,7 @@ impl ServerWorkerState {
         if self.io_threads.is_close_pending(Token(token_value)) {
             return;
         }
+        self.ctx.abort_upstream_transaction(token_value);
         self.retire_runtime_source(token);
         self.full_sync.pending_dual_rdb_snapshots.remove(&token);
         self.cancel_runtime_runnable(

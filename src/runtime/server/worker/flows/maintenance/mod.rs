@@ -227,7 +227,12 @@ impl ServerWorkerState {
         let is_primary = self.ctx.replication().role
             == crate::engine::distributed::replication::ReplicationRole::Primary;
         let backlog = &self.ctx.replication().backlog;
-        if ttl_sec <= 0 || !is_primary || has_attached_replicas || !backlog.is_active() {
+        if ttl_sec <= 0
+            || !is_primary
+            || has_attached_replicas
+            || !backlog.is_active()
+            || backlog.unreleased_bytes() > 0
+        {
             self.ctx.replication_mut().backlog_idle_deadline_ms = 0;
             return;
         }
@@ -394,6 +399,30 @@ impl ServerWorkerState {
         should_close
     }
 
+    fn expire_cluster_handshakes(
+        &mut self,
+        state: &mut crate::engine::distributed::cluster::ClusterState,
+        now_ms: i64,
+        node_timeout_ms: u64,
+    ) {
+        // Match C getHandshakeTimeout(): small node timeouts still allow one second.
+        let expired_handshakes = state.expire_handshake_nodes(now_ms, node_timeout_ms.max(1_000));
+        for node_id in expired_handshakes {
+            let tokens: Vec<usize> = self
+                .cluster_bus
+                .connections
+                .iter()
+                .filter_map(|(token_value, connection)| {
+                    (connection.node_name == node_id || connection.handshake_node_name == node_id)
+                        .then_some(*token_value)
+                })
+                .collect();
+            for token_value in tokens {
+                self.teardown_cluster_bus_connection_with_state(state, Token(token_value), false);
+            }
+        }
+    }
+
     fn run_cluster_cron(&mut self) {
         if !self.ctx.config_mut().server.cluster_enabled {
             return;
@@ -448,26 +477,7 @@ impl ServerWorkerState {
             // that tick does not otherwise recompute topology.
             state.observe_topology_evaluation(now);
             state.set_manual_failover_timeout_ms(manual_failover_timeout);
-            let expired_handshakes = state.expire_handshake_nodes(now, node_timeout);
-            for node_id in expired_handshakes {
-                let tokens: Vec<usize> = self
-                    .cluster_bus
-                    .connections
-                    .iter()
-                    .filter_map(|(token_value, connection)| {
-                        (connection.node_name == node_id
-                            || connection.handshake_node_name == node_id)
-                            .then_some(*token_value)
-                    })
-                    .collect();
-                for token_value in tokens {
-                    self.teardown_cluster_bus_connection_with_state(
-                        state,
-                        Token(token_value),
-                        false,
-                    );
-                }
-            }
+            self.expire_cluster_handshakes(state, now, node_timeout);
             self.cluster_bus
                 .schedule_asymmetric_meets(state, now, node_timeout);
             state.set_replica_migration_allowed(allow_replica_migration);
@@ -564,6 +574,9 @@ impl ServerWorkerState {
     }
 
     fn run_expire_cycle(&mut self) {
+        if self.ctx.replication_aof_write_error().is_some() {
+            return;
+        }
         if !self.ctx.config_mut().server.active_expire_enabled
             || self.ctx.config_mut().server.import_mode
         {
@@ -734,11 +747,11 @@ impl ServerWorkerState {
             PropagationOp::both(db_idx, replication_svc::encode_command(&[b"UNLINK", key]));
         self.queue_slot_migration_mutations(std::slice::from_ref(&migration_op));
         let sequenced = self._sequence_background_unlink(db_idx, key);
-        for frame in &sequenced.replication_frames {
-            self.propagate_to_replicas(frame);
-        }
         for frame in &sequenced.aof_frames {
             self.feed_aof(frame);
+        }
+        for frame in &sequenced.replication_frames {
+            self.propagate_to_replicas(frame);
         }
     }
 
@@ -812,11 +825,11 @@ impl ServerWorkerState {
             self.ctx
                 .persistence_mut()
                 .set_aof_selected_db(sequenced.aof_selected_db);
-            for frame in &sequenced.replication_frames {
-                self.propagate_to_replicas(frame);
-            }
             for frame in &sequenced.aof_frames {
                 self.feed_aof(frame);
+            }
+            for frame in &sequenced.replication_frames {
+                self.propagate_to_replicas(frame);
             }
             if notified_hash_keys.insert((db_idx, key.clone())) {
                 let db_str = db_idx.to_string();
@@ -859,9 +872,10 @@ impl ServerWorkerState {
         }
     }
 
-    fn update_pause_skip_expire(&mut self) {
+    pub(crate) fn update_pause_skip_expire(&mut self) {
         let now = mstime();
         let paused = self.ctx.client_pause().is_paused(now) != PauseAction::None
+            || self.ctx.replication_aof_write_error().is_some()
             || (self.ctx.replication().is_replica()
                 && self.ctx.config().replication.replica_read_only);
         let num_dbs = self.ctx.num_dbs();
@@ -1720,6 +1734,142 @@ mod tests {
     }
 
     #[test]
+    fn cluster_handshake_expiry_keeps_young_node_with_one_ms_timeout() {
+        let mut backend = ServerWorkerState::new(1).unwrap();
+        backend.ctx.config_mut().server.cluster_enabled = true;
+        backend.ctx.config_mut().server.cluster_node_timeout = 1;
+        let mut state = ClusterState::new("127.0.0.1", 6379, 16_379);
+        let handshake_id = state.ensure_handshake_node("127.0.0.1", 6380, 16_380, 1_000);
+        state.set_debug_disable_reconnection(true);
+        *backend.ctx.cluster_state_mut() = Some(Box::new(state));
+        let _time = crate::foundation::io::sys::time::enter_command_time_snapshot(1_062);
+
+        backend.run_cluster_cron();
+
+        let state = backend.ctx.cluster_state().as_deref().unwrap();
+        assert!(
+            state.nodes.contains_key(&handshake_id),
+            "a 62 ms handshake must survive a configured 1 ms node timeout"
+        );
+        assert!(state.pending_connects.is_empty());
+    }
+
+    #[test]
+    fn cluster_handshake_expiry_keeps_nodes_through_the_one_second_boundary() {
+        let mut backend = ServerWorkerState::new(1).unwrap();
+        let mut state = ClusterState::new("127.0.0.1", 6379, 16_379);
+        let handshake_id = state.ensure_handshake_node("127.0.0.1", 6380, 16_380, 1_000);
+
+        for age_ms in [62, 999, 1_000] {
+            backend.expire_cluster_handshakes(&mut state, 1_000 + age_ms, 1);
+
+            assert!(
+                state.nodes.contains_key(&handshake_id),
+                "a handshake aged {age_ms} ms must survive the one second minimum"
+            );
+            assert!(state.pending_connects.is_empty());
+        }
+    }
+
+    #[test]
+    fn cluster_handshake_expiry_removes_both_links_and_schedules_one_reconnect() {
+        let mut backend = ServerWorkerState::new(1).unwrap();
+        let mut state = ClusterState::new("127.0.0.1", 6379, 16_379);
+        let handshake_id = state.ensure_handshake_node("127.0.0.1", 6380, 16_380, 1_000);
+        let unrelated_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let mut unrelated = ClusterNode::new(
+            unrelated_id.to_string(),
+            "127.0.0.1".to_string(),
+            6381,
+            16_381,
+            true,
+        );
+        unrelated.flags &= !CLUSTER_NODE_MYSELF;
+        state.nodes.insert(unrelated_id.to_string(), unrelated);
+        let addr = "127.0.0.1:0".parse().unwrap();
+        let outgoing = backend.transport.bind_tcp(addr).unwrap().token;
+        let incoming = backend.transport.bind_tcp(addr).unwrap().token;
+        let unrelated = backend.transport.bind_tcp(addr).unwrap().token;
+        backend.cluster_bus.register_outgoing_for_node(
+            outgoing,
+            "127.0.0.1:16380".parse().unwrap(),
+            true,
+            handshake_id.clone(),
+        );
+        backend
+            .cluster_bus
+            .register_incoming(incoming, "127.0.0.1:26380".parse().unwrap());
+        backend
+            .cluster_bus
+            .connections
+            .get_mut(&incoming.0)
+            .unwrap()
+            .handshake_node_name = handshake_id.clone();
+        backend
+            .cluster_bus
+            .register_incoming(unrelated, "127.0.0.1:26381".parse().unwrap());
+        backend
+            .cluster_bus
+            .connections
+            .get_mut(&unrelated.0)
+            .unwrap()
+            .node_name = unrelated_id.to_string();
+        backend.refresh_cluster_link_views_for_state(&mut state);
+        assert_eq!(state.link_views().count(), 3);
+
+        backend.expire_cluster_handshakes(&mut state, 2_000, 1);
+
+        assert!(state.nodes.contains_key(&handshake_id));
+        assert_eq!(state.link_views().count(), 3);
+        assert!(state.pending_connects.is_empty());
+        for token in [outgoing, incoming, unrelated] {
+            assert!(backend.cluster_bus.connections.contains_key(&token.0));
+            assert!(backend.transport.is_registered(token));
+        }
+
+        backend.expire_cluster_handshakes(&mut state, 2_001, 1);
+
+        assert!(!state.nodes.contains_key(&handshake_id));
+        assert!(state.nodes.contains_key(unrelated_id));
+        for token in [outgoing, incoming] {
+            assert!(!backend.cluster_bus.connections.contains_key(&token.0));
+            assert!(!backend.transport.is_registered(token));
+            assert!(!backend.is_pending_transport_removal(token));
+        }
+        assert!(backend.cluster_bus.connections.contains_key(&unrelated.0));
+        assert!(backend.transport.is_registered(unrelated));
+        assert_eq!(state.link_views().count(), 1);
+        assert_eq!(
+            state.link_views().next().unwrap().node_id.as_str(),
+            unrelated_id
+        );
+        assert_eq!(
+            state.pending_connects,
+            vec![("127.0.0.1".to_string(), 16_380, true)]
+        );
+    }
+
+    #[test]
+    fn cluster_handshake_expiry_respects_a_larger_configured_timeout() {
+        let mut backend = ServerWorkerState::new(1).unwrap();
+        let mut state = ClusterState::new("127.0.0.1", 6379, 16_379);
+        let handshake_id = state.ensure_handshake_node("127.0.0.1", 6380, 16_380, 1_000);
+
+        for age_ms in [1_001, 4_999, 5_000] {
+            backend.expire_cluster_handshakes(&mut state, 1_000 + age_ms, 5_000);
+            assert!(state.nodes.contains_key(&handshake_id));
+            assert!(state.pending_connects.is_empty());
+        }
+        backend.expire_cluster_handshakes(&mut state, 6_001, 5_000);
+
+        assert!(!state.nodes.contains_key(&handshake_id));
+        assert_eq!(
+            state.pending_connects,
+            vec![("127.0.0.1".to_string(), 16_380, true)]
+        );
+    }
+
+    #[test]
     fn cluster_cron_forgets_the_handshake_connection_created_by_meet() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let meet_addr = listener.local_addr().unwrap();
@@ -1857,6 +2007,24 @@ mod tests {
         backend.ctx.dbs_mut().set_pause_skip_expire_all(true);
 
         assert!(!backend.ctx.db_mut(0).unwrap().exists(b"expired"));
+        assert!(backend
+            .ctx
+            .db(0)
+            .unwrap()
+            .get_allow_expired(b"expired")
+            .is_some());
+    }
+
+    #[test]
+    fn strict_aof_fault_prevents_active_expiration() {
+        let mut backend = ServerWorkerState::new(1).unwrap();
+        backend.ctx.config_mut().replication.repl_after_aof_fsync = true;
+        backend.ctx.db_mut(0).unwrap().set(
+            b"expired".to_vec(),
+            crate::foundation::io::store::Robj::string("value"),
+        );
+        backend.ctx.db_mut(0).unwrap().set_expire(b"expired", 1);
+        backend.run_expire_cycle();
         assert!(backend
             .ctx
             .db(0)

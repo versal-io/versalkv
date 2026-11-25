@@ -51,6 +51,7 @@ pub struct RdbState {
 }
 
 pub struct AofRewriteState {
+    pub baseline_epoch: u64,
     pub buffer: Vec<u8>,
     pub force_select: bool,
     pub last_duration_sec: i64,
@@ -60,7 +61,16 @@ pub struct AofRewriteState {
     pub limit_logged: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AofBaseline {
+    #[default]
+    Unavailable,
+    Ready,
+}
+
 pub struct AofState {
+    pub baseline_epoch: u64,
+    pub replication_baseline: AofBaseline,
     pub journal: Option<AofJournal>,
     pub started_this_session: bool,
     pub current_size: u64,
@@ -76,6 +86,11 @@ pub struct AofState {
 }
 
 impl AofState {
+    pub fn invalidate_replication_baseline(&mut self) {
+        self.baseline_epoch = self.baseline_epoch.saturating_add(1);
+        self.replication_baseline = AofBaseline::Unavailable;
+    }
+
     pub fn buffer_allocation_bytes(&self) -> usize {
         self.journal
             .as_ref()
@@ -117,6 +132,8 @@ impl PersistenceState {
                 current_fork_perc: 0.0,
             },
             aof: AofState {
+                baseline_epoch: 0,
+                replication_baseline: AofBaseline::Unavailable,
                 journal: None,
                 started_this_session: false,
                 current_size: 0,
@@ -127,6 +144,7 @@ impl PersistenceState {
                 delayed_fsync: 0,
                 last_timestamp_annotation_sec: -1,
                 rewrite: AofRewriteState {
+                    baseline_epoch: 0,
                     buffer: Vec::new(),
                     force_select: false,
                     last_duration_sec: -1,
@@ -430,6 +448,7 @@ impl PersistenceState {
             return Err(StateError::ChildAlreadyRunning);
         }
         self.child = Some(PersistenceChild::AofRewrite { pid, started_ms });
+        self.aof.rewrite.baseline_epoch = self.aof.baseline_epoch;
         self.aof_rewrite_scheduled = false;
         self.reset_aof_selected_db();
         self.aof.rewrite.buffer.clear();

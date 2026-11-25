@@ -113,6 +113,7 @@ fn apply_config_set_one_with_exec(
         return Ok(());
     }
     let old_dual_channel = ctx.config().replication.dual_channel_replication;
+    let old_fsync = ctx.config().persistence.aof_fsync;
     if param == "loglevel" {
         let level = match val_trimmed.to_lowercase().as_str() {
             "debug" => log::LevelFilter::Debug,
@@ -129,6 +130,15 @@ fn apply_config_set_one_with_exec(
     }
     if let Some(result) = config_registry().try_set(ctx.config_mut(), param, val_trimmed) {
         result?;
+        if param == "appendfsync" {
+            let mode = ctx.config().persistence.aof_fsync;
+            if let Some(journal) = ctx.aof_mut().journal.as_mut() {
+                if let Err(error) = journal.appender.set_fsync_mode(mode) {
+                    ctx.config_mut().persistence.aof_fsync = old_fsync;
+                    return Err(format!("ERR AOF fsync mode switch failed: {error}"));
+                }
+            }
+        }
         if matches!(
             param,
             "maxmemory-policy" | "lfu-log-factor" | "lfu-decay-time"
@@ -322,8 +332,67 @@ pub fn config_set(
         check += 1 + value_arg_count;
     }
 
-    // Snapshot all server config fields for cross-param rollback on apply failure.
-    let server_snapshot = ctx.config().server.clone();
+    let mut proposed = ctx.config().clone();
+    let mut check = 1;
+    while check < args.args.len() {
+        let param = String::from_utf8_lossy(&args.args[check]).to_ascii_lowercase();
+        let value = String::from_utf8_lossy(&args.args[check + 1]);
+        let result = match param.as_str() {
+            "appendonly" => super::parse_bool_strict(&value).map(|enabled| {
+                proposed.persistence.aof_enabled = enabled;
+            }),
+            "repl-after-aof-fsync" | "appendfsync" | "no-appendfsync-on-rewrite" => {
+                config_registry().try_set(&mut proposed, &param, &value)
+                    .expect("durability settings are registered")
+            }
+            _ => Ok(()),
+        };
+        if let Err(error) = result {
+            return Value::error(format_config_set_error(&param, error));
+        }
+        check += 1 + config_set_value_arg_count(args, check, &param);
+    }
+    if let Err(error) = proposed.validate_replication_durability() {
+        return Value::error(error);
+    }
+    let mode_changed = proposed.replication.repl_after_aof_fsync
+        != ctx.config().replication.repl_after_aof_fsync;
+    let should_defer_durability = mode_changed || ctx.config().replication.repl_after_aof_fsync;
+    let durability_policy_changed = mode_changed
+        || proposed.persistence.aof_enabled != ctx.config().persistence.aof_enabled
+        || proposed.persistence.aof_fsync != ctx.config().persistence.aof_fsync
+        || proposed.persistence.aof_no_fsync_on_rewrite
+            != ctx.config().persistence.aof_no_fsync_on_rewrite;
+    let strict_policy_changed = durability_policy_changed && should_defer_durability;
+    if durability_policy_changed
+        && seen.iter().any(|parameter| {
+            !matches!(parameter.as_str(), "repl-after-aof-fsync" | "appendonly" | "appendfsync" | "no-appendfsync-on-rewrite")
+        })
+    {
+        return Value::error(
+            "ERR AOF replication durability changes must be separate from unrelated configuration",
+        );
+    }
+    if strict_policy_changed
+        && (conn.in_transaction() || ctx.replication().has_active_upstream_transaction())
+    {
+        return Value::error("ERR AOF replication durability cannot change during a transaction");
+    }
+    if strict_policy_changed {
+        if proposed.replication.repl_after_aof_fsync
+            && (ctx.is_loading()
+                || ctx.replication().async_loading
+                || ctx.persistence().aof_rewrite_scheduled()
+                || ctx.persistence().aof_rewrite_child_pid().is_some())
+        {
+            return Value::error("ERR local AOF baseline is not ready");
+        }
+        if let Err(error) = ctx.sync_replication_aof() {
+            return Value::error(error);
+        }
+    }
+
+    // Snapshot all configuration sections for rollback on apply failure.
     let runtime_config_snapshot = ctx.config().clone();
     // Snapshot raw OS-level oom_score_adj before any apply; best-effort (ignore failure on non-Linux).
     let oom_snapshot: Option<i32> = read_oom_score_adj();
@@ -348,7 +417,12 @@ pub fn config_set(
                 });
             joined_value.as_slice()
         };
-        let result = if param == "port" {
+        let result = if param == "repl-after-aof-fsync"
+            || (should_defer_durability
+                && matches!(param.as_str(), "appendonly" | "appendfsync" | "no-appendfsync-on-rewrite"))
+        {
+            Ok(())
+        } else if param == "port" {
             let value = String::from_utf8_lossy(value);
             match value.parse::<u16>() {
                 Ok(port) => {
@@ -361,8 +435,8 @@ pub fn config_set(
             config_set_one(conn, ctx, &param, value)
         };
         if let Err(e) = result {
-            // Rollback: restore server fields from snapshot taken before first mutation.
-            ctx.config_mut().server = server_snapshot.clone();
+            // Restore every configuration section before rebuilding eviction metadata.
+            *ctx.config_mut() = runtime_config_snapshot.clone();
             ctx.sync_eviction_policy();
             // Restore OS-level oom_score_adj via the high-level helper so oom_score_adj_adjusted
             // flag is reset correctly.
@@ -408,11 +482,33 @@ pub fn config_set(
     let listener_changed = bind_changed || port_changed;
     if cluster_config_changed && !listener_changed {
         if let Err(error) = apply_cluster_config_snapshot(ctx) {
-            ctx.config_mut().server = server_snapshot;
+            *ctx.config_mut() = runtime_config_snapshot.clone();
             ctx.sync_eviction_policy();
             return Value::error(error);
         }
     }
+    if should_defer_durability {
+        for (parameter, value) in [
+            ("appendfsync", proposed.persistence.aof_fsync.as_str()),
+            ("no-appendfsync-on-rewrite", super::bool_to_yesno(proposed.persistence.aof_no_fsync_on_rewrite)),
+            ("appendonly", super::bool_to_yesno(proposed.persistence.aof_enabled)),
+        ] {
+            if !seen.contains(parameter) {
+                continue;
+            }
+            if let Err(error) = config_set_one(conn, ctx, parameter, value.as_bytes()) {
+                let old_mode = runtime_config_snapshot.persistence.aof_fsync;
+                if let Some(journal) = ctx.aof_mut().journal.as_mut() {
+                    let _ = journal.appender.set_fsync_mode(old_mode);
+                }
+                *ctx.config_mut() = runtime_config_snapshot.clone();
+                ctx.sync_eviction_policy();
+                return Value::error(format_config_set_error(parameter, error));
+            }
+        }
+    }
+    ctx.config_mut().replication.repl_after_aof_fsync =
+        proposed.replication.repl_after_aof_fsync;
     if io_threads_changed {
         ctx.request_io_threads_reconfigure(runtime_config_snapshot.clone(), requested_io_threads);
     }
@@ -456,6 +552,227 @@ mod tests {
     use crate::framework::commands::server::config::get::config_get;
     use crate::framework::context::ServerContext;
     use bytes::Bytes;
+
+    #[test]
+    fn nonstrict_failed_mixed_disable_preserves_the_enabled_journal() {
+        use crate::foundation::io::persistence::{AofAppender, AofFsync};
+        let path = std::env::temp_dir().join(format!("versal-config-nonstrict-{}.aof", rand::random::<u64>()));
+        let mut ctx = ServerContext::new(1);
+        let mut conn = Connection::new_fake();
+        ctx.config_mut().persistence.aof_enabled = true;
+        ctx.aof_mut().journal = Some(crate::foundation::io::persistence::journal::AofJournal::new(
+            AofAppender::open_append_path(&path, AofFsync::No).unwrap(),
+        ));
+        let args = CommandArgs::from_parts(
+            ["CONFIG", "SET", "appendonly", "no", "port", "bad"]
+                .into_iter().map(Bytes::from).collect(),
+        );
+        assert!(matches!(config_set(&mut conn, &args, &mut ctx), Value::Error(_)));
+        assert!(ctx.config().persistence.aof_enabled);
+        assert!(ctx.aof().journal.is_some());
+        drop(ctx);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn nonstrict_transaction_can_enable_aof_without_a_sync_guard() {
+        let mut ctx = ServerContext::new(1);
+        let mut conn = Connection::new_fake();
+        assert!(conn.transaction.begin(0, 0));
+        let args = CommandArgs::from_parts(
+            ["CONFIG", "SET", "appendonly", "yes"]
+                .into_iter().map(Bytes::from).collect(),
+        );
+        assert_eq!(config_set(&mut conn, &args, &mut ctx), Value::ok());
+        assert!(ctx.config().persistence.aof_enabled);
+        assert!(ctx.persistence().aof_rewrite_scheduled());
+    }
+
+    #[test]
+    fn healthy_durability_batch_can_disable_both_replication_gate_and_aof() {
+        use crate::foundation::io::persistence::{AofAppender, AofFsync};
+        let path = std::env::temp_dir().join(format!("versal-config-disable-{}.aof", rand::random::<u64>()));
+        let mut ctx = ServerContext::new(1);
+        let mut conn = Connection::new_fake();
+        ctx.config_mut().persistence.aof_enabled = true;
+        ctx.config_mut().replication.repl_after_aof_fsync = true;
+        ctx.aof_mut().replication_baseline = crate::engine::persistence::AofBaseline::Ready;
+        ctx.aof_mut().journal = Some(
+            crate::foundation::io::persistence::journal::AofJournal::new(
+                AofAppender::open_append_path(&path, AofFsync::EverySec).unwrap(),
+            ),
+        );
+        let args = CommandArgs::from_parts(
+            ["CONFIG", "SET", "appendonly", "no", "repl-after-aof-fsync", "no"]
+                .into_iter().map(Bytes::from).collect(),
+        );
+        assert_eq!(config_set(&mut conn, &args, &mut ctx), Value::ok());
+        assert!(!ctx.config().persistence.aof_enabled);
+        assert!(!ctx.config().replication.repl_after_aof_fsync);
+        assert!(ctx.aof().journal.is_none());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn unchanged_durability_policy_allows_an_ordinary_mixed_batch_without_sync() {
+        use crate::foundation::io::persistence::{AofAppender, AofFsync};
+        let mut ctx = ServerContext::new(1);
+        let mut conn = Connection::new_fake();
+        ctx.config_mut().persistence.aof_enabled = true;
+        ctx.config_mut().persistence.aof_fsync = AofFsync::Always;
+        ctx.config_mut().replication.repl_after_aof_fsync = true;
+        ctx.aof_mut().journal = Some(
+            crate::foundation::io::persistence::journal::AofJournal::new(
+                AofAppender::open_append_path(std::path::Path::new("/dev/null"), AofFsync::Always).unwrap(),
+            ),
+        );
+        let args = CommandArgs::from_parts(
+            ["CONFIG", "SET", "appendfsync", "always", "maxmemory-samples", "9"]
+                .into_iter().map(Bytes::from).collect(),
+        );
+        assert_eq!(config_set(&mut conn, &args, &mut ctx), Value::ok());
+        assert_eq!(ctx.config().server.maxmemory_samples, 9);
+    }
+
+    #[test]
+    fn durability_policy_change_rejects_mixed_unrelated_parameters() {
+        use crate::foundation::io::persistence::{AofAppender, AofFsync};
+        let path = std::env::temp_dir().join(format!("versal-config-mixed-{}.aof", rand::random::<u64>()));
+        let mut ctx = ServerContext::new(1);
+        let mut conn = Connection::new_fake();
+        ctx.config_mut().persistence.aof_enabled = true;
+        ctx.aof_mut().replication_baseline = crate::engine::persistence::AofBaseline::Ready;
+        ctx.aof_mut().journal = Some(
+            crate::foundation::io::persistence::journal::AofJournal::new(
+                AofAppender::open_append_path(&path, AofFsync::EverySec).unwrap(),
+            ),
+        );
+        for parameter in ["maxmemory", "save", "dir", "hz"] {
+            let value = match parameter { "maxmemory" => "100000", "save" => "10 1", "dir" => "/tmp", _ => "20" };
+            let args = CommandArgs::from_parts(
+                ["CONFIG", "SET", parameter, value, "repl-after-aof-fsync", "yes"]
+                    .into_iter().map(Bytes::from).collect(),
+            );
+            assert!(matches!(config_set(&mut conn, &args, &mut ctx), Value::Error(_)), "{parameter}");
+            assert!(!ctx.config().replication.repl_after_aof_fsync);
+        }
+        drop(ctx);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn strict_fsync_policy_change_requires_ready_baseline_and_no_transaction() {
+        use crate::foundation::io::persistence::AofFsync;
+        let mut ctx = ServerContext::new(1);
+        let mut conn = Connection::new_fake();
+        ctx.config_mut().persistence.aof_enabled = true;
+        ctx.config_mut().persistence.aof_fsync = AofFsync::Always;
+        ctx.config_mut().replication.repl_after_aof_fsync = true;
+        let args = CommandArgs::from_parts(
+            ["CONFIG", "SET", "appendfsync", "everysec"].into_iter().map(Bytes::from).collect(),
+        );
+        assert!(matches!(config_set(&mut conn, &args, &mut ctx), Value::Error(_)));
+        assert_eq!(ctx.config().persistence.aof_fsync, AofFsync::Always);
+        assert!(conn.transaction.begin(0, 0));
+        ctx.aof_mut().replication_baseline = crate::engine::persistence::AofBaseline::Ready;
+        assert!(matches!(config_set(&mut conn, &args, &mut ctx), Value::Error(_)));
+        assert_eq!(ctx.config().persistence.aof_fsync, AofFsync::Always);
+    }
+
+    #[test]
+    fn failed_ordinary_config_batch_restores_all_config_sections() {
+        use crate::foundation::io::persistence::{AofAppender, AofFsync};
+        let mut ctx = ServerContext::new(1);
+        let mut conn = Connection::new_fake();
+        ctx.config_mut().persistence.aof_enabled = true;
+        ctx.config_mut().persistence.aof_fsync = AofFsync::No;
+        ctx.aof_mut().journal = Some(
+            crate::foundation::io::persistence::journal::AofJournal::new(
+                AofAppender::open_append_path(std::path::Path::new("/dev/null"), AofFsync::No).unwrap(),
+            ),
+        );
+        let old_save = format!("{:?}", ctx.config().persistence.saveparams);
+        let args = CommandArgs::from_parts(
+            ["CONFIG", "SET", "save", "10 1", "maxmemory-policy", "allkeys-lfu", "appendfsync", "always"]
+                .into_iter().map(Bytes::from).collect(),
+        );
+        assert!(matches!(config_set(&mut conn, &args, &mut ctx), Value::Error(_)));
+        assert_eq!(format!("{:?}", ctx.config().persistence.saveparams), old_save);
+        assert_eq!(ctx.config().server.maxmemory_policy, "noeviction");
+    }
+
+    #[test]
+    fn incompatible_durability_config_batch_is_rejected_before_mutation() {
+        let mut ctx = ServerContext::new(1);
+        let mut conn = Connection::new_fake();
+        ctx.config_mut().persistence.aof_enabled = true;
+        ctx.config_mut().replication.repl_after_aof_fsync = true;
+        for (parameter, value) in [
+            ("appendonly", "no"),
+            ("appendfsync", "no"),
+            ("no-appendfsync-on-rewrite", "yes"),
+        ] {
+            let args = CommandArgs::from_parts(
+                ["CONFIG", "SET", "maxmemory-samples", "9", parameter, value]
+                    .into_iter()
+                    .map(Bytes::from)
+                    .collect(),
+            );
+            assert!(matches!(config_set(&mut conn, &args, &mut ctx), Value::Error(_)));
+            assert_eq!(ctx.config().server.maxmemory_samples, 5);
+            assert!(ctx.config().persistence.aof_enabled);
+            assert!(ctx.config().replication.repl_after_aof_fsync);
+        }
+    }
+
+    #[test]
+    fn failed_config_batch_preserves_strict_mode_and_its_aof_resources() {
+        use crate::foundation::io::persistence::{AofAppender, AofFsync};
+        let path = std::env::temp_dir().join(format!(
+            "versal-config-durability-{}-{}.aof",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+        ));
+        let mut ctx = ServerContext::new(1);
+        let mut conn = Connection::new_fake();
+        ctx.config_mut().persistence.aof_enabled = true;
+        ctx.config_mut().persistence.aof_fsync = AofFsync::Always;
+        ctx.config_mut().replication.repl_after_aof_fsync = true;
+        ctx.aof_mut().replication_baseline = crate::engine::persistence::AofBaseline::Ready;
+        ctx.aof_mut().journal = Some(
+            crate::foundation::io::persistence::journal::AofJournal::new(
+                AofAppender::open_append_path(&path, AofFsync::Always).unwrap(),
+            ),
+        );
+        for parameter in ["appendfsync", "appendonly"] {
+            let args = CommandArgs::from_parts(
+                ["CONFIG", "SET", "repl-after-aof-fsync", "no", parameter, "no", "port", "bad"]
+                    .into_iter().map(Bytes::from).collect(),
+            );
+            assert!(matches!(config_set(&mut conn, &args, &mut ctx), Value::Error(_)));
+            assert!(ctx.config().replication.repl_after_aof_fsync);
+            assert!(ctx.config().persistence.aof_enabled);
+            assert_eq!(ctx.config().persistence.aof_fsync, AofFsync::Always);
+            assert_eq!(ctx.aof().journal.as_ref().unwrap().appender.fsync_mode(), AofFsync::Always);
+        }
+        drop(ctx);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn enabling_durable_replication_requires_a_complete_local_baseline() {
+        let mut ctx = ServerContext::new(1);
+        let mut conn = Connection::new_fake();
+        ctx.config_mut().persistence.aof_enabled = true;
+        let args = CommandArgs::from_parts(
+            ["CONFIG", "SET", "repl-after-aof-fsync", "yes"]
+                .into_iter()
+                .map(Bytes::from)
+                .collect(),
+        );
+        assert!(matches!(config_set(&mut conn, &args, &mut ctx), Value::Error(_)));
+        assert!(!ctx.config().replication.repl_after_aof_fsync);
+    }
 
     #[test]
     fn protected_config_gate_honors_no_yes_and_local_modes() {

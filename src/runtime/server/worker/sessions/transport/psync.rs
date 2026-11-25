@@ -721,6 +721,12 @@ impl ServerWorkerState {
             self.defer_full_resync(request, options);
             return FullSyncProgress::Started;
         }
+        if let Err(error) = self.ctx.ensure_replication_snapshot_durable() {
+            replies.push(
+                crate::foundation::io::protocol::serializer::serialize_to_vec(&Value::error(error)),
+            );
+            return FullSyncProgress::Started;
+        }
 
         let function_codes = self.full_sync_function_codes(options.filter_mode);
         let batch_boundary = self.try_join_disk_sync_batch(request, options, &function_codes);

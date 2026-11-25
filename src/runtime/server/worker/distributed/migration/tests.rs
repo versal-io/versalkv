@@ -1407,6 +1407,76 @@ fn failed_import_propagates_terminal_state_to_replicas() {
 }
 
 #[test]
+fn slot_import_direct_frames_wait_for_their_own_aof_stamp() {
+    use crate::foundation::io::persistence::{AofAppender, AofFsync};
+    let mut runtime = ServerWorkerState::new_with_slot_router(1, 14, |key| {
+        crate::engine::distributed::cluster::node::key_hash_slot(key) as usize
+    })
+    .unwrap();
+    crate::framework::commands::register_all(&mut runtime.registry);
+    let id = MigrationJobId::parse(b"ffffffffffffffffffffffffffffffffffffffff").unwrap();
+    let key = b"{atomic}key";
+    let slot = crate::engine::distributed::cluster::node::key_hash_slot(key);
+    let ranges = SlotRanges::new(vec![SlotRange::new(slot, slot).unwrap()]).unwrap();
+    let mut state = ClusterState::new("127.0.0.1", 6380, 16_380);
+    state
+        .migrations
+        .start(MigrationJob::new(
+            id.clone(),
+            NodeId::parse(b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap(),
+            NodeId::parse(state.myself.name.as_bytes()).unwrap(),
+            ranges.clone(),
+            MigrationOperation::Import,
+            1,
+        ))
+        .unwrap();
+    *runtime.ctx.cluster_state_mut() = Some(Box::new(state));
+    runtime.ctx.create_slot_import(id.clone(), &ranges);
+    let mut connection = Connection::new_fake();
+    connection.set_token_for_test(Token(93));
+    connection.slot_migration_role = Some(SlotMigrationConnectionRole::Import(id.clone()));
+    let token = runtime.connection_registry.insert(connection);
+    let path =
+        std::env::temp_dir().join(format!("versal-import-stamp-{}.aof", rand::random::<u64>()));
+    let mut appender = AofAppender::open_append_path(&path, AofFsync::No).unwrap();
+    appender.force_fsync().unwrap();
+    runtime.ctx.aof_mut().journal =
+        Some(crate::foundation::io::persistence::journal::AofJournal::new(appender));
+    runtime.ctx.aof_mut().replication_baseline = crate::engine::persistence::AofBaseline::Ready;
+    runtime.ctx.config_mut().persistence.aof_enabled = true;
+    runtime.ctx.config_mut().persistence.aof_fsync = AofFsync::No;
+    runtime.ctx.config_mut().replication.repl_after_aof_fsync = true;
+    runtime.ctx.replication_mut().backlog.activate();
+    let args = crate::engine::command::CommandArgs::from_parts(vec![
+        bytes::Bytes::from_static(b"SET"),
+        bytes::Bytes::copy_from_slice(key),
+        bytes::Bytes::from_static(b"value"),
+    ]);
+    assert!(runtime.apply_slot_import_command(token, args));
+    assert!(runtime.ctx.replication().backlog.unreleased_bytes() > 0);
+    runtime.flush_aof_if_needed();
+    runtime
+        .ctx
+        .aof_mut()
+        .journal
+        .as_mut()
+        .unwrap()
+        .appender
+        .force_fsync()
+        .unwrap();
+    runtime.release_synced_replication();
+    assert_eq!(runtime.ctx.replication().backlog.unreleased_bytes(), 0);
+    runtime.fail_slot_migration(&id, "test terminal");
+    runtime.drive_slot_migration_actions();
+    assert!(
+        runtime.ctx.replication().backlog.unreleased_bytes() > 0,
+        "terminal metadata needs its own AOF stamp"
+    );
+    drop(runtime);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn target_oom_fails_live_import_before_applying_write() {
     let mut runtime = ServerWorkerState::new_with_slot_router(1, 14, |key| {
         crate::engine::distributed::cluster::node::key_hash_slot(key) as usize
@@ -1465,6 +1535,869 @@ fn target_oom_fails_live_import_before_applying_write() {
     );
     assert!(job.message.as_deref().unwrap().contains("OOM"));
     assert_eq!(runtime.ctx.slot_import_key_count(0, slot as usize), 0);
+}
+
+#[test]
+fn strict_target_import_rejects_durability_faults_before_mutation() {
+    use crate::foundation::io::persistence::{AofAppender, AofFsync};
+    for has_pending_backlog in [false, true] {
+        let mut runtime = ServerWorkerState::new_with_slot_router(1, 14, |key| {
+            crate::engine::distributed::cluster::node::key_hash_slot(key) as usize
+        })
+        .unwrap();
+        crate::framework::commands::register_all(&mut runtime.registry);
+        let id = MigrationJobId::parse(b"ffffffffffffffffffffffffffffffffffffffff").unwrap();
+        let key = b"{atomic}fault";
+        let slot = crate::engine::distributed::cluster::node::key_hash_slot(key);
+        let ranges = SlotRanges::new(vec![SlotRange::new(slot, slot).unwrap()]).unwrap();
+        let mut state = ClusterState::new("127.0.0.1", 6380, 16_380);
+        state
+            .migrations
+            .start(MigrationJob::new(
+                id.clone(),
+                NodeId::parse(b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap(),
+                NodeId::parse(state.myself.name.as_bytes()).unwrap(),
+                ranges.clone(),
+                MigrationOperation::Import,
+                1,
+            ))
+            .unwrap();
+        *runtime.ctx.cluster_state_mut() = Some(Box::new(state));
+        runtime.ctx.create_slot_import(id.clone(), &ranges);
+        runtime.ctx.db_mut(0).unwrap().set(
+            key.to_vec(),
+            crate::foundation::io::store::Robj::string("live-before"),
+        );
+        let mut connection = Connection::new_fake();
+        connection.set_token_for_test(Token(93));
+        connection.slot_migration_role = Some(SlotMigrationConnectionRole::Import(id));
+        let token = runtime.connection_registry.insert(connection);
+        let path =
+            std::env::temp_dir().join(format!("versal-import-fault-{}.aof", rand::random::<u64>()));
+        runtime.ctx.aof_mut().journal = Some(
+            crate::foundation::io::persistence::journal::AofJournal::new(
+                AofAppender::open_append_path(&path, AofFsync::No).unwrap(),
+            ),
+        );
+        runtime.ctx.config_mut().persistence.aof_enabled = true;
+        runtime.ctx.config_mut().replication.repl_after_aof_fsync = true;
+        if has_pending_backlog {
+            runtime.ctx.aof_mut().replication_baseline =
+                crate::engine::persistence::AofBaseline::Ready;
+            runtime
+                .ctx
+                .config_mut()
+                .replication
+                .replica_output_buffer_hard_limit = 1;
+            runtime.ctx.config_mut().server.repl_backlog_size = 1;
+            runtime.ctx.replication_mut().backlog.activate();
+            let frame =
+                crate::engine::distributed::replication::protocol::encode_command(&[b"PING"]);
+            runtime.feed_aof(&frame);
+            runtime.propagate_to_replicas(&frame);
+        }
+        let args = crate::engine::command::CommandArgs::from_parts(
+            [b"SET".as_slice(), key, b"value"]
+                .into_iter()
+                .map(bytes::Bytes::copy_from_slice)
+                .collect(),
+        );
+        assert!(runtime.apply_slot_import_command(token, args));
+        assert_eq!(
+            runtime.connection_registry[Token(token)].state,
+            ConnectionState::Closing
+        );
+        assert_eq!(runtime.ctx.slot_import_key_count(0, slot as usize), 0);
+        assert_eq!(
+            runtime
+                .ctx
+                .db(0)
+                .unwrap()
+                .get_no_expire(key)
+                .unwrap()
+                .as_bytes(),
+            b"live-before"
+        );
+        drop(runtime);
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
+fn terminal_migration_fixture(
+    operation: MigrationOperation,
+    slots: &[u16],
+) -> (ServerWorkerState, MigrationJobId, std::path::PathBuf) {
+    use crate::foundation::io::persistence::{AofAppender, AofFsync};
+    let mut runtime = ServerWorkerState::new_with_slot_router(1, 14, |key| {
+        crate::engine::distributed::cluster::node::key_hash_slot(key) as usize
+    })
+    .unwrap();
+    crate::framework::commands::register_all(&mut runtime.registry);
+    let mut state = ClusterState::new("127.0.0.1", 6380, 16_380);
+    let local = NodeId::parse(state.myself.name.as_bytes()).unwrap();
+    let remote = NodeId::parse(b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+    let node = ClusterNode::new(
+        remote.as_str().to_string(),
+        "127.0.0.1".into(),
+        6379,
+        16379,
+        true,
+    );
+    state.nodes.insert(node.name.clone(), node);
+    let id = MigrationJobId::parse(b"ffffffffffffffffffffffffffffffffffffffff").unwrap();
+    let ranges = SlotRanges::new(
+        slots
+            .iter()
+            .map(|slot| SlotRange::new(*slot, *slot).unwrap())
+            .collect(),
+    )
+    .unwrap();
+    let (source, target, phase) = match operation {
+        MigrationOperation::Import => (
+            remote.clone(),
+            local,
+            MigrationPhase::Import(
+                crate::engine::distributed::cluster::migration::ImportPhase::FailoverGranted,
+            ),
+        ),
+        MigrationOperation::Export => (
+            local,
+            remote.clone(),
+            MigrationPhase::Export(ExportPhase::FailoverGranted),
+        ),
+    };
+    let mut job = MigrationJob::new(
+        id.clone(),
+        source,
+        target,
+        ranges.clone(),
+        operation,
+        crate::foundation::io::sys::time::unixtime(),
+    );
+    job.phase = phase;
+    state.migrations.start(job).unwrap();
+    for slot in slots {
+        state
+            .set_slot_node(*slot as usize, remote.as_str())
+            .unwrap();
+    }
+    state.finalize_slot_changes();
+    *runtime.ctx.cluster_state_mut() = Some(Box::new(state));
+    if operation == MigrationOperation::Import {
+        runtime.ctx.create_slot_import(id.clone(), &ranges);
+        let mut connection = Connection::new_fake();
+        connection.set_token_for_test(Token(93));
+        connection.slot_migration_role = Some(SlotMigrationConnectionRole::Import(id.clone()));
+        runtime.connection_registry.insert(connection);
+    } else {
+        runtime.ctx.client_pause_mut().action = crate::framework::context::PauseAction::Write;
+        runtime.ctx.client_pause_mut().reason = "slot_migration_in_progress";
+        runtime.ctx.client_pause_mut().end_time_ms =
+            crate::foundation::io::sys::time::mstime() + 60_000;
+    }
+    let path = std::env::temp_dir().join(format!("versal-terminal-{}.aof", rand::random::<u64>()));
+    runtime.ctx.aof_mut().journal = Some(
+        crate::foundation::io::persistence::journal::AofJournal::new(
+            AofAppender::open_append_path(&path, AofFsync::No).unwrap(),
+        ),
+    );
+    runtime.ctx.aof_mut().replication_baseline = crate::engine::persistence::AofBaseline::Ready;
+    runtime.ctx.config_mut().persistence.aof_enabled = true;
+    runtime.ctx.config_mut().persistence.aof_fsync = AofFsync::No;
+    runtime.ctx.config_mut().replication.repl_after_aof_fsync = true;
+    runtime.ctx.replication_mut().backlog.activate();
+    (runtime, id, path)
+}
+
+fn terminal_migration_fault(runtime: &mut ServerWorkerState, fault: &str) {
+    match fault {
+        "unavailable" => {
+            runtime.ctx.aof_mut().replication_baseline =
+                crate::engine::persistence::AofBaseline::Unavailable
+        }
+        "write-error" => {
+            runtime.ctx.aof_mut().last_write_status =
+                crate::engine::persistence::OperationStatus::Err;
+            // A write-only flush during another job's cleanup must not clear
+            // this sync failure before the explicit recovery step.
+            let progress = runtime
+                .ctx
+                .aof()
+                .journal
+                .as_ref()
+                .unwrap()
+                .appender
+                .sync_handle();
+            progress.complete_for_test(
+                progress.written_stamp_for_test(),
+                Err(std::io::Error::other("injected terminal sync failure")),
+            );
+        }
+        "pending" => {
+            runtime
+                .ctx
+                .config_mut()
+                .replication
+                .replica_output_buffer_hard_limit = 1;
+            runtime.ctx.config_mut().server.repl_backlog_size = 1;
+            let frame =
+                crate::engine::distributed::replication::protocol::encode_command(&[b"PING"]);
+            runtime.feed_aof(&frame);
+            runtime.propagate_to_replicas(&frame);
+        }
+        _ => panic!("unknown durability fault"),
+    }
+    assert!(runtime.ctx.replication_aof_write_error().is_some());
+}
+
+fn recover_terminal_migration(runtime: &mut ServerWorkerState) {
+    runtime.ctx.aof_mut().replication_baseline = crate::engine::persistence::AofBaseline::Ready;
+    runtime.ctx.aof_mut().last_write_status = crate::engine::persistence::OperationStatus::Ok;
+    runtime
+        .ctx
+        .aof_mut()
+        .journal
+        .as_mut()
+        .unwrap()
+        .appender
+        .force_fsync()
+        .unwrap();
+    runtime.release_synced_replication();
+    assert!(runtime.ctx.replication_aof_write_error().is_none());
+}
+
+#[test]
+fn strict_terminal_import_durability_wait_does_not_hide_another_slots_timeout() {
+    for fault in ["unavailable", "write-error", "pending"] {
+        let keys = [
+            b"{terminal}import".as_slice(),
+            b"{stalled}import".as_slice(),
+        ];
+        let slots = keys.map(crate::engine::distributed::cluster::node::key_hash_slot);
+        assert_ne!(slots[0], slots[1]);
+        let (mut runtime, id, path) =
+            terminal_migration_fixture(MigrationOperation::Import, &slots[..1]);
+        runtime.ctx.config_mut().replication.repl_timeout = 2;
+        let stalled_id =
+            MigrationJobId::parse(b"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee").unwrap();
+        let stalled_ranges =
+            SlotRanges::new(vec![SlotRange::new(slots[1], slots[1]).unwrap()]).unwrap();
+        let state = runtime.ctx.cluster_state_mut().as_deref_mut().unwrap();
+        let first = state.migrations.get(&id).unwrap();
+        let source = first.source.clone();
+        state
+            .migrations
+            .start(MigrationJob::new(
+                stalled_id.clone(),
+                source.clone(),
+                first.target.clone(),
+                stalled_ranges.clone(),
+                MigrationOperation::Import,
+                crate::foundation::io::sys::time::unixtime(),
+            ))
+            .unwrap();
+        state
+            .set_slot_node(slots[1] as usize, source.as_str())
+            .unwrap();
+        state.finalize_slot_changes();
+        runtime
+            .ctx
+            .create_slot_import(stalled_id.clone(), &stalled_ranges);
+        for (job_id, key) in [(&id, keys[0]), (&stalled_id, keys[1])] {
+            runtime
+                .ctx
+                .apply_slot_import(
+                    job_id,
+                    crate::engine::command::CommandArgs::from_parts(
+                        [b"SET".as_slice(), key, b"staged"]
+                            .into_iter()
+                            .map(bytes::Bytes::copy_from_slice)
+                            .collect(),
+                    ),
+                    &runtime.registry,
+                )
+                .unwrap();
+        }
+        let mut connection = Connection::new_fake();
+        connection.set_token_for_test(Token(94));
+        connection.last_interaction = std::time::Instant::now() - std::time::Duration::from_secs(3);
+        connection.slot_migration_role =
+            Some(SlotMigrationConnectionRole::Import(stalled_id.clone()));
+        let stalled_token = runtime.connection_registry.insert(connection);
+        let ranges = runtime
+            .ctx
+            .cluster_state()
+            .as_deref()
+            .unwrap()
+            .migrations
+            .get(&id)
+            .unwrap()
+            .ranges
+            .clone();
+        let staged = runtime.ctx.slot_import_snapshot(&id, &ranges).unwrap();
+        terminal_migration_fault(&mut runtime, fault);
+
+        for _ in 0..2 {
+            runtime.drive_slot_migration_progress();
+            let state = runtime.ctx.cluster_state().as_deref().unwrap();
+            assert_eq!(
+                state.migrations.get(&id).unwrap().phase,
+                MigrationPhase::Import(
+                    crate::engine::distributed::cluster::migration::ImportPhase::FailoverGranted
+                )
+            );
+            assert_eq!(
+                state.declared_node_by_slot(slots[0] as usize).unwrap().name,
+                source.as_str()
+            );
+            assert_eq!(runtime.ctx.slot_import_key_count(0, slots[0] as usize), 1);
+            assert_eq!(
+                runtime.ctx.slot_import_snapshot(&id, &ranges).unwrap(),
+                staged
+            );
+            assert_eq!(
+                state.migrations.get(&stalled_id).unwrap().phase,
+                MigrationPhase::Terminal(
+                    crate::engine::distributed::cluster::migration::TerminalPhase::Failed
+                )
+            );
+            assert_eq!(
+                state
+                    .migrations
+                    .get(&stalled_id)
+                    .unwrap()
+                    .message
+                    .as_deref(),
+                Some("Timed out after too long with no interaction")
+            );
+            assert_eq!(runtime.ctx.slot_import_key_count(0, slots[1] as usize), 0);
+            assert_eq!(
+                runtime.connection_registry[Token(stalled_token)].state,
+                ConnectionState::Closing
+            );
+            assert!(keys
+                .iter()
+                .all(|key| runtime.ctx.db(0).unwrap().get_no_expire(key).is_none()));
+        }
+        for (_, connection) in runtime.connection_registry.iter_mut() {
+            connection.last_interaction =
+                std::time::Instant::now() - std::time::Duration::from_secs(3);
+        }
+        recover_terminal_migration(&mut runtime);
+        runtime.drive_slot_migration_progress();
+        let state = runtime.ctx.cluster_state().as_deref().unwrap();
+        assert_eq!(
+            state.migrations.get(&id).unwrap().phase,
+            MigrationPhase::Terminal(
+                crate::engine::distributed::cluster::migration::TerminalPhase::Success
+            )
+        );
+        assert_eq!(
+            state.declared_node_by_slot(slots[0] as usize).unwrap().name,
+            state.myself.name
+        );
+        assert_eq!(
+            runtime
+                .ctx
+                .db(0)
+                .unwrap()
+                .get_no_expire(keys[0])
+                .unwrap()
+                .as_bytes(),
+            b"staged"
+        );
+        assert!(runtime.ctx.db(0).unwrap().get_no_expire(keys[1]).is_none());
+        drop(runtime);
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[test]
+fn strict_terminal_export_without_durability_wait_keeps_pause_timeout() {
+    let key = b"{terminal}export";
+    let slot = crate::engine::distributed::cluster::node::key_hash_slot(key);
+    let (mut runtime, id, path) = terminal_migration_fixture(MigrationOperation::Export, &[slot]);
+    runtime.ctx.db_mut(0).unwrap().set(
+        key.to_vec(),
+        crate::foundation::io::store::Robj::string("live"),
+    );
+    assert!(runtime.ctx.replication_aof_write_error().is_none());
+    assert_eq!(runtime.ctx.replication().backlog.unreleased_bytes(), 0);
+    runtime.ctx.client_pause_mut().end_time_ms = 1;
+    let dirty = runtime.ctx.persistence().dirty();
+    let offset = runtime.ctx.replication().backlog.reported_offset();
+
+    runtime.drive_slot_migration_progress();
+
+    let state = runtime.ctx.cluster_state().as_deref().unwrap();
+    let job = state.migrations.get(&id).unwrap();
+    assert_eq!(
+        job.phase,
+        MigrationPhase::Terminal(
+            crate::engine::distributed::cluster::migration::TerminalPhase::Failed
+        )
+    );
+    assert!(job
+        .message
+        .as_deref()
+        .unwrap()
+        .contains("Unpaused before migration completed"));
+    assert_eq!(
+        state.declared_node_by_slot(slot as usize).unwrap().name,
+        job.target.as_str()
+    );
+    assert_eq!(
+        runtime
+            .ctx
+            .db(0)
+            .unwrap()
+            .get_no_expire(key)
+            .unwrap()
+            .as_bytes(),
+        b"live"
+    );
+    assert_eq!(runtime.ctx.persistence().dirty(), dirty);
+    assert_eq!(runtime.ctx.replication().backlog.reported_offset(), offset);
+    drop(runtime);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn strict_terminal_import_without_durability_wait_keeps_connection_timeout() {
+    let key = b"{terminal}import";
+    let slot = crate::engine::distributed::cluster::node::key_hash_slot(key);
+    let (mut runtime, id, path) = terminal_migration_fixture(MigrationOperation::Import, &[slot]);
+    runtime.ctx.config_mut().replication.repl_timeout = 2;
+    runtime
+        .ctx
+        .apply_slot_import(
+            &id,
+            crate::engine::command::CommandArgs::from_parts(
+                [b"SET".as_slice(), key, b"staged"]
+                    .into_iter()
+                    .map(bytes::Bytes::copy_from_slice)
+                    .collect(),
+            ),
+            &runtime.registry,
+        )
+        .unwrap();
+    for (_, connection) in runtime.connection_registry.iter_mut() {
+        connection.last_interaction = std::time::Instant::now() - std::time::Duration::from_secs(3);
+    }
+    assert!(runtime.ctx.replication_aof_write_error().is_none());
+
+    runtime.drive_slot_migration_progress();
+
+    let state = runtime.ctx.cluster_state().as_deref().unwrap();
+    assert_eq!(
+        state.migrations.get(&id).unwrap().phase,
+        MigrationPhase::Terminal(
+            crate::engine::distributed::cluster::migration::TerminalPhase::Failed
+        )
+    );
+    assert_ne!(
+        state.declared_node_by_slot(slot as usize).unwrap().name,
+        state.myself.name
+    );
+    assert_eq!(runtime.ctx.slot_import_key_count(0, slot as usize), 0);
+    assert!(runtime.ctx.db(0).unwrap().get_no_expire(key).is_none());
+    drop(runtime);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn strict_terminal_durability_wait_clears_on_explicit_failure() {
+    for operation in [MigrationOperation::Import, MigrationOperation::Export] {
+        let key = b"{terminal}cancel";
+        let slot = crate::engine::distributed::cluster::node::key_hash_slot(key);
+        let (mut runtime, id, path) = terminal_migration_fixture(operation, &[slot]);
+        terminal_migration_fault(&mut runtime, "unavailable");
+        runtime.drive_slot_migration_progress();
+        assert!(runtime.slot_migration_durability_waits.contains(&id));
+
+        runtime.fail_slot_migration(&id, "Canceled while waiting for local durability");
+
+        assert!(runtime.slot_migration_durability_waits.is_empty());
+        assert_eq!(
+            runtime
+                .ctx
+                .cluster_state()
+                .as_deref()
+                .unwrap()
+                .migrations
+                .get(&id)
+                .unwrap()
+                .phase,
+            MigrationPhase::Terminal(
+                crate::engine::distributed::cluster::migration::TerminalPhase::Failed
+            )
+        );
+        drop(runtime);
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[test]
+fn strict_terminal_import_preserves_staged_data_until_durability_recovers() {
+    for fault in ["unavailable", "write-error", "pending"] {
+        let key = b"{terminal}import";
+        let slot = crate::engine::distributed::cluster::node::key_hash_slot(key);
+        let (mut runtime, id, path) =
+            terminal_migration_fixture(MigrationOperation::Import, &[slot]);
+        runtime.ctx.config_mut().replication.repl_timeout = 2;
+        runtime
+            .ctx
+            .apply_slot_import(
+                &id,
+                crate::engine::command::CommandArgs::from_parts(
+                    [b"SET".as_slice(), key, b"staged"]
+                        .into_iter()
+                        .map(bytes::Bytes::copy_from_slice)
+                        .collect(),
+                ),
+                &runtime.registry,
+            )
+            .unwrap();
+        runtime.ctx.db_mut(0).unwrap().set(
+            b"unrelated".to_vec(),
+            crate::foundation::io::store::Robj::string("live"),
+        );
+        let ranges = runtime
+            .ctx
+            .cluster_state()
+            .as_deref()
+            .unwrap()
+            .migrations
+            .get(&id)
+            .unwrap()
+            .ranges
+            .clone();
+        let staged = runtime.ctx.slot_import_snapshot(&id, &ranges).unwrap();
+        if fault == "write-error" {
+            for (_, connection) in runtime.connection_registry.iter_mut() {
+                connection.last_interaction =
+                    std::time::Instant::now() - std::time::Duration::from_secs(120);
+            }
+        }
+        terminal_migration_fault(&mut runtime, fault);
+        let offset = runtime.ctx.replication().backlog.reported_offset();
+        for _ in 0..2 {
+            runtime.drive_slot_migration_progress();
+            let state = runtime.ctx.cluster_state().as_deref().unwrap();
+            assert_eq!(
+                state.migrations.get(&id).unwrap().phase,
+                MigrationPhase::Import(
+                    crate::engine::distributed::cluster::migration::ImportPhase::FailoverGranted
+                )
+            );
+            assert_ne!(
+                state.declared_node_by_slot(slot as usize).unwrap().name,
+                state.myself.name
+            );
+            assert_eq!(runtime.ctx.slot_import_key_count(0, slot as usize), 1);
+            assert_eq!(
+                runtime.ctx.slot_import_snapshot(&id, &ranges).unwrap(),
+                staged
+            );
+            assert!(runtime.ctx.db(0).unwrap().get_no_expire(key).is_none());
+            assert_eq!(runtime.ctx.replication().backlog.reported_offset(), offset);
+            assert!(runtime.slot_migration_durability_waits.contains(&id));
+            for (_, connection) in runtime.connection_registry.iter_mut() {
+                connection.last_interaction =
+                    std::time::Instant::now() - std::time::Duration::from_secs(3);
+            }
+        }
+        recover_terminal_migration(&mut runtime);
+        runtime.drive_slot_migration_progress();
+        let state = runtime.ctx.cluster_state().as_deref().unwrap();
+        assert_eq!(
+            state.migrations.get(&id).unwrap().phase,
+            MigrationPhase::Terminal(
+                crate::engine::distributed::cluster::migration::TerminalPhase::Success
+            )
+        );
+        assert_eq!(
+            state.declared_node_by_slot(slot as usize).unwrap().name,
+            state.myself.name
+        );
+        assert!(runtime.slot_migration_durability_waits.is_empty());
+        assert_eq!(runtime.ctx.slot_import_key_count(0, slot as usize), 0);
+        assert_eq!(
+            runtime
+                .ctx
+                .db(0)
+                .unwrap()
+                .get_no_expire(key)
+                .unwrap()
+                .as_bytes(),
+            b"staged"
+        );
+        assert_eq!(
+            runtime
+                .ctx
+                .db(0)
+                .unwrap()
+                .get_no_expire(b"unrelated")
+                .unwrap()
+                .as_bytes(),
+            b"live"
+        );
+        let offset = runtime.ctx.replication().backlog.reported_offset();
+        runtime.drive_slot_migration_progress();
+        assert_eq!(runtime.ctx.replication().backlog.reported_offset(), offset);
+        drop(runtime);
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[test]
+fn strict_terminal_export_preserves_live_data_until_durability_recovers() {
+    for fault in ["unavailable", "write-error", "pending"] {
+        let key = b"{terminal}export";
+        let slot = crate::engine::distributed::cluster::node::key_hash_slot(key);
+        let (mut runtime, id, path) =
+            terminal_migration_fixture(MigrationOperation::Export, &[slot]);
+        runtime.ctx.db_mut(0).unwrap().set(
+            key.to_vec(),
+            crate::foundation::io::store::Robj::string("live"),
+        );
+        terminal_migration_fault(&mut runtime, fault);
+        if fault != "unavailable" {
+            runtime.ctx.client_pause_mut().end_time_ms = 1;
+        }
+        let offset = runtime.ctx.replication().backlog.reported_offset();
+        let dirty = runtime.ctx.persistence().dirty();
+        for _ in 0..2 {
+            runtime.drive_slot_migration_progress();
+            assert_eq!(
+                runtime
+                    .ctx
+                    .cluster_state()
+                    .as_deref()
+                    .unwrap()
+                    .migrations
+                    .get(&id)
+                    .unwrap()
+                    .phase,
+                MigrationPhase::Export(ExportPhase::FailoverGranted)
+            );
+            assert_eq!(
+                runtime
+                    .ctx
+                    .db(0)
+                    .unwrap()
+                    .get_no_expire(key)
+                    .unwrap()
+                    .as_bytes(),
+                b"live"
+            );
+            assert_eq!(runtime.ctx.replication().backlog.reported_offset(), offset);
+            assert_eq!(runtime.ctx.persistence().dirty(), dirty);
+            assert!(runtime.slot_migration_durability_waits.contains(&id));
+            runtime.ctx.client_pause_mut().end_time_ms = 1;
+        }
+        recover_terminal_migration(&mut runtime);
+        runtime.drive_slot_migration_progress();
+        // A single slot may fill the pending budget; completing cleanup must remain retryable.
+        recover_terminal_migration(&mut runtime);
+        runtime.drive_slot_migration_progress();
+        assert_eq!(
+            runtime
+                .ctx
+                .cluster_state()
+                .as_deref()
+                .unwrap()
+                .migrations
+                .get(&id)
+                .unwrap()
+                .phase,
+            MigrationPhase::Terminal(
+                crate::engine::distributed::cluster::migration::TerminalPhase::Success
+            )
+        );
+        assert!(runtime.ctx.db(0).unwrap().get_no_expire(key).is_none());
+        assert!(runtime.slot_migration_durability_waits.is_empty());
+        assert_eq!(runtime.ctx.persistence().dirty(), dirty + 1);
+        let offset = runtime.ctx.replication().backlog.reported_offset();
+        runtime.drive_slot_migration_progress();
+        assert_eq!(runtime.ctx.replication().backlog.reported_offset(), offset);
+        assert_eq!(runtime.ctx.persistence().dirty(), dirty + 1);
+        drop(runtime);
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[test]
+fn strict_terminal_export_rechecks_pending_between_slots_and_jobs() {
+    let mut keys = [b"{first}key".as_slice(), b"{second}key".as_slice()];
+    keys.sort_by_key(|key| crate::engine::distributed::cluster::node::key_hash_slot(key));
+    for separate_jobs in [false, true] {
+        let slots = keys.map(crate::engine::distributed::cluster::node::key_hash_slot);
+        let (mut runtime, id, path) = terminal_migration_fixture(
+            MigrationOperation::Export,
+            if separate_jobs { &slots[..1] } else { &slots },
+        );
+        let mut ids = vec![id.clone()];
+        if separate_jobs {
+            let state = runtime.ctx.cluster_state_mut().as_deref_mut().unwrap();
+            let first = state.migrations.get(&id).unwrap();
+            let second_id =
+                MigrationJobId::parse(b"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee").unwrap();
+            let mut job = MigrationJob::new(
+                second_id.clone(),
+                first.source.clone(),
+                first.target.clone(),
+                SlotRanges::new(vec![SlotRange::new(slots[1], slots[1]).unwrap()]).unwrap(),
+                MigrationOperation::Export,
+                crate::foundation::io::sys::time::unixtime(),
+            );
+            job.phase = MigrationPhase::Export(ExportPhase::FailoverGranted);
+            let target = job.target.clone();
+            state.migrations.start(job).unwrap();
+            state
+                .set_slot_node(slots[1] as usize, target.as_str())
+                .unwrap();
+            state.finalize_slot_changes();
+            ids.push(second_id);
+        }
+        for key in keys {
+            runtime.ctx.db_mut(0).unwrap().set(
+                key.to_vec(),
+                crate::foundation::io::store::Robj::string("live"),
+            );
+        }
+        runtime
+            .ctx
+            .config_mut()
+            .replication
+            .replica_output_buffer_hard_limit = 1;
+        runtime.ctx.config_mut().server.repl_backlog_size = 1;
+        runtime.drive_slot_migration_progress();
+        assert!(runtime.ctx.replication_aof_write_error().is_some());
+        assert_eq!(
+            keys.iter()
+                .filter(|key| runtime.ctx.db(0).unwrap().get_no_expire(key).is_some())
+                .count(),
+            1
+        );
+        assert!(ids.iter().all(|id| !runtime
+            .ctx
+            .cluster_state()
+            .as_deref()
+            .unwrap()
+            .migrations
+            .get(id)
+            .unwrap()
+            .phase
+            .is_terminal()));
+        assert!(ids
+            .iter()
+            .all(|id| runtime.slot_migration_durability_waits.contains(id)));
+        runtime.ctx.client_pause_mut().end_time_ms = 1;
+        let offset = runtime.ctx.replication().backlog.reported_offset();
+        runtime.drive_slot_migration_progress();
+        assert_eq!(runtime.ctx.replication().backlog.reported_offset(), offset);
+        recover_terminal_migration(&mut runtime);
+        runtime.drive_slot_migration_progress();
+        recover_terminal_migration(&mut runtime);
+        runtime.drive_slot_migration_progress();
+        assert!(keys
+            .iter()
+            .all(|key| runtime.ctx.db(0).unwrap().get_no_expire(key).is_none()));
+        assert!(ids.iter().all(|id| runtime
+            .ctx
+            .cluster_state()
+            .as_deref()
+            .unwrap()
+            .migrations
+            .get(id)
+            .unwrap()
+            .phase
+            == MigrationPhase::Terminal(
+                crate::engine::distributed::cluster::migration::TerminalPhase::Success
+            )));
+        assert_eq!(runtime.ctx.persistence().dirty(), 2);
+        assert!(runtime.slot_migration_durability_waits.is_empty());
+        recover_terminal_migration(&mut runtime);
+        let mut decoder = crate::foundation::io::persistence::AofDecoder::new();
+        let bytes = std::fs::read(&path).unwrap();
+        let mut deleted = Vec::new();
+        loop {
+            match decoder.step(&bytes).unwrap() {
+                crate::foundation::io::persistence::AofStep::Command(parts)
+                    if parts[0] == b"UNLINK" =>
+                {
+                    deleted.push(parts[1].clone())
+                }
+                crate::foundation::io::persistence::AofStep::Command(_) => {}
+                crate::foundation::io::persistence::AofStep::Finished(_) => break,
+                other => panic!("unexpected AOF step: {other:?}"),
+            }
+        }
+        deleted.sort();
+        let mut expected = keys.map(<[u8]>::to_vec);
+        expected.sort();
+        assert_eq!(deleted, expected);
+        let offset = runtime.ctx.replication().backlog.reported_offset();
+        runtime.drive_slot_migration_progress();
+        assert_eq!(runtime.ctx.replication().backlog.reported_offset(), offset);
+        drop(runtime);
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[test]
+fn terminal_migration_default_off_does_not_require_a_durable_aof() {
+    for operation in [MigrationOperation::Import, MigrationOperation::Export] {
+        let key = b"{terminal}default-off";
+        let slot = crate::engine::distributed::cluster::node::key_hash_slot(key);
+        let (mut runtime, id, path) = terminal_migration_fixture(operation, &[slot]);
+        // This test isolates the legacy admission policy from connection timeouts.
+        runtime.ctx.config_mut().replication.repl_timeout = 0;
+        if operation == MigrationOperation::Import {
+            runtime
+                .ctx
+                .apply_slot_import(
+                    &id,
+                    crate::engine::command::CommandArgs::from_parts(
+                        [b"SET".as_slice(), key, b"staged"]
+                            .into_iter()
+                            .map(bytes::Bytes::copy_from_slice)
+                            .collect(),
+                    ),
+                    &runtime.registry,
+                )
+                .unwrap();
+        } else {
+            runtime.ctx.db_mut(0).unwrap().set(
+                key.to_vec(),
+                crate::foundation::io::store::Robj::string("live"),
+            );
+        }
+        terminal_migration_fault(&mut runtime, "unavailable");
+        runtime.ctx.config_mut().replication.repl_after_aof_fsync = false;
+        runtime.drive_slot_migration_progress();
+        assert_eq!(
+            runtime
+                .ctx
+                .cluster_state()
+                .as_deref()
+                .unwrap()
+                .migrations
+                .get(&id)
+                .unwrap()
+                .phase,
+            MigrationPhase::Terminal(
+                crate::engine::distributed::cluster::migration::TerminalPhase::Success
+            )
+        );
+        assert_eq!(
+            runtime.ctx.db(0).unwrap().get_no_expire(key).is_some(),
+            operation == MigrationOperation::Import
+        );
+        drop(runtime);
+        std::fs::remove_file(path).unwrap();
+    }
 }
 
 #[test]

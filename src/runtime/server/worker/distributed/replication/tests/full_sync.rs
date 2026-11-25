@@ -1,5 +1,228 @@
 use super::*;
 
+#[test]
+fn cross_client_full_sync_replacement_clears_the_old_upstream_transaction() {
+    use super::durability::{apply_parts, cross_client_config};
+    use crate::foundation::io::protocol::Value;
+    let dir =
+        std::env::temp_dir().join(format!("versal-txn-replacement-{}", rand::random::<u64>()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut fixture = atomic_full_sync_fixture(&dir, &dir.join("old.aof"));
+    crate::framework::commands::register_all(&mut fixture.backend.registry);
+    fixture
+        .backend
+        .ctx
+        .config_mut()
+        .replication
+        .repl_after_aof_fsync = true;
+    fixture.backend.ctx.aof_mut().replication_baseline =
+        crate::engine::persistence::AofBaseline::Ready;
+    fixture.backend.ctx.set_loading(false);
+    let config_token = add_connection(&mut fixture.backend, 85);
+    apply_parts(
+        &mut fixture.backend,
+        fixture.connection_token,
+        &mut fixture.link,
+        &[b"MULTI"],
+    )
+    .unwrap();
+    apply_parts(
+        &mut fixture.backend,
+        fixture.connection_token,
+        &mut fixture.link,
+        &[b"SET", b"obsolete", b"value"],
+    )
+    .unwrap();
+    assert!(matches!(
+        cross_client_config(
+            &mut fixture.backend,
+            config_token,
+            &[b"repl-after-aof-fsync", b"no"]
+        ),
+        Value::Error(_)
+    ));
+    fixture
+        .backend
+        .commit_streamed_rdb(
+            fixture.connection_token,
+            &mut fixture.link,
+            fixture.commit.take().unwrap(),
+        )
+        .unwrap();
+    assert!(
+        !fixture.backend.connection_registry[Token(fixture.connection_token)]
+            .transaction
+            .is_active()
+    );
+    assert!(fixture
+        .backend
+        .ctx
+        .db(0)
+        .unwrap()
+        .get_no_expire(b"obsolete")
+        .is_none());
+    assert!(fixture
+        .backend
+        .ctx
+        .db(0)
+        .unwrap()
+        .get_no_expire(b"new")
+        .is_some());
+    assert_eq!(
+        cross_client_config(
+            &mut fixture.backend,
+            config_token,
+            &[b"repl-after-aof-fsync", b"no"]
+        ),
+        Value::ok()
+    );
+    drop(fixture);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn nonstrict_dataset_replacement_cannot_enable_strict_mode_using_the_old_aof() {
+    for is_disk in [false, true] {
+        let dir = std::env::temp_dir().join(format!(
+            "versal-nonstrict-replace-{}",
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut fixture = atomic_full_sync_fixture(&dir, &dir.join("old.aof"));
+        fixture.backend.ctx.aof_mut().replication_baseline =
+            crate::engine::persistence::AofBaseline::Ready;
+        fixture
+            .backend
+            .ctx
+            .config_mut()
+            .persistence
+            .aof_use_rdb_preamble = false;
+        // Reject the asynchronous rewrite before it forks or rotates the journal.
+        fixture.backend.ctx.config_mut().server.aof_rewrite_cpulist = "invalid".to_string();
+        let mut commit = fixture.commit.take().unwrap();
+        commit.disk_backed = is_disk;
+        fixture
+            .backend
+            .commit_streamed_rdb(fixture.connection_token, &mut fixture.link, commit)
+            .unwrap();
+        assert!(fixture
+            .backend
+            .ctx
+            .db(0)
+            .unwrap()
+            .get_no_expire(b"new")
+            .is_some());
+        assert_eq!(
+            fixture.backend.ctx.aof().replication_baseline,
+            crate::engine::persistence::AofBaseline::Unavailable
+        );
+        let args = CommandArgs::from_parts(
+            ["CONFIG", "SET", "repl-after-aof-fsync", "yes"]
+                .into_iter()
+                .map(Bytes::from)
+                .collect(),
+        );
+        let mut conn = Connection::new_fake();
+        assert!(matches!(
+            crate::framework::commands::server::config::config_set(
+                &mut conn,
+                &args,
+                &mut fixture.backend.ctx
+            ),
+            crate::foundation::io::protocol::Value::Error(_)
+        ));
+        assert!(
+            !fixture
+                .backend
+                .ctx
+                .config()
+                .replication
+                .repl_after_aof_fsync
+        );
+        drop(fixture);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[test]
+fn strict_full_sync_old_journal_sync_failure_keeps_dataset_and_baseline_unpublished() {
+    let dir = std::env::temp_dir().join(format!(
+        "versal-task5-old-sync-error-{}",
+        std::process::id(),
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut fixture = atomic_full_sync_fixture(&dir, std::path::Path::new("/dev/null"));
+    fixture
+        .backend
+        .ctx
+        .config_mut()
+        .replication
+        .repl_after_aof_fsync = true;
+    fixture
+        .backend
+        .ctx
+        .config_mut()
+        .persistence
+        .aof_use_rdb_preamble = false;
+    fixture.backend.ctx.aof_mut().replication_baseline =
+        crate::engine::persistence::AofBaseline::Ready;
+    assert!(fixture
+        .backend
+        .commit_streamed_rdb(
+            fixture.connection_token,
+            &mut fixture.link,
+            fixture.commit.take().unwrap(),
+        )
+        .is_err());
+    assert_atomic_full_sync_state_unchanged(&fixture);
+    assert_eq!(
+        fixture.backend.ctx.aof().replication_baseline,
+        crate::engine::persistence::AofBaseline::Ready
+    );
+    assert!(!dir.join("appendonlydir").exists());
+    fixture.backend.ctx.aof_mut().journal.take();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn strict_direct_full_sync_failure_invalidates_old_dataset_baseline() {
+    let dir = std::env::temp_dir().join(format!(
+        "versal-task5-direct-old-sync-error-{}",
+        std::process::id(),
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut fixture = atomic_full_sync_fixture(&dir, std::path::Path::new("/dev/null"));
+    fixture
+        .backend
+        .ctx
+        .config_mut()
+        .replication
+        .repl_after_aof_fsync = true;
+    fixture.backend.ctx.aof_mut().replication_baseline =
+        crate::engine::persistence::AofBaseline::Ready;
+    let mut commit = fixture.commit.take().unwrap();
+    *fixture.backend.ctx.dbs_mut() = commit.swapped.take().unwrap();
+    commit.disk_backed = false;
+    commit.raw = None;
+    let previous_position = fixture.link.applied_position();
+
+    assert!(fixture
+        .backend
+        .commit_streamed_rdb(fixture.connection_token, &mut fixture.link, commit,)
+        .is_err());
+
+    assert_eq!(
+        fixture.backend.ctx.aof().replication_baseline,
+        crate::engine::persistence::AofBaseline::Unavailable
+    );
+    assert_eq!(fixture.link.applied_position(), previous_position);
+    assert!(fixture.backend.ctx.is_loading());
+    fixture.backend.ctx.aof_mut().journal.take();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 struct AtomicFullSyncFixture {
     backend: ServerWorkerState,
     connection_token: usize,

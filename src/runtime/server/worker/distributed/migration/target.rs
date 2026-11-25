@@ -22,6 +22,15 @@ impl ServerWorkerState {
         {
             return false;
         }
+        if self.ctx.replication_aof_write_error().is_some() {
+            self.fail_slot_migration(
+                &id,
+                "Local AOF durability is unavailable during slot import",
+            );
+            self.connection_registry[crate::framework::capabilities::io::Token(connection_token)]
+                .mark_closing();
+            return true;
+        }
         let rejects_for_oom = self.registry.lookup(&args.name).is_some_and(|spec| {
             (spec.flags & crate::engine::command::CMD_DENYOOM) != 0
                 && self.ctx.maxmemory_state().is_over_limit()
@@ -50,10 +59,10 @@ impl ServerWorkerState {
             self.connection_registry[crate::framework::capabilities::io::Token(connection_token)]
                 .mark_closing();
         } else {
-            self.propagate_to_replicas(&frame);
             if self.ctx.config().persistence.aof_enabled {
                 self.feed_aof(&frame);
             }
+            self.propagate_to_replicas(&frame);
         }
         true
     }

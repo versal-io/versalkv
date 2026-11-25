@@ -117,7 +117,9 @@ fn first_allowed_cpu() -> String {
 #[cfg(target_os = "linux")]
 #[test]
 fn aof_rewrite_child_applies_configured_cpu_affinity() {
-    use crate::foundation::io::sys::process::{send_signal, wait_blocking, ProcessSignal, WaitOutcome};
+    use crate::foundation::io::sys::process::{
+        send_signal, wait_blocking, ProcessSignal, WaitOutcome,
+    };
 
     let dir = _temp_dir().join("affinity");
     let _ = std::fs::remove_dir_all(&dir);
@@ -141,9 +143,7 @@ fn aof_rewrite_child_applies_configured_cpu_affinity() {
         let affinity = status
             .lines()
             .find_map(|line| line.strip_prefix("Cpus_allowed_list:\t"));
-        let stopped = status
-            .lines()
-            .any(|line| line.starts_with("State:\tT"));
+        let stopped = status.lines().any(|line| line.starts_with("State:\tT"));
         if affinity == Some(cpu.as_str()) && stopped {
             break;
         }
@@ -304,5 +304,207 @@ fn replacement_aof_open_failure_disables_aof_and_resets_only_aof_cursor() {
     assert_eq!(ctx.persistence().aof_selected_db(), -1);
     assert_eq!(ctx.repl_seldb(), 9);
     assert!(ctx.aof().journal.is_none());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn rewrite_completion_rejects_old_journal_sync_error_before_install() {
+    let dir = _temp_dir().join("old-journal-sync-error");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut ctx = ServerContext::new(1);
+    ctx.config_mut().persistence.dir = dir.to_string_lossy().into_owned();
+    ctx.config_mut().persistence.aof_enabled = true;
+    ctx.config_mut().persistence.aof_fsync = crate::foundation::io::persistence::AofFsync::No;
+    let appender = AofAppender::open_append_path(
+        std::path::Path::new("/dev/null"),
+        crate::foundation::io::persistence::AofFsync::No,
+    )
+    .unwrap();
+    ctx.aof_mut().journal = Some(AofJournal::new(appender));
+    let options = rewrite_file_options(&ctx);
+    ctx.persistence_mut()
+        .begin_aof_rewrite_child(12345, 1_000)
+        .unwrap();
+    crate::foundation::io::persistence::aof_rewrite::write_rewrite_temp(
+        ctx.dbs(),
+        &[],
+        &[],
+        &options,
+        12345,
+    )
+    .unwrap();
+
+    assert_eq!(
+        super::apply_aof_rewrite_child_completion(&mut ctx, 12345, true),
+        Some(ReapResult::Error),
+    );
+    assert_eq!(ctx.aof().rewrite.last_status, OperationStatus::Err);
+    assert_eq!(
+        ctx.aof().journal.as_ref().unwrap().appender.path(),
+        "/dev/null"
+    );
+    assert!(!options.aof_dir().join("appendonly.aof.manifest").exists());
+    assert_eq!(
+        ctx.aof().replication_baseline,
+        crate::engine::persistence::AofBaseline::Unavailable
+    );
+    ctx.aof_mut().journal.take();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn complete_rewrite_installs_ready_replication_baseline() {
+    let dir = _temp_dir().join("ready-baseline");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut ctx = ServerContext::new(1);
+    ctx.config_mut().persistence.dir = dir.to_string_lossy().into_owned();
+    ctx.config_mut().persistence.aof_enabled = true;
+    ctx.config_mut().persistence.aof_fsync = crate::foundation::io::persistence::AofFsync::No;
+    ctx.db_mut(0).unwrap().set(
+        b"key".to_vec(),
+        crate::foundation::io::store::Robj::string("value"),
+    );
+    let options = rewrite_file_options(&ctx);
+    ctx.persistence_mut()
+        .begin_aof_rewrite_child(12346, 1_000)
+        .unwrap();
+    crate::foundation::io::persistence::aof_rewrite::write_rewrite_temp(
+        ctx.dbs(),
+        &[],
+        &[],
+        &options,
+        12346,
+    )
+    .unwrap();
+
+    assert_eq!(
+        super::apply_aof_rewrite_child_completion(&mut ctx, 12346, true),
+        Some(ReapResult::Success)
+    );
+    assert_eq!(
+        ctx.aof().replication_baseline,
+        crate::engine::persistence::AofBaseline::Ready
+    );
+    let journal = ctx.aof().journal.as_ref().unwrap();
+    assert!(journal
+        .appender
+        .sync_handle()
+        .is_durable(journal.appender.appended_stamp()));
+    ctx.aof_mut()
+        .journal
+        .take()
+        .unwrap()
+        .appender
+        .shutdown()
+        .unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn strict_install_directory_failure_keeps_the_baseline_unavailable() {
+    for appenddirname in ["", "appendonlydir"] {
+        let dir = _temp_dir().join(format!("install-sync-failure-{appenddirname}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut ctx = ServerContext::new(1);
+        ctx.config_mut().persistence.dir = dir.to_string_lossy().into_owned();
+        ctx.config_mut().persistence.aof_appenddirname = appenddirname.to_string();
+        ctx.config_mut().persistence.aof_enabled = true;
+        ctx.config_mut().replication.repl_after_aof_fsync = true;
+        ctx.aof_mut().replication_baseline = crate::engine::persistence::AofBaseline::Ready;
+        _prepare_successful_rewrite_child(&mut ctx);
+        crate::foundation::io::persistence::aof_rewrite::FAIL_NEXT_INSTALL_DIRECTORY_SYNC
+            .with(|fail| fail.set(true));
+        assert_eq!(_reap_rewrite_child(&mut ctx), ReapResult::Error);
+        assert_eq!(
+            ctx.aof().replication_baseline,
+            crate::engine::persistence::AofBaseline::Unavailable
+        );
+        assert_eq!(ctx.aof().last_write_status, OperationStatus::Err);
+        assert!(ctx.persistence().aof_rewrite_scheduled());
+        assert!(ctx.config().persistence.aof_enabled);
+        drop(ctx);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[test]
+fn strict_rewrite_reopen_failure_keeps_aof_enabled_and_ready_installed_base() {
+    let dir = _temp_dir().join("strict-reopen-failure");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut ctx = ServerContext::new(1);
+    ctx.config_mut().persistence.dir = dir.to_string_lossy().into_owned();
+    ctx.config_mut().persistence.aof_enabled = true;
+    ctx.config_mut().replication.repl_after_aof_fsync = true;
+    _prepare_successful_rewrite_child(&mut ctx);
+    FAIL_NEXT_REWRITE_AOF_OPEN.with(|fail| fail.set(true));
+
+    assert_eq!(_reap_rewrite_child(&mut ctx), ReapResult::Error);
+
+    assert!(ctx.config().persistence.aof_enabled);
+    assert_eq!(ctx.aof().last_write_status, OperationStatus::Err);
+    assert_eq!(
+        ctx.aof().replication_baseline,
+        crate::engine::persistence::AofBaseline::Ready
+    );
+    assert!(ctx.aof().journal.is_none());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn strict_first_rewrite_finalize_failure_does_not_enable_empty_baseline() {
+    let dir = _temp_dir().join("strict-first-finalize-failure");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut ctx = ServerContext::new(1);
+    ctx.config_mut().persistence.dir = dir.to_string_lossy().into_owned();
+    ctx.config_mut().persistence.aof_enabled = true;
+    ctx.config_mut().replication.repl_after_aof_fsync = true;
+    let pid = _prepare_successful_rewrite_child(&mut ctx);
+    std::fs::remove_file(rewrite_file_options(&ctx).temp_path(pid)).unwrap();
+    FAIL_NEXT_REWRITE_AOF_OPEN.with(|fail| fail.set(true));
+
+    assert_eq!(_reap_rewrite_child(&mut ctx), ReapResult::Error);
+
+    assert!(ctx.config().persistence.aof_enabled);
+    assert_eq!(ctx.aof().last_write_status, OperationStatus::Err);
+    assert_eq!(
+        ctx.aof().replication_baseline,
+        crate::engine::persistence::AofBaseline::Unavailable
+    );
+    assert!(ctx.aof().journal.is_none());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn strict_first_rewrite_empty_fallback_is_unavailable_and_rescheduled() {
+    let dir = _temp_dir().join("strict-empty-fallback");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut ctx = ServerContext::new(1);
+    ctx.config_mut().persistence.dir = dir.to_string_lossy().into_owned();
+    ctx.config_mut().persistence.aof_enabled = true;
+    ctx.config_mut().replication.repl_after_aof_fsync = true;
+    let pid = _prepare_successful_rewrite_child(&mut ctx);
+    std::fs::remove_file(rewrite_file_options(&ctx).temp_path(pid)).unwrap();
+
+    assert_eq!(_reap_rewrite_child(&mut ctx), ReapResult::Error);
+
+    assert_eq!(
+        ctx.aof().replication_baseline,
+        crate::engine::persistence::AofBaseline::Unavailable
+    );
+    assert_eq!(ctx.aof().last_write_status, OperationStatus::Err);
+    assert!(ctx.persistence().aof_rewrite_scheduled());
+    assert!(ctx.config().persistence.aof_enabled);
+    ctx.aof_mut()
+        .journal
+        .take()
+        .unwrap()
+        .appender
+        .shutdown()
+        .unwrap();
     std::fs::remove_dir_all(dir).unwrap();
 }

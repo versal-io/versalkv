@@ -61,7 +61,12 @@ impl super::ServerContext {
             .allocation_bytes()
             .saturating_add(self.replication().replica_output_buffer_allocation_bytes);
         let backlog = self.config().server.repl_backlog_size.max(0) as usize;
-        let replication_not_counted = repl_buffer.saturating_sub(backlog);
+        let mut replication_not_counted = repl_buffer.saturating_sub(backlog);
+        if self.config().replication.repl_after_aof_fsync {
+            // Unpublished data cannot be discarded to satisfy the memory limit.
+            replication_not_counted = replication_not_counted
+                .saturating_sub(self.replication().backlog.unreleased_bytes());
+        }
         let aof_not_counted = if self.config().persistence.aof_enabled {
             self.aof().buffer_allocation_bytes()
         } else {

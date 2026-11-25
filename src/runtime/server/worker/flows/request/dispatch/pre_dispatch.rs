@@ -14,6 +14,20 @@ use super::{
 };
 
 impl ServerWorkerState {
+    pub(crate) fn replicated_command_requires_durable_aof(&self, args: &CommandArgs) -> bool {
+        let Some(spec) = self.registry.lookup(&args.name) else {
+            return true;
+        };
+        if spec.name == "exec" {
+            return true;
+        }
+        let flags = super::subcmd_flags::effective_command_flags_for_call(
+            spec.name, spec.flags, args, &self.ctx,
+        );
+        ((flags & CMD_WRITE) != 0 || matches!(spec.name, "eval" | "evalsha" | "fcall"))
+            && !is_ro_script(spec.name, args, &self.ctx)
+    }
+
     pub(super) fn stage_sentinel_mode(
         &self,
         _facts: &CommandClientFacts,
@@ -467,6 +481,17 @@ impl ServerWorkerState {
         // Gated reap: only retires a lingering diskless child when no relay is in flight (ABA-safe).
         self.collect_idle_diskless_child_exit();
         let has_write_flag = (meta.flags & CMD_WRITE) != 0;
+        if (has_write_flag || matches!(meta.name, "eval" | "evalsha" | "fcall"))
+            && !is_ro_script(meta.name, args, &self.ctx)
+        {
+            if let Some(error) = self.ctx.replication_aof_write_error() {
+                return Some(DispatchOutcome {
+                    action: DispatchAction::Rejected,
+                    call_flags,
+                    reject_reply: Some(error),
+                });
+            }
+        }
         if (has_write_flag || meta.name.eq_ignore_ascii_case("ping"))
             && self.ctx.config().persistence.stop_writes_on_bgsave_error
             && !self.ctx.config().persistence.saveparams.is_empty()

@@ -9,6 +9,20 @@ fn default_config() -> Config {
     Config::parse_from(["versal-server"])
 }
 
+#[test]
+fn durable_replication_configuration_file_reaches_runtime() {
+    assert!(!default_config().repl_after_aof_fsync);
+    let config = load_temp_config(
+        "durable-replication",
+        "appendonly yes\nappendfsync everysec\nrepl-after-aof-fsync yes\n",
+    )
+    .unwrap();
+    let mut runtime = RuntimeConfig::new();
+    config.apply_to(&mut runtime);
+    assert!(runtime.replication.repl_after_aof_fsync);
+    assert!(runtime.validate_replication_durability().is_ok());
+}
+
 fn load_temp_config(label: &str, contents: &str) -> std::io::Result<Config> {
     let path = std::env::temp_dir().join(format!(
         "versal-{label}-{}-{}.conf",

@@ -170,6 +170,32 @@ impl ServerWorkerState {
         self.propagate_to_replicas_with_ack(frame, false);
     }
 
+    pub(crate) fn release_synced_replication(&mut self) {
+        let is_enabled = self.ctx.config().replication.repl_after_aof_fsync;
+        if is_enabled
+            && self
+                .ctx
+                .aof()
+                .journal
+                .as_ref()
+                .is_some_and(|journal| journal.appender.sync_handle().last_error().is_some())
+        {
+            self.ctx.aof_mut().last_write_status = crate::engine::persistence::OperationStatus::Err;
+        }
+        let backlog = &mut self.ctx.replication_mut().backlog;
+        let has_released = if is_enabled {
+            backlog.release_durable_replication()
+        } else if backlog.replication_release_cursor() < backlog.next_stream_cursor() {
+            backlog.disable_replication_fence();
+            true
+        } else {
+            false
+        };
+        if has_released {
+            self.propagate_to_replicas(b"");
+        }
+    }
+
     pub(crate) fn propagate_replication_frame(&mut self, frame: &[u8]) {
         self.propagate_to_replicas_with_ack(frame, false);
     }
@@ -180,6 +206,19 @@ impl ServerWorkerState {
         // start or advance replication history merely by registering a link.
         if !self.ctx.replication().backlog.is_active() {
             return;
+        }
+        let is_durable_mode = self.ctx.config().replication.repl_after_aof_fsync;
+        if is_durable_mode {
+            let cursor = self.ctx.replication().backlog.replication_release_cursor();
+            self.ctx
+                .replication_mut()
+                .backlog
+                .set_replication_release_cursor(Some(cursor));
+        } else {
+            self.ctx
+                .replication_mut()
+                .backlog
+                .disable_replication_fence();
         }
         let backlog_capacity = self.ctx.config().server.repl_backlog_size.max(0) as usize;
         let first_frame_cursor = self.ctx.replication().backlog.next_stream_cursor();
@@ -274,6 +313,23 @@ impl ServerWorkerState {
             }
         };
         debug_assert_eq!(appended.start, first_frame_cursor);
+        if is_durable_mode {
+            if let Some(journal) = self.ctx.aof().journal.as_ref().filter(|_| {
+                self.ctx.aof().replication_baseline
+                    == crate::engine::persistence::AofBaseline::Ready
+            }) {
+                let stamp = journal.appender.appended_stamp();
+                let sync = journal.appender.sync_handle();
+                self.ctx
+                    .replication_mut()
+                    .backlog
+                    .fence_replication(stamp, sync);
+            }
+            self.ctx
+                .replication_mut()
+                .backlog
+                .release_durable_replication();
+        }
         let backlog_end = self.ctx.replication().backlog.next_stream_cursor();
         let ids: Vec<_> = self
             .replication_runtime
@@ -289,7 +345,12 @@ impl ServerWorkerState {
                     continue;
                 };
                 let connection_id = link.connection_id();
-                match link.advance_terminal_dual_main_stream(appended.end, backlog_end) {
+                let advance = if is_durable_mode {
+                    Ok(false)
+                } else {
+                    link.advance_terminal_dual_main_stream(appended.end, backlog_end)
+                };
+                match advance {
                     Ok(true) => {
                         link.mark_replication_queued(terminal_dual_frame.len());
                         Ok((connection_id, terminal_dual_frame.clone()))
@@ -913,6 +974,11 @@ impl ServerWorkerState {
     }
 
     fn execute_dual_channel_full_resync(&mut self, conn_id: ConnectionId, primary_id: ReplicaId) {
+        if let Err(error) = self.ctx.ensure_replication_snapshot_durable() {
+            crate::server_log!(warning, "Downstream snapshot blocked: {}", error);
+            self.remove_connection(conn_id.0);
+            return;
+        }
         if !self
             .connection_registry
             .contains(crate::framework::capabilities::io::Token(conn_id.0))
@@ -1177,6 +1243,7 @@ impl ServerWorkerState {
     /// has isolated the whole pair, otherwise the main close is treated as an
     /// unrelated client close and can leave the RDB loading gate behind.
     pub(crate) fn abort_replica_session_for_role_change(&mut self) {
+        self.discard_upstream_transactions();
         let main = self
             .replication_runtime
             .replica_link()
@@ -1219,6 +1286,10 @@ impl ServerWorkerState {
             .iter()
             .any(|(_, (ready_at, _))| force || now >= *ready_at);
         if !any_ready {
+            return;
+        }
+        if let Err(error) = self.ctx.ensure_replication_snapshot_durable() {
+            crate::server_log!(warning, "Downstream snapshot blocked: {}", error);
             return;
         }
         let max_replicas = self
@@ -1550,6 +1621,15 @@ impl ServerWorkerState {
         ids: Vec<crate::framework::distributed::replication::ReplicaId>,
     ) {
         if ids.is_empty() {
+            return;
+        }
+        if let Err(error) = self.ctx.ensure_replication_snapshot_durable() {
+            crate::server_log!(warning, "Downstream snapshot blocked: {}", error);
+            for id in ids {
+                if let Some(link) = self.replication_runtime.primary_link(id) {
+                    self.remove_connection(link.connection_id().0);
+                }
+            }
             return;
         }
         let key_delay_us = self.ctx.config().persistence.rdb_key_save_delay;

@@ -3,6 +3,23 @@ use crate::engine::extension::config::spec_registry::ConfigRegistry;
 
 pub(crate) fn register_replication_configs(reg: &mut ConfigRegistry) {
     reg.register(&ConfigSpec {
+        name: "repl-after-aof-fsync",
+        type_: ConfigType::Bool,
+        enum_values: &[],
+        numeric_min: 0,
+        numeric_max: 0,
+        flags: &[],
+        alias: None,
+        get: |config| ConfigValue::Bool(config.replication.repl_after_aof_fsync),
+        set: |config, value| match value {
+            ConfigValue::Bool(value) => {
+                config.replication.repl_after_aof_fsync = *value;
+                Ok(())
+            }
+            _ => Err("repl-after-aof-fsync must be a boolean".to_string()),
+        },
+    });
+    reg.register(&ConfigSpec {
         name: "replica-announce-ip",
         type_: ConfigType::String,
         enum_values: &[],

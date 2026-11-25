@@ -1,5 +1,7 @@
 #[derive(Clone)]
 pub struct ReplicationConfig {
+    /// Release downstream data only after successful local AOF synchronization.
+    pub repl_after_aof_fsync: bool,
     pub master_host: Option<String>,
     pub master_port: u16,
     pub master_link_status: String,
@@ -47,6 +49,7 @@ pub struct ReplicationConfig {
 impl ReplicationConfig {
     pub fn new() -> Self {
         Self {
+            repl_after_aof_fsync: false,
             master_host: None,
             master_port: 0,
             master_link_status: "down".to_string(),

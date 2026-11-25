@@ -11,6 +11,8 @@ pub struct PreparedSyncedRdbAofBase {
     old_manifest: Option<Vec<u8>>,
     manifest_committed: bool,
     finalized: bool,
+    is_single_file: bool,
+    single_backup: Option<PathBuf>,
 }
 
 impl PreparedSyncedRdbAofBase {
@@ -18,14 +20,25 @@ impl PreparedSyncedRdbAofBase {
         &self.incr_path
     }
 
+    pub fn installed_incremental_path(&self) -> &Path {
+        if self.is_single_file {
+            &self.manifest_path
+        } else {
+            &self.incr_path
+        }
+    }
+
     pub fn commit_manifest(&mut self) -> std::io::Result<()> {
         std::fs::rename(&self.temp_manifest, &self.manifest_path)?;
         self.manifest_committed = true;
-        Ok(())
+        super::manifest::sync_directory(&self.app_dir)
     }
 
     pub fn finalize(mut self) {
         self.finalized = true;
+        if let Some(backup) = &self.single_backup {
+            let _ = std::fs::remove_file(backup);
+        }
         for entry in &self.old_entries {
             let old_path = self.app_dir.join(&entry.filename);
             if old_path != self.base_path && old_path != self.incr_path {
@@ -34,16 +47,33 @@ impl PreparedSyncedRdbAofBase {
         }
     }
 
-    fn rollback_manifest(&self) {
+    pub fn rollback(mut self) -> std::io::Result<()> {
+        if self.manifest_committed {
+            if let Err(error) = self.rollback_manifest() {
+                // Keep both possible baselines; the owner must invalidate its durability claim.
+                self.finalized = true;
+                return Err(error);
+            }
+            self.manifest_committed = false;
+        }
+        Ok(())
+    }
+
+    fn rollback_manifest(&self) -> std::io::Result<()> {
+        if self.is_single_file {
+            match &self.single_backup {
+                Some(backup) => std::fs::rename(backup, &self.manifest_path)?,
+                None => std::fs::remove_file(&self.manifest_path)?,
+            }
+            return super::manifest::sync_directory(&self.app_dir);
+        }
         match &self.old_manifest {
             Some(content) => {
-                let rollback = self.manifest_path.with_extension("manifest.rollback.tmp");
-                if std::fs::write(&rollback, content).is_ok() {
-                    let _ = std::fs::rename(rollback, &self.manifest_path);
-                }
+                super::manifest::write_manifest_atomically(&self.manifest_path, content)
             }
             None => {
-                let _ = std::fs::remove_file(&self.manifest_path);
+                std::fs::remove_file(&self.manifest_path)?;
+                super::manifest::sync_directory(&self.app_dir)
             }
         }
     }
@@ -55,11 +85,18 @@ impl Drop for PreparedSyncedRdbAofBase {
             return;
         }
         if self.manifest_committed {
-            self.rollback_manifest();
+            if let Err(error) = self.rollback_manifest() {
+                // A failed rollback may leave either manifest active. Keep both baselines.
+                log::error!("Failed to roll back AOF manifest; retaining prepared files: {error}");
+                return;
+            }
         }
         let _ = std::fs::remove_file(&self.temp_manifest);
         let _ = std::fs::remove_file(&self.base_path);
         let _ = std::fs::remove_file(&self.incr_path);
+        if let Some(backup) = &self.single_backup {
+            let _ = std::fs::remove_file(backup);
+        }
     }
 }
 
@@ -70,14 +107,21 @@ pub fn prepare_synced_rdb_as_aof_base(
     rdb: &[u8],
 ) -> std::io::Result<PreparedSyncedRdbAofBase> {
     let app_dir = Path::new(dir).join(appenddirname);
-    std::fs::create_dir_all(&app_dir)?;
+    super::manifest::create_aof_directory(&app_dir)?;
+    if appenddirname.is_empty() {
+        return prepare_single_file_base(app_dir, filename, rdb);
+    }
     let manifest_path = app_dir.join(format!("{}.manifest", filename));
     let old_manifest = match std::fs::read(&manifest_path) {
         Ok(content) => Some(content),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(error),
     };
-    let old_entries = super::manifest::read_manifest_entries(&manifest_path).unwrap_or_default();
+    let old_entries = old_manifest
+        .as_deref()
+        .map(super::manifest::parse_manifest_bytes)
+        .transpose()?
+        .unwrap_or_default();
     let (base_sequence, incr_sequence) =
         super::manifest::next_rewrite_sequences(&manifest_path, false)?;
     let base_name = format!("{}.{}.base.rdb", filename, base_sequence);
@@ -95,9 +139,69 @@ pub fn prepare_synced_rdb_as_aof_base(
         old_manifest,
         manifest_committed: false,
         finalized: false,
+        is_single_file: false,
+        single_backup: None,
     };
     write_prepared_files(&mut prepared, base_sequence, incr_sequence, rdb)?;
     Ok(prepared)
+}
+
+fn prepare_single_file_base(
+    app_dir: PathBuf,
+    filename: &str,
+    rdb: &[u8],
+) -> std::io::Result<PreparedSyncedRdbAofBase> {
+    let target = app_dir.join(filename);
+    let staged = app_dir.join(format!(".{filename}.sync.tmp"));
+    let mut prepared = PreparedSyncedRdbAofBase {
+        app_dir,
+        manifest_path: target,
+        temp_manifest: staged.clone(),
+        base_path: staged.clone(),
+        incr_path: staged,
+        old_entries: Vec::new(),
+        old_manifest: None,
+        manifest_committed: false,
+        finalized: false,
+        is_single_file: true,
+        single_backup: None,
+    };
+    let mut file = std::fs::File::create(&prepared.temp_manifest)?;
+    file.write_all(rdb)?;
+    file.sync_all()?;
+    if prepared.manifest_path.try_exists()? {
+        std::fs::File::open(&prepared.manifest_path)?.sync_all()?;
+        prepared.single_backup = Some(create_single_file_backup(
+            &prepared.manifest_path,
+            &prepared.app_dir,
+            filename,
+        )?);
+    }
+    super::manifest::sync_directory(&prepared.app_dir)?;
+    Ok(prepared)
+}
+
+fn create_single_file_backup(
+    target: &Path,
+    app_dir: &Path,
+    filename: &str,
+) -> std::io::Result<PathBuf> {
+    static NEXT_BACKUP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    loop {
+        let sequence = NEXT_BACKUP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let backup = app_dir.join(format!(
+            ".{filename}.sync.previous.{}.{}",
+            std::process::id(),
+            sequence,
+        ));
+        // A crash or PID reuse may leave this name occupied. Never overwrite or
+        // remove an unknown backup, which may be the only surviving old baseline.
+        match std::fs::hard_link(target, &backup) {
+            Ok(()) => return Ok(backup),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn write_prepared_files(
@@ -125,7 +229,7 @@ fn write_prepared_files(
     let mut file = std::fs::File::create(&prepared.temp_manifest)?;
     file.write_all(manifest.as_bytes())?;
     file.sync_all()?;
-    std::fs::File::open(&prepared.app_dir)?.sync_all()?;
+    super::manifest::sync_directory(&prepared.app_dir)?;
     Ok(())
 }
 
@@ -136,8 +240,25 @@ pub fn install_synced_rdb_as_aof_base(
     rdb: &[u8],
 ) -> std::io::Result<(PathBuf, PathBuf)> {
     let mut prepared = prepare_synced_rdb_as_aof_base(dir, filename, appenddirname, rdb)?;
-    let paths = (prepared.base_path.clone(), prepared.incr_path.clone());
-    prepared.commit_manifest()?;
+    if let Err(install_error) = prepared.commit_manifest() {
+        return match prepared.rollback() {
+            Ok(()) => Err(install_error),
+            Err(rollback_error) => Err(std::io::Error::new(
+                rollback_error.kind(),
+                format!(
+                    "AOF installation failed: {install_error}; rollback failed: {rollback_error}"
+                ),
+            )),
+        };
+    }
+    let paths = if prepared.is_single_file {
+        (
+            prepared.manifest_path.clone(),
+            prepared.manifest_path.clone(),
+        )
+    } else {
+        (prepared.base_path.clone(), prepared.incr_path.clone())
+    };
     prepared.finalize();
     Ok(paths)
 }

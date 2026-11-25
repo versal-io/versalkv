@@ -1,4 +1,12 @@
+use crate::foundation::io::persistence::aof::{AofSyncHandle, AofWriteStamp};
 use std::collections::VecDeque;
+
+#[derive(Debug, Clone)]
+struct ReplicationDurabilityFence {
+    end: BacklogCursor,
+    stamp: AofWriteStamp,
+    sync: AofSyncHandle,
+}
 
 use super::{
     BacklogCursor, InvalidReplicationPosition, PsyncRequestOffset, ReplicationOffset,
@@ -55,6 +63,8 @@ pub struct ReplicationBacklog {
     /// until the replica drains them. `None` means no replica pin, so trimming
     /// proceeds strictly to capacity.
     min_protected_cursor: Option<BacklogCursor>,
+    replication_release_cursor: Option<BacklogCursor>,
+    durability_fences: VecDeque<ReplicationDurabilityFence>,
     /// Ring buffer of replication bytes. Eviction drops from the front (oldest).
     bytes: VecDeque<u8>,
     history_valid: bool,
@@ -74,6 +84,8 @@ impl ReplicationBacklog {
             restored_reported_offset: None,
             empty_cursor_valid: false,
             min_protected_cursor: None,
+            replication_release_cursor: None,
+            durability_fences: VecDeque::new(),
             bytes: VecDeque::with_capacity(capacity),
             history_valid: false,
             active: false,
@@ -141,6 +153,7 @@ impl ReplicationBacklog {
         if self.active {
             return false;
         }
+        self.disable_replication_fence();
         self.replid = crate::engine::distributed::replication::protocol::generate_replid();
         self.second_replid.clear();
         self.second_replid_offset = None;
@@ -199,9 +212,21 @@ impl ReplicationBacklog {
         self.bytes
             .capacity()
             .saturating_mul(std::mem::size_of::<u8>())
+            .saturating_add(
+                self.durability_fences
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<ReplicationDurabilityFence>()),
+            )
+    }
+
+    pub fn unreleased_bytes(&self) -> usize {
+        self.next_cursor
+            .checked_distance_from(self.replication_release_cursor())
+            .unwrap_or(0)
     }
 
     pub fn clear_history(&mut self) {
+        self.disable_replication_fence();
         self.bytes.clear();
         self.history_valid = false;
         self.active = false;
@@ -217,6 +242,10 @@ impl ReplicationBacklog {
     /// that could authorize partial resynchronization is invalidated and the
     /// retained allocation is returned to the allocator.
     pub fn expire_history(&mut self) {
+        if self.unreleased_bytes() > 0 {
+            return;
+        }
+        self.disable_replication_fence();
         self.replid = crate::engine::distributed::replication::protocol::generate_replid();
         self.second_replid.clear();
         self.second_replid_offset = None;
@@ -307,6 +336,66 @@ impl ReplicationBacklog {
         Some(self.bytes.iter().skip(skip).copied().collect())
     }
 
+    pub fn replication_release_cursor(&self) -> BacklogCursor {
+        self.replication_release_cursor
+            .unwrap_or(self.next_cursor)
+            .min(self.next_cursor)
+    }
+
+    pub fn set_replication_release_cursor(&mut self, cursor: Option<BacklogCursor>) {
+        self.replication_release_cursor = cursor;
+        self.evict_excess();
+    }
+
+    pub fn fence_replication(&mut self, stamp: AofWriteStamp, sync: AofSyncHandle) {
+        let end = self.next_cursor;
+        if let Some(last) = self.durability_fences.back_mut() {
+            if last.stamp == stamp {
+                last.end = end;
+                return;
+            }
+        }
+        self.durability_fences
+            .push_back(ReplicationDurabilityFence { end, stamp, sync });
+    }
+
+    pub fn release_durable_replication(&mut self) -> bool {
+        let mut released = None;
+        while self
+            .durability_fences
+            .front()
+            .is_some_and(|fence| fence.sync.is_durable(fence.stamp))
+        {
+            released = self.durability_fences.pop_front().map(|fence| fence.end);
+        }
+        if let Some(cursor) = released {
+            self.set_replication_release_cursor(Some(cursor));
+            return true;
+        }
+        false
+    }
+
+    pub fn disable_replication_fence(&mut self) {
+        self.durability_fences.clear();
+        self.set_replication_release_cursor(None);
+    }
+
+    pub fn read_released_from(&self, cursor: BacklogCursor) -> Option<Vec<u8>> {
+        if self.replication_release_cursor.is_none() {
+            return self.read_from(cursor);
+        }
+        let first = self.first_byte_cursor();
+        if cursor < first || cursor > self.next_cursor {
+            return None;
+        }
+        let count = self
+            .replication_release_cursor()
+            .checked_distance_from(cursor)
+            .unwrap_or(0);
+        let skip = cursor.checked_distance_from(first)?;
+        Some(self.bytes.iter().skip(skip).take(count).copied().collect())
+    }
+
     pub fn set_capacity(&mut self, capacity: usize) {
         self.capacity = capacity;
         self.evict_excess();
@@ -384,6 +473,7 @@ impl ReplicationBacklog {
     }
 
     pub fn restore_primary_from_rdb_boundary(&mut self, replid: &str, boundary: SnapshotBoundary) {
+        self.disable_replication_fence();
         use crate::engine::distributed::replication::protocol;
 
         self.second_replid = replid.to_string();
@@ -418,6 +508,7 @@ impl ReplicationBacklog {
 
     /// Publish a previously validated RDB boundary as the active upstream history.
     pub fn adopt_primary_from_rdb_boundary(&mut self, replid: &str, boundary: SnapshotBoundary) {
+        self.disable_replication_fence();
         self.replid = replid.to_string();
         self.second_replid.clear();
         self.second_replid_offset = None;
@@ -460,7 +551,11 @@ impl ReplicationBacklog {
         // floor, so an aggressively small `repl-backlog-size` (the shutdown
         // test sets 1 byte) can't tear a still-live replica link down.
         let first = self.first_byte_cursor();
-        let drain = match self.min_protected_cursor {
+        let protected = match (self.min_protected_cursor, self.replication_release_cursor) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        let drain = match protected {
             None => excess,
             Some(protected) if protected <= first => 0,
             Some(protected) => {
@@ -748,6 +843,20 @@ mod tests {
         assert_eq!(backlog.read_from(cursor(3)), Some(b"def".to_vec()));
         assert_eq!(backlog.read_from(cursor(6)), Some(Vec::new()));
         assert_eq!(backlog.read_from(cursor(7)), None);
+    }
+
+    #[test]
+    fn unreleased_replication_is_retained_and_hidden_from_consumers() {
+        let mut backlog = make_backlog("replid", 1);
+        backlog.set_replication_release_cursor(Some(cursor(0)));
+        backlog.append(b"abcdef").unwrap();
+        assert_eq!(backlog.history_len(), 6);
+        assert_eq!(backlog.read_released_from(cursor(0)), Some(Vec::new()));
+        assert_eq!(backlog.read_released_from(cursor(3)), Some(Vec::new()));
+        backlog.set_min_protected_cursor(Some(cursor(0)));
+        backlog.set_replication_release_cursor(Some(cursor(3)));
+        assert_eq!(backlog.read_released_from(cursor(0)), Some(b"abc".to_vec()));
+        assert_eq!(backlog.replication_release_cursor(), cursor(3));
     }
 
     #[test]

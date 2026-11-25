@@ -148,12 +148,29 @@ fn flush_queue_vectored(
 }
 
 impl ServerWorkerState {
+    fn is_replication_output_durable(&self, token: Token) -> bool {
+        if !self.ctx.config().replication.repl_after_aof_fsync {
+            return true;
+        }
+        self.replication_runtime
+            .primary_for_connection(crate::framework::distributed::replication::ConnectionId(
+                token.0,
+            ))
+            .is_none_or(|link| {
+                link.next_send_cursor()
+                    <= self.ctx.replication().backlog.replication_release_cursor()
+            })
+    }
+
     fn try_submit_threaded_write(
         &mut self,
         connection_token: usize,
         byte_budget: Option<usize>,
     ) -> bool {
         let token = self.connection_registry[Token(connection_token)].token();
+        if !self.is_replication_output_durable(token) {
+            return false;
+        }
         if !self.connection_registry[Token(connection_token)].has_pending_output() {
             return false;
         }
@@ -403,6 +420,9 @@ impl ServerWorkerState {
     /// (replication.c:1902-1908).
     pub(crate) fn flush_connection_output(&mut self, connection_token: usize) -> WriteOutcome {
         let token_value = self.connection_registry[Token(connection_token)].token().0;
+        if !self.is_replication_output_durable(Token(token_value)) {
+            return WriteOutcome::Backpressured;
+        }
         let is_master_link = self.is_master_link(token_value);
         let is_slot_export =
             is_slot_export_connection(&self.connection_registry[Token(connection_token)]);
@@ -469,6 +489,9 @@ impl ServerWorkerState {
     }
 
     pub(crate) fn handle_writable(&mut self, token: Token) {
+        if !self.is_replication_output_durable(token) {
+            return;
+        }
         if !self.socket_write_owned_by_main_thread(token) {
             return;
         }
@@ -1021,7 +1044,12 @@ impl ServerWorkerState {
                     self.ctx
                         .persistence_mut()
                         .record_aof_size(appender.current_size());
-                    let _ = appender.force_fsync();
+                    if let Err(error) = appender.force_fsync() {
+                        crate::server_log!(warning, "Can't synchronize initial AOF: {}", error);
+                        self.ctx.aof_mut().last_write_status =
+                            crate::engine::persistence::OperationStatus::Err;
+                        return;
+                    }
                     self.ctx.aof_mut().last_fsync_sec =
                         (crate::foundation::io::store::kv_engine::now_ms() / 1000) as i64;
                     self.ctx.aof_mut().last_write_status =
@@ -1035,7 +1063,11 @@ impl ServerWorkerState {
                 }
                 Err(e) => {
                     crate::server_log!(warning, "Can't open AOF for append: {}", e);
-                    self.ctx.config_mut().persistence.aof_enabled = false;
+                    if !self.ctx.config().replication.repl_after_aof_fsync {
+                        self.ctx.config_mut().persistence.aof_enabled = false;
+                    }
+                    self.ctx.aof_mut().last_write_status =
+                        crate::engine::persistence::OperationStatus::Err;
                     self.ctx.persistence_mut().reset_aof_selected_db();
                     return;
                 }
@@ -1053,10 +1085,12 @@ impl ServerWorkerState {
         } else {
             configured_fsync
         };
+        let sync_wake = self.aof_sync_wake.clone();
         let aof = match self.ctx.aof_mut().journal.as_mut() {
             Some(a) => a,
             None => return,
         };
+        aof.appender.set_sync_waker(sync_wake);
         // Keep the appender on the live configured mode except while the C
         // no-appendfsync-on-rewrite gate is active.
         if aof.appender.fsync_mode() != effective_fsync {
@@ -1076,7 +1110,14 @@ impl ServerWorkerState {
             Ok(()) => {
                 self.ctx.persistence_mut().record_aof_size(current_size);
                 self.ctx.aof_mut().last_write_status =
-                    crate::engine::persistence::OperationStatus::Ok;
+                    if self.ctx.config().replication.repl_after_aof_fsync
+                        && self.ctx.aof().replication_baseline
+                            == crate::engine::persistence::AofBaseline::Unavailable
+                    {
+                        crate::engine::persistence::OperationStatus::Err
+                    } else {
+                        crate::engine::persistence::OperationStatus::Ok
+                    };
                 if fsync_mode == crate::foundation::io::persistence::AofFsync::EverySec
                     || fsync_mode == crate::foundation::io::persistence::AofFsync::Always
                 {

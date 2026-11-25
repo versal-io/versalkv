@@ -10,4 +10,4 @@ pub use types::{
     SCRIPT_ALLOW_STALE, SCRIPT_EVAL_MODE, SCRIPT_NO_CLUSTER, SCRIPT_NO_WRITES, SCRIPT_READ_ONLY,
     SCRIPT_WRITE_DIRTY,
 };
-pub use types::{PropagationBatch, PropagationOp, PropagationTargets};
+pub use types::{PropagationBatch, PropagationOp, PropagationPersistence, PropagationTargets};

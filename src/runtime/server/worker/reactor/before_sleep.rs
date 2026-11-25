@@ -161,6 +161,7 @@ impl ServerWorkerState {
         self.sync_module_timer_event();
         self.evict_clients();
         self.flush_aof_if_needed();
+        self.release_synced_replication();
         if self.dispatch_before_poll_slot(BeforePollSlot::AofBarrier, DispatchContext::Normal)?
             == LoopControl::Stop
         {
@@ -252,6 +253,7 @@ impl ServerWorkerState {
 
     pub(crate) fn finish_turn_pending_outputs(&mut self) {
         self.flush_aof_if_needed();
+        self.release_synced_replication();
         self.schedule_pending_replica_writes_before_sleep();
         self.event_batch.activate_next_turn_before_poll_slots(&[
             BeforePollSlot::OrdinaryWrites,

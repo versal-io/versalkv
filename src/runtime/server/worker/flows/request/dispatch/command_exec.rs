@@ -210,16 +210,7 @@ impl ServerWorkerState {
         executor: CommandExecutor,
         args: &CommandArgs,
     ) -> Value {
-        let should_skip_expire = self
-            .ctx
-            .client_pause()
-            .is_paused(crate::foundation::io::sys::time::mstime())
-            != crate::framework::context::PauseAction::None
-            || (self.ctx.replication().is_replica()
-                && self.ctx.config().replication.replica_read_only);
-        self.ctx
-            .dbs_mut()
-            .set_pause_skip_expire_all(should_skip_expire);
+        self.update_pause_skip_expire();
         let replica_local_expire_only =
             self.ctx.replication().is_replica() && !self.ctx.config().replication.replica_read_only;
         for db_idx in 0..self.ctx.num_dbs() {
@@ -737,8 +728,32 @@ impl ServerWorkerState {
             &mut connection_effects,
             effects,
         );
-        let operations =
+        let mut operations =
             self.take_command_propagation_ops(plan, &state, &mut connection_effects, effects, mode);
+        if self.ctx.config().replication.repl_after_aof_fsync {
+            for operation in &mut operations {
+                if operation.persistence
+                    != crate::engine::extension::script::PropagationPersistence::Data
+                {
+                    continue;
+                }
+                operation.targets = match operation.targets {
+                    PropagationTargets::None => PropagationTargets::Aof,
+                    PropagationTargets::Replication => PropagationTargets::Both,
+                    target => target,
+                };
+            }
+        } else {
+            for operation in &operations {
+                if operation.persistence
+                    == crate::engine::extension::script::PropagationPersistence::Data
+                    && (!operation.targets.includes_aof()
+                        || !self.ctx.config().persistence.aof_enabled)
+                {
+                    self.ctx.aof_mut().invalidate_replication_baseline();
+                }
+            }
+        }
         Self::merge_connection_notifications(&mut connection_effects, effects);
         self.dispose_data_lazyfree_objects(connection_effects.take_lazyfree_objects());
         CommandPropagationCapture {

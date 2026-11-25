@@ -1,8 +1,12 @@
+#[cfg(test)]
+mod appender_tests;
+mod fsync;
 mod manifest;
 mod manifest_install;
 #[cfg(test)]
 mod manifest_tests;
 pub mod rewrite;
+mod sync;
 
 pub use manifest::{
     ensure_aof_increment, format_manifest_token, gc_aof_history, next_rewrite_sequences,
@@ -12,13 +16,14 @@ pub use manifest::{
 pub use manifest_install::{
     install_synced_rdb_as_aof_base, prepare_synced_rdb_as_aof_base, PreparedSyncedRdbAofBase,
 };
+pub use sync::{AofSyncHandle, AofWriteStamp};
 
+use crate::foundation::io::transport::TransportWakeHandle;
+use fsync::FsyncThread;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Seek, SeekFrom, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
-use std::thread::{self, JoinHandle};
+use sync::{new_stamp, reserve_logical_offset};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AofFsync {
@@ -69,83 +74,29 @@ pub trait AofCommandPlayer {
     fn execute(&mut self, args: &[&[u8]]) -> Result<(), String>;
 }
 
-struct FsyncThread {
-    handle: Option<JoinHandle<()>>,
-    shutdown: Arc<AtomicBool>,
-    final_sync: Arc<AtomicBool>,
-    done: Arc<(Mutex<bool>, Condvar)>,
-}
-
-impl FsyncThread {
-    fn spawn(fd: File) -> Self {
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let final_sync = Arc::new(AtomicBool::new(true));
-        let done = Arc::new((Mutex::new(false), Condvar::new()));
-
-        let th_shutdown = Arc::clone(&shutdown);
-        let th_final_sync = Arc::clone(&final_sync);
-        let th_done = Arc::clone(&done);
-
-        let handle = thread::Builder::new()
-            .name("aof-fsync".to_string())
-            .spawn(move || {
-                let mut last_fsync = crate::foundation::io::store::kv_engine::now_ms();
-                loop {
-                    if th_shutdown.load(Ordering::Acquire) {
-                        break;
-                    }
-                    let now = crate::foundation::io::store::kv_engine::now_ms();
-                    let elapsed = now.saturating_sub(last_fsync);
-                    if elapsed >= 1000 {
-                        let _ = fd.sync_data();
-                        last_fsync = crate::foundation::io::store::kv_engine::now_ms();
-                    }
-                    let sleep_ms = if elapsed >= 1000 { 1 } else { 1000 - elapsed };
-                    let wait_ms = sleep_ms.min(100);
-                    thread::sleep(std::time::Duration::from_millis(wait_ms));
-                }
-                if th_final_sync.load(Ordering::Acquire) {
-                    let _ = fd.sync_data();
-                }
-                let (lock, cvar) = &*th_done;
-                if let Ok(mut done_flag) = lock.lock() {
-                    *done_flag = true;
-                    cvar.notify_one();
-                }
-            })
-            .expect("failed to spawn aof-fsync thread");
-
-        FsyncThread {
-            handle: Some(handle),
-            shutdown,
-            final_sync,
-            done,
+fn write_pending(
+    writer: &mut impl Write,
+    buf: &mut Vec<u8>,
+    current_size: &mut u64,
+) -> io::Result<()> {
+    let mut consumed = 0;
+    let result = loop {
+        if consumed == buf.len() {
+            break Ok(());
         }
-    }
-
-    fn stop(&mut self, final_sync: bool) {
-        self.final_sync.store(final_sync, Ordering::Release);
-        self.shutdown.store(true, Ordering::Release);
-        if let Some(handle) = self.handle.take() {
-            let (lock, cvar) = &*self.done;
-            if let Ok(done_flag) = lock.lock() {
-                if !*done_flag {
-                    let _ = cvar
-                        .wait_timeout_while(done_flag, std::time::Duration::from_secs(2), |done| {
-                            !*done
-                        })
-                        .unwrap();
-                }
+        match writer.write(&buf[consumed..]) {
+            Ok(0) => break Err(io::ErrorKind::WriteZero.into()),
+            Ok(bytes) => {
+                consumed += bytes;
+                *current_size += bytes as u64;
             }
-            let _ = handle.join();
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => break Err(error),
         }
-    }
-}
-
-impl Drop for FsyncThread {
-    fn drop(&mut self) {
-        self.stop(true);
-    }
+    };
+    // Keep only the unwritten suffix, even when a later write fails.
+    buf.drain(..consumed);
+    result
 }
 
 // ======================== AofAppender ========================
@@ -161,6 +112,9 @@ pub struct AofAppender {
     last_write_ok: bool,
 
     fsync_thread: Option<FsyncThread>,
+    appended: AofWriteStamp,
+    generation_start: AofWriteStamp,
+    progress: AofSyncHandle,
 
     path: String,
 }
@@ -168,8 +122,10 @@ pub struct AofAppender {
 impl AofAppender {
     fn from_open_file(fd: File, path: &Path, fsync_mode: AofFsync) -> io::Result<Self> {
         let current_size = fd.metadata()?.len();
+        let appended = new_stamp()?;
+        let progress = AofSyncHandle::new(appended);
         let fsync_thread = match fsync_mode {
-            AofFsync::EverySec => Some(FsyncThread::spawn(fd.try_clone()?)),
+            AofFsync::EverySec => Some(FsyncThread::spawn(fd.try_clone()?, progress.clone())?),
             _ => None,
         };
         Ok(Self {
@@ -179,6 +135,9 @@ impl AofAppender {
             current_size,
             last_write_ok: true,
             fsync_thread,
+            appended,
+            generation_start: appended,
+            progress,
             path: path.to_string_lossy().into_owned(),
         })
     }
@@ -193,15 +152,19 @@ impl AofAppender {
         filename: &str,
         appenddirname: &str,
         mode: AofOpenMode,
-    ) -> (std::path::PathBuf, bool) {
+    ) -> io::Result<std::path::PathBuf> {
         if appenddirname.is_empty() {
-            (Path::new(dir).join(filename), false)
+            Ok(Path::new(dir).join(filename))
         } else if mode == AofOpenMode::AppendExisting {
-            (resolve_aof_read_path(dir, filename, appenddirname), true)
+            resolve_aof_read_paths_checked(dir, filename, appenddirname)?
+                .pop()
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "Missing active AOF file")
+                })
         } else {
             let app_dir = Path::new(dir).join(appenddirname);
             let incr_name = format!("{}.1.incr.aof", filename);
-            (app_dir.join(&incr_name), true)
+            Ok(app_dir.join(&incr_name))
         }
     }
 
@@ -215,7 +178,7 @@ impl AofAppender {
             let incr_name = format!("{}.1.incr.aof", filename);
             let manifest_content =
                 format!("file {} seq 1 type i\n", format_manifest_token(&incr_name));
-            std::fs::write(&manifest_path, manifest_content)?;
+            manifest::write_manifest_atomically(&manifest_path, manifest_content.as_bytes())?;
         }
         Ok(())
     }
@@ -229,14 +192,18 @@ impl AofAppender {
     ) -> io::Result<Self> {
         if !appenddirname.is_empty() {
             let app_dir = Path::new(dir).join(appenddirname);
-            std::fs::create_dir_all(&app_dir)?;
-            if mode == AofOpenMode::CreateNew {
-                Self::ensure_manifest(dir, filename, appenddirname)?;
-            }
+            manifest::create_aof_directory(&app_dir)?;
         }
-        let (path, _is_multi) = Self::build_multi_file_path(dir, filename, appenddirname, mode);
+        let path = Self::build_multi_file_path(dir, filename, appenddirname, mode)?;
+        let has_manifest = !appenddirname.is_empty()
+            && Path::new(dir)
+                .join(appenddirname)
+                .join(format!("{}.manifest", filename))
+                .exists();
+        let is_new = !path.exists();
         let mut opts = OpenOptions::new();
-        opts.write(true).create(true);
+        opts.write(true)
+            .create(mode == AofOpenMode::CreateNew || !has_manifest);
         match mode {
             AofOpenMode::CreateNew => {
                 opts.truncate(true);
@@ -246,72 +213,107 @@ impl AofAppender {
             }
         }
         let fd = opts.open(&path)?;
+        if is_new || mode == AofOpenMode::CreateNew {
+            fd.sync_all()?;
+            manifest::sync_parent(&path)?;
+        }
+        Self::ensure_manifest(dir, filename, appenddirname)?;
         Self::from_open_file(fd, &path, fsync)
     }
 
     pub fn feed(&mut self, frame: &[u8]) {
+        if frame.is_empty() {
+            return;
+        }
         self.buf.extend_from_slice(frame);
+        self.appended.offset = reserve_logical_offset(frame.len() as u64);
+    }
+
+    pub fn appended_stamp(&self) -> AofWriteStamp {
+        self.appended
+    }
+
+    pub fn sync_handle(&self) -> AofSyncHandle {
+        self.progress.clone()
+    }
+
+    pub fn set_sync_waker(&mut self, waker: TransportWakeHandle) {
+        self.progress.set_waker(waker);
+    }
+
+    fn write_buffer(&mut self) -> io::Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        let result = write_pending(&mut self.fd, &mut self.buf, &mut self.current_size);
+        self.record_buffer_write(result)
+    }
+
+    fn record_buffer_write(&mut self, result: io::Result<()>) -> io::Result<()> {
+        match result {
+            Ok(()) => {
+                self.progress.publish_written(self.appended);
+                self.last_write_ok = true;
+                Ok(())
+            }
+            Err(error) => {
+                self.last_write_ok = false;
+                Err(error)
+            }
+        }
+    }
+
+    fn sync_data(&mut self) -> io::Result<()> {
+        self.progress.sync_with(|| self.fd.sync_data())
+    }
+
+    fn ensure_fsync_worker(&mut self) -> io::Result<()> {
+        if self.fsync_mode == AofFsync::EverySec && self.fsync_thread.is_none() {
+            self.fsync_thread = Some(FsyncThread::spawn(
+                self.fd.try_clone()?,
+                self.progress.clone(),
+            )?);
+        }
+        Ok(())
     }
 
     pub fn flush(&mut self, force: bool) -> io::Result<()> {
-        if self.buf.is_empty() && !force {
+        self.ensure_fsync_worker()?;
+        let should_sync = force
+            || (self.fsync_mode == AofFsync::Always
+                && ((self.appended != self.generation_start
+                    && !self.progress.is_durable(self.appended))
+                    || self.progress.last_error().is_some()));
+        if self.buf.is_empty() && !should_sync {
             return Ok(());
         }
-        if !self.buf.is_empty() {
-            match self.fd.write_all(&self.buf) {
-                Ok(()) => {
-                    self.current_size += self.buf.len() as u64;
-                    self.buf.clear();
-                    self.last_write_ok = true;
-                }
-                Err(e) => {
-                    self.last_write_ok = false;
-                    return Err(e);
-                }
-            }
-        }
-
-        let need_fsync_now = force
-            || match self.fsync_mode {
-                AofFsync::Always => true,
-                AofFsync::EverySec => false,
-                AofFsync::No => false,
-            };
-
-        if need_fsync_now {
-            match self.fd.sync_data() {
-                Ok(()) => {
-                    self.last_write_ok = true;
-                }
-                Err(e) => {
-                    self.last_write_ok = false;
-                    return Err(e);
-                }
-            }
+        self.write_buffer()?;
+        if should_sync {
+            self.sync_data()?;
         }
         Ok(())
     }
 
     pub fn force_fsync(&mut self) -> io::Result<()> {
-        self.fd.sync_data()
+        self.flush(true)
     }
 
     pub fn set_fsync_mode(&mut self, mode: AofFsync) -> io::Result<()> {
         if mode == self.fsync_mode {
-            return Ok(());
+            return self.ensure_fsync_worker();
         }
-        let old_was_bg = self.fsync_mode == AofFsync::EverySec;
-        let new_is_bg = mode == AofFsync::EverySec;
+        if mode == AofFsync::Always {
+            // Keep the existing worker and policy intact if the handoff sync fails.
+            self.flush(true)?;
+        }
+        if mode == AofFsync::EverySec {
+            let worker = FsyncThread::spawn(self.fd.try_clone()?, self.progress.clone())?;
+            self.fsync_thread = Some(worker);
+        } else if let Some(mut th) = self.fsync_thread.take() {
+            // In particular, switching to `no` must not introduce a final fsync.
+            th.stop(false)?;
+        }
         self.fsync_mode = mode;
-
-        if old_was_bg && !new_is_bg {
-            if let Some(mut th) = self.fsync_thread.take() {
-                th.stop(false);
-            }
-        } else if new_is_bg && !old_was_bg {
-            let th_fd = self.fd.try_clone()?;
-            self.fsync_thread = Some(FsyncThread::spawn(th_fd));
-        }
         Ok(())
     }
 
@@ -325,25 +327,57 @@ impl AofAppender {
         self.buf.capacity()
     }
     pub fn last_write_ok(&self) -> bool {
-        self.last_write_ok
+        self.last_write_ok && self.progress.last_error().is_none()
     }
 
     pub fn path(&self) -> &str {
         &self.path
     }
 
+    /// Record the destination after the owner atomically renames this open file.
+    pub(crate) fn record_installed_path(&mut self, path: &Path) {
+        self.path = path.to_string_lossy().into_owned();
+    }
+
     pub fn shutdown(&mut self) -> io::Result<()> {
-        if let Some(mut th) = self.fsync_thread.take() {
-            th.stop(true);
+        let result = self.shutdown_inner();
+        if result.is_err() && self.fsync_mode == AofFsync::EverySec && self.fsync_thread.is_none() {
+            if let Err(error) = self.ensure_fsync_worker() {
+                log::error!("Failed to restore AOF sync worker after shutdown failure: {error}");
+            }
         }
-        self.flush(true)?;
-        self.fd.sync_all()?;
+        result
+    }
+
+    fn shutdown_inner(&mut self) -> io::Result<()> {
+        let write_result = self.write_buffer();
+        if let Some(mut th) = self.fsync_thread.take() {
+            let stop_result = th.stop(write_result.is_ok());
+            write_result?;
+            stop_result?;
+        } else {
+            write_result?;
+            self.sync_data()?;
+        }
+        // Preserve metadata-sync errors in the same observable completion state.
+        self.progress.sync_with(|| self.fd.sync_all())?;
         Ok(())
     }
 
     pub fn truncate(&mut self, size: u64) -> io::Result<()> {
+        let progress = self.progress.clone();
+        let _guard = progress.sync_guard();
+        let initial = new_stamp()?;
         self.fd.set_len(size)?;
         self.current_size = size;
+        self.appended = initial;
+        self.generation_start = initial;
+        progress.reset(initial);
+        if !self.buf.is_empty() {
+            self.appended.offset = reserve_logical_offset(self.buf.len() as u64);
+        }
+        // Once truncation succeeds, stale stamps stay invalid even if seeking fails.
+        self.fd.seek(SeekFrom::Start(size))?;
         Ok(())
     }
 }

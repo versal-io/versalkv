@@ -1528,6 +1528,410 @@ fn direct_set_builds_compatible_frames_for_both_sinks() {
 }
 
 #[test]
+fn durable_replication_records_script_mutations_before_target_filtering() {
+    use crate::engine::extension::script::{
+        PropagationOp, PropagationPersistence, PropagationTargets,
+    };
+    let mut backend = ServerWorkerState::new(1).unwrap();
+    crate::framework::commands::register_all(&mut backend.registry);
+    backend.ctx.config_mut().replication.repl_after_aof_fsync = true;
+    backend.ctx.set_repl_seldb(0);
+    backend.ctx.persistence_mut().set_aof_selected_db(0);
+    let token = add_fake_connection(&mut backend);
+    let first =
+        crate::engine::distributed::replication::protocol::encode_command(&[b"SET", b"a", b"1"]);
+    let second =
+        crate::engine::distributed::replication::protocol::encode_command(&[b"SET", b"b", b"2"]);
+    backend.connection_registry[Token(token)].record_script_propagation(PropagationOp::new(
+        0,
+        PropagationTargets::None,
+        first.clone(),
+    ));
+    backend.connection_registry[Token(token)].record_script_propagation(PropagationOp::new(
+        0,
+        PropagationTargets::Replication,
+        second.clone(),
+    ));
+    let publish = crate::engine::distributed::replication::protocol::encode_command(&[
+        b"PUBLISH", b"channel", b"value",
+    ]);
+    let mut transient = PropagationOp::new(0, PropagationTargets::Replication, publish.clone());
+    transient.persistence = PropagationPersistence::Transient;
+    backend.connection_registry[Token(token)].record_script_propagation(transient);
+    let args = make_args(&[b"EVAL", b"return 1", b"0"]);
+    let flags = backend.registry.lookup(b"eval").unwrap().flags;
+    let connection_effects = take_connection_command_effects(&mut backend, token);
+    let mut effects = DispatchSideEffects::default();
+    backend.build_command_propagation(
+        CommandPropagationInput {
+            connection_token: token,
+            token_value: token,
+            args: &args,
+            name: "eval",
+            command_flags: flags,
+            rejected: false,
+        },
+        connection_effects,
+        &mut effects,
+    );
+    let multi = crate::engine::distributed::replication::protocol::encode_command(&[b"MULTI"]);
+    let exec = crate::engine::distributed::replication::protocol::encode_command(&[b"EXEC"]);
+    assert_eq!(
+        effects.aof_only,
+        vec![multi.clone(), first, second.clone(), exec.clone()]
+    );
+    assert_eq!(effects.replication_only, vec![multi, second, publish, exec]);
+}
+
+#[test]
+fn rewrite_cannot_confirm_a_snapshot_after_unlogged_script_mutations() {
+    use crate::engine::extension::script::{PropagationOp, PropagationTargets};
+    let mut backend = ServerWorkerState::new(1).unwrap();
+    crate::framework::commands::register_all(&mut backend.registry);
+    let dir =
+        std::env::temp_dir().join(format!("versal-rewrite-unlogged-{}", rand::random::<u64>()));
+    std::fs::create_dir(&dir).unwrap();
+    backend.ctx.config_mut().persistence.dir = dir.to_string_lossy().into_owned();
+    backend.ctx.config_mut().persistence.aof_enabled = true;
+    backend.ctx.config_mut().persistence.aof_appenddirname = String::new();
+    backend.ctx.aof_mut().replication_baseline =
+        crate::engine::persistence::AofBaseline::Unavailable;
+    let token = add_fake_connection(&mut backend);
+    let pid = 4567;
+    backend
+        .ctx
+        .persistence_mut()
+        .begin_aof_rewrite_child(pid, 0)
+        .unwrap();
+    let options = crate::foundation::io::persistence::aof_rewrite::AofRewriteFileOptions {
+        dir: dir.clone(),
+        filename: backend.ctx.config().persistence.aof_filename.clone(),
+        appenddirname: String::new(),
+        use_rdb_preamble: false,
+        timestamp_enabled: false,
+        key_delay_us: 0,
+        rdb_compression: true,
+        incremental_fsync: true,
+    };
+    crate::foundation::io::persistence::aof_rewrite::write_rewrite_temp(
+        backend.ctx.dbs(),
+        &[],
+        &[],
+        &options,
+        pid,
+    )
+    .unwrap();
+    for _ in 0..2 {
+        backend.connection_registry[Token(token)].record_script_propagation(PropagationOp::new(
+            0,
+            PropagationTargets::None,
+            crate::engine::distributed::replication::protocol::encode_command(&[
+                b"SET", b"late", b"value",
+            ]),
+        ));
+        let args = make_args(&[b"EVAL", b"return 1", b"0"]);
+        let flags = backend.registry.lookup(b"eval").unwrap().flags;
+        let connection_effects = take_connection_command_effects(&mut backend, token);
+        backend.build_command_propagation(
+            CommandPropagationInput {
+                connection_token: token,
+                token_value: token,
+                args: &args,
+                name: "eval",
+                command_flags: flags,
+                rejected: false,
+            },
+            connection_effects,
+            &mut DispatchSideEffects::default(),
+        );
+    }
+    assert_eq!(
+        crate::framework::commands::server::bgrewriteaof::apply_aof_rewrite_child_completion(
+            &mut backend.ctx,
+            pid,
+            true,
+        ),
+        Some(crate::framework::commands::server::bgrewriteaof::ReapResult::Error)
+    );
+    assert_eq!(
+        backend.ctx.aof().replication_baseline,
+        crate::engine::persistence::AofBaseline::Unavailable
+    );
+    assert!(backend.ctx.persistence().aof_rewrite_scheduled());
+    drop(backend);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn omitted_aof_script_mutation_invalidates_online_enablement_baseline() {
+    use crate::engine::extension::script::{PropagationOp, PropagationTargets};
+    let mut backend = ServerWorkerState::new(1).unwrap();
+    crate::framework::commands::register_all(&mut backend.registry);
+    backend.ctx.aof_mut().replication_baseline = crate::engine::persistence::AofBaseline::Ready;
+    let token = add_fake_connection(&mut backend);
+    backend.connection_registry[Token(token)].record_script_propagation(PropagationOp::new(
+        0,
+        PropagationTargets::Replication,
+        crate::engine::distributed::replication::protocol::encode_command(&[
+            b"SET", b"counter", b"10",
+        ]),
+    ));
+    let args = make_args(&[b"EVAL", b"return 1", b"0"]);
+    let flags = backend.registry.lookup(b"eval").unwrap().flags;
+    let connection_effects = take_connection_command_effects(&mut backend, token);
+    let mut effects = DispatchSideEffects::default();
+    backend.build_command_propagation(
+        CommandPropagationInput {
+            connection_token: token,
+            token_value: token,
+            args: &args,
+            name: "eval",
+            command_flags: flags,
+            rejected: false,
+        },
+        connection_effects,
+        &mut effects,
+    );
+    assert_eq!(
+        backend.ctx.aof().replication_baseline,
+        crate::engine::persistence::AofBaseline::Unavailable
+    );
+    assert!(effects.aof_only.is_empty());
+}
+
+#[test]
+fn full_sync_registers_preceding_writes_in_the_same_read_batch() {
+    use crate::foundation::io::persistence::{AofAppender, AofFsync};
+    for parts in [
+        &[b"PSYNC".as_slice(), b"?", b"-1"][..],
+        &[b"SYNC".as_slice()][..],
+    ] {
+        let mut backend = ServerWorkerState::new(1).unwrap();
+        crate::framework::commands::register_all(&mut backend.registry);
+        let token = add_fake_connection(&mut backend);
+        backend.connection_registry[Token(token)].set_skip_propagation(false);
+        let path = std::env::temp_dir().join(format!(
+            "versal-pipeline-snapshot-{}.aof",
+            rand::random::<u64>()
+        ));
+        backend.ctx.config_mut().persistence.aof_enabled = true;
+        backend.ctx.config_mut().persistence.aof_fsync = AofFsync::No;
+        backend.ctx.config_mut().replication.repl_after_aof_fsync = true;
+        backend.ctx.aof_mut().replication_baseline = crate::engine::persistence::AofBaseline::Ready;
+        backend.ctx.aof_mut().journal = Some(
+            crate::foundation::io::persistence::journal::AofJournal::new(
+                AofAppender::open_append_path(&path, AofFsync::No).unwrap(),
+            ),
+        );
+        let mut batch = ReadBatchEffects::default();
+        backend.process_parsed_command(
+            Token(token),
+            make_args(&[b"SET", b"key", b"value"]),
+            "set".to_string(),
+            false,
+            &mut batch,
+        );
+        assert!(!batch.aof_only.is_empty());
+        backend.process_parsed_command(
+            Token(token),
+            make_args(parts),
+            String::from_utf8_lossy(parts[0]).to_ascii_lowercase(),
+            false,
+            &mut batch,
+        );
+        assert!(
+            batch.aof_only.is_empty(),
+            "snapshot must drain previous propagation"
+        );
+        assert!(std::fs::read(&path)
+            .unwrap()
+            .windows(3)
+            .any(|bytes| bytes == b"SET"));
+        let appender = &backend.ctx.aof().journal.as_ref().unwrap().appender;
+        assert!(appender.sync_handle().is_durable(appender.appended_stamp()));
+        drop(backend);
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[test]
+fn strict_same_batch_writes_cannot_cross_the_pending_backlog_hard_limit() {
+    use crate::foundation::io::persistence::{AofAppender, AofFsync};
+    let mut backend = ServerWorkerState::new(1).unwrap();
+    crate::framework::commands::register_all(&mut backend.registry);
+    let token = add_fake_connection(&mut backend);
+    backend.connection_registry[Token(token)].set_skip_propagation(false);
+    let path = std::env::temp_dir().join(format!(
+        "versal-batch-admission-{}.aof",
+        rand::random::<u64>()
+    ));
+    backend.ctx.config_mut().persistence.aof_enabled = true;
+    backend.ctx.config_mut().persistence.aof_fsync = AofFsync::No;
+    backend.ctx.config_mut().replication.repl_after_aof_fsync = true;
+    backend
+        .ctx
+        .config_mut()
+        .replication
+        .replica_output_buffer_hard_limit = 1;
+    backend.ctx.config_mut().server.repl_backlog_size = 1;
+    backend.ctx.aof_mut().replication_baseline = crate::engine::persistence::AofBaseline::Ready;
+    backend.ctx.aof_mut().journal = Some(
+        crate::foundation::io::persistence::journal::AofJournal::new(
+            AofAppender::open_append_path(&path, AofFsync::No).unwrap(),
+        ),
+    );
+    backend.ctx.replication_mut().backlog.activate();
+    let mut batch = ReadBatchEffects::default();
+    for key in [b"first".as_slice(), b"second"] {
+        backend.process_parsed_command(
+            Token(token),
+            make_args(&[b"SET", key, b"1"]),
+            "set".to_string(),
+            false,
+            &mut batch,
+        );
+    }
+    assert!(backend.ctx.db(0).unwrap().get_no_expire(b"first").is_some());
+    assert!(backend
+        .ctx
+        .db(0)
+        .unwrap()
+        .get_no_expire(b"second")
+        .is_none());
+    assert!(batch.replies.last().unwrap().starts_with(b"-OOM"));
+    drop(backend);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn strict_failed_aof_read_does_not_lazily_delete_an_expired_key() {
+    let mut backend = ServerWorkerState::new(1).unwrap();
+    crate::framework::commands::register_all(&mut backend.registry);
+    backend.ctx.config_mut().replication.repl_after_aof_fsync = true;
+    let token = add_fake_connection(&mut backend);
+    backend.ctx.db_mut(0).unwrap().set(
+        b"expired".to_vec(),
+        crate::foundation::io::store::Robj::string("value"),
+    );
+    backend.ctx.db_mut(0).unwrap().set_expire(b"expired", 1);
+    let mut batch = ReadBatchEffects::default();
+    backend.process_parsed_command(
+        Token(token),
+        make_args(&[b"GET", b"expired"]),
+        "get".to_string(),
+        false,
+        &mut batch,
+    );
+    assert!(backend
+        .ctx
+        .db(0)
+        .unwrap()
+        .get_allow_expired(b"expired")
+        .is_some());
+    assert!(batch.aof_only.is_empty());
+}
+
+#[test]
+fn asynchronous_config_rollbacks_restore_eviction_metadata() {
+    for kind in 0..3 {
+        let mut backend = ServerWorkerState::new(1).unwrap();
+        let token = add_fake_connection(&mut backend);
+        let previous = backend.ctx.config().clone();
+        backend.ctx.config_mut().server.maxmemory_policy = "allkeys-lfu".to_string();
+        backend.ctx.sync_eviction_policy();
+        let result = match kind {
+            0 => {
+                backend
+                    .ctx
+                    .request_tcp_rebind(previous, None, "invalid".to_string(), 6379, "bind");
+                backend.resolve_tcp_rebind_request(token)
+            }
+            1 => {
+                backend.ctx.config_mut().server.tls_port = 6380;
+                backend.ctx.config_mut().server.tls_cert_file = "/missing/cert.pem".to_string();
+                backend
+                    .ctx
+                    .request_tls_reconfigure(previous, true, false, false, "tls-port");
+                backend.resolve_tls_reconfigure_request(token)
+            }
+            _ => {
+                backend.ctx.request_io_threads_reconfigure(previous, 0);
+                backend.resolve_io_threads_reconfigure_request()
+            }
+        };
+        assert!(matches!(result, Some(Value::Error(_))));
+        assert_eq!(backend.ctx.config().server.maxmemory_policy, "noeviction");
+        backend.ctx.db_mut(0).unwrap().set(
+            b"new".to_vec(),
+            crate::foundation::io::store::Robj::string("value"),
+        );
+        assert_eq!(
+            backend.ctx.db(0).unwrap().get_lfu_access_minutes(b"new"),
+            None,
+            "rollback kind={kind}"
+        );
+    }
+}
+
+#[test]
+fn durability_mode_switch_syncs_preceding_writes_in_the_same_read_batch() {
+    use crate::foundation::io::persistence::{AofAppender, AofFsync};
+    let mut backend = ServerWorkerState::new(1).unwrap();
+    crate::framework::commands::register_all(&mut backend.registry);
+    let token = add_fake_connection(&mut backend);
+    backend.connection_registry[Token(token)].set_skip_propagation(false);
+    let path = std::env::temp_dir().join(format!(
+        "versal-pipeline-durability-{}-{}.aof",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    backend.ctx.config_mut().persistence.aof_enabled = true;
+    backend.ctx.config_mut().persistence.aof_fsync = AofFsync::No;
+    backend.ctx.config_mut().replication.repl_after_aof_fsync = true;
+    backend.ctx.aof_mut().replication_baseline = crate::engine::persistence::AofBaseline::Ready;
+    backend.ctx.aof_mut().journal = Some(
+        crate::foundation::io::persistence::journal::AofJournal::new(
+            AofAppender::open_append_path(&path, AofFsync::No).unwrap(),
+        ),
+    );
+    let mut batch = ReadBatchEffects::default();
+    assert_eq!(
+        backend.process_parsed_command(
+            Token(token),
+            make_args(&[b"SET", b"key", b"value"]),
+            "set".to_string(),
+            false,
+            &mut batch,
+        ),
+        LoopAction::Continue
+    );
+    assert!(!batch.aof_only.is_empty());
+    assert_eq!(
+        backend.process_parsed_command(
+            Token(token),
+            make_args(&[b"CONFIG", b"SET", b"repl-after-aof-fsync", b"no"]),
+            "config".to_string(),
+            false,
+            &mut batch,
+        ),
+        LoopAction::Continue
+    );
+    assert!(!backend.ctx.config().replication.repl_after_aof_fsync);
+    let appender = &backend.ctx.aof().journal.as_ref().unwrap().appender;
+    assert!(appender.sync_handle().is_durable(appender.appended_stamp()));
+    assert!(batch.aof_only.is_empty());
+    assert!(std::fs::read(&path)
+        .unwrap()
+        .windows(3)
+        .any(|bytes| bytes == b"SET"));
+    drop(backend);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn writable_replica_local_write_does_not_append_to_replication_history() {
     let mut backend = ServerWorkerState::new(1).unwrap();
     crate::framework::commands::register_all(&mut backend.registry);

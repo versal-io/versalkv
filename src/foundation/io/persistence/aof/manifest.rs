@@ -4,6 +4,56 @@ use std::path::{Path, PathBuf};
 
 pub const MAX_MANIFEST_LINE_LEN: usize = 1024;
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static FAIL_NEXT_DIRECTORY_SYNC: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+}
+
+pub(crate) fn sync_directory(path: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    if FAIL_NEXT_DIRECTORY_SYNC.with(|fail| fail.replace(false)) {
+        return Err(io::Error::other("injected AOF directory sync failure"));
+    }
+    std::fs::File::open(path)?.sync_all()
+}
+
+pub(crate) fn sync_parent(path: &Path) -> io::Result<()> {
+    sync_directory(
+        path.parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(Path::new(".")),
+    )
+}
+
+pub(crate) fn create_aof_directory(path: &Path) -> io::Result<()> {
+    std::fs::create_dir_all(path)?;
+    // Include existing ancestors: their entries may have just been created by an appender.
+    let absolute = std::path::absolute(path)?;
+    let mut directory = Some(absolute.as_path());
+    while let Some(path) = directory {
+        sync_directory(path)?;
+        directory = path.parent();
+    }
+    Ok(())
+}
+
+pub(crate) fn write_manifest_atomically(path: &Path, content: &[u8]) -> io::Result<()> {
+    let temp = path.with_extension("manifest.tmp");
+    let result = (|| {
+        let mut file = std::fs::File::create(&temp)?;
+        file.write_all(content)?;
+        file.sync_all()?;
+        std::fs::rename(&temp, path)?;
+        sync_parent(path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(temp);
+    }
+    result
+}
+
 #[derive(Clone, Debug)]
 pub struct AofManifestEntry {
     pub filename: String,
@@ -135,13 +185,18 @@ pub fn ensure_aof_increment(dir: &str, filename: &str, appenddirname: &str) -> i
     let content = std::fs::read_to_string(&manifest_path)?;
     let entries = read_manifest_entries(&manifest_path)?;
     if entries.iter().any(|entry| entry.kind == 'i') {
+        for entry in entries.iter().filter(|entry| entry.kind == 'i') {
+            std::fs::metadata(app_dir.join(&entry.filename))?;
+        }
         return Ok(());
     }
     let incr_name = format!("{}.1.incr.aof", filename);
     OpenOptions::new()
         .create(true)
         .append(true)
-        .open(app_dir.join(&incr_name))?;
+        .open(app_dir.join(&incr_name))?
+        .sync_all()?;
+    sync_directory(&app_dir)?;
     append_manifest_entry(&manifest_path, &content, &incr_name, 1)
 }
 
@@ -174,7 +229,9 @@ pub fn rotate_aof_increment(dir: &str, filename: &str, appenddirname: &str) -> i
     OpenOptions::new()
         .create_new(true)
         .write(true)
-        .open(&incr_path)?;
+        .open(&incr_path)?
+        .sync_all()?;
+    sync_directory(&app_dir)?;
     append_manifest_entry(&manifest_path, &content, &incr_name, sequence)?;
     Ok(incr_path)
 }
@@ -192,9 +249,8 @@ pub fn gc_aof_history(dir: &str, filename: &str, appenddirname: &str) -> io::Res
     let manifest_path = app_dir.join(format!("{}.manifest", filename));
     let entries = read_manifest_entries(&manifest_path)?;
     let mut active_manifest = String::new();
-    for entry in entries {
+    for entry in &entries {
         if entry.kind == 'h' {
-            let _ = std::fs::remove_file(app_dir.join(entry.filename));
             continue;
         }
         use std::fmt::Write as _;
@@ -207,7 +263,11 @@ pub fn gc_aof_history(dir: &str, filename: &str, appenddirname: &str) -> io::Res
         )
         .map_err(io::Error::other)?;
     }
-    std::fs::write(manifest_path, active_manifest)
+    write_manifest_atomically(&manifest_path, active_manifest.as_bytes())?;
+    for entry in entries.iter().filter(|entry| entry.kind == 'h') {
+        let _ = std::fs::remove_file(app_dir.join(&entry.filename));
+    }
+    Ok(())
 }
 
 fn max_sequences(content: &str) -> io::Result<(u64, u64)> {
@@ -246,19 +306,23 @@ fn read_or_upgrade_legacy(
             if !old_path.exists() {
                 return Ok(None);
             }
-            std::fs::create_dir_all(app_dir)?;
+            create_aof_directory(app_dir)?;
+            std::fs::File::open(&old_path)?.sync_all()?;
             std::fs::rename(&old_path, app_dir.join(filename))?;
+            sync_parent(&old_path)?;
             let incr_name = format!("{}.1.incr.aof", filename);
             OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(app_dir.join(&incr_name))?;
+                .open(app_dir.join(&incr_name))?
+                .sync_all()?;
+            sync_directory(app_dir)?;
             let content = format!(
                 "file {} seq 1 type b\nfile {} seq 1 type i\n",
                 format_manifest_token(filename),
                 format_manifest_token(&incr_name)
             );
-            std::fs::write(manifest_path, &content)?;
+            write_manifest_atomically(manifest_path, content.as_bytes())?;
             Ok(Some(content))
         }
         Err(error) => Err(error),
@@ -276,7 +340,10 @@ fn migrate_interrupted_legacy(
     }
     let old_path = Path::new(dir).join(configured_filename);
     if old_path.exists() {
+        std::fs::File::open(&old_path)?.sync_all()?;
         std::fs::rename(old_path, destination)?;
+        sync_directory(Path::new(dir))?;
+        sync_parent(destination)?;
     }
     Ok(())
 }
@@ -287,16 +354,19 @@ fn append_manifest_entry(
     incr_name: &str,
     sequence: u64,
 ) -> io::Result<()> {
-    let mut manifest = OpenOptions::new().append(true).open(manifest_path)?;
+    let mut manifest = old_content.to_owned();
     if !old_content.ends_with('\n') {
-        manifest.write_all(b"\n")?;
+        manifest.push('\n');
     }
+    use std::fmt::Write as _;
     writeln!(
         manifest,
         "file {} seq {} type i",
         format_manifest_token(incr_name),
         sequence
     )
+    .map_err(io::Error::other)?;
+    write_manifest_atomically(manifest_path, manifest.as_bytes())
 }
 
 fn tokenize(line: &str) -> io::Result<Vec<String>> {

@@ -79,6 +79,25 @@ fn server_context_excludes_replication_and_slot_export_buffers() {
 }
 
 #[test]
+fn server_context_charges_unreleased_replication_to_maxmemory() {
+    let mut ctx = ServerContext::new(1);
+    ctx.config_mut().server.repl_backlog_size = 0;
+    ctx.replication_mut().backlog.set_capacity(8_192);
+    ctx.replication_mut()
+        .backlog
+        .set_replication_release_cursor(Some(
+            crate::engine::distributed::replication::BacklogCursor::ZERO,
+        ));
+    ctx.replication_mut()
+        .backlog
+        .append(&vec![b'x'; 4_096])
+        .unwrap();
+    let ordinary = ctx.maxmemory_state().not_counted;
+    ctx.config_mut().replication.repl_after_aof_fsync = true;
+    assert_eq!(ctx.maxmemory_state().not_counted, ordinary - 4_096);
+}
+
+#[test]
 fn server_context_excludes_active_aof_buffer_allocation() {
     let path = std::env::temp_dir().join(format!(
         "versal-maxmemory-aof-{}-{}.aof",

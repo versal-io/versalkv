@@ -87,10 +87,13 @@ pub(super) fn config_set_persistence(
                     crate::framework::commands::server::bgrewriteaof::start_aof_rewrite(ctx)
                 });
             }
-            if !new_val {
-                ctx.config_mut().persistence.aof_enabled = false;
-            }
             if !new_val && old_val {
+                if let Some(mut journal) = ctx.aof_mut().journal.take() {
+                    if let Err(error) = journal.appender.shutdown() {
+                        ctx.aof_mut().journal = Some(journal);
+                        return Err(format!("MISCONF AOF shutdown failed: {error}"));
+                    }
+                }
                 ctx.persistence_mut().set_aof_rewrite_scheduled(false);
                 if let Some(pid) = ctx.persistence().aof_rewrite_child_pid() {
                     crate::server_log!(notice, "Killing AOF child pid {}", pid);
@@ -101,10 +104,12 @@ pub(super) fn config_set_persistence(
                     let _ = crate::foundation::io::sys::process::wait_blocking(pid);
                     ctx.persistence_mut().abort_child();
                 }
-                if let Some(mut journal) = ctx.aof_mut().journal.take() {
-                    let _ = journal.appender.shutdown();
-                }
                 ctx.persistence_mut().reset_aof_selected_db();
+            }
+            if !new_val {
+                ctx.config_mut().persistence.aof_enabled = false;
+                ctx.aof_mut().replication_baseline =
+                    crate::engine::persistence::AofBaseline::Unavailable;
             }
         }
         "aof-disable-auto-gc" => {

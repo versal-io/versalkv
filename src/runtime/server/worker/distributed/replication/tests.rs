@@ -2484,6 +2484,7 @@ fn eof_marker_only_on_rdb_channel_in_dual_mode() {
 
 mod direct_child;
 mod dual;
+mod durability;
 mod full_sync;
 mod paused_dual;
 mod regression;

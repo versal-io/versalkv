@@ -333,6 +333,7 @@ static SIMPLE_CONFIGS: &[(&str, Setter)] = &[
     ("set-proc-title",                    Setter::Bool(|c, v| c.set_proc_title = v)),
     ("always-show-logo",                  Setter::Bool(|c, v| c.always_show_logo = v)),
     ("appendfsync",                       Setter::Lower(|c, v| c.appendfsync = v)),
+    ("repl-after-aof-fsync",              Setter::Bool(|c, v| c.repl_after_aof_fsync = v)),
     ("repl-diskless-load",                Setter::Lower(|c, v| c.repl_diskless_load = v)),
     ("rdb-version-check",                 Setter::Lower(|c, v| c.rdb_version_check = v)),
     ("daemonize",                         Setter::Bool(|c, v| c.daemonize = v)),

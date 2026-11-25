@@ -25,10 +25,17 @@ impl PropagationTargets {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PropagationPersistence {
+    Data,
+    Transient,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PropagationBatch {
     pub db_id: u32,
     pub targets: PropagationTargets,
+    pub persistence: PropagationPersistence,
     pub bytes: Vec<u8>,
     command_count: usize,
 }
@@ -38,6 +45,7 @@ impl PropagationBatch {
         Self {
             db_id,
             targets,
+            persistence: PropagationPersistence::Data,
             bytes,
             command_count: 1,
         }
@@ -60,6 +68,7 @@ impl PropagationBatch {
         let mut batch = Self {
             db_id,
             targets,
+            persistence: PropagationPersistence::Data,
             bytes: Vec::new(),
             command_count: 0,
         };
@@ -403,17 +412,17 @@ impl ScriptRunCtx {
         &mut self,
         db_id: u32,
         targets: PropagationTargets,
+        persistence: PropagationPersistence,
         frame: Vec<u8>,
     ) {
-        if let Some(batch) = self
-            .propagation_ops
-            .last_mut()
-            .filter(|batch| batch.db_id == db_id && batch.targets == targets)
-        {
+        if let Some(batch) = self.propagation_ops.last_mut().filter(|batch| {
+            batch.db_id == db_id && batch.targets == targets && batch.persistence == persistence
+        }) {
             batch.append_frame(frame);
         } else {
-            self.propagation_ops
-                .push(PropagationBatch::new(db_id, targets, frame));
+            let mut batch = PropagationBatch::new(db_id, targets, frame);
+            batch.persistence = persistence;
+            self.propagation_ops.push(batch);
         }
     }
 
@@ -421,17 +430,17 @@ impl ScriptRunCtx {
         &mut self,
         db_id: u32,
         targets: PropagationTargets,
+        persistence: PropagationPersistence,
         args: &crate::engine::command::CommandArgs,
     ) {
-        if let Some(batch) = self
-            .propagation_ops
-            .last_mut()
-            .filter(|batch| batch.db_id == db_id && batch.targets == targets)
-        {
+        if let Some(batch) = self.propagation_ops.last_mut().filter(|batch| {
+            batch.db_id == db_id && batch.targets == targets && batch.persistence == persistence
+        }) {
             batch.append_command(args);
         } else {
-            self.propagation_ops
-                .push(PropagationBatch::from_command(db_id, targets, args));
+            let mut batch = PropagationBatch::from_command(db_id, targets, args);
+            batch.persistence = persistence;
+            self.propagation_ops.push(batch);
         }
     }
 }
